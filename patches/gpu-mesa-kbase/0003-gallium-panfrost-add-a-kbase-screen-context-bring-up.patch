@@ -1,0 +1,148 @@
+From 4d564057fee8d195cab16b996c9dd2dc74451527 Mon Sep 17 00:00:00 2001
+From: nura <nura@localhost>
+Date: Sat, 24 Oct 2026 23:50:52 -0500
+Subject: [PATCH 3/3] gallium/panfrost: add a kbase screen/context bring-up
+ skeleton
+
+panfrost-kbase-skeleton opens /dev/maliN, builds the driver option cache
+from panfrost's own driinfo list (there is no DRI loader for a kbase fd),
+creates a real pipe_screen through panfrost_create_screen() and a
+pipe_context, prints identification and tears both down.  It draws nothing
+and exposes no GL entry point; it exists to prove the Gallium object model
+comes up on the kbase winsys.
+---
+ src/gallium/drivers/panfrost/meson.build      | 16 +++
+ .../panfrost/panfrost_kbase_skeleton.c        | 97 +++++++++++++++++++
+ 2 files changed, 113 insertions(+)
+ create mode 100644 src/gallium/drivers/panfrost/panfrost_kbase_skeleton.c
+
+diff --git a/src/gallium/drivers/panfrost/meson.build b/src/gallium/drivers/panfrost/meson.build
+index 9f32064..1e3f118 100644
+--- a/src/gallium/drivers/panfrost/meson.build
++++ b/src/gallium/drivers/panfrost/meson.build
+@@ -134,3 +134,19 @@ driver_panfrost = declare_dependency(
+   compile_args : compile_args_panfrost,
+   link_with : [libpanfrost, libpanfrostwinsys, libpanfrost_shared, libpanfrost_compiler, libpanfrost_decode, libpanfrost_lib],
+ )
++
++# First milestone of the kbase (/dev/mali0, UK 10.6) winsys: build the
++# Panfrost Gallium screen and a pipe_context on top of the kbase pan_kmod
++# backend, print identification and tear down.  It is a bring-up probe, not a
++# renderer; it draws nothing.
++panfrost_kbase_skeleton = executable(
++  'panfrost-kbase-skeleton',
++  'panfrost_kbase_skeleton.c',
++  include_directories : panfrost_includes,
++  c_args : [c_msvc_compat_args, compile_args_panfrost],
++  link_with : [libpanfrost, libpanfrost_versions, libpanfrost_lib,
++               libpanfrost_compiler, libpanfrost_decode, libgallium, _libnir],
++  dependencies : [idep_mesautil, idep_nir, idep_xmlconfig, dep_libdrm,
++                  dep_thread],
++  build_by_default : true,
++)
+diff --git a/src/gallium/drivers/panfrost/panfrost_kbase_skeleton.c b/src/gallium/drivers/panfrost/panfrost_kbase_skeleton.c
+new file mode 100644
+index 0000000..cb26f18
+--- /dev/null
++++ b/src/gallium/drivers/panfrost/panfrost_kbase_skeleton.c
+@@ -0,0 +1,97 @@
++/*
++ * Copyright © 2026 Nura userspace effort
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * panfrost-kbase-skeleton: create a Panfrost Gallium screen and context on
++ * top of the kbase (/dev/mali0, UK 10.6) kmod backend.
++ *
++ * This is the first integration milestone, not a renderer: it opens the kbase
++ * device, builds a real pipe_screen through panfrost_create_screen() (which
++ * runs panfrost_device_init and allocates the tiler heap / sample positions
++ * through kbase SAME_VA memory), creates a pipe_context (which creates the
++ * JM context through the backend), prints identification, and tears both
++ * down.  No draw, clear or blit is issued and no GL entry point exists.
++ *
++ * The DRI loader normally builds the driver-option cache.  There is no DRI
++ * loader for a kbase fd, so the skeleton builds the same cache from the
++ * driver's own driinfo list (the exact list the DRI target compiles in).
++ *
++ * Usage: panfrost-kbase-skeleton [/dev/maliN]
++ * Exit:  0 = screen+context created, 2 = no kbase device, 1 = failure.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_defines.h"
++#include "util/driconf.h"
++#include "util/macros.h"
++#include "util/xmlconfig.h"
++#include "pan_public.h"
++
++/* panfrost's option descriptions, as compiled into the DRI target by
++ * drm_helper.h. */
++static const driOptionDescription panfrost_driconf[] = {
++#include "driinfo_panfrost.h"
++};
++
++int
++main(int argc, char **argv)
++{
++   const char *path = argc > 1 ? argv[1] : "/dev/mali0";
++   struct pipe_screen *screen;
++   struct pipe_context *ctx;
++   driOptionCache options = {0};
++   driOptionCache options_info = {0};
++   struct pipe_screen_config config = {
++      .options = &options,
++      .options_info = &options_info,
++   };
++   int fd;
++
++   driParseOptionInfo(&options_info, panfrost_driconf,
++                      ARRAY_SIZE(panfrost_driconf));
++   driParseConfigFiles(&options, &options_info,
++                       &(driConfigFileParseParams){.driverName = "panfrost"});
++
++   fd = open(path, O_RDWR | O_CLOEXEC);
++   if (fd < 0) {
++      fprintf(stderr, "%s: cannot open %s: %s\n", argv[0], path,
++              strerror(errno));
++      return 2;
++   }
++
++   screen = panfrost_create_screen(fd, &config, NULL);
++   if (!screen) {
++      fprintf(stderr, "%s: panfrost_create_screen() failed "
++                      "(kbase backend or GPU unsupported)\n", argv[0]);
++      close(fd);
++      return 1;
++   }
++
++   printf("screen:  %s (%s, %s)\n", screen->get_name(screen),
++          screen->get_vendor(screen), screen->get_device_vendor(screen));
++
++   ctx = screen->context_create(screen, NULL, 0);
++   if (!ctx) {
++      fprintf(stderr, "%s: context_create() failed\n", argv[0]);
++      screen->destroy(screen);
++      return 1;
++   }
++
++   printf("context: created (pipe_context=%p); rendering not implemented\n",
++          (void *)ctx);
++
++   ctx->destroy(ctx);
++   screen->destroy(screen);
++   printf("teardown complete\n");
++   return 0;
++}
+-- 
+2.56.0
+

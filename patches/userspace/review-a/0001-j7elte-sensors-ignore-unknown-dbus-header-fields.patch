@@ -1,0 +1,78 @@
+--- a/device/archived/j7elte-sensors/dbus-wire.c
++++ b/device/archived/j7elte-sensors/dbus-wire.c
+@@ -330,6 +330,35 @@
+ 		r->off = r->len;
+ }
+ 
++/* Skip the value of a variant with type signature sig.  Header fields this
++ * implementation does not interpret are ignored as the D-Bus specification
++ * requires; in practice that is UNIX_FDS (9), which GLib/GDBus clients put
++ * on every method call, with signature "u". */
++static int skip_variant_value(struct dw_reader *r, const char *sig)
++{
++	uint32_t u;
++	uint8_t y;
++	int b;
++	const char *s;
++	size_t n;
++
++	switch (sig[0]) {
++	case 'u':
++		return dw_r_uint32(r, &u);
++	case 'b':
++		return dw_r_bool(r, &b);
++	case 'y':
++		return r_u8(r, &y);
++	case 's':
++	case 'o':
++		return dw_r_string(r, &s, &n);
++	case 'g':
++		return dw_r_signature(r, &s, &n);
++	default:
++		return -1;
++	}
++}
++
+ /* ------------------------------------------------------------------ */
+ /* outgoing messages                                                  */
+ /* ------------------------------------------------------------------ */
+@@ -368,6 +397,7 @@
+ 	HF_DESTINATION = 6,
+ 	HF_SENDER = 7,
+ 	HF_SIGNATURE = 8,
++	HF_UNIX_FDS = 9,
+ };
+ 
+ static void add_field_str(struct dw_writer *w, enum header_field code,
+@@ -575,9 +605,18 @@
+ 			m->reply_serial = u;
+ 			m->has_reply_serial = 1;
+ 			break;
++		case HF_UNIX_FDS:
++			if (strcmp(sig, "u"))
++				return -1;
++			if (dw_r_uint32(&value, &u) < 0)
++				return -1;
++			break;
+ 		default:
+-			/* unknown/unsupported header field */
+-			return -1;
++			/* Unknown header field: ignore its value (D-Bus spec
++			 * requires this; unknown types remain an error). */
++			if (skip_variant_value(&value, sig) < 0)
++				return -1;
++			break;
+ 		}
+ 		/* values are parsed through a copy; advance the outer reader */
+ 		r.off = value.off;
+--- a/device/archived/j7elte-sensors/APKBUILD
++++ b/device/archived/j7elte-sensors/APKBUILD
+@@ -40,7 +40,7 @@
+ 
+ sha512sums="
+ 514b545790a70400480f72458ce4f24a659b5a56132b8b0abe46a5f9aa0c4cdcfdf8514da51ea46f92d52a7298765418ad50394712464f40625b9271dcef782b  j7elte-sensors.c
+-1518a879a7c2543c30b34972fb2f097381572194c476f8be54aa1431e83c117b616bba8d814217e7a2b01f8f17fbc7d9afea38e82e6a6d996e194a2e5f074d88  dbus-wire.c
++9c49ea039d5cdfec2cae61f6ce0200aaa368163498be63e07be0793eee8744ce891ddd4d1472de2c685cac9e7acc526096ea712ce721cfa10dff072f96a73304  dbus-wire.c
+ 11ddaf7a1895cb09e76c00c3add3ff61cb659ca852bdb3f82b5d89304a11869a0bd54cb65a5054a70ac1a0e21401c120c0a3934270fd4c650b9a1f58a6e890d4  dbus-wire.h
+ 9c7944bff72372781cf3887a1389811406dd16a594916cabb7ef55dfb83b4d23f2d19fed9984ea3c0409b7f390369160143b7a026de40acbbd8a6c8643a38b20  Makefile
+ 43febf50866f5d7cb7db163066cfce8c3c217a99407444d7b28fcfdd27840b983427413cb292f7615cf3b921301351861a83fa8c196ddf02457b96eb5343b9f9  j7elte-sensors.service

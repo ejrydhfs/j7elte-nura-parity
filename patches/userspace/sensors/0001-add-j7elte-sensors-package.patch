@@ -1,0 +1,2432 @@
+diff --git a/device/archived/j7elte-sensors/APKBUILD b/device/archived/j7elte-sensors/APKBUILD
+new file mode 100644
+index 0000000..10ad6baaa4e4d03a91e8f2cd893c3c6db79f4b3e
+--- /dev/null
++++ b/device/archived/j7elte-sensors/APKBUILD
+@@ -0,0 +1,49 @@
++# Maintainer: j7elte parity work <parity@example.invalid>
++# net.hadess.SensorProxy bridge for the Samsung K2HH accelerometer and the
++# CM36672P/STK3013 proximity sensor, which are evdev/sysfs devices (not IIO)
++# in the Nura kernel.
++pkgname=j7elte-sensors
++pkgver=1.0.0
++pkgrel=0
++pkgdesc="net.hadess.SensorProxy bridge for Samsung Galaxy J7 (j7elte) evdev sensors"
++url="https://postmarketos.org"
++arch="aarch64"
++license="GPL-3.0-or-later"
++depends="dbus"
++makedepends=""
++options="!check"
++source="
++	j7elte-sensors.c
++	dbus-wire.c
++	dbus-wire.h
++	Makefile
++	j7elte-sensors.service
++	j7elte-sensors.initd
++	j7elte-sensors.conf
++"
++builddir="$srcdir"
++
++build() {
++	make CC="$CC" CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
++}
++
++package() {
++	install -Dm755 j7elte-sensors \
++		"$pkgdir"/usr/bin/j7elte-sensors
++	install -Dm644 j7elte-sensors.service \
++		"$pkgdir"/usr/lib/systemd/system/j7elte-sensors.service
++	install -Dm755 j7elte-sensors.initd \
++		"$pkgdir"/etc/init.d/j7elte-sensors
++	install -Dm644 j7elte-sensors.conf \
++		"$pkgdir"/usr/share/dbus-1/system.d/j7elte-sensors.conf
++}
++
++sha512sums="
++514b545790a70400480f72458ce4f24a659b5a56132b8b0abe46a5f9aa0c4cdcfdf8514da51ea46f92d52a7298765418ad50394712464f40625b9271dcef782b  j7elte-sensors.c
++1518a879a7c2543c30b34972fb2f097381572194c476f8be54aa1431e83c117b616bba8d814217e7a2b01f8f17fbc7d9afea38e82e6a6d996e194a2e5f074d88  dbus-wire.c
++11ddaf7a1895cb09e76c00c3add3ff61cb659ca852bdb3f82b5d89304a11869a0bd54cb65a5054a70ac1a0e21401c120c0a3934270fd4c650b9a1f58a6e890d4  dbus-wire.h
++9c7944bff72372781cf3887a1389811406dd16a594916cabb7ef55dfb83b4d23f2d19fed9984ea3c0409b7f390369160143b7a026de40acbbd8a6c8643a38b20  Makefile
++43febf50866f5d7cb7db163066cfce8c3c217a99407444d7b28fcfdd27840b983427413cb292f7615cf3b921301351861a83fa8c196ddf02457b96eb5343b9f9  j7elte-sensors.service
++782d36620a67b4f95f17f19d17e6512e7578b2abdc880c51adfbef1d84555311026650569f3aaa2e73a007ec78085c1f1982b7d258524b3c2fb2f1ca81336a1a  j7elte-sensors.initd
++deec0aeaf5ca6dc5c481f53c3f9ed77456aaf9df410e88cfff3c64a07eebdb63789638a3d2492589b267c6d5a2bb8abbf18b4d6355fa1d32e1c7e6ed037500a7  j7elte-sensors.conf
++"
+diff --git a/device/archived/j7elte-sensors/Makefile b/device/archived/j7elte-sensors/Makefile
+new file mode 100644
+index 0000000..8f9c12511a431d7ef1fd0eb3978cea6ebbd76f7b
+--- /dev/null
++++ b/device/archived/j7elte-sensors/Makefile
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: GPL-3.0-or-later
++PREFIX ?= /usr
++CC ?= cc
++CFLAGS ?= -O2 -g
++CFLAGS += -Wall -Wextra -std=gnu11
++LDFLAGS ?=
++LDLIBS += -lm
++
++SRCS = j7elte-sensors.c dbus-wire.c
++OBJS = $(SRCS:.c=.o)
++BIN = j7elte-sensors
++
++all: $(BIN)
++
++$(BIN): $(OBJS)
++	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
++
++%.o: %.c dbus-wire.h
++	$(CC) $(CFLAGS) -c -o $@ $<
++
++install: $(BIN)
++	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
++	install -Dm644 j7elte-sensors.service \
++		$(DESTDIR)$(PREFIX)/lib/systemd/system/j7elte-sensors.service
++	install -Dm755 j7elte-sensors.initd \
++		$(DESTDIR)/etc/init.d/j7elte-sensors
++	install -Dm644 j7elte-sensors.conf \
++		$(DESTDIR)$(PREFIX)/share/dbus-1/system.d/j7elte-sensors.conf
++
++clean:
++	rm -f $(BIN) $(OBJS)
++
++.PHONY: all install clean
+diff --git a/device/archived/j7elte-sensors/dbus-wire.c b/device/archived/j7elte-sensors/dbus-wire.c
+new file mode 100644
+index 0000000..b870dedd3f67042ea120e653e820e08a7254cd4a
+--- /dev/null
++++ b/device/archived/j7elte-sensors/dbus-wire.c
+@@ -0,0 +1,981 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/*
++ * dbus-wire.c - minimal D-Bus binary protocol implementation
++ *
++ * Only the subset needed by net.hadess.SensorProxy is implemented.  The
++ * code is deliberately dependency-free (no libdbus, no GLib) so that the
++ * daemon can be built for musl and statically linked.
++ */
++#include "dbus-wire.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stddef.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error "dbus-wire.c only implements the little-endian D-Bus wire format"
++#endif
++
++#define DW_MAX_MESSAGE (4u * 1024u * 1024u)
++#define DW_HEADER_SIZE 16u
++
++struct dw_writer {
++	uint8_t *buf;
++	size_t len;
++	size_t cap;
++};
++
++struct dw_conn {
++	int fd;
++	uint32_t serial;
++	uint8_t *in;
++	size_t inlen;
++	size_t incap;
++	char unique[128];
++};
++
++/* ------------------------------------------------------------------ */
++/* little-endian helpers                                              */
++/* ------------------------------------------------------------------ */
++
++static uint32_t get_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void put_le32(uint8_t *p, uint32_t v)
++{
++	p[0] = v & 0xff;
++	p[1] = (v >> 8) & 0xff;
++	p[2] = (v >> 16) & 0xff;
++	p[3] = (v >> 24) & 0xff;
++}
++
++static size_t align_up(size_t v, size_t a)
++{
++	return (v + a - 1) & ~(a - 1);
++}
++
++static void set_err(char *err, size_t errlen, const char *fmt, ...)
++{
++	va_list ap;
++
++	if (!err || errlen == 0)
++		return;
++	va_start(ap, fmt);
++	vsnprintf(err, errlen, fmt, ap);
++	va_end(ap);
++}
++
++/* ------------------------------------------------------------------ */
++/* writer                                                             */
++/* ------------------------------------------------------------------ */
++
++static void w_reserve(struct dw_writer *w, size_t extra)
++{
++	size_t need = w->len + extra;
++	size_t cap;
++	uint8_t *nb;
++
++	if (need <= w->cap)
++		return;
++	cap = w->cap ? w->cap : 512;
++	while (cap < need)
++		cap *= 2;
++	nb = realloc(w->buf, cap);
++	if (!nb) {
++		fprintf(stderr, "j7elte-sensors: out of memory\n");
++		exit(1);
++	}
++	w->buf = nb;
++	w->cap = cap;
++}
++
++static void w_bytes(struct dw_writer *w, const void *p, size_t n)
++{
++	w_reserve(w, n);
++	memcpy(w->buf + w->len, p, n);
++	w->len += n;
++}
++
++static void w_u8(struct dw_writer *w, uint8_t v)
++{
++	w_bytes(w, &v, 1);
++}
++
++static void w_pad(struct dw_writer *w, size_t align)
++{
++	size_t target = align_up(w->len, align);
++
++	if (target > w->len) {
++		size_t n = target - w->len;
++		w_reserve(w, n);
++		memset(w->buf + w->len, 0, n);
++		w->len += n;
++	}
++}
++
++void dw_w_align(struct dw_writer *w, size_t align)
++{
++	w_pad(w, align);
++}
++
++void dw_w_uint32(struct dw_writer *w, uint32_t v)
++{
++	uint8_t b[4];
++
++	w_pad(w, 4);
++	put_le32(b, v);
++	w_bytes(w, b, 4);
++}
++
++void dw_w_bool(struct dw_writer *w, int v)
++{
++	dw_w_uint32(w, v ? 1 : 0);
++}
++
++void dw_w_double(struct dw_writer *w, double v)
++{
++	union {
++		double d;
++		uint64_t u;
++	} u;
++	uint8_t b[8];
++
++	u.d = v;
++	w_pad(w, 8);
++	put_le32(b, (uint32_t)(u.u & 0xffffffffu));
++	put_le32(b + 4, (uint32_t)(u.u >> 32));
++	w_bytes(w, b, 8);
++}
++
++void dw_w_string(struct dw_writer *w, const char *s)
++{
++	size_t n = strlen(s);
++
++	dw_w_uint32(w, (uint32_t)n);
++	w_bytes(w, s, n + 1);
++}
++
++void dw_w_object_path(struct dw_writer *w, const char *s)
++{
++	dw_w_string(w, s);
++}
++
++void dw_w_signature(struct dw_writer *w, const char *s)
++{
++	size_t n = strlen(s);
++
++	if (n > 255) {
++		fprintf(stderr, "j7elte-sensors: signature too long\n");
++		exit(1);
++	}
++	w_u8(w, (uint8_t)n);
++	w_bytes(w, s, n + 1);
++}
++
++void dw_w_variant_string(struct dw_writer *w, const char *s)
++{
++	dw_w_signature(w, "s");
++	w_pad(w, 4);
++	dw_w_string(w, s);
++}
++
++void dw_w_variant_bool(struct dw_writer *w, int v)
++{
++	dw_w_signature(w, "b");
++	w_pad(w, 4);
++	dw_w_bool(w, v);
++}
++
++void dw_w_variant_double(struct dw_writer *w, double v)
++{
++	dw_w_signature(w, "d");
++	w_pad(w, 8);
++	dw_w_double(w, v);
++}
++
++struct dw_array_marker dw_w_array_begin(struct dw_writer *w,
++					size_t elem_align)
++{
++	struct dw_array_marker m;
++
++	dw_w_uint32(w, 0); /* length placeholder */
++	m.length_offset = w->len - 4;
++	w_pad(w, elem_align);
++	m.data_start = w->len;
++	return m;
++}
++
++void dw_w_array_end(struct dw_writer *w, struct dw_array_marker m)
++{
++	uint32_t len = (uint32_t)(w->len - m.data_start);
++
++	put_le32(w->buf + m.length_offset, len);
++}
++
++/* ------------------------------------------------------------------ */
++/* reader                                                             */
++/* ------------------------------------------------------------------ */
++
++static int r_need(struct dw_reader *r, size_t n)
++{
++	return r->off + n <= r->len;
++}
++
++static int r_pad(struct dw_reader *r, size_t align)
++{
++	size_t target = align_up(r->off, align);
++
++	if (target > r->len)
++		return -1;
++	r->off = target;
++	return 0;
++}
++
++static int r_u8(struct dw_reader *r, uint8_t *v)
++{
++	if (!r_need(r, 1))
++		return -1;
++	*v = r->p[r->off++];
++	return 0;
++}
++
++int dw_r_uint32(struct dw_reader *r, uint32_t *v)
++{
++	if (r_pad(r, 4) < 0 || !r_need(r, 4))
++		return -1;
++	*v = get_le32(r->p + r->off);
++	r->off += 4;
++	return 0;
++}
++
++int dw_r_bool(struct dw_reader *r, int *v)
++{
++	uint32_t u;
++
++	if (dw_r_uint32(r, &u) < 0)
++		return -1;
++	*v = u ? 1 : 0;
++	return 0;
++}
++
++static int r_bytes(struct dw_reader *r, const char **s, size_t *n, size_t len)
++{
++	if (r->off + len > r->len)
++		return -1;
++	*s = (const char *)(r->p + r->off);
++	if (n)
++		*n = len;
++	r->off += len;
++	return 0;
++}
++
++int dw_r_string(struct dw_reader *r, const char **s, size_t *n)
++{
++	uint32_t len;
++
++	if (dw_r_uint32(r, &len) < 0)
++		return -1;
++	if (len >= DW_MAX_MESSAGE)
++		return -1;
++	if (r->off + (size_t)len + 1 > r->len)
++		return -1;
++	*s = (const char *)(r->p + r->off);
++	if (n)
++		*n = len;
++	r->off += (size_t)len + 1;
++	return 0;
++}
++
++int dw_r_signature(struct dw_reader *r, const char **s, size_t *n)
++{
++	uint8_t len;
++
++	if (r_u8(r, &len) < 0)
++		return -1;
++	return r_bytes(r, s, n, (size_t)len + 1);
++}
++
++int dw_r_variant(struct dw_reader *r, char sig[8], struct dw_reader *value)
++{
++	const char *s;
++	size_t n;
++
++	if (dw_r_signature(r, &s, &n) < 0)
++		return -1;
++	if (n == 0 || n > 7)
++		return -1;
++	memcpy(sig, s, n);
++	sig[n - 1] = '\0';
++	if (value)
++		*value = *r;
++	return 0;
++}
++
++void dw_r_skip(struct dw_reader *r, size_t n)
++{
++	if (r->off + n <= r->len)
++		r->off += n;
++	else
++		r->off = r->len;
++}
++
++/* ------------------------------------------------------------------ */
++/* outgoing messages                                                  */
++/* ------------------------------------------------------------------ */
++
++static int send_all(int fd, const void *buf, size_t len)
++{
++	const uint8_t *p = buf;
++
++	while (len > 0) {
++		ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
++
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			if (errno == EAGAIN || errno == EWOULDBLOCK) {
++				struct pollfd pfd = { .fd = fd, .events = POLLOUT };
++
++				if (poll(&pfd, 1, 5000) <= 0)
++					return -1;
++				continue;
++			}
++			return -1;
++		}
++		p += n;
++		len -= (size_t)n;
++	}
++	return 0;
++}
++
++enum header_field {
++	HF_PATH = 1,
++	HF_INTERFACE = 2,
++	HF_MEMBER = 3,
++	HF_ERROR_NAME = 4,
++	HF_REPLY_SERIAL = 5,
++	HF_DESTINATION = 6,
++	HF_SENDER = 7,
++	HF_SIGNATURE = 8,
++};
++
++static void add_field_str(struct dw_writer *w, enum header_field code,
++			  char sigchar, const char *value)
++{
++	w_pad(w, 8);
++	w_u8(w, (uint8_t)code);
++	dw_w_signature(w, sigchar == 'g' ? "g" : (sigchar == 'o' ? "o" : "s"));
++	if (sigchar == 'g') {
++		dw_w_signature(w, value);
++	} else {
++		w_pad(w, 4);
++		dw_w_string(w, value);
++	}
++}
++
++static void add_field_u32(struct dw_writer *w, enum header_field code,
++			  uint32_t value)
++{
++	w_pad(w, 8);
++	w_u8(w, (uint8_t)code);
++	dw_w_signature(w, "u");
++	w_pad(w, 4);
++	dw_w_uint32(w, value);
++}
++
++static int send_message(struct dw_conn *c, uint8_t type, uint8_t flags,
++			const char *dest, const char *path, const char *iface,
++			const char *member, const char *error_name,
++			uint32_t reply_serial, const char *sig,
++			void (*fill)(struct dw_writer *, void *), void *ud)
++{
++	struct dw_writer w = { 0 };
++	uint32_t serial = ++c->serial;
++	size_t fields_len, body_start, body_len;
++	int ret;
++
++	w_reserve(&w, DW_HEADER_SIZE);
++	memset(w.buf, 0, DW_HEADER_SIZE);
++	w.len = DW_HEADER_SIZE;
++
++	if (path)
++		add_field_str(&w, HF_PATH, 'o', path);
++	if (iface)
++		add_field_str(&w, HF_INTERFACE, 's', iface);
++	if (member)
++		add_field_str(&w, HF_MEMBER, 's', member);
++	if (error_name)
++		add_field_str(&w, HF_ERROR_NAME, 's', error_name);
++	if (reply_serial)
++		add_field_u32(&w, HF_REPLY_SERIAL, reply_serial);
++	if (dest)
++		add_field_str(&w, HF_DESTINATION, 's', dest);
++	if (sig && sig[0])
++		add_field_str(&w, HF_SIGNATURE, 'g', sig);
++
++	fields_len = w.len - DW_HEADER_SIZE;
++	w_pad(&w, 8);
++	body_start = w.len;
++	if (fill)
++		fill(&w, ud);
++	body_len = w.len - body_start;
++
++	w.buf[0] = 'l';
++	w.buf[1] = type;
++	w.buf[2] = flags;
++	w.buf[3] = 1;
++	put_le32(w.buf + 4, (uint32_t)body_len);
++	put_le32(w.buf + 8, serial);
++	put_le32(w.buf + 12, (uint32_t)fields_len);
++
++	ret = send_all(c->fd, w.buf, w.len) < 0 ? -1 : 0;
++	free(w.buf);
++	if (ret < 0)
++		return -1;
++	return (int)serial;
++}
++
++int dw_send_method(struct dw_conn *c, const char *dest, const char *path,
++		   const char *iface, const char *member, const char *sig,
++		   void (*fill)(struct dw_writer *, void *), void *ud,
++		   uint32_t flags)
++{
++	return send_message(c, DW_TYPE_METHOD_CALL, (uint8_t)flags, dest, path,
++			    iface, member, NULL, 0, sig, fill, ud);
++}
++
++int dw_send_return(struct dw_conn *c, const struct dw_msg *call,
++		   const char *sig,
++		   void (*fill)(struct dw_writer *, void *), void *ud)
++{
++	if (call->flags & DW_FLAG_NO_REPLY_EXPECTED)
++		return 0;
++	return send_message(c, DW_TYPE_METHOD_RETURN, 0, call->sender,
++			    NULL, NULL, NULL, NULL, call->serial, sig, fill, ud);
++}
++
++struct error_ctx {
++	const char *message;
++};
++
++static void fill_error_string(struct dw_writer *w, void *ud)
++{
++	struct error_ctx *ctx = ud;
++
++	dw_w_string(w, ctx->message);
++}
++
++int dw_send_error(struct dw_conn *c, const struct dw_msg *call,
++		  const char *error_name, const char *message)
++{
++	struct error_ctx ctx = { .message = message };
++
++	if (call->flags & DW_FLAG_NO_REPLY_EXPECTED)
++		return 0;
++	if (send_message(c, DW_TYPE_ERROR, 0, call->sender, NULL, NULL, NULL,
++			 error_name, call->serial, "s", fill_error_string,
++			 &ctx) < 0)
++		return -1;
++	return 0;
++}
++
++int dw_send_signal(struct dw_conn *c, const char *path, const char *iface,
++		   const char *member, const char *sig,
++		   void (*fill)(struct dw_writer *, void *), void *ud)
++{
++	return send_message(c, DW_TYPE_SIGNAL, 0, NULL, path, iface, member,
++			    NULL, 0, sig, fill, ud);
++}
++
++/* ------------------------------------------------------------------ */
++/* incoming messages                                                  */
++/* ------------------------------------------------------------------ */
++
++static void copy_field(char *dst, size_t dstlen, const char *src, size_t n)
++{
++	if (n >= dstlen)
++		n = dstlen - 1;
++	memcpy(dst, src, n);
++	dst[n] = '\0';
++}
++
++static int parse_header_fields(const uint8_t *raw, size_t fields_len,
++			       struct dw_msg *m)
++{
++	struct dw_reader r = { .p = raw, .len = DW_HEADER_SIZE + fields_len,
++			       .off = DW_HEADER_SIZE };
++
++	while (r.off < r.len) {
++		uint8_t code;
++		char sig[8];
++		struct dw_reader value;
++		const char *s;
++		size_t n;
++		uint32_t u;
++
++		if (r_pad(&r, 8) < 0)
++			return -1;
++		if (r.off == r.len)
++			break;
++		if (r_u8(&r, &code) < 0)
++			return -1;
++		if (dw_r_variant(&r, sig, &value) < 0)
++			return -1;
++		switch (code) {
++		case HF_PATH:
++		case HF_INTERFACE:
++		case HF_MEMBER:
++		case HF_DESTINATION:
++		case HF_SENDER:
++			if (strcmp(sig, "s") && strcmp(sig, "o"))
++				return -1;
++			if (dw_r_string(&value, &s, &n) < 0)
++				return -1;
++			if (code == HF_PATH)
++				copy_field(m->path, sizeof(m->path), s, n);
++			else if (code == HF_INTERFACE)
++				copy_field(m->iface, sizeof(m->iface), s, n);
++			else if (code == HF_MEMBER)
++				copy_field(m->member, sizeof(m->member), s, n);
++			else if (code == HF_DESTINATION)
++				copy_field(m->dest, sizeof(m->dest), s, n);
++			else if (code == HF_SENDER)
++				copy_field(m->sender, sizeof(m->sender), s, n);
++			break;
++		case HF_ERROR_NAME:
++			if (strcmp(sig, "s"))
++				return -1;
++			if (dw_r_string(&value, &s, &n) < 0)
++				return -1;
++			copy_field(m->error_name, sizeof(m->error_name), s, n);
++			break;
++		case HF_SIGNATURE:
++			if (strcmp(sig, "g"))
++				return -1;
++			if (dw_r_signature(&value, &s, &n) < 0)
++				return -1;
++			copy_field(m->sig, sizeof(m->sig), s, n);
++			break;
++		case HF_REPLY_SERIAL:
++			if (strcmp(sig, "u"))
++				return -1;
++			if (dw_r_uint32(&value, &u) < 0)
++				return -1;
++			m->reply_serial = u;
++			m->has_reply_serial = 1;
++			break;
++		default:
++			/* unknown/unsupported header field */
++			return -1;
++		}
++		/* values are parsed through a copy; advance the outer reader */
++		r.off = value.off;
++	}
++	return 0;
++}
++
++int dw_next_message(struct dw_conn *c, struct dw_msg *m)
++{
++	uint32_t body_len, fields_len;
++	size_t header_end, total, pad;
++	const uint8_t *raw;
++
++	memset(m, 0, sizeof(*m));
++	if (c->inlen < DW_HEADER_SIZE)
++		return 0;
++	raw = c->in;
++	if (raw[0] != 'l')
++		return -1;
++	if (raw[3] != 1)
++		return -1;
++	body_len = get_le32(raw + 4);
++	fields_len = get_le32(raw + 12);
++	if (body_len > DW_MAX_MESSAGE || fields_len > DW_MAX_MESSAGE)
++		return -1;
++	header_end = DW_HEADER_SIZE + fields_len;
++	pad = align_up(header_end, 8) - header_end;
++	total = header_end + pad + body_len;
++	if (total > DW_MAX_MESSAGE)
++		return -1;
++	if (c->inlen < total)
++		return 0;
++
++	m->type = raw[1];
++	m->flags = raw[2];
++	m->serial = get_le32(raw + 8);
++	m->body_len = body_len;
++	m->raw = raw;
++	m->raw_len = total;
++	m->body_off = header_end + pad;
++	if (parse_header_fields(raw, fields_len, m) < 0)
++		return -1;
++
++	memmove(c->in, c->in + total, c->inlen - total);
++	c->inlen -= total;
++	return 1;
++}
++
++int dw_conn_fill(struct dw_conn *c, int timeout_ms)
++{
++	struct pollfd pfd = { .fd = c->fd, .events = POLLIN };
++	ssize_t n;
++	int r;
++
++	if (c->inlen == c->incap) {
++		size_t cap = c->incap ? c->incap * 2 : 8192;
++		uint8_t *nb = realloc(c->in, cap);
++
++		if (!nb)
++			return -1;
++		c->in = nb;
++		c->incap = cap;
++	}
++	if (timeout_ms >= 0) {
++		r = poll(&pfd, 1, timeout_ms);
++		if (r < 0)
++			return errno == EINTR ? 0 : -1;
++		if (r == 0)
++			return 0;
++	}
++	n = recv(c->fd, c->in + c->inlen, c->incap - c->inlen, 0);
++	if (n < 0) {
++		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
++			return 0;
++		return -1;
++	}
++	if (n == 0)
++		return -1; /* peer closed */
++	c->inlen += (size_t)n;
++	return 1;
++}
++
++/* ------------------------------------------------------------------ */
++/* authentication and connection setup                                */
++/* ------------------------------------------------------------------ */
++
++static int wait_fd(int fd, short events, int timeout_ms)
++{
++	struct pollfd pfd = { .fd = fd, .events = events };
++	int r;
++
++	do {
++		r = poll(&pfd, 1, timeout_ms);
++	} while (r < 0 && errno == EINTR);
++	return r;
++}
++
++static int read_auth_line(int fd, char *buf, size_t buflen, int timeout_ms)
++{
++	size_t off = 0;
++
++	while (off + 1 < buflen) {
++		char ch;
++		ssize_t n;
++
++		if (wait_fd(fd, POLLIN, timeout_ms) <= 0)
++			return -1;
++		n = recv(fd, &ch, 1, 0);
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			return -1;
++		}
++		if (n == 0)
++			return -1;
++		if (ch == '\r')
++			continue;
++		if (ch == '\n') {
++			buf[off] = '\0';
++			return 0;
++		}
++		buf[off++] = ch;
++	}
++	return -1;
++}
++
++static int hex_encode(const char *in, char *out, size_t outlen)
++{
++	static const char hex[] = "0123456789abcdef";
++	size_t i, n = strlen(in);
++
++	if (n * 2 + 1 > outlen)
++		return -1;
++	for (i = 0; i < n; i++) {
++		out[i * 2] = hex[(unsigned char)in[i] >> 4];
++		out[i * 2 + 1] = hex[(unsigned char)in[i] & 0x0f];
++	}
++	out[n * 2] = '\0';
++	return 0;
++}
++
++static int sockaddr_from_address(const char *address, struct sockaddr_un *sa,
++				 socklen_t *salen)
++{
++	const char *p;
++
++	memset(sa, 0, sizeof(*sa));
++	sa->sun_family = AF_UNIX;
++	if (!address || !*address)
++		address = "unix:path=/run/dbus/system_bus_socket";
++
++	p = strstr(address, "unix:path=");
++	if (p) {
++		const char *path = p + strlen("unix:path=");
++		size_t n = strcspn(path, ";,");
++
++		if (n >= sizeof(sa->sun_path))
++			return -1;
++		memcpy(sa->sun_path, path, n);
++		sa->sun_path[n] = '\0';
++		*salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n + 1);
++		return 0;
++	}
++	p = strstr(address, "unix:abstract=");
++	if (p) {
++		const char *name = p + strlen("unix:abstract=");
++		size_t n = strcspn(name, ";,");
++
++		if (n + 1 >= sizeof(sa->sun_path))
++			return -1;
++		sa->sun_path[0] = '\0';
++		memcpy(sa->sun_path + 1, name, n);
++		sa->sun_path[n + 1] = '\0';
++		*salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
++		return 0;
++	}
++	return -1;
++}
++
++static int wait_for_reply(struct dw_conn *c, int serial, struct dw_msg *out,
++			  char *err, size_t errlen)
++{
++	int guard = 0;
++
++	for (;;) {
++		struct dw_msg m;
++		int r;
++
++		while ((r = dw_next_message(c, &m)) == 1) {
++			if ((m.type == DW_TYPE_METHOD_RETURN ||
++			     m.type == DW_TYPE_ERROR) &&
++			    m.has_reply_serial &&
++			    m.reply_serial == (uint32_t)serial) {
++				*out = m;
++				if (m.type == DW_TYPE_ERROR) {
++					set_err(err, errlen, "D-Bus error %s",
++						m.error_name);
++					return -1;
++				}
++				return 0;
++			}
++			/* ignore unrelated traffic during setup */
++		}
++		if (r < 0) {
++			set_err(err, errlen, "malformed D-Bus message");
++			return -1;
++		}
++		if (dw_conn_fill(c, 5000) < 0) {
++			set_err(err, errlen, "D-Bus connection closed during setup");
++			return -1;
++		}
++		if (++guard > 100) {
++			set_err(err, errlen, "timed out waiting for D-Bus reply");
++			return -1;
++		}
++	}
++}
++
++struct dw_conn *dw_conn_open(const char *address, char *err, size_t errlen)
++{
++	struct dw_conn *c;
++	struct sockaddr_un sa;
++	socklen_t salen;
++	char line[512];
++	char uid[32], hexuid[64];
++	int fd, serial;
++
++	c = calloc(1, sizeof(*c));
++	if (!c) {
++		set_err(err, errlen, "out of memory");
++		return NULL;
++	}
++	c->fd = -1;
++
++	if (sockaddr_from_address(address, &sa, &salen) < 0) {
++		set_err(err, errlen, "unsupported D-Bus address '%s'",
++			address ? address : "");
++		goto fail;
++	}
++
++	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++	if (fd < 0) {
++		set_err(err, errlen, "socket: %s", strerror(errno));
++		goto fail;
++	}
++	if (connect(fd, (struct sockaddr *)&sa, salen) < 0) {
++		set_err(err, errlen, "connect(%s): %s",
++			sa.sun_path[0] ? sa.sun_path : address, strerror(errno));
++		close(fd);
++		goto fail;
++	}
++	c->fd = fd;
++
++	/* SASL EXTERNAL: NUL, AUTH EXTERNAL <hex-uid>, BEGIN */
++	if (send_all(fd, "\0", 1) < 0) {
++		set_err(err, errlen, "auth write failed");
++		goto fail;
++	}
++	snprintf(uid, sizeof(uid), "%u", (unsigned)getuid());
++	if (hex_encode(uid, hexuid, sizeof(hexuid)) < 0) {
++		set_err(err, errlen, "uid encoding failed");
++		goto fail;
++	}
++	snprintf(line, sizeof(line), "AUTH EXTERNAL %s\r\n", hexuid);
++	if (send_all(fd, line, strlen(line)) < 0) {
++		set_err(err, errlen, "auth write failed");
++		goto fail;
++	}
++	line[0] = '\0';
++	if (read_auth_line(fd, line, sizeof(line), 5000) < 0 ||
++	    strncmp(line, "OK ", 3) != 0) {
++		set_err(err, errlen, "D-Bus EXTERNAL auth rejected: %s", line);
++		goto fail;
++	}
++	if (send_all(fd, "BEGIN\r\n", 7) < 0) {
++		set_err(err, errlen, "auth BEGIN failed");
++		goto fail;
++	}
++
++	serial = dw_send_method(c, "org.freedesktop.DBus",
++				"/org/freedesktop/DBus", "org.freedesktop.DBus",
++				"Hello", NULL, NULL, NULL, 0);
++	if (serial < 0) {
++		set_err(err, errlen, "could not send Hello");
++		goto fail;
++	}
++
++	{
++		struct dw_msg m;
++		struct dw_reader r;
++		const char *name;
++		size_t n;
++
++		if (wait_for_reply(c, serial, &m, err, errlen) < 0)
++			goto fail;
++		r.p = m.raw;
++		r.len = m.raw_len;
++		r.off = m.body_off;
++		name = "";
++		n = 0;
++		if (dw_r_string(&r, &name, &n) == 0)
++			copy_field(c->unique, sizeof(c->unique), name, n);
++	}
++
++	if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
++		set_err(err, errlen, "fcntl: %s", strerror(errno));
++		goto fail;
++	}
++	return c;
++
++fail:
++	if (c->fd >= 0)
++		close(c->fd);
++	free(c->in);
++	free(c);
++	return NULL;
++}
++
++void dw_conn_free(struct dw_conn *c)
++{
++	if (!c)
++		return;
++	if (c->fd >= 0)
++		close(c->fd);
++	free(c->in);
++	free(c);
++}
++
++int dw_conn_fd(const struct dw_conn *c)
++{
++	return c->fd;
++}
++
++struct request_name_ctx {
++	const char *name;
++};
++
++static void fill_request_name(struct dw_writer *w, void *ud)
++{
++	struct request_name_ctx *ctx = ud;
++
++	dw_w_string(w, ctx->name);
++	dw_w_uint32(w, 0x1 | 0x4); /* ALLOW_REPLACEMENT | DO_NOT_QUEUE */
++}
++
++int dw_request_name(struct dw_conn *c, const char *name, char *err,
++		    size_t errlen)
++{
++	struct request_name_ctx ctx = { .name = name };
++	struct dw_msg m;
++	struct dw_reader r;
++	uint32_t result;
++	int serial;
++
++	serial = dw_send_method(c, "org.freedesktop.DBus",
++				"/org/freedesktop/DBus", "org.freedesktop.DBus",
++				"RequestName", "su", fill_request_name, &ctx, 0);
++	if (serial < 0) {
++		set_err(err, errlen, "could not send RequestName");
++		return -1;
++	}
++	if (wait_for_reply(c, serial, &m, err, errlen) < 0)
++		return -1;
++	r.p = m.raw;
++	r.len = m.raw_len;
++	r.off = m.body_off;
++	if (dw_r_uint32(&r, &result) < 0) {
++		set_err(err, errlen, "malformed RequestName reply");
++		return -1;
++	}
++	/* 1 = primary owner, 4 = already owner */
++	if (result != 1 && result != 4) {
++		set_err(err, errlen, "could not own %s (RequestName result %u)",
++			name, result);
++		return -1;
++	}
++	return 0;
++}
++
++struct add_match_ctx {
++	const char *rule;
++};
++
++static void fill_add_match(struct dw_writer *w, void *ud)
++{
++	struct add_match_ctx *ctx = ud;
++
++	dw_w_string(w, ctx->rule);
++}
++
++int dw_add_match(struct dw_conn *c, const char *rule)
++{
++	struct add_match_ctx ctx = { .rule = rule };
++
++	if (dw_send_method(c, "org.freedesktop.DBus",
++			   "/org/freedesktop/DBus", "org.freedesktop.DBus",
++			   "AddMatch", "s", fill_add_match, &ctx,
++			   DW_FLAG_NO_REPLY_EXPECTED) < 0)
++		return -1;
++	return 0;
++}
+diff --git a/device/archived/j7elte-sensors/dbus-wire.h b/device/archived/j7elte-sensors/dbus-wire.h
+new file mode 100644
+index 0000000..3696213950c45aeb8ca0fbade47a65a4d56fa64a
+--- /dev/null
++++ b/device/archived/j7elte-sensors/dbus-wire.h
+@@ -0,0 +1,123 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/*
++ * dbus-wire.h - minimal D-Bus binary protocol client/server helpers
++ *
++ * Implements only what j7elte-sensors needs: SASL EXTERNAL authentication,
++ * Hello/RequestName, method calls/replies/errors, and signals with the
++ * standard marshalling formats used by net.hadess.SensorProxy.
++ *
++ * No libdbus/GLib dependency, so the daemon builds against musl and can be
++ * statically linked.
++ */
++#ifndef J7ELTE_DBUS_WIRE_H
++#define J7ELTE_DBUS_WIRE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define DW_TYPE_METHOD_CALL 1
++#define DW_TYPE_METHOD_RETURN 2
++#define DW_TYPE_ERROR 3
++#define DW_TYPE_SIGNAL 4
++
++#define DW_FLAG_NO_REPLY_EXPECTED 0x1
++
++struct dw_conn;
++struct dw_writer;
++
++struct dw_msg {
++	uint8_t type;
++	uint8_t flags;
++	uint32_t serial;
++	uint32_t reply_serial;
++	int has_reply_serial;
++	uint32_t body_len;
++
++	char path[256];
++	char iface[128];
++	char member[64];
++	char sender[128];
++	char dest[128];
++	char sig[128];
++	char error_name[128];
++
++	const uint8_t *raw; /* message start */
++	size_t raw_len;
++	size_t body_off;    /* offset of body inside raw */
++};
++
++struct dw_reader {
++	const uint8_t *p;
++	size_t len;
++	size_t off;
++};
++
++/* Connection handling. Returns NULL and fills err on failure. */
++struct dw_conn *dw_conn_open(const char *address, char *err, size_t errlen);
++void dw_conn_free(struct dw_conn *c);
++int dw_conn_fd(const struct dw_conn *c);
++
++/* Non-blocking convenience: poll and read whatever is available.
++ * Returns 1 if bytes were read, 0 on timeout/no data, -1 on error. */
++int dw_conn_fill(struct dw_conn *c, int timeout_ms);
++
++/* Extract the next complete message. Returns 1 on success, 0 if more data
++ * is needed, -1 on protocol error. The returned pointers live in the
++ * connection's buffer until the next call to dw_conn_fill(). */
++int dw_next_message(struct dw_conn *c, struct dw_msg *m);
++
++/* Send a method call (optionally expecting a reply). */
++int dw_send_method(struct dw_conn *c, const char *dest, const char *path,
++		   const char *iface, const char *member, const char *sig,
++		   void (*fill)(struct dw_writer *, void *), void *ud,
++		   uint32_t flags);
++
++/* Reply helpers. */
++int dw_send_return(struct dw_conn *c, const struct dw_msg *call,
++		   const char *sig,
++		   void (*fill)(struct dw_writer *, void *), void *ud);
++int dw_send_error(struct dw_conn *c, const struct dw_msg *call,
++		  const char *error_name, const char *message);
++int dw_send_signal(struct dw_conn *c, const char *path, const char *iface,
++		   const char *member, const char *sig,
++		   void (*fill)(struct dw_writer *, void *), void *ud);
++
++/* Blocking helpers used during initialisation. */
++int dw_request_name(struct dw_conn *c, const char *name, char *err,
++		    size_t errlen);
++int dw_add_match(struct dw_conn *c, const char *rule);
++
++/* ---- writer API (used from fill callbacks) ------------------------- */
++void dw_w_string(struct dw_writer *w, const char *s);
++void dw_w_object_path(struct dw_writer *w, const char *s);
++void dw_w_signature(struct dw_writer *w, const char *s);
++void dw_w_uint32(struct dw_writer *w, uint32_t v);
++void dw_w_bool(struct dw_writer *w, int v);
++void dw_w_double(struct dw_writer *w, double v);
++void dw_w_align(struct dw_writer *w, size_t align);
++
++void dw_w_variant_string(struct dw_writer *w, const char *s);
++void dw_w_variant_bool(struct dw_writer *w, int v);
++void dw_w_variant_double(struct dw_writer *w, double v);
++
++/* Opens/closes an array (4-byte length prefix followed by alignment
++ * padding to the element alignment).  The D-Bus array length excludes that
++ * padding.  Elements must be written between the two calls. */
++struct dw_array_marker {
++	size_t length_offset;
++	size_t data_start;
++};
++struct dw_array_marker dw_w_array_begin(struct dw_writer *w,
++					size_t elem_align);
++void dw_w_array_end(struct dw_writer *w, struct dw_array_marker m);
++
++/* ---- reader API ---------------------------------------------------- */
++int dw_r_string(struct dw_reader *r, const char **s, size_t *n);
++int dw_r_signature(struct dw_reader *r, const char **s, size_t *n);
++int dw_r_uint32(struct dw_reader *r, uint32_t *v);
++int dw_r_bool(struct dw_reader *r, int *v);
++/* Reads a variant signature and points value at the contained value. */
++int dw_r_variant(struct dw_reader *r, char sig[8], struct dw_reader *value);
++void dw_r_skip(struct dw_reader *r, size_t n);
++
++#endif /* J7ELTE_DBUS_WIRE_H */
+diff --git a/device/archived/j7elte-sensors/j7elte-sensors.c b/device/archived/j7elte-sensors/j7elte-sensors.c
+new file mode 100644
+index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
+--- /dev/null
++++ b/device/archived/j7elte-sensors/j7elte-sensors.c
+@@ -0,0 +1,1141 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/*
++ * j7elte-sensors - expose the Samsung Galaxy J7 (j7elte) evdev sensors
++ *                  through net.hadess.SensorProxy
++ *
++ * The downstream kernel drivers do not use IIO:
++ *   - K2HH accelerometer: input device "accelerometer_sensor",
++ *     EV_REL REL_X/REL_Y/REL_Z (raw, 8192 LSB/g at the +-4g range the driver
++ *     selects when enabled), plus REL_DIAL/REL_MISC timestamps.
++ *     Control: <input-device>/enable and <input-device>/poll_delay.
++ *   - CM36672P / STK3013 proximity: input device "proximity_sensor",
++ *     EV_ABS ABS_DISTANCE (0 = close, 1 = far).
++ *     Control: <input-device>/enable.
++ *   - No ambient-light interface is registered by either proximity driver in
++ *     this kernel (see parity/reports/sensors.md), so HasAmbientLight=false.
++ *
++ * The daemon speaks the D-Bus binary protocol directly (dbus-wire.c) and
++ * implements the iio-sensor-proxy interface so existing desktop consumers
++ * work unchanged.
++ */
++#define _GNU_SOURCE
++
++#include "dbus-wire.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/input.h>
++#include <math.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#define SENSOR_PROXY_NAME "net.hadess.SensorProxy"
++#define SENSOR_PROXY_PATH "/net/hadess/SensorProxy"
++#define ACCEL_INPUT_NAME "accelerometer_sensor"
++#define PROX_INPUT_NAME "proximity_sensor"
++
++/*
++ * k2hh.c enables K2HH_RANGE_4G before streaming (SENSITIVITY_4G = 122 ug/LSB,
++ * i.e. MAX_ACCEL_1G = 8192 LSB per g).  iio-sensor-proxy's orientation code
++ * works in units of 1 g = 256, hence raw / 32.
++ */
++#define K2HH_LSB_PER_G 8192.0
++#define ORIENT_UNITS_PER_G 256.0
++#define ACCEL_POLL_DELAY_NS 100000000LL /* 10 Hz */
++
++#define MAX_EVENT_DEV 64
++#define MAX_CLAIMS 32
++#define CLAIM_NAME_MAX 128
++
++struct sensor {
++	const char *kind;
++	int present;
++	int fd;
++	int enabled;
++	int has_enable;
++	int has_delay;
++	char evpath[64];
++	char sysfs[256];
++	char enable_path[320];
++	char delay_path[320];
++};
++
++static struct dw_conn *bus;
++static struct sensor accel_sensor = { .kind = "accelerometer", .fd = -1 };
++static struct sensor prox_sensor = { .kind = "proximity", .fd = -1 };
++
++static volatile sig_atomic_t stop_requested;
++static int verbose;
++
++/* ------------------------------------------------------------------ */
++/* logging                                                            */
++/* ------------------------------------------------------------------ */
++
++static void logmsg(const char *fmt, ...)
++{
++	va_list ap;
++
++	fputs("j7elte-sensors: ", stderr);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
++}
++
++static void logdbg(const char *fmt, ...)
++{
++	va_list ap;
++
++	if (!verbose)
++		return;
++	fputs("j7elte-sensors: ", stderr);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
++}
++
++/* ------------------------------------------------------------------ */
++/* orientation / tilt (algorithm compatible with iio-sensor-proxy 3.9, */
++/* which took it from sensorfw; GPL-3.0-or-later).                    */
++/* ------------------------------------------------------------------ */
++
++enum orientation {
++	ORIENT_UNDEFINED,
++	ORIENT_NORMAL,
++	ORIENT_BOTTOM_UP,
++	ORIENT_LEFT_UP,
++	ORIENT_RIGHT_UP,
++};
++
++enum tilt {
++	TILT_UNDEFINED,
++	TILT_VERTICAL,
++	TILT_TILTED_UP,
++	TILT_TILTED_DOWN,
++	TILT_FACE_UP,
++	TILT_FACE_DOWN,
++};
++
++static const char *const orientation_names[] = {
++	"undefined", "normal", "bottom-up", "left-up", "right-up",
++};
++
++static const char *const tilt_names[] = {
++	"undefined", "vertical", "tilted-up", "tilted-down", "face-up",
++	"face-down",
++};
++
++#define RADIANS_TO_DEGREES (180.0 / M_PI)
++#define SAME_AXIS_LIMIT 5
++#define THRESHOLD_LANDSCAPE 35
++#define THRESHOLD_PORTRAIT 35
++#define THRESHOLD_FACE_DOWN 70
++#define THRESHOLD_TILT 20
++#define TILT_MAX 90
++
++static enum orientation orientation_calc(enum orientation prev, int x, int y,
++					 int z)
++{
++	enum orientation ret = prev;
++	int portrait_rotation, landscape_rotation;
++
++	portrait_rotation = (int)lround(atan2(x, sqrt((double)y * y +
++						     (double)z * z)) *
++					RADIANS_TO_DEGREES);
++	landscape_rotation = (int)lround(atan2(y, sqrt((double)x * x +
++						       (double)z * z)) *
++					 RADIANS_TO_DEGREES);
++
++	/* On the common border of two thresholds, keep the previous value. */
++	if (abs(portrait_rotation) > THRESHOLD_PORTRAIT &&
++	    abs(landscape_rotation) > THRESHOLD_LANDSCAPE)
++		return prev;
++
++	if (abs(portrait_rotation) > THRESHOLD_PORTRAIT) {
++		ret = portrait_rotation > 0 ? ORIENT_LEFT_UP : ORIENT_RIGHT_UP;
++		if ((prev == ORIENT_LEFT_UP || prev == ORIENT_RIGHT_UP) &&
++		    abs(portrait_rotation) < SAME_AXIS_LIMIT)
++			ret = prev;
++	} else if (abs(landscape_rotation) > THRESHOLD_LANDSCAPE) {
++		ret = landscape_rotation > 0 ? ORIENT_BOTTOM_UP : ORIENT_NORMAL;
++		if ((prev == ORIENT_BOTTOM_UP || prev == ORIENT_NORMAL) &&
++		    abs(landscape_rotation) < SAME_AXIS_LIMIT)
++			ret = prev;
++	}
++
++	return ret;
++}
++
++static enum tilt tilt_calc(enum tilt prev, int x, int y, int z)
++{
++	enum tilt ret = prev;
++	int tilt;
++
++	tilt = (int)lround(atan2(z, sqrt((double)x * x + (double)y * y)) *
++			   RADIANS_TO_DEGREES);
++
++	if (abs(tilt) <= THRESHOLD_TILT)
++		ret = TILT_VERTICAL;
++	else if (abs(tilt) > THRESHOLD_TILT && abs(tilt) < THRESHOLD_FACE_DOWN)
++		ret = tilt > 0 ? TILT_TILTED_UP : TILT_TILTED_DOWN;
++	else if (abs(tilt) >= THRESHOLD_FACE_DOWN && abs(tilt) <= TILT_MAX)
++		ret = tilt > 0 ? TILT_FACE_UP : TILT_FACE_DOWN;
++	else
++		ret = TILT_UNDEFINED;
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* D-Bus property state                                               */
++/* ------------------------------------------------------------------ */
++
++static enum orientation current_orientation = ORIENT_UNDEFINED;
++static enum tilt current_tilt = TILT_UNDEFINED;
++static int proximity_near;
++/* The kernel exposes no ambient-light channel for this device. */
++static const int has_ambient_light = 0;
++
++struct claim_list {
++	int count;
++	char names[MAX_CLAIMS][CLAIM_NAME_MAX];
++};
++
++static struct claim_list accel_claims;
++static struct claim_list prox_claims;
++static struct claim_list light_claims;
++
++/* ------------------------------------------------------------------ */
++/* properties                                                         */
++/* ------------------------------------------------------------------ */
++
++static int write_sysfs(const char *path, const char *value)
++{
++	int fd = open(path, O_WRONLY | O_CLOEXEC);
++	ssize_t n;
++
++	if (fd < 0)
++		return -1;
++	n = write(fd, value, strlen(value));
++	close(fd);
++	return n == (ssize_t)strlen(value) ? 0 : -1;
++}
++
++struct prop_ctx {
++	const char *name;
++	enum { PT_BOOL, PT_STRING, PT_DOUBLE } type;
++	int b;
++	const char *s;
++	double d;
++};
++
++static int write_prop_variant(struct dw_writer *w, const char *name)
++{
++	if (!strcmp(name, "HasAccelerometer"))
++		dw_w_variant_bool(w, accel_sensor.present);
++	else if (!strcmp(name, "AccelerometerOrientation"))
++		dw_w_variant_string(w, orientation_names[current_orientation]);
++	else if (!strcmp(name, "AccelerometerTilt"))
++		dw_w_variant_string(w, tilt_names[current_tilt]);
++	else if (!strcmp(name, "HasAmbientLight"))
++		dw_w_variant_bool(w, has_ambient_light);
++	else if (!strcmp(name, "LightLevelUnit"))
++		dw_w_variant_string(w, "lux");
++	else if (!strcmp(name, "LightLevel"))
++		dw_w_variant_double(w, 0.0);
++	else if (!strcmp(name, "HasProximity"))
++		dw_w_variant_bool(w, prox_sensor.present);
++	else if (!strcmp(name, "ProximityNear"))
++		dw_w_variant_bool(w, proximity_near);
++	else
++		return -1;
++	return 0;
++}
++
++static void fill_props_changed(struct dw_writer *w, void *ud)
++{
++	struct prop_ctx *ctx = ud;
++	struct dw_array_marker dict, invalidated;
++
++	dw_w_string(w, SENSOR_PROXY_NAME);
++
++	dict = dw_w_array_begin(w, 8);
++	dw_w_string(w, ctx->name);
++	switch (ctx->type) {
++	case PT_BOOL:
++		dw_w_variant_bool(w, ctx->b);
++		break;
++	case PT_STRING:
++		dw_w_variant_string(w, ctx->s);
++		break;
++	case PT_DOUBLE:
++		dw_w_variant_double(w, ctx->d);
++		break;
++	}
++	dw_w_array_end(w, dict);
++
++	invalidated = dw_w_array_begin(w, 4); /* empty "as" */
++	dw_w_array_end(w, invalidated);
++}
++
++static void emit_bool_prop(const char *name, int value)
++{
++	struct prop_ctx ctx = { .name = name, .type = PT_BOOL, .b = value };
++
++	if (dw_send_signal(bus, SENSOR_PROXY_PATH,
++			   "org.freedesktop.DBus.Properties",
++			   "PropertiesChanged", "sa{sv}as", fill_props_changed,
++			   &ctx) < 0)
++		logmsg("failed to emit %s change", name);
++}
++
++static void emit_string_prop(const char *name, const char *value)
++{
++	struct prop_ctx ctx = { .name = name, .type = PT_STRING, .s = value };
++
++	if (dw_send_signal(bus, SENSOR_PROXY_PATH,
++			   "org.freedesktop.DBus.Properties",
++			   "PropertiesChanged", "sa{sv}as", fill_props_changed,
++			   &ctx) < 0)
++		logmsg("failed to emit %s change", name);
++}
++
++/* ------------------------------------------------------------------ */
++/* evdev discovery                                                    */
++/* ------------------------------------------------------------------ */
++
++#define BITS_PER_LONG (8 * sizeof(unsigned long))
++#define NBITS(x) (((x) - 1) / BITS_PER_LONG + 1)
++#define TEST_BIT(bit, arr) \
++	(((arr)[(bit) / BITS_PER_LONG] >> ((bit) % BITS_PER_LONG)) & 1)
++
++static int evdev_test_bits(int fd, unsigned long request, int bit,
++			   unsigned long *bits, size_t nbits)
++{
++	memset(bits, 0, nbits * sizeof(*bits));
++	if (ioctl(fd, request, bits) < 0)
++		return 0;
++	return TEST_BIT(bit, bits) ? 1 : 0;
++}
++
++static int evdev_is_accel(int fd)
++{
++	unsigned long bits[NBITS(REL_MAX)];
++
++	return evdev_test_bits(fd, EVIOCGBIT(EV_REL, sizeof(bits)), REL_X,
++			       bits, NBITS(REL_MAX)) &&
++	       evdev_test_bits(fd, EVIOCGBIT(EV_REL, sizeof(bits)), REL_Y,
++			       bits, NBITS(REL_MAX)) &&
++	       evdev_test_bits(fd, EVIOCGBIT(EV_REL, sizeof(bits)), REL_Z,
++			       bits, NBITS(REL_MAX));
++}
++
++static int evdev_is_prox(int fd)
++{
++	unsigned long bits[NBITS(ABS_MAX)];
++
++	return evdev_test_bits(fd, EVIOCGBIT(EV_ABS, sizeof(bits)),
++			       ABS_DISTANCE, bits, NBITS(ABS_MAX));
++}
++
++static void sensor_close(struct sensor *s)
++{
++	if (s->fd >= 0) {
++		close(s->fd);
++		s->fd = -1;
++	}
++	s->present = 0;
++	s->enabled = 0;
++}
++
++static void drain_events(int fd)
++{
++	struct input_event ev;
++
++	while (read(fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev))
++		;
++}
++
++static int sensor_from_event(int idx, const char *want_name,
++			     int (*capable)(int), struct sensor *s)
++{
++	char path[64], name[256];
++	int fd;
++
++	snprintf(path, sizeof(path), "/dev/input/event%d", idx);
++	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0)
++		return 0;
++	memset(name, 0, sizeof(name));
++	if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 ||
++	    strcmp(name, want_name) != 0 || !capable(fd)) {
++		close(fd);
++		return 0;
++	}
++
++	if (s->fd >= 0)
++		close(s->fd);
++	s->fd = fd;
++	s->present = 1;
++	s->enabled = 0;
++	snprintf(s->evpath, sizeof(s->evpath), "%s", path);
++	snprintf(s->sysfs, sizeof(s->sysfs), "/sys/class/input/event%d/device",
++		 idx);
++	snprintf(s->enable_path, sizeof(s->enable_path), "%s/enable", s->sysfs);
++	snprintf(s->delay_path, sizeof(s->delay_path), "%s/poll_delay",
++		 s->sysfs);
++	s->has_enable = access(s->enable_path, W_OK) == 0;
++	s->has_delay = access(s->delay_path, W_OK) == 0;
++
++	logmsg("found %s at %s (control: enable=%s poll_delay=%s)", s->kind,
++	       path, s->has_enable ? "yes" : "no",
++	       s->has_delay ? "yes" : "no");
++	if (!s->has_enable)
++		logmsg("warning: %s has no writable sysfs 'enable'; "
++		       "reading will start unconditionally", s->kind);
++	return 1;
++}
++
++static int discover_sensor(struct sensor *s, const char *name,
++			   int (*capable)(int))
++{
++	int i;
++
++	for (i = 0; i < MAX_EVENT_DEV; i++)
++		if (sensor_from_event(i, name, capable, s))
++			return 1;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* sensor enable/disable                                              */
++/* ------------------------------------------------------------------ */
++
++static void sensor_set_enabled(struct sensor *s, int on)
++{
++	char delay[32];
++
++	if (!s->present || s->enabled == on)
++		return;
++	if (on) {
++		if (s->has_delay) {
++			snprintf(delay, sizeof(delay), "%lld",
++				 ACCEL_POLL_DELAY_NS);
++			if (write_sysfs(s->delay_path, delay) < 0)
++				logmsg("failed to write %s", s->delay_path);
++		}
++		if (s->has_enable &&
++		    write_sysfs(s->enable_path, "1") < 0) {
++			logmsg("failed to enable %s via %s: %s", s->kind,
++			       s->enable_path, strerror(errno));
++			return;
++		}
++		drain_events(s->fd);
++	} else {
++		if (s->has_enable &&
++		    write_sysfs(s->enable_path, "0") < 0)
++			logmsg("failed to disable %s via %s: %s", s->kind,
++			       s->enable_path, strerror(errno));
++		drain_events(s->fd);
++	}
++	s->enabled = on;
++	logdbg("%s %s", s->kind, on ? "enabled" : "disabled");
++}
++
++/* ------------------------------------------------------------------ */
++/* claim tracking                                                     */
++/* ------------------------------------------------------------------ */
++
++static int claim_list_add(struct claim_list *l, const char *name)
++{
++	int i;
++
++	for (i = 0; i < l->count; i++)
++		if (!strcmp(l->names[i], name))
++			return 0; /* already claimed */
++	if (l->count >= MAX_CLAIMS)
++		return -1;
++	snprintf(l->names[l->count], CLAIM_NAME_MAX, "%s", name);
++	l->count++;
++	return 1;
++}
++
++static int claim_list_remove(struct claim_list *l, const char *name)
++{
++	int i;
++
++	for (i = 0; i < l->count; i++) {
++		if (strcmp(l->names[i], name))
++			continue;
++		memmove(&l->names[i], &l->names[i + 1],
++			(size_t)(l->count - i - 1) * CLAIM_NAME_MAX);
++		l->count--;
++		return 1;
++	}
++	return 0;
++}
++
++static void claims_release_owner(const char *name)
++{
++	int a, p, l;
++
++	a = claim_list_remove(&accel_claims, name);
++	p = claim_list_remove(&prox_claims, name);
++	l = claim_list_remove(&light_claims, name);
++	if (!a && !p && !l)
++		return;
++	logdbg("released claims of vanished client %s", name);
++	if (a && accel_claims.count == 0)
++		sensor_set_enabled(&accel_sensor, 0);
++	if (p && prox_claims.count == 0)
++		sensor_set_enabled(&prox_sensor, 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* input event processing                                             */
++/* ------------------------------------------------------------------ */
++
++static void accel_reading(int raw_x, int raw_y, int raw_z)
++{
++	enum orientation new_orientation;
++	enum tilt new_tilt;
++	int x, y, z;
++
++	/*
++	 * Convert to iio-sensor-proxy's "1 g == 256" units.
++	 *
++	 * The K2HH driver emits Android-convention proper acceleration
++	 * (the axis pointing at the sky reads +g; the Android HAL only
++	 * multiplies by 9.80665/8192, see AccelerometerSensor.cpp in
++	 * android_hardware_samsung_sensors).  iio-sensor-proxy's
++	 * orientation_calc(), inherited from sensorfw, expects the gravity
++	 * vector instead, so negate it: this makes an upright phone report
++	 * "normal" (the upstream test vector for normal is (0, -256, 0)).
++	 * tilt_calc() expects proper acceleration (z=+256 is "face-up"), so
++	 * it uses the unnegated vector.
++	 */
++	x = (int)(raw_x * ORIENT_UNITS_PER_G / K2HH_LSB_PER_G);
++	y = (int)(raw_y * ORIENT_UNITS_PER_G / K2HH_LSB_PER_G);
++	z = (int)(raw_z * ORIENT_UNITS_PER_G / K2HH_LSB_PER_G);
++
++	new_orientation = orientation_calc(current_orientation, -x, -y, -z);
++	if (new_orientation != current_orientation) {
++		current_orientation = new_orientation;
++		logdbg("orientation: %s", orientation_names[current_orientation]);
++		emit_string_prop("AccelerometerOrientation",
++				 orientation_names[current_orientation]);
++	}
++
++	new_tilt = tilt_calc(current_tilt, x, y, z);
++	if (new_tilt != current_tilt) {
++		current_tilt = new_tilt;
++		logdbg("tilt: %s", tilt_names[current_tilt]);
++		emit_string_prop("AccelerometerTilt",
++				 tilt_names[current_tilt]);
++	}
++}
++
++static void proximity_reading(int distance)
++{
++	int near = distance == 0; /* 0 = close, 1 = far (driver comments) */
++
++	if (near == proximity_near)
++		return;
++	proximity_near = near;
++	logdbg("proximity: %s", near ? "near" : "far");
++	emit_bool_prop("ProximityNear", near);
++}
++
++static int handle_accel_events(void)
++{
++	struct input_event ev;
++	int x = 0, y = 0, z = 0, saw_rel = 0;
++
++	/*
++	 * The evdev layer does not deliver zero-valued EV_REL events, but
++	 * k2hh_work_func() reads all three axes for every report and emits
++	 * them in a single SYN_REPORT.  A missing axis therefore means that
++	 * its raw value was exactly 0, not that the previous value should be
++	 * reused (EV_REL carries absolute samples in this driver).  Keep the
++	 * accumulator zero-initialised and consider every report complete.
++	 */
++	while (read(accel_sensor.fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
++		if (getenv("J7ELTE_EVDEV_DEBUG"))
++			fprintf(stderr, "evdev: type=%u code=%u value=%d\n",
++				ev.type, ev.code, ev.value);
++		if (ev.type == EV_REL) {
++			saw_rel = 1;
++			switch (ev.code) {
++			case REL_X:
++				x = ev.value;
++				break;
++			case REL_Y:
++				y = ev.value;
++				break;
++			case REL_Z:
++				z = ev.value;
++				break;
++			default:
++				break;
++			}
++		} else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
++			if (saw_rel)
++				accel_reading(x, y, z);
++			x = y = z = 0;
++			saw_rel = 0;
++		}
++	}
++	return 0;
++}
++
++static int handle_prox_events(void)
++{
++	struct input_event ev;
++
++	while (read(prox_sensor.fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
++		if (ev.type == EV_ABS && ev.code == ABS_DISTANCE)
++			proximity_reading(ev.value);
++	}
++	return 0;
++}
++
++static void prox_read_initial(void)
++{
++	struct input_absinfo info;
++
++	if (prox_sensor.fd < 0)
++		return;
++	if (ioctl(prox_sensor.fd, EVIOCGABS(ABS_DISTANCE), &info) == 0) {
++		logdbg("initial ABS_DISTANCE=%d", info.value);
++		proximity_reading(info.value);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* D-Bus interface                                                    */
++/* ------------------------------------------------------------------ */
++
++static const char introspection_xml[] =
++"<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"\n"
++"\"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n"
++"<node>\n"
++"  <interface name=\"net.hadess.SensorProxy\">\n"
++"    <property name=\"HasAccelerometer\" type=\"b\" access=\"read\"/>\n"
++"    <property name=\"AccelerometerOrientation\" type=\"s\" access=\"read\"/>\n"
++"    <property name=\"AccelerometerTilt\" type=\"s\" access=\"read\"/>\n"
++"    <property name=\"HasAmbientLight\" type=\"b\" access=\"read\"/>\n"
++"    <property name=\"LightLevelUnit\" type=\"s\" access=\"read\"/>\n"
++"    <property name=\"LightLevel\" type=\"d\" access=\"read\"/>\n"
++"    <property name=\"HasProximity\" type=\"b\" access=\"read\"/>\n"
++"    <property name=\"ProximityNear\" type=\"b\" access=\"read\"/>\n"
++"    <method name=\"ClaimAccelerometer\"/>\n"
++"    <method name=\"ReleaseAccelerometer\"/>\n"
++"    <method name=\"ClaimLight\"/>\n"
++"    <method name=\"ReleaseLight\"/>\n"
++"    <method name=\"ClaimProximity\"/>\n"
++"    <method name=\"ReleaseProximity\"/>\n"
++"  </interface>\n"
++"  <interface name=\"org.freedesktop.DBus.Properties\">\n"
++"    <method name=\"Get\">\n"
++"      <arg name=\"interface_name\" type=\"s\" direction=\"in\"/>\n"
++"      <arg name=\"property_name\" type=\"s\" direction=\"in\"/>\n"
++"      <arg name=\"value\" type=\"v\" direction=\"out\"/>\n"
++"    </method>\n"
++"    <method name=\"GetAll\">\n"
++"      <arg name=\"interface_name\" type=\"s\" direction=\"in\"/>\n"
++"      <arg name=\"properties\" type=\"a{sv}\" direction=\"out\"/>\n"
++"    </method>\n"
++"    <method name=\"Set\">\n"
++"      <arg name=\"interface_name\" type=\"s\" direction=\"in\"/>\n"
++"      <arg name=\"property_name\" type=\"s\" direction=\"in\"/>\n"
++"      <arg name=\"value\" type=\"v\" direction=\"in\"/>\n"
++"    </method>\n"
++"    <signal name=\"PropertiesChanged\">\n"
++"      <arg name=\"interface_name\" type=\"s\"/>\n"
++"      <arg name=\"changed_properties\" type=\"a{sv}\"/>\n"
++"      <arg name=\"invalidated_properties\" type=\"as\"/>\n"
++"    </signal>\n"
++"  </interface>\n"
++"  <interface name=\"org.freedesktop.DBus.Introspectable\">\n"
++"    <method name=\"Introspect\">\n"
++"      <arg name=\"xml_data\" type=\"s\" direction=\"out\"/>\n"
++"    </method>\n"
++"  </interface>\n"
++"  <interface name=\"org.freedesktop.DBus.Peer\">\n"
++"    <method name=\"Ping\"/>\n"
++"    <method name=\"GetMachineId\">\n"
++"      <arg name=\"machine_uuid\" type=\"s\" direction=\"out\"/>\n"
++"    </method>\n"
++"  </interface>\n"
++"</node>\n";
++
++static const char *const property_names[] = {
++	"HasAccelerometer",
++	"AccelerometerOrientation",
++	"AccelerometerTilt",
++	"HasAmbientLight",
++	"LightLevelUnit",
++	"LightLevel",
++	"HasProximity",
++	"ProximityNear",
++	NULL,
++};
++
++struct string_ctx {
++	const char *s;
++};
++
++static void fill_string(struct dw_writer *w, void *ud)
++{
++	struct string_ctx *ctx = ud;
++
++	dw_w_string(w, ctx->s);
++}
++
++struct variant_ctx {
++	const char *name;
++};
++
++static void fill_variant(struct dw_writer *w, void *ud)
++{
++	struct variant_ctx *ctx = ud;
++
++	write_prop_variant(w, ctx->name);
++}
++
++struct get_all_ctx {
++	int dummy;
++};
++
++static void fill_all_props(struct dw_writer *w, void *ud)
++{
++	struct dw_array_marker dict;
++	int i;
++
++	(void)ud;
++	dict = dw_w_array_begin(w, 8);
++	for (i = 0; property_names[i]; i++) {
++		dw_w_align(w, 8);
++		dw_w_string(w, property_names[i]);
++		write_prop_variant(w, property_names[i]);
++	}
++	dw_w_array_end(w, dict);
++}
++
++static int read_two_strings(struct dw_msg *m, struct dw_reader *r,
++			    char *a, size_t alen, char *b, size_t blen)
++{
++	const char *s;
++	size_t n;
++
++	r->p = m->raw;
++	r->len = m->raw_len;
++	r->off = m->body_off;
++	if (dw_r_string(r, &s, &n) < 0 || n >= alen)
++		return -1;
++	memcpy(a, s, n);
++	a[n] = '\0';
++	if (dw_r_string(r, &s, &n) < 0 || n >= blen)
++		return -1;
++	memcpy(b, s, n);
++	b[n] = '\0';
++	return 0;
++}
++
++static int prop_known(const char *name)
++{
++	int i;
++
++	for (i = 0; property_names[i]; i++)
++		if (!strcmp(name, property_names[i]))
++			return 1;
++	return 0;
++}
++
++static void handle_properties_call(struct dw_msg *m)
++{
++	struct dw_reader r;
++	char iface[128], prop[128];
++
++	if (!strcmp(m->member, "Get")) {
++		struct variant_ctx ctx;
++
++		if (read_two_strings(m, &r, iface, sizeof(iface), prop,
++				     sizeof(prop)) < 0 ||
++		    strcmp(iface, SENSOR_PROXY_NAME) != 0 ||
++		    !prop_known(prop)) {
++			dw_send_error(bus, m, "org.freedesktop.DBus.Error.InvalidArgs",
++				      "Invalid interface or property name");
++			return;
++		}
++		ctx.name = prop;
++		dw_send_return(bus, m, "v", fill_variant, &ctx);
++	} else if (!strcmp(m->member, "GetAll")) {
++		struct dw_reader rr;
++		const char *s;
++		size_t n;
++		struct get_all_ctx ctx = { 0 };
++
++		rr.p = m->raw;
++		rr.len = m->raw_len;
++		rr.off = m->body_off;
++		if (dw_r_string(&rr, &s, &n) < 0 || n >= sizeof(iface) ||
++		    strcmp(s, SENSOR_PROXY_NAME) != 0) {
++			dw_send_error(bus, m, "org.freedesktop.DBus.Error.InvalidArgs",
++				      "Invalid interface name");
++			return;
++		}
++		dw_send_return(bus, m, "a{sv}", fill_all_props, &ctx);
++	} else if (!strcmp(m->member, "Set")) {
++		dw_send_error(bus, m,
++			      "org.freedesktop.DBus.Error.PropertyReadOnly",
++			      "All net.hadess.SensorProxy properties are read-only");
++	} else {
++		dw_send_error(bus, m, "org.freedesktop.DBus.Error.UnknownMethod",
++			      "Unknown method on org.freedesktop.DBus.Properties");
++	}
++}
++
++static void handle_claim(struct dw_msg *m, int claim)
++{
++	struct claim_list *list;
++	struct sensor *sensor;
++
++	if (!strcmp(m->member, "ClaimAccelerometer") ||
++	    !strcmp(m->member, "ReleaseAccelerometer")) {
++		list = &accel_claims;
++		sensor = &accel_sensor;
++	} else if (!strcmp(m->member, "ClaimProximity") ||
++		   !strcmp(m->member, "ReleaseProximity")) {
++		list = &prox_claims;
++		sensor = &prox_sensor;
++	} else {
++		list = &light_claims;
++		sensor = NULL;
++	}
++
++	if (claim) {
++		int added = claim_list_add(list, m->sender);
++
++		if (added < 0) {
++			dw_send_error(bus, m,
++				      "org.freedesktop.DBus.Error.LimitsExceeded",
++				      "Too many clients");
++			return;
++		}
++		if (added && list->count == 1 && sensor) {
++			sensor_set_enabled(sensor, 1);
++			if (sensor == &prox_sensor)
++				prox_read_initial();
++		}
++	} else {
++		if (claim_list_remove(list, m->sender) &&
++		    list->count == 0 && sensor)
++			sensor_set_enabled(sensor, 0);
++	}
++	dw_send_return(bus, m, NULL, NULL, NULL);
++}
++
++static void handle_sensor_call(struct dw_msg *m)
++{
++	if (!strcmp(m->member, "ClaimAccelerometer"))
++		handle_claim(m, 1);
++	else if (!strcmp(m->member, "ReleaseAccelerometer"))
++		handle_claim(m, 0);
++	else if (!strcmp(m->member, "ClaimLight"))
++		handle_claim(m, 1);
++	else if (!strcmp(m->member, "ReleaseLight"))
++		handle_claim(m, 0);
++	else if (!strcmp(m->member, "ClaimProximity"))
++		handle_claim(m, 1);
++	else if (!strcmp(m->member, "ReleaseProximity"))
++		handle_claim(m, 0);
++	else
++		dw_send_error(bus, m, "org.freedesktop.DBus.Error.UnknownMethod",
++			      "Unknown method on net.hadess.SensorProxy");
++}
++
++static void handle_name_owner_changed(struct dw_msg *m)
++{
++	struct dw_reader r;
++	const char *name, *old_owner, *new_owner;
++	size_t n1, n2, n3;
++
++	r.p = m->raw;
++	r.len = m->raw_len;
++	r.off = m->body_off;
++	if (dw_r_string(&r, &name, &n1) < 0 ||
++	    dw_r_string(&r, &old_owner, &n2) < 0 ||
++	    dw_r_string(&r, &new_owner, &n3) < 0)
++		return;
++	if (n3 == 0 && n2 > 0 && n1 > 0 && n1 < 128) {
++		char owner[128];
++
++		/* For NameOwnerChanged the vanished client is in "name". */
++		memcpy(owner, name, n1);
++		owner[n1] = '\0';
++		claims_release_owner(owner);
++	}
++}
++
++static int read_machine_id(char *out, size_t outlen)
++{
++	static const char *const paths[] = {
++		"/etc/machine-id", "/var/lib/dbus/machine-id", NULL
++	};
++	int i;
++
++	for (i = 0; paths[i]; i++) {
++		char raw[64];
++		ssize_t n;
++		int fd = open(paths[i], O_RDONLY | O_CLOEXEC);
++
++		if (fd < 0)
++			continue;
++		n = read(fd, raw, sizeof(raw) - 1);
++		close(fd);
++		if (n <= 0)
++			continue;
++		while (n > 0 && (raw[n - 1] == '\n' || raw[n - 1] == '\r' ||
++				 raw[n - 1] == ' '))
++			n--;
++		raw[n] = '\0';
++		if (n != 32)
++			continue;
++		if (snprintf(out, outlen,
++			     "%.8s-%.4s-%.4s-%.4s-%.12s",
++			     raw, raw + 8, raw + 12, raw + 16, raw + 20) >=
++		    (int)outlen)
++			return -1;
++		return 0;
++	}
++	return -1;
++}
++
++static void handle_message(struct dw_msg *m)
++{
++	if (m->type == DW_TYPE_METHOD_CALL) {
++		if (!strcmp(m->iface, "org.freedesktop.DBus.Properties")) {
++			handle_properties_call(m);
++		} else if (!strcmp(m->iface,
++				   "org.freedesktop.DBus.Introspectable") &&
++			   !strcmp(m->member, "Introspect")) {
++			struct string_ctx ctx = { introspection_xml };
++
++			dw_send_return(bus, m, "s", fill_string, &ctx);
++		} else if (!strcmp(m->iface, "org.freedesktop.DBus.Peer") &&
++			   !strcmp(m->member, "Ping")) {
++			dw_send_return(bus, m, NULL, NULL, NULL);
++		} else if (!strcmp(m->iface, "org.freedesktop.DBus.Peer") &&
++			   !strcmp(m->member, "GetMachineId")) {
++			char uuid[40];
++			struct string_ctx ctx = { uuid };
++
++			if (read_machine_id(uuid, sizeof(uuid)) < 0) {
++				dw_send_error(bus, m,
++					      "org.freedesktop.DBus.Error.Failed",
++					      "No machine ID available");
++				return;
++			}
++			dw_send_return(bus, m, "s", fill_string, &ctx);
++		} else if (!strcmp(m->iface, SENSOR_PROXY_NAME)) {
++			handle_sensor_call(m);
++		} else {
++			dw_send_error(bus, m,
++				      "org.freedesktop.DBus.Error.UnknownInterface",
++				      "Unknown interface");
++		}
++	} else if (m->type == DW_TYPE_SIGNAL) {
++		if (!strcmp(m->iface, "org.freedesktop.DBus") &&
++		    !strcmp(m->member, "NameOwnerChanged"))
++			handle_name_owner_changed(m);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* main loop                                                          */
++/* ------------------------------------------------------------------ */
++
++static void on_signal(int sig)
++{
++	(void)sig;
++	stop_requested = 1;
++}
++
++static void discover_missing(void)
++{
++	if (!accel_sensor.present) {
++		if (discover_sensor(&accel_sensor, ACCEL_INPUT_NAME,
++				    evdev_is_accel)) {
++			emit_bool_prop("HasAccelerometer", 1);
++			if (accel_claims.count > 0)
++				sensor_set_enabled(&accel_sensor, 1);
++		}
++	}
++	if (!prox_sensor.present) {
++		if (discover_sensor(&prox_sensor, PROX_INPUT_NAME,
++				    evdev_is_prox)) {
++			emit_bool_prop("HasProximity", 1);
++			if (prox_claims.count > 0) {
++				sensor_set_enabled(&prox_sensor, 1);
++				prox_read_initial();
++			}
++		}
++	}
++}
++
++static void usage(const char *argv0)
++{
++	fprintf(stderr,
++		"usage: %s [--address D-BUS-ADDRESS] [--verbose]\n"
++		"  Default address: $DBUS_SYSTEM_BUS_ADDRESS or "
++		"unix:path=/run/dbus/system_bus_socket\n", argv0);
++}
++
++int main(int argc, char **argv)
++{
++	const char *address = getenv("DBUS_SYSTEM_BUS_ADDRESS");
++	char err[256];
++	struct sigaction sa = { .sa_handler = on_signal };
++	int i;
++
++	for (i = 1; i < argc; i++) {
++		if (!strcmp(argv[i], "--address") && i + 1 < argc) {
++			address = argv[++i];
++		} else if (!strcmp(argv[i], "--verbose") ||
++			   !strcmp(argv[i], "-v")) {
++			verbose = 1;
++		} else if (!strcmp(argv[i], "--help") ||
++			   !strcmp(argv[i], "-h")) {
++			usage(argv[0]);
++			return 0;
++		} else {
++			usage(argv[0]);
++			return 2;
++		}
++	}
++
++	sigemptyset(&sa.sa_mask);
++	sigaction(SIGTERM, &sa, NULL);
++	sigaction(SIGINT, &sa, NULL);
++
++	bus = dw_conn_open(address, err, sizeof(err));
++	if (!bus) {
++		logmsg("cannot connect to D-Bus: %s", err);
++		return 1;
++	}
++	if (dw_request_name(bus, SENSOR_PROXY_NAME, err, sizeof(err)) < 0) {
++		logmsg("%s", err);
++		dw_conn_free(bus);
++		return 1;
++	}
++	if (dw_add_match(bus, "type='signal',sender='org.freedesktop.DBus',"
++			 "interface='org.freedesktop.DBus',"
++			 "member='NameOwnerChanged'") < 0)
++		logmsg("warning: could not subscribe to NameOwnerChanged");
++
++	discover_sensor(&accel_sensor, ACCEL_INPUT_NAME, evdev_is_accel);
++	discover_sensor(&prox_sensor, PROX_INPUT_NAME, evdev_is_prox);
++	if (!accel_sensor.present)
++		logmsg("warning: '%s' input device not found yet",
++		       ACCEL_INPUT_NAME);
++	if (!prox_sensor.present)
++		logmsg("warning: '%s' input device not found yet",
++		       PROX_INPUT_NAME);
++	logmsg("owning %s as %s", SENSOR_PROXY_NAME,
++	       accel_sensor.present || prox_sensor.present ?
++	       "sensor proxy" : "empty sensor proxy");
++
++	while (!stop_requested) {
++		struct pollfd fds[3];
++		int nfds = 0, dbus_idx, accel_idx = -1, prox_idx = -1;
++		int timeout = (accel_sensor.present && prox_sensor.present) ?
++			      -1 : 2000;
++		int r;
++
++		dbus_idx = nfds;
++		fds[nfds].fd = dw_conn_fd(bus);
++		fds[nfds].events = POLLIN;
++		fds[nfds].revents = 0;
++		nfds++;
++		if (accel_sensor.fd >= 0) {
++			accel_idx = nfds;
++			fds[nfds].fd = accel_sensor.fd;
++			fds[nfds].events = POLLIN;
++			fds[nfds].revents = 0;
++			nfds++;
++		}
++		if (prox_sensor.fd >= 0) {
++			prox_idx = nfds;
++			fds[nfds].fd = prox_sensor.fd;
++			fds[nfds].events = POLLIN;
++			fds[nfds].revents = 0;
++			nfds++;
++		}
++
++		r = poll(fds, (nfds_t)nfds, timeout);
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			logmsg("poll: %s", strerror(errno));
++			break;
++		}
++		if (r == 0) {
++			discover_missing();
++			continue;
++		}
++
++		if (fds[dbus_idx].revents & POLLIN) {
++			while (dw_conn_fill(bus, 0) == 1)
++				;
++			for (;;) {
++				struct dw_msg m;
++				int mr = dw_next_message(bus, &m);
++
++				if (mr == 0)
++					break;
++				if (mr < 0) {
++					logmsg("malformed D-Bus message");
++					stop_requested = 1;
++					break;
++				}
++				handle_message(&m);
++			}
++		}
++		if (fds[dbus_idx].revents & (POLLHUP | POLLERR)) {
++			logmsg("D-Bus connection closed");
++			break;
++		}
++		if (accel_idx >= 0 && fds[accel_idx].revents & POLLIN)
++			handle_accel_events();
++		if (prox_idx >= 0 && fds[prox_idx].revents & POLLIN)
++			handle_prox_events();
++		if (accel_idx >= 0 &&
++		    fds[accel_idx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
++			logmsg("accelerometer input device disappeared");
++			sensor_close(&accel_sensor);
++			emit_bool_prop("HasAccelerometer", 0);
++		}
++		if (prox_idx >= 0 &&
++		    fds[prox_idx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
++			logmsg("proximity input device disappeared");
++			sensor_close(&prox_sensor);
++			emit_bool_prop("HasProximity", 0);
++		}
++	}
++
++	sensor_set_enabled(&accel_sensor, 0);
++	sensor_set_enabled(&prox_sensor, 0);
++	sensor_close(&accel_sensor);
++	sensor_close(&prox_sensor);
++	dw_conn_free(bus);
++	logmsg("stopped");
++	return 0;
++}
+diff --git a/device/archived/j7elte-sensors/j7elte-sensors.conf b/device/archived/j7elte-sensors/j7elte-sensors.conf
+new file mode 100644
+index 0000000..237341daec934b4c65ba39c2b087f44a5cb8d68b
+--- /dev/null
++++ b/device/archived/j7elte-sensors/j7elte-sensors.conf
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="UTF-8"?> <!-- -*- XML -*- -->
++
++<!DOCTYPE busconfig PUBLIC
++ "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
++ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
++<busconfig>
++
++  <!-- j7elte-sensors: only root may provide the sensor proxy -->
++  <policy user="root">
++    <allow own="net.hadess.SensorProxy"/>
++  </policy>
++
++  <!-- Any local user may query properties and claim sensors -->
++  <policy context="default">
++    <allow send_destination="net.hadess.SensorProxy" send_interface="net.hadess.SensorProxy"/>
++    <allow send_destination="net.hadess.SensorProxy" send_interface="org.freedesktop.DBus.Introspectable"/>
++    <allow send_destination="net.hadess.SensorProxy" send_interface="org.freedesktop.DBus.Properties"/>
++    <allow send_destination="net.hadess.SensorProxy" send_interface="org.freedesktop.DBus.Peer"/>
++  </policy>
++
++</busconfig>
+diff --git a/device/archived/j7elte-sensors/j7elte-sensors.initd b/device/archived/j7elte-sensors/j7elte-sensors.initd
+new file mode 100755
+index 0000000..24877964c40500221f371eda3c6bd10cc4eba4bb
+--- /dev/null
++++ b/device/archived/j7elte-sensors/j7elte-sensors.initd
+@@ -0,0 +1,12 @@
++#!/sbin/openrc-run
++# SPDX-License-Identifier: GPL-3.0-or-later
++
++description="Samsung Galaxy J7 (j7elte) evdev sensor proxy"
++command="/usr/bin/j7elte-sensors"
++command_background=true
++pidfile="/run/${RC_SVCNAME}.pid"
++
++depend() {
++	need dbus
++	after dbus
++}
+diff --git a/device/archived/j7elte-sensors/j7elte-sensors.service b/device/archived/j7elte-sensors/j7elte-sensors.service
+new file mode 100644
+index 0000000..956024d07e3114dcb44b6b1a3eaa2d781de30d6a
+--- /dev/null
++++ b/device/archived/j7elte-sensors/j7elte-sensors.service
+@@ -0,0 +1,24 @@
++[Unit]
++Description=Samsung Galaxy J7 (j7elte) evdev sensor proxy
++After=dbus.service
++Requires=dbus.service
++
++[Service]
++Type=dbus
++BusName=net.hadess.SensorProxy
++ExecStart=/usr/bin/j7elte-sensors
++Restart=on-failure
++RestartSec=2
++
++# The daemon only needs the bus socket and the input/sysfs interfaces.
++ProtectSystem=strict
++ProtectControlGroups=true
++ProtectHome=true
++ProtectKernelModules=true
++PrivateTmp=true
++RestrictAddressFamilies=AF_UNIX
++MemoryDenyWriteExecute=true
++NoNewPrivileges=true
++
++[Install]
++WantedBy=multi-user.target

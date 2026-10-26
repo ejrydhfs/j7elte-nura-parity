@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore battery capacity_max from EFS (Samsung Galaxy J7 / j7elte)
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+ConditionPathExists=/sys/class/power_supply/battery/batt_capacity_max
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/j7elte-power/restore-capacity-max
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3112 @@
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index b16c50e..0a05cd1 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -201,6 +201,8 @@ config DRM_SAVAGE
+ 
+ source "drivers/gpu/drm/exynos/Kconfig"
+ 
++source "drivers/gpu/drm/exynos7580/Kconfig"
++
+ source "drivers/gpu/drm/vmwgfx/Kconfig"
+ 
+ source "drivers/gpu/drm/gma500/Kconfig"
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 1c9f243..5903a04 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -45,6 +45,7 @@ obj-$(CONFIG_DRM_VMWGFX)+= vmwgfx/
+ obj-$(CONFIG_DRM_VIA)	+=via/
+ obj-$(CONFIG_DRM_NOUVEAU) +=nouveau/
+ obj-$(CONFIG_DRM_EXYNOS) +=exynos/
++obj-$(CONFIG_DRM_EXYNOS7580) += exynos7580/
+ obj-$(CONFIG_DRM_GMA500) += gma500/
+ obj-$(CONFIG_DRM_UDL) += udl/
+ obj-$(CONFIG_DRM_AST) += ast/
+diff --git a/drivers/gpu/drm/drm_gem_cma_helper.c b/drivers/gpu/drm/drm_gem_cma_helper.c
+index 0a7e011..15c4d44 100644
+--- a/drivers/gpu/drm/drm_gem_cma_helper.c
++++ b/drivers/gpu/drm/drm_gem_cma_helper.c
+@@ -35,8 +35,15 @@ static unsigned int get_gem_mmap_offset(struct drm_gem_object *obj)
+ static void drm_gem_cma_buf_destroy(struct drm_device *drm,
+ 		struct drm_gem_cma_object *cma_obj)
+ {
+-	dma_free_writecombine(drm->dev, cma_obj->base.size, cma_obj->vaddr,
+-			cma_obj->paddr);
++	/*
++	 * arm64 (this tree) only provides the attribute based DMA API, the
++	 * dma_{alloc,free}_writecombine() wrappers are 32 bit ARM only.
++	 */
++	DEFINE_DMA_ATTRS(attrs);
++
++	dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
++	dma_free_attrs(drm->dev, cma_obj->base.size, cma_obj->vaddr,
++			cma_obj->paddr, &attrs);
+ }
+ 
+ /*
+@@ -50,6 +57,7 @@ struct drm_gem_cma_object *drm_gem_cma_create(struct drm_device *drm,
+ {
+ 	struct drm_gem_cma_object *cma_obj;
+ 	struct drm_gem_object *gem_obj;
++	DEFINE_DMA_ATTRS(attrs);
+ 	int ret;
+ 
+ 	size = round_up(size, PAGE_SIZE);
+@@ -58,8 +66,9 @@ struct drm_gem_cma_object *drm_gem_cma_create(struct drm_device *drm,
+ 	if (!cma_obj)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	cma_obj->vaddr = dma_alloc_writecombine(drm->dev, size,
+-			&cma_obj->paddr, GFP_KERNEL | __GFP_NOWARN);
++	dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
++	cma_obj->vaddr = dma_alloc_attrs(drm->dev, size, &cma_obj->paddr,
++			GFP_KERNEL | __GFP_NOWARN, &attrs);
+ 	if (!cma_obj->vaddr) {
+ 		dev_err(drm->dev, "failed to allocate buffer with size %d\n", size);
+ 		ret = -ENOMEM;
+diff --git a/drivers/gpu/drm/exynos7580/Kconfig b/drivers/gpu/drm/exynos7580/Kconfig
+new file mode 100644
+index 0000000..15c0d98
+--- /dev/null
++++ b/drivers/gpu/drm/exynos7580/Kconfig
+@@ -0,0 +1,18 @@
++config DRM_EXYNOS7580
++	tristate "DRM/KMS support for Samsung Exynos 7580 (DECON + MIPI DSIM)"
++	depends on DRM && OF && ARM64 && ARCH_EXYNOS
++	select DRM_KMS_HELPER
++	select DRM_KMS_CMA_HELPER
++	select VIDEOMODE_HELPERS
++	help
++	  DRM/KMS driver for the Samsung Exynos 7580 display subsystem:
++	  the DECON display controller, the MIPI DSIM master/D-PHY and the
++	  ea8061 720x1280 panel found on the Galaxy J7 (j7elte).
++
++	  Provides a single CRTC with one primary plane, a DSI encoder and
++	  connector, CMA backed dumb buffers and fbdev emulation.  The
++	  vendor fbdev display stack (EXYNOS_DECON_EXYNOS7580) must be
++	  disabled when this driver is enabled, both claim the same
++	  hardware.
++
++	  If M is selected the module will be called exynos7580-drm.
+diff --git a/drivers/gpu/drm/exynos7580/Makefile b/drivers/gpu/drm/exynos7580/Makefile
+new file mode 100644
+index 0000000..6ccffe0
+--- /dev/null
++++ b/drivers/gpu/drm/exynos7580/Makefile
+@@ -0,0 +1,11 @@
++#
++# Samsung Exynos 7580 DECON/DSIM DRM driver
++#
++# Register maps, LCD description and the ea8061 command byte streams are
++# shared with the vendor fbdev driver, so its directory is on the include
++# path (it is still present in the tree, only its Kconfig option is off).
++#
++ccflags-y += -I$(srctree)/drivers/video/exynos/decon_7580
++
++obj-$(CONFIG_DRM_EXYNOS7580) += exynos7580-drm.o
++exynos7580-drm-y := exynos7580_drm.o exynos7580_decon.o exynos7580_dsim.o
+diff --git a/drivers/gpu/drm/exynos7580/exynos7580_decon.c b/drivers/gpu/drm/exynos7580/exynos7580_decon.c
+new file mode 100644
+index 0000000..2f0493a
+--- /dev/null
++++ b/drivers/gpu/drm/exynos7580/exynos7580_decon.c
+@@ -0,0 +1,465 @@
++/*
++ * Samsung Exynos 7580 DECON (display controller) support
++ *
++ * Every register write in this file mirrors a function of the vendor fbdev
++ * driver in drivers/video/exynos/decon_7580/.  The reference is noted at the
++ * function level; register offsets and field encodings come from
++ * drivers/video/exynos/decon_7580/regs-decon.h (included through
++ * exynos7580_drm.h).
++ *
++ * The vendor driver has no notion of DRM objects: it programs DECON from
++ * decon_core.c (decon_enable/decon_disable/__decon_update_regs) using the
++ * register primitives of decon_reg_7580.c.  This file keeps exactly the same
++ * register order, but expresses it as prepare/start/stop so that it fits the
++ * legacy DRM CRTC helper model.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/delay.h>
++#include <linux/io.h>
++
++#include "regs-decon.h"
++#include "exynos7580_drm.h"
++
++static inline u32 decon_read(struct exynos7580_drm *drv, u32 reg)
++{
++	return readl(drv->decon_base + reg);
++}
++
++static inline void decon_write(struct exynos7580_drm *drv, u32 reg, u32 val)
++{
++	writel(val, drv->decon_base + reg);
++}
++
++static inline void decon_write_mask(struct exynos7580_drm *drv, u32 reg,
++				    u32 val, u32 mask)
++{
++	u32 old = decon_read(drv, reg);
++
++	writel((val & mask) | (old & ~mask), drv->decon_base + reg);
++}
++
++/*
++ * decon_reg_reset() - software reset of the display controller
++ * (decon_reg_7580.c:decon_reg_reset)
++ */
++void exynos7580_decon_reset(struct exynos7580_drm *drv)
++{
++	int tries;
++
++	decon_write(drv, VIDCON0, VIDCON0_SWRESET);
++	for (tries = 2000; tries; --tries) {
++		if (!(decon_read(drv, VIDCON0) & VIDCON0_SWRESET))
++			break;
++		udelay(10);
++	}
++
++	if (!tries)
++		dev_err(drv->dev, "DECON reset timed out\n");
++}
++
++/*
++ * decon_reg_clear_win()
++ */
++static void decon_clear_win(struct exynos7580_drm *drv, int win)
++{
++	decon_write(drv, WINCON(win), WINCON_RESET_VALUE);
++	decon_write(drv, VIDOSD_A(win), 0);
++	decon_write(drv, VIDOSD_B(win), 0);
++	decon_write(drv, VIDOSD_C(win), 0);
++	decon_write(drv, VIDOSD_D(win), 0);
++}
++
++/*
++ * decon_reg_set_porch()
++ */
++static void decon_set_porch(struct exynos7580_drm *drv, int dsi)
++{
++	struct decon_lcd *lcd = &drv->lcd;
++
++	decon_write(drv, VIDTCON0(dsi),
++		    VIDTCON0_VBPD(lcd->vbp - 1) | VIDTCON0_VFPD(lcd->vfp - 1));
++	decon_write(drv, VIDTCON1(dsi), VIDTCON1_VSPW(lcd->vsa - 1));
++	decon_write(drv, VIDTCON2(dsi),
++		    VIDTCON2_HBPD(lcd->hbp - 1) | VIDTCON2_HFPD(lcd->hfp - 1));
++	decon_write(drv, VIDTCON3(dsi), VIDTCON3_HSPW(lcd->hsa - 1));
++	decon_write(drv, VIDTCON4(dsi),
++		    VIDTCON4_LINEVAL(lcd->yres - 1) |
++		    VIDTCON4_HOZVAL(lcd->xres - 1));
++}
++
++static void decon_shadow_protect(struct exynos7580_drm *drv, int win, bool on)
++{
++	decon_write_mask(drv, SHADOWCON, on ? ~0 : 0,
++			 SHADOWCON_WIN_PROTECT(win));
++}
++
++static void decon_update_standalone(struct exynos7580_drm *drv)
++{
++	decon_write_mask(drv, DECON_UPDATE, ~0, DECON_UPDATE_STANDALONE_F);
++}
++
++/*
++ * decon_reg_wait_for_update_timeout(), with the vendor 300 ms timeout.
++ * Once the shadow update has been latched the standalone bit self clears.
++ */
++static int decon_wait_update(struct exynos7580_drm *drv, unsigned long usec)
++{
++	unsigned long cnt = usec / 100;
++
++	while ((decon_read(drv, DECON_UPDATE) & DECON_UPDATE_STANDALONE_F) &&
++	       --cnt)
++		udelay(100);
++
++	if (!cnt) {
++		dev_err(drv->dev, "DECON shadow update timed out\n");
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
++/*
++ * decon_reg_wait_stop_status_timeout(): VIDCON0 DECON_STOP_STATUS is set while
++ * the controller is still running and clears once it has stopped.
++ */
++static int decon_wait_stop(struct exynos7580_drm *drv, unsigned long usec)
++{
++	unsigned long cnt = usec / 10;
++	bool running;
++
++	do {
++		running = !!(decon_read(drv, VIDCON0) &
++			     VIDCON0_DECON_STOP_STATUS);
++		if (running)
++			udelay(10);
++	} while (running && --cnt);
++
++	return running ? -EBUSY : 0;
++}
++
++static u32 decon_wincon(u32 format)
++{
++	u32 val;
++
++	switch (format) {
++	case DRM_FORMAT_XRGB8888:
++		val = WINCON_BPPMODE_XRGB8888 | WINCON_ALPHA_SEL;
++		break;
++	case DRM_FORMAT_ARGB8888:
++		val = WINCON_BPPMODE_ARGB8888 | WINCON_BLD_PIX |
++			WINCON_ALPHA_SEL;
++		break;
++	default:
++		return 0;
++	}
++
++	/*
++	 * exynos7580 must use 16 word burst; the field has no shadow register
++	 * so it has to be retained on every update (decon_core.c:2310).
++	 *
++	 * OUTSTAND_MAX also has no shadow register and the vendor driver forces
++	 * it back to its reset value on every write
++	 * (decon_reg_7580.c:decon_reg_set_regs_data).
++	 */
++	return val | WINCON_BURSTLEN_16WORD | WINCON_ENWIN |
++	       (WINCON_OUTSTAND_MAX_DEFAULT << WINCON_OUTSTAND_MAX_POS);
++}
++
++static int decon_check_fb(struct exynos7580_drm *drv,
++			  struct drm_framebuffer *fb)
++{
++	if (!fb)
++		return -EINVAL;
++
++	if (fb->width != drv->lcd.xres || fb->height != drv->lcd.yres) {
++		dev_err(drv->dev, "unsupported fb size %ux%u (panel is %ux%u)\n",
++			fb->width, fb->height, drv->lcd.xres, drv->lcd.yres);
++		return -EINVAL;
++	}
++
++	/*
++	 * DECON has no stride register: VIDW_WHOLE_X covers a line of exactly
++	 * width * bytes-per-pixel, see decon_core.c:decon_set_win_buffer()
++	 * (fix.line_length = src.f_w * bpp / 8).
++	 */
++	if (fb->pitches[0] != fb->width * (fb->bits_per_pixel >> 3)) {
++		dev_err(drv->dev, "non-tight pitch %u is not supported\n",
++			fb->pitches[0]);
++		return -EINVAL;
++	}
++
++	if (!decon_wincon(fb->pixel_format)) {
++		dev_err(drv->dev, "unsupported pixel format %08x\n",
++			fb->pixel_format);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static dma_addr_t decon_fb_iova(struct exynos7580_drm *drv,
++				struct drm_framebuffer *fb)
++{
++	struct drm_gem_cma_object *cma_obj;
++	dma_addr_t iova = 0;
++
++	cma_obj = drm_fb_cma_get_gem_obj(fb, 0);
++	if (!cma_obj) {
++		dev_err(drv->dev, "framebuffer has no GEM object\n");
++		return 0;
++	}
++
++	if (exynos7580_iova_get(drv, &cma_obj->base, &iova))
++		return 0;
++
++	/* The controller requires a 32 bit address. */
++	if (upper_32_bits(iova)) {
++		dev_err(drv->dev, "buffer address %pad is out of range\n", &iova);
++		return 0;
++	}
++
++	return iova;
++}
++
++/*
++ * Program window 0 with the given framebuffer.  Mirrors
++ * decon_reg_set_regs_data() + the shadow update done by
++ * __decon_update_regs().
++ */
++static int decon_set_window(struct exynos7580_drm *drv,
++			    struct drm_framebuffer *fb)
++{
++	dma_addr_t iova;
++	int ret;
++
++	ret = decon_check_fb(drv, fb);
++	if (ret)
++		return ret;
++
++	iova = decon_fb_iova(drv, fb);
++	if (!iova)
++		return -EINVAL;
++
++	decon_shadow_protect(drv, 0, true);
++
++	/* window 0 is fed by IDMA G0 (decon_reg_config_win_channel) */
++	decon_write_mask(drv, WINCHMAP0, WINCHMAP_DMA(IDMA_G0 + 1, 0),
++			 WINCHMAP_MASK(0));
++
++	decon_write(drv, WINCON(0), decon_wincon(fb->pixel_format));
++	decon_write(drv, WIN_MAP(0), 0);	/* no colour map */
++
++	decon_write(drv, VIDOSD_A(0), VIDOSD_A_TOPLEFT_X(0) |
++		    VIDOSD_A_TOPLEFT_Y(0));
++	decon_write(drv, VIDOSD_B(0),
++		    VIDOSD_B_BOTRIGHT_X(fb->width - 1) |
++		    VIDOSD_B_BOTRIGHT_Y(fb->height - 1));
++	decon_write(drv, VIDOSD_C(0), 0);
++	/* opaque plane alpha, same value as decon_set_alpha_blending() */
++	decon_write(drv, VIDOSD_D(0),
++		    VIDOSD_D_ALPHA1_R_F(0xff) | VIDOSD_D_ALPHA1_G_F(0xff) |
++		    VIDOSD_D_ALPHA1_B_F(0xff));
++
++	decon_write(drv, VIDW_ADD0(0), (u32)iova);
++	decon_write(drv, VIDW_WHOLE_X(0), fb->width);
++	decon_write(drv, VIDW_WHOLE_Y(0), fb->height);
++	decon_write(drv, VIDW_OFFSET_X(0), 0);
++	decon_write(drv, VIDW_OFFSET_Y(0), 0);
++
++	decon_shadow_protect(drv, 0, false);
++	decon_update_standalone(drv);
++
++	return 0;
++}
++
++/*
++ * Bring DECON into the state produced by decon_reg_init() +
++ * decon_reg_configure_lcd() for a video mode DSI output, and load window 0.
++ * Output stays disabled (VIDCON0 ENVID cleared) until exynos7580_decon_start().
++ */
++int exynos7580_decon_prepare(struct exynos7580_drm *drv,
++			     struct drm_framebuffer *fb)
++{
++	struct decon_lcd *lcd = &drv->lcd;
++	int win, ret;
++
++	if (lcd->mode != DECON_VIDEO_MODE) {
++		dev_err(drv->dev, "only MIPI video mode is supported\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&drv->lock);
++
++	exynos7580_decon_reset(drv);
++
++	decon_write(drv, BLENDCON, BLENDCON_NEW_8BIT_ALPHA_VALUE);
++
++	/* RGB interface towards DSIM, display on */
++	decon_write(drv, VIDOUTCON0, VIDOUTCON0_LCD_ON_F |
++		    VIDOUTCON0_RGBIF_F);
++
++	decon_write_mask(drv, CRCCTRL, 0, CRCCTRL_CRCCLKEN |
++			 CRCCTRL_CRCEN | CRCCTRL_CRCSTART_F);
++
++	/* video mode holds the pixel clock (decon_reg_init) */
++	decon_write_mask(drv, VIDCON1(0), VIDCON1_VCLK_HOLD,
++			 VIDCON1_VCLK_MASK);
++
++	for (win = 0; win < EXYNOS7580_MAX_WINDOWS; win++)
++		decon_clear_win(drv, win);
++
++	decon_write_mask(drv, VIDCON1(0), VIDCON1_RGB_ORDER_O_RGB,
++			 VIDCON1_RGB_ORDER_O_MASK);
++	decon_set_porch(drv, 0);
++
++	decon_write(drv, LINECNT_OP_THRESHOLD(0), lcd->yres - 1);
++
++	decon_write_mask(drv, VCLKCON0, ~0, VCLKCON0_CLKVALUP);
++	decon_write_mask(drv, VCLKCON0, ~0, VCLKCON0_VLCKFREE);
++	decon_write_mask(drv, VIDCON0, 0, VIDCON0_ENVID_F | VIDCON0_ENVID);
++
++	decon_write(drv, VIDINTCON1, VIDINTCON1_INT_I80 |
++		    VIDINTCON1_INT_FRAME | VIDINTCON1_INT_FIFO);
++
++	ret = decon_set_window(drv, fb);
++
++	mutex_unlock(&drv->lock);
++
++	return ret;
++}
++
++/*
++ * decon_reg_start(): enable the video output and latch the shadow registers.
++ */
++void exynos7580_decon_start(struct exynos7580_drm *drv)
++{
++	mutex_lock(&drv->lock);
++
++	decon_write_mask(drv, VIDCON0, ~0, VIDCON0_ENVID_F | VIDCON0_ENVID);
++	decon_update_standalone(drv);
++
++	mutex_unlock(&drv->lock);
++}
++
++/*
++ * decon_reg_stop(): stop at the next frame boundary, wait for the controller
++ * to report stopped and reset it.
++ */
++void exynos7580_decon_stop(struct exynos7580_drm *drv)
++{
++	mutex_lock(&drv->lock);
++
++	decon_write_mask(drv, VIDCON0, 0, VIDCON0_ENVID_F);
++	decon_update_standalone(drv);
++
++	if (decon_wait_stop(drv, 20 * 1000))
++		dev_warn(drv->dev, "DECON did not stop in time\n");
++
++	decon_write(drv, VIDINTCON1, VIDINTCON1_INT_I80 |
++		    VIDINTCON1_INT_FRAME | VIDINTCON1_INT_FIFO);
++
++	exynos7580_decon_reset(drv);
++
++	mutex_unlock(&drv->lock);
++}
++
++/*
++ * Address update for an already running pipe (legacy mode_set_base / plane
++ * update).
++ */
++int exynos7580_decon_set_base(struct exynos7580_drm *drv,
++			      struct drm_framebuffer *fb)
++{
++	dma_addr_t iova;
++	int ret;
++
++	ret = decon_check_fb(drv, fb);
++	if (ret)
++		return ret;
++
++	iova = decon_fb_iova(drv, fb);
++	if (!iova)
++		return -EINVAL;
++
++	mutex_lock(&drv->lock);
++
++	decon_shadow_protect(drv, 0, true);
++	decon_write(drv, VIDW_ADD0(0), (u32)iova);
++	decon_write(drv, VIDW_WHOLE_X(0), fb->width);
++	decon_write(drv, VIDW_WHOLE_Y(0), fb->height);
++	decon_write(drv, VIDW_OFFSET_X(0), 0);
++	decon_write(drv, VIDW_OFFSET_Y(0), 0);
++	decon_shadow_protect(drv, 0, false);
++
++	decon_update_standalone(drv);
++	decon_wait_update(drv, 300 * 1000);
++
++	mutex_unlock(&drv->lock);
++
++	return 0;
++}
++
++void exynos7580_decon_disable_window(struct exynos7580_drm *drv)
++{
++	mutex_lock(&drv->lock);
++
++	decon_shadow_protect(drv, 0, true);
++	decon_write_mask(drv, WINCON(0), 0, WINCON_ENWIN);
++	decon_shadow_protect(drv, 0, false);
++	decon_update_standalone(drv);
++
++	mutex_unlock(&drv->lock);
++}
++
++/*
++ * Vblank: DECON raises INT_FRAME at the beginning of vsync.  The vendor
++ * driver programs VIDINTCON0 the same way in decon_reg_set_int().
++ */
++void exynos7580_decon_vblank(struct exynos7580_drm *drv, bool enable)
++{
++	/*
++	 * Called by drm_vblank_get()/drm_vblank_put() with the vblank spinlock
++	 * held, so no sleeping locks here.
++	 */
++	if (enable) {
++		u32 val = VIDINTCON0_INT_ENABLE | VIDINTCON0_FIFOLEVEL_EMPTY |
++			  VIDINTCON0_INT_FRAME | VIDINTCON0_FRAMESEL0_VSYNC;
++
++		decon_write(drv, VIDINTCON1, VIDINTCON1_INT_FRAME);
++		decon_write(drv, VIDINTCON0, val);
++	} else {
++		decon_write_mask(drv, VIDINTCON0, 0, VIDINTCON0_INT_ENABLE);
++	}
++}
++
++irqreturn_t exynos7580_decon_irq(int irq, void *data)
++{
++	struct drm_device *drm = data;
++	struct exynos7580_drm *drv = drm->dev_private;
++	u32 status;
++	bool handled = false;
++
++	if (!drv)
++		return IRQ_NONE;
++
++	status = decon_read(drv, VIDINTCON1);
++
++	if (status & VIDINTCON1_INT_FRAME) {
++		decon_write(drv, VIDINTCON1, VIDINTCON1_INT_FRAME);
++		drv->vblank_count++;
++		drm_handle_vblank(drm, 0);
++		handled = true;
++	}
++
++	if (status & VIDINTCON1_INT_FIFO) {
++		/* FIFO underrun, only meaningful for diagnostics. */
++		decon_write(drv, VIDINTCON1, VIDINTCON1_INT_FIFO);
++		handled = true;
++	}
++
++	return handled ? IRQ_HANDLED : IRQ_NONE;
++}
+diff --git a/drivers/gpu/drm/exynos7580/exynos7580_drm.c b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+new file mode 100644
+index 0000000..8793d44
+--- /dev/null
++++ b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+@@ -0,0 +1,1329 @@
++/*
++ * Samsung Exynos 7580 (universal7580 / j7elte) DRM/KMS driver
++ *
++ * Single display pipe: DECON -> MIPI DSIM -> ea8061 720x1280 panel.
++ *
++ * This driver is deliberately standalone instead of extending
++ * drivers/gpu/drm/exynos: the in-tree Exynos DRM is the pre-atomic 3.10
++ * framework built around FIMD/HDMI/mixer, and the Exynos 7580 DECON has a
++ * different register map and a different power/clock model (runtime PM power
++ * domain + exynos_iovmm).  Adding a second display controller there would
++ * have touched 3.10's fragile non-atomic encoder/connector plumbing used by
++ * the other (unused on this board) outputs.
++ *
++ * Only legacy CRTC helpers are used; 3.10 has no atomic helpers.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/exynos_iovmm.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_gpio.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++
++#include "exynos7580_drm.h"
++
++#include <drm/drm_fb_helper.h>
++
++#define DRIVER_NAME	"exynos7580-drm"
++#define DRIVER_DESC	"Samsung Exynos 7580 DECON/DSIM DRM driver"
++#define DRIVER_DATE	"20261024"
++#define DRIVER_MAJOR	1
++#define DRIVER_MINOR	0
++#define DRIVER_PATCHLEVEL 0
++
++static int exynos7580_load(struct drm_device *drm, unsigned long flags);
++static int exynos7580_unload(struct drm_device *drm);
++
++static struct exynos7580_drm *crtc_to_drv(struct drm_crtc *crtc)
++{
++	return container_of(crtc, struct exynos7580_drm, crtc);
++}
++
++static struct exynos7580_drm *encoder_to_drv(struct drm_encoder *encoder)
++{
++	return container_of(encoder, struct exynos7580_drm, encoder);
++}
++
++static struct exynos7580_drm *connector_to_drv(struct drm_connector *connector)
++{
++	return container_of(connector, struct exynos7580_drm, connector);
++}
++
++static struct exynos7580_drm *plane_to_drv(struct drm_plane *plane)
++{
++	return container_of(plane, struct exynos7580_drm, plane);
++}
++
++/* ---------------------------------------------------------------------- */
++/* Device tree parsing							  */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * Board control lists.  The syntax is the one implemented by the vendor
++ * driver in drivers/video/exynos/decon_7580/decon_board.c:
++ *
++ *   subnode {
++ *       type = "regulator,enable", "delay,usleep", ...;
++ *       regulator = "LCD_1P8", ...;
++ *       delay = <10000 11000>, ...;
++ *       gpios = <&gpd1 3 0x1>, ...;
++ *   };
++ *
++ * Only the actions used by the j7elte board description are supported.
++ */
++static int exynos7580_parse_board_list(struct exynos7580_drm *drv,
++				       struct device_node *board,
++				       const char *name,
++				       struct exynos7580_board_action *acts,
++				       int max, int *count)
++{
++	struct device_node *np;
++	struct property *prop;
++	const char *type;
++	int n = 0, reg_idx = 0, delay_idx = 0, gpio_idx = 0;
++
++	np = of_get_child_by_name(board, name);
++	if (!np)
++		return -ENOENT;
++
++	of_property_for_each_string(np, "type", prop, type) {
++		struct exynos7580_board_action *a;
++
++		if (n >= max) {
++			dev_warn(drv->dev, "%s: too many actions, truncated\n",
++				 name);
++			break;
++		}
++
++		a = &acts[n];
++
++		if (!strncmp(type, "regulator,", 10)) {
++			const char *rname;
++			struct regulator *reg;
++
++			if (of_property_read_string_index(np, "regulator",
++							  reg_idx++, &rname)) {
++				dev_err(drv->dev, "%s: missing regulator name\n",
++					name);
++				goto err;
++			}
++
++			reg = devm_regulator_get(drv->dev, rname);
++			if (IS_ERR(reg)) {
++				int ret = PTR_ERR(reg);
++
++				dev_err(drv->dev, "no regulator %s: %d\n",
++					rname, ret);
++				if (ret == -EPROBE_DEFER)
++					goto err_defer;
++				goto err;
++			}
++
++			a->regulator = reg;
++			a->type = strstr(type, "disable") ?
++				EXYNOS7580_BOARD_REGULATOR_DISABLE :
++				EXYNOS7580_BOARD_REGULATOR_ENABLE;
++		} else if (!strncmp(type, "gpio,", 5)) {
++			a->type = strstr(type, "high") ?
++				EXYNOS7580_BOARD_GPIO_HIGH :
++				EXYNOS7580_BOARD_GPIO_LOW;
++			gpio_idx++;
++		} else if (!strncmp(type, "delay,usleep", 12)) {
++			if (of_property_read_u32_index(np, "delay", delay_idx++,
++						       &a->delay[0]) ||
++			    of_property_read_u32_index(np, "delay", delay_idx++,
++						       &a->delay[1])) {
++				dev_err(drv->dev, "%s: missing usleep range\n",
++					name);
++				goto err;
++			}
++			a->type = EXYNOS7580_BOARD_DELAY_USLEEP;
++		} else if (!strncmp(type, "delay,msleep", 12)) {
++			if (of_property_read_u32_index(np, "delay", delay_idx++,
++						       &a->delay[0])) {
++				dev_err(drv->dev, "%s: missing msleep\n", name);
++				goto err;
++			}
++			a->type = EXYNOS7580_BOARD_DELAY_MSLEEP;
++		} else if (!strncmp(type, "delay,mdelay", 12)) {
++			if (of_property_read_u32_index(np, "delay", delay_idx++,
++						       &a->delay[0])) {
++				dev_err(drv->dev, "%s: missing mdelay\n", name);
++				goto err;
++			}
++			a->type = EXYNOS7580_BOARD_DELAY_MDELAY;
++		} else {
++			dev_warn(drv->dev, "%s: unsupported action \"%s\"\n",
++				 name, type);
++			continue;
++		}
++
++		n++;
++	}
++
++	of_node_put(np);
++	*count = n;
++	return 0;
++
++err_defer:
++	of_node_put(np);
++	return -EPROBE_DEFER;
++err:
++	of_node_put(np);
++	return -EINVAL;
++}
++
++static int exynos7580_parse_dt(struct exynos7580_drm *drv)
++{
++	struct device_node *np = drv->dev->of_node;
++	struct device_node *lcd_np, *board_np;
++	u32 res[3];
++	u32 val;
++	int ret;
++
++	drv->dsim_np = of_find_compatible_node(NULL, NULL,
++					       "samsung,exynos7580-dsim");
++	if (!drv->dsim_np) {
++		dev_err(drv->dev, "no DSIM node found\n");
++		return -ENODEV;
++	}
++
++	lcd_np = of_parse_phandle(drv->dsim_np, "lcd_info", 0);
++	if (!lcd_np) {
++		dev_err(drv->dev, "DSIM node has no lcd_info\n");
++		return -EINVAL;
++	}
++
++	if (of_property_read_u32(lcd_np, "mode", &val)) {
++		dev_err(drv->dev, "panel has no mode\n");
++		goto err_lcd;
++	}
++	drv->lcd.mode = val;
++
++	if (of_property_read_u32_array(lcd_np, "resolution", res, 2)) {
++		dev_err(drv->dev, "panel has no resolution\n");
++		goto err_lcd;
++	}
++	drv->lcd.xres = res[0];
++	drv->lcd.yres = res[1];
++
++	of_property_read_u32_array(lcd_np, "size", res, 2);
++	drv->lcd.width = res[0];
++	drv->lcd.height = res[1];
++
++	of_property_read_u32(lcd_np, "timing,refresh", &drv->lcd.fps);
++
++	if (of_property_read_u32_array(lcd_np, "timing,h-porch", res, 3)) {
++		dev_err(drv->dev, "panel has no horizontal porches\n");
++		goto err_lcd;
++	}
++	drv->lcd.hbp = res[0];
++	drv->lcd.hfp = res[1];
++	drv->lcd.hsa = res[2];
++
++	if (of_property_read_u32_array(lcd_np, "timing,v-porch", res, 3)) {
++		dev_err(drv->dev, "panel has no vertical porches\n");
++		goto err_lcd;
++	}
++	drv->lcd.vbp = res[0];
++	drv->lcd.vfp = res[1];
++	drv->lcd.vsa = res[2];
++
++	of_property_read_u32(lcd_np, "timing,dsi-hs-clk", &drv->lcd.hs_clk);
++	of_property_read_u32(lcd_np, "timing,dsi-escape-clk",
++			     &drv->lcd.esc_clk);
++	of_property_read_u32(lcd_np, "mic", &drv->lcd.mic_enabled);
++	of_property_read_u32(lcd_np, "type_of_ddi", &drv->lcd.ddi_type);
++	of_property_read_u32(lcd_np, "rev", &drv->panel_rev);
++	of_node_put(lcd_np);
++
++	if (!drv->lcd.xres || !drv->lcd.yres ||
++	    !drv->lcd.hs_clk || !drv->lcd.esc_clk) {
++		dev_err(drv->dev, "incomplete panel description\n");
++		return -EINVAL;
++	}
++
++	if (of_property_read_u32(np, "disp-pll-clk", &val) || !val)
++		val = 64500000;		/* j7elte pixel clock (disp_pll), 828x1300x60 */
++	drv->disp_pll_rate = val;
++
++	if (of_property_read_u32(drv->dsim_np, "data_lane_cnt", &val)) {
++		dev_err(drv->dev, "DSIM node has no data_lane_cnt\n");
++		return -EINVAL;
++	}
++	if (val < 1 || val > 4) {
++		dev_err(drv->dev, "invalid lane count %u\n", val);
++		return -EINVAL;
++	}
++	drv->data_lanes = val;
++
++	board_np = of_parse_phandle(drv->dsim_np, "decon_board", 0);
++	if (!board_np) {
++		dev_err(drv->dev, "DSIM node has no decon_board\n");
++		return -EINVAL;
++	}
++
++	ret = exynos7580_parse_board_list(drv, board_np,
++					  "dsim_set_panel_power_enable",
++					  drv->power_on,
++					  EXYNOS7580_MAX_BOARD_ACTIONS,
++					  &drv->num_power_on);
++	if (ret && ret != -ENOENT)
++		goto err_board;
++
++	ret = exynos7580_parse_board_list(drv, board_np,
++					  "dsim_set_panel_power_disable",
++					  drv->power_off,
++					  EXYNOS7580_MAX_BOARD_ACTIONS,
++					  &drv->num_power_off);
++	if (ret && ret != -ENOENT)
++		goto err_board;
++
++	/*
++	 * The reset list carries one gpio entry per edge.  All of them point at
++	 * the same line (see exynos7580-j7elte_rev00.dts), so request it once.
++	 */
++	{
++		struct device_node *rst;
++		int gpio;
++
++		rst = of_get_child_by_name(board_np, "dsim_reset_panel");
++		if (rst) {
++			gpio = of_get_named_gpio(rst, "gpios", 0);
++			if (gpio < 0) {
++				dev_err(drv->dev, "panel reset gpio missing\n");
++				of_node_put(rst);
++				ret = gpio;
++				goto err_board;
++			}
++
++			ret = devm_gpio_request_one(drv->dev, gpio,
++						    GPIOF_OUT_INIT_LOW,
++						    "panel-reset");
++			if (ret) {
++				dev_err(drv->dev, "cannot claim reset gpio %d\n",
++					gpio);
++				of_node_put(rst);
++				goto err_board;
++			}
++
++			drv->reset_gpio = gpio;
++			drv->reset_gpio_valid = true;
++			of_node_put(rst);
++		}
++
++		ret = exynos7580_parse_board_list(drv, board_np,
++						  "dsim_reset_panel",
++						  drv->reset,
++						  EXYNOS7580_MAX_BOARD_ACTIONS,
++						  &drv->num_reset);
++		if (ret && ret != -ENOENT)
++			goto err_board;
++	}
++
++	of_node_put(board_np);
++
++	/* Build the one and only mode of this panel. */
++	{
++		struct drm_display_mode *mode = &drv->mode;
++		u32 htotal = drv->lcd.xres + drv->lcd.hbp + drv->lcd.hfp +
++			     drv->lcd.hsa;
++		u32 vtotal = drv->lcd.yres + drv->lcd.vbp + drv->lcd.vfp +
++			     drv->lcd.vsa;
++
++		memset(mode, 0, sizeof(*mode));
++		mode->clock = (htotal * vtotal * drv->lcd.fps) / 1000;
++		mode->hdisplay = drv->lcd.xres;
++		mode->hsync_start = drv->lcd.xres + drv->lcd.hfp;
++		mode->hsync_end = mode->hsync_start + drv->lcd.hsa;
++		mode->htotal = htotal;
++		mode->vdisplay = drv->lcd.yres;
++		mode->vsync_start = drv->lcd.yres + drv->lcd.vfp;
++		mode->vsync_end = mode->vsync_start + drv->lcd.vsa;
++		mode->vtotal = vtotal;
++		mode->flags = 0;
++		drm_mode_set_name(mode);
++	}
++
++	dev_info(drv->dev, "panel %s, %u Mbps/lane, %d lanes, video mode\n",
++		 drv->mode.name, drv->lcd.hs_clk, drv->data_lanes);
++
++	return 0;
++
++err_board:
++	of_node_put(board_np);
++	return ret;
++err_lcd:
++	of_node_put(lcd_np);
++	return -EINVAL;
++}
++
++/* ---------------------------------------------------------------------- */
++/* Clocks and power							  */
++/* ---------------------------------------------------------------------- */
++
++static struct clk *exynos7580_clk(struct exynos7580_drm *drv, const char *name)
++{
++	struct clk *clk = clk_get(drv->dev, name);
++
++	if (IS_ERR(clk)) {
++		dev_err(drv->dev, "cannot get clock %s: %ld\n", name,
++			PTR_ERR(clk));
++		return NULL;
++	}
++
++	return clk;
++}
++
++/*
++ * Mirrors decon_int_set_clocks()/decon_clk_set_* from
++ * drivers/video/exynos/decon_7580/decon-int_drv.c and decon_helper.c.
++ * The divider helper there programs parent_rate / (divider + 1).
++ */
++static void exynos7580_clk_config(struct exynos7580_drm *drv)
++{
++	unsigned long rate;
++
++	clk_set_rate(drv->disp_pll, drv->disp_pll_rate);
++
++	/* eclk: DECON core clock */
++	clk_set_parent(drv->mout_eclk_a, drv->bus_pll);
++	clk_set_parent(drv->mout_eclk_b, drv->mout_eclk_a);
++	clk_set_parent(drv->mout_eclk_user, drv->sclk_disp_eclk);
++	clk_set_parent(drv->m_decon0_eclk, drv->mout_eclk_user);
++
++	rate = clk_get_rate(drv->mout_eclk_b);
++	clk_set_rate(drv->dout_sclk_disp_eclk, DIV_ROUND_UP(rate, 5)); /* /5 */
++	clk_set_rate(drv->d_decon0_eclk, clk_get_rate(drv->m_decon0_eclk));
++
++	/* vclk: pixel clock, disp_pll / 1 = 64.5 MHz (828 x 1300 x 60) */
++	clk_set_parent(drv->m_decon0_vclk, drv->disp_pll);
++	clk_set_rate(drv->d_decon0_vclk, clk_get_rate(drv->m_decon0_vclk));
++
++	/* aclk: DMA clock */
++	clk_set_parent(drv->mout_aclk_disp_200, drv->bus_pll);
++	rate = clk_get_rate(drv->mout_aclk_disp_200);
++	clk_set_rate(drv->dout_aclk_disp_200, DIV_ROUND_UP(rate, 4)); /* /4 */
++	clk_set_parent(drv->mout_aclk_disp_200_user, drv->aclk_disp_200);
++
++	/* pclk: bus clock for SFR accesses */
++	if (drv->d_pclk_disp) {
++		struct clk *parent = clk_get_parent(drv->d_pclk_disp);
++
++		if (parent)
++			clk_set_rate(drv->d_pclk_disp,
++				     DIV_ROUND_UP(clk_get_rate(parent), 2));
++	}
++}
++
++static int exynos7580_get_clocks(struct exynos7580_drm *drv)
++{
++	drv->decon_pclk = exynos7580_clk(drv, "pclk_decon0");
++	drv->decon_aclk = exynos7580_clk(drv, "aclk_decon0");
++	drv->decon_eclk = exynos7580_clk(drv, "decon0_eclk");
++	drv->decon_vclk = exynos7580_clk(drv, "decon0_vclk");
++	drv->decon_aclk_disp = exynos7580_clk(drv, "aclk_disp");
++	drv->disp_pll = exynos7580_clk(drv, "disp_pll");
++	drv->bus_pll = exynos7580_clk(drv, "bus_pll");
++	drv->mout_eclk_a = exynos7580_clk(drv,
++			"mout_sclk_disp_decon_int_eclk_a");
++	drv->mout_eclk_b = exynos7580_clk(drv,
++			"mout_sclk_disp_decon_int_eclk_b");
++	drv->mout_eclk_user = exynos7580_clk(drv,
++			"mout_sclk_decon_int_eclk_user");
++	drv->sclk_disp_eclk = exynos7580_clk(drv,
++			"sclk_disp_decon_int_eclk");
++	drv->dout_sclk_disp_eclk = exynos7580_clk(drv,
++			"dout_sclk_disp_decon_int_eclk");
++	drv->m_decon0_eclk = exynos7580_clk(drv, "m_decon0_eclk");
++	drv->d_decon0_eclk = exynos7580_clk(drv, "d_decon0_eclk");
++	drv->m_decon0_vclk = exynos7580_clk(drv, "m_decon0_vclk");
++	drv->d_decon0_vclk = exynos7580_clk(drv, "d_decon0_vclk");
++	drv->mout_aclk_disp_200 = exynos7580_clk(drv, "mout_aclk_disp_200");
++	drv->dout_aclk_disp_200 = exynos7580_clk(drv, "dout_aclk_disp_200");
++	drv->mout_aclk_disp_200_user = exynos7580_clk(drv,
++			"mout_aclk_disp_200_user");
++	drv->d_pclk_disp = exynos7580_clk(drv, "d_pclk_disp");
++	drv->aclk_disp_200 = exynos7580_clk(drv, "aclk_disp_200");
++	drv->mif_pll = exynos7580_clk(drv, "mif_pll");
++
++	/* DSIM clocks live on the dsim node, look them up by phandle. */
++	drv->dsim_pclk = of_clk_get_by_name(drv->dsim_np, "pclk_dsim0");
++	if (IS_ERR(drv->dsim_pclk))
++		drv->dsim_pclk = NULL;
++	drv->dsim_esc_clk = of_clk_get_by_name(drv->dsim_np, "mipi0_rx");
++	if (IS_ERR(drv->dsim_esc_clk))
++		drv->dsim_esc_clk = NULL;
++	drv->dsim_byte_clk = of_clk_get_by_name(drv->dsim_np, "mipi0_bit");
++	if (IS_ERR(drv->dsim_byte_clk))
++		drv->dsim_byte_clk = NULL;
++	drv->dsim_rgb_vclk = of_clk_get_by_name(drv->dsim_np, "rgb_vclk0");
++	if (IS_ERR(drv->dsim_rgb_vclk))
++		drv->dsim_rgb_vclk = NULL;
++	drv->dsim_pclk_disp = of_clk_get_by_name(drv->dsim_np, "pclk_disp");
++	if (IS_ERR(drv->dsim_pclk_disp))
++		drv->dsim_pclk_disp = NULL;
++
++	if (!drv->decon_pclk || !drv->decon_aclk || !drv->decon_eclk ||
++	    !drv->decon_vclk || !drv->decon_aclk_disp || !drv->disp_pll ||
++	    !drv->bus_pll || !drv->dsim_pclk || !drv->dsim_esc_clk ||
++	    !drv->dsim_byte_clk || !drv->dsim_rgb_vclk ||
++	    !drv->dsim_pclk_disp)
++		return -ENODEV;
++
++	return 0;
++}
++
++static void exynos7580_clk_enable(struct exynos7580_drm *drv)
++{
++	clk_prepare_enable(drv->decon_pclk);
++	clk_prepare_enable(drv->decon_aclk);
++	clk_prepare_enable(drv->decon_eclk);
++	clk_prepare_enable(drv->decon_vclk);
++	clk_prepare_enable(drv->decon_aclk_disp);
++	clk_prepare_enable(drv->dsim_pclk);
++	clk_prepare_enable(drv->dsim_rgb_vclk);
++	clk_prepare_enable(drv->dsim_pclk_disp);
++}
++
++static void exynos7580_clk_disable(struct exynos7580_drm *drv)
++{
++	clk_disable_unprepare(drv->dsim_pclk_disp);
++	clk_disable_unprepare(drv->dsim_rgb_vclk);
++	clk_disable_unprepare(drv->dsim_pclk);
++	clk_disable_unprepare(drv->decon_aclk_disp);
++	clk_disable_unprepare(drv->decon_vclk);
++	clk_disable_unprepare(drv->decon_eclk);
++	clk_disable_unprepare(drv->decon_aclk);
++	clk_disable_unprepare(drv->decon_pclk);
++}
++
++static int exynos7580_runtime_suspend(struct device *dev)
++{
++	struct exynos7580_drm *drv = dev_get_drvdata(dev);
++
++	if (!drv)
++		return 0;
++
++	exynos7580_clk_disable(drv);
++	return 0;
++}
++
++static int exynos7580_runtime_resume(struct device *dev)
++{
++	struct exynos7580_drm *drv = dev_get_drvdata(dev);
++
++	if (!drv)
++		return 0;
++
++	exynos7580_clk_config(drv);
++	exynos7580_clk_enable(drv);
++	return 0;
++}
++
++static const struct dev_pm_ops exynos7580_pm_ops = {
++	.runtime_suspend = exynos7580_runtime_suspend,
++	.runtime_resume = exynos7580_runtime_resume,
++};
++
++/* ---------------------------------------------------------------------- */
++/* GEM/IOMMU helpers							  */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * DECON fetches pixels through the display System MMU (sysmmu@14860000), so
++ * every scanout buffer needs an IOVA, exactly like the vendor driver's
++ * ion_iovmm_map() in decon_core.c:decon_map_ion_handle().  Mappings are
++ * cached per GEM object and released from the GEM free callback.
++ */
++int exynos7580_iova_get(struct exynos7580_drm *drv, struct drm_gem_object *obj,
++			dma_addr_t *iova)
++{
++	struct drm_gem_cma_object *cma_obj = to_drm_gem_cma_obj(obj);
++	struct exynos7580_iova *m;
++	int ret = 0;
++
++	mutex_lock(&drv->iova_lock);
++
++	list_for_each_entry(m, &drv->iova_list, list) {
++		if (m->obj == obj) {
++			*iova = m->iova;
++			goto out;
++		}
++	}
++
++	if (!drv->use_iommu) {
++		*iova = cma_obj->paddr;
++		goto out;
++	}
++
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!m) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	{
++		struct sg_table sgt;
++
++		ret = sg_alloc_table(&sgt, 1, GFP_KERNEL);
++		if (ret) {
++			kfree(m);
++			goto out;
++		}
++
++		sg_set_buf(sgt.sgl, cma_obj->vaddr, obj->size);
++		m->iova = iovmm_map(drv->dev, sgt.sgl, 0, obj->size,
++				    DMA_TO_DEVICE, 0);
++		sg_free_table(&sgt);
++
++		if (IS_ERR_VALUE(m->iova)) {
++			dev_err(drv->dev, "failed to map %zu bytes: %ld\n",
++				(size_t)obj->size, (long)m->iova);
++			kfree(m);
++			ret = -ENOMEM;
++			goto out;
++		}
++	}
++
++	m->obj = obj;
++	list_add_tail(&m->list, &drv->iova_list);
++	*iova = m->iova;
++out:
++	mutex_unlock(&drv->iova_lock);
++	return ret;
++}
++
++static void exynos7580_iova_put(struct exynos7580_drm *drv,
++				struct drm_gem_object *obj)
++{
++	struct exynos7580_iova *m, *tmp;
++
++	mutex_lock(&drv->iova_lock);
++
++	list_for_each_entry_safe(m, tmp, &drv->iova_list, list) {
++		if (m->obj != obj)
++			continue;
++
++		if (drv->use_iommu)
++			iovmm_unmap(drv->dev, m->iova);
++		list_del(&m->list);
++		kfree(m);
++		break;
++	}
++
++	mutex_unlock(&drv->iova_lock);
++}
++
++static void exynos7580_gem_free_object(struct drm_gem_object *obj)
++{
++	struct exynos7580_drm *drv = obj->dev->dev_private;
++
++	if (drv)
++		exynos7580_iova_put(drv, obj);
++
++	drm_gem_cma_free_object(obj);
++}
++
++struct drm_framebuffer *exynos7580_fb_create(struct drm_device *drm,
++					     struct drm_file *file_priv,
++					     struct drm_mode_fb_cmd2 *mode_cmd)
++{
++	return drm_fb_cma_create(drm, file_priv, mode_cmd);
++}
++
++/* ---------------------------------------------------------------------- */
++/* CRTC								  */
++/* ---------------------------------------------------------------------- */
++
++static bool exynos7580_mode_is_panel(struct exynos7580_drm *drv,
++				     const struct drm_display_mode *mode)
++{
++	return mode->hdisplay == drv->lcd.xres &&
++	       mode->vdisplay == drv->lcd.yres;
++}
++
++static void exynos7580_crtc_dpms(struct drm_crtc *crtc, int mode)
++{
++	struct exynos7580_drm *drv = crtc_to_drv(crtc);
++
++	if (mode == DRM_MODE_DPMS_ON) {
++		/*
++		 * From off to on the legacy helper calls us before the
++		 * encoder; only prepare the controller here, the encoder
++		 * starts the output once the DSI link is up.
++		 */
++		if (!drv->display_on && crtc->fb)
++			exynos7580_decon_prepare(drv, crtc->fb);
++	} else {
++		if (drv->display_on) {
++			exynos7580_decon_stop(drv);
++			drv->display_on = false;
++		}
++	}
++}
++
++static void exynos7580_crtc_prepare(struct drm_crtc *crtc)
++{
++}
++
++static void exynos7580_crtc_commit(struct drm_crtc *crtc)
++{
++	struct exynos7580_drm *drv = crtc_to_drv(crtc);
++
++	if (!drv->display_on) {
++		exynos7580_decon_start(drv);
++		drv->display_on = true;
++	}
++}
++
++static bool exynos7580_crtc_mode_fixup(struct drm_crtc *crtc,
++				       const struct drm_display_mode *mode,
++				       struct drm_display_mode *adjusted_mode)
++{
++	struct exynos7580_drm *drv = crtc_to_drv(crtc);
++
++	return exynos7580_mode_is_panel(drv, mode);
++}
++
++static int exynos7580_crtc_mode_set(struct drm_crtc *crtc,
++				    struct drm_display_mode *mode,
++				    struct drm_display_mode *adjusted_mode,
++				    int x, int y, struct drm_framebuffer *old_fb)
++{
++	struct exynos7580_drm *drv = crtc_to_drv(crtc);
++
++	if (!exynos7580_mode_is_panel(drv, mode))
++		return -EINVAL;
++
++	if (drv->display_on)
++		return exynos7580_decon_set_base(drv, crtc->fb);
++
++	return exynos7580_decon_prepare(drv, crtc->fb);
++}
++
++static int exynos7580_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
++					 struct drm_framebuffer *old_fb)
++{
++	struct exynos7580_drm *drv = crtc_to_drv(crtc);
++
++	if (!crtc->fb)
++		return -EINVAL;
++
++	return exynos7580_decon_set_base(drv, crtc->fb);
++}
++
++static void exynos7580_crtc_disable(struct drm_crtc *crtc)
++{
++	struct exynos7580_drm *drv = crtc_to_drv(crtc);
++
++	if (drv->display_on) {
++		exynos7580_decon_stop(drv);
++		drv->display_on = false;
++	}
++
++	if (drv->dsim_on)
++		exynos7580_dsim_disable(drv);
++}
++
++static void exynos7580_crtc_destroy(struct drm_crtc *crtc)
++{
++	drm_crtc_cleanup(crtc);
++}
++
++static const struct drm_crtc_helper_funcs exynos7580_crtc_helper_funcs = {
++	.dpms = exynos7580_crtc_dpms,
++	.prepare = exynos7580_crtc_prepare,
++	.commit = exynos7580_crtc_commit,
++	.mode_fixup = exynos7580_crtc_mode_fixup,
++	.mode_set = exynos7580_crtc_mode_set,
++	.mode_set_base = exynos7580_crtc_mode_set_base,
++	.disable = exynos7580_crtc_disable,
++};
++
++static const struct drm_crtc_funcs exynos7580_crtc_funcs = {
++	.set_config = drm_crtc_helper_set_config,
++	.destroy = exynos7580_crtc_destroy,
++};
++
++/* ---------------------------------------------------------------------- */
++/* Encoder							  */
++/* ---------------------------------------------------------------------- */
++
++static void exynos7580_encoder_dpms(struct drm_encoder *encoder, int mode)
++{
++	struct exynos7580_drm *drv = encoder_to_drv(encoder);
++
++	if (mode == DRM_MODE_DPMS_ON) {
++		if (!drv->dsim_on)
++			exynos7580_dsim_enable(drv);
++		if (!drv->display_on && encoder->crtc && encoder->crtc->fb) {
++			exynos7580_decon_start(drv);
++			drv->display_on = true;
++		}
++	} else {
++		if (drv->dsim_on)
++			exynos7580_dsim_disable(drv);
++	}
++}
++
++static bool exynos7580_encoder_mode_fixup(struct drm_encoder *encoder,
++					  const struct drm_display_mode *mode,
++					  struct drm_display_mode *adjusted_mode)
++{
++	struct exynos7580_drm *drv = encoder_to_drv(encoder);
++
++	return exynos7580_mode_is_panel(drv, mode);
++}
++
++static void exynos7580_encoder_mode_set(struct drm_encoder *encoder,
++					struct drm_display_mode *mode,
++					struct drm_display_mode *adjusted_mode)
++{
++	struct exynos7580_drm *drv = encoder_to_drv(encoder);
++
++	/*
++	 * The DSI link and the panel have to be up before the controller is
++	 * started (crtc commit), as in the vendor driver where DSIM s_stream(1)
++	 * runs before decon_reg_init()/decon_reg_start().
++	 */
++	if (!drv->dsim_on)
++		exynos7580_dsim_enable(drv);
++}
++
++static void exynos7580_encoder_disable(struct drm_encoder *encoder)
++{
++	struct exynos7580_drm *drv = encoder_to_drv(encoder);
++
++	if (drv->dsim_on)
++		exynos7580_dsim_disable(drv);
++}
++
++static void exynos7580_encoder_destroy(struct drm_encoder *encoder)
++{
++	drm_encoder_cleanup(encoder);
++}
++
++static const struct drm_encoder_helper_funcs exynos7580_encoder_helper_funcs = {
++	.dpms = exynos7580_encoder_dpms,
++	.mode_fixup = exynos7580_encoder_mode_fixup,
++	.mode_set = exynos7580_encoder_mode_set,
++	.disable = exynos7580_encoder_disable,
++};
++
++static const struct drm_encoder_funcs exynos7580_encoder_funcs = {
++	.destroy = exynos7580_encoder_destroy,
++};
++
++/* ---------------------------------------------------------------------- */
++/* Connector							  */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * 3.10 has no DRM_MODE_CONNECTOR_DSI; an internal panel is reported as LVDS,
++ * which is what pre-DSI connector enums used for fixed panels.
++ */
++static int exynos7580_connector_get_modes(struct drm_connector *connector)
++{
++	struct exynos7580_drm *drv = connector_to_drv(connector);
++	struct drm_display_mode *mode;
++
++	mode = drm_mode_create(connector->dev);
++	if (!mode)
++		return 0;
++
++	drm_mode_copy(mode, &drv->mode);
++	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
++	drm_mode_probed_add(connector, mode);
++
++	return 1;
++}
++
++static int exynos7580_connector_mode_valid(struct drm_connector *connector,
++					   struct drm_display_mode *mode)
++{
++	struct exynos7580_drm *drv = connector_to_drv(connector);
++
++	return exynos7580_mode_is_panel(drv, mode) ? MODE_OK : MODE_BAD;
++}
++
++static struct drm_encoder *
++exynos7580_connector_best_encoder(struct drm_connector *connector)
++{
++	struct exynos7580_drm *drv = connector_to_drv(connector);
++
++	return &drv->encoder;
++}
++
++static enum drm_connector_status
++exynos7580_connector_detect(struct drm_connector *connector, bool force)
++{
++	/* The panel is soldered on; it is always there. */
++	return connector_status_connected;
++}
++
++static void exynos7580_connector_dpms(struct drm_connector *connector,
++				      int mode)
++{
++	drm_helper_connector_dpms(connector, mode);
++}
++
++static void exynos7580_connector_destroy(struct drm_connector *connector)
++{
++	drm_connector_cleanup(connector);
++}
++
++static const struct drm_connector_helper_funcs
++exynos7580_connector_helper_funcs = {
++	.get_modes = exynos7580_connector_get_modes,
++	.mode_valid = exynos7580_connector_mode_valid,
++	.best_encoder = exynos7580_connector_best_encoder,
++};
++
++static const struct drm_connector_funcs exynos7580_connector_funcs = {
++	.dpms = exynos7580_connector_dpms,
++	.detect = exynos7580_connector_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = exynos7580_connector_destroy,
++};
++
++/* ---------------------------------------------------------------------- */
++/* Primary plane							  */
++/* ---------------------------------------------------------------------- */
++
++static const uint32_t exynos7580_plane_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++};
++
++static int exynos7580_plane_update(struct drm_plane *plane,
++				   struct drm_crtc *crtc,
++				   struct drm_framebuffer *fb,
++				   int crtc_x, int crtc_y,
++				   unsigned int crtc_w, unsigned int crtc_h,
++				   uint32_t src_x, uint32_t src_y,
++				   uint32_t src_w, uint32_t src_h)
++{
++	struct exynos7580_drm *drv = plane_to_drv(plane);
++
++	if (crtc != &drv->crtc || !fb)
++		return -EINVAL;
++
++	/* Window 0 covers the whole panel; no scaling or panning. */
++	if (crtc_x || crtc_y || crtc_w != drv->lcd.xres ||
++	    crtc_h != drv->lcd.yres || src_x || src_y ||
++	    src_w != (drv->lcd.xres << 16) || src_h != (drv->lcd.yres << 16))
++		return -EINVAL;
++
++	return exynos7580_decon_set_base(drv, fb);
++}
++
++static int exynos7580_plane_disable(struct drm_plane *plane)
++{
++	struct exynos7580_drm *drv = plane_to_drv(plane);
++
++	exynos7580_decon_disable_window(drv);
++	return 0;
++}
++
++static void exynos7580_plane_destroy(struct drm_plane *plane)
++{
++	drm_plane_cleanup(plane);
++}
++
++static const struct drm_plane_funcs exynos7580_plane_funcs = {
++	.update_plane = exynos7580_plane_update,
++	.disable_plane = exynos7580_plane_disable,
++	.destroy = exynos7580_plane_destroy,
++};
++
++/* ---------------------------------------------------------------------- */
++/* Mode configuration and mode set objects				  */
++/* ---------------------------------------------------------------------- */
++
++static void exynos7580_output_poll_changed(struct drm_device *drm)
++{
++	struct exynos7580_drm *drv = drm->dev_private;
++
++	if (drv && drv->fbdev)
++		drm_fbdev_cma_hotplug_event(drv->fbdev);
++}
++
++static const struct drm_mode_config_funcs exynos7580_mode_config_funcs = {
++	.fb_create = exynos7580_fb_create,
++	.output_poll_changed = exynos7580_output_poll_changed,
++};
++
++static int exynos7580_modeset_init(struct exynos7580_drm *drv)
++{
++	struct drm_device *drm = drv->drm;
++	int ret;
++
++	drm_mode_config_init(drm);
++	drv->modeset_init = true;
++
++	drm->mode_config.min_width = drv->lcd.xres;
++	drm->mode_config.max_width = drv->lcd.xres;
++	drm->mode_config.min_height = drv->lcd.yres;
++	drm->mode_config.max_height = drv->lcd.yres;
++	drm->mode_config.funcs = &exynos7580_mode_config_funcs;
++
++	ret = drm_crtc_init(drm, &drv->crtc, &exynos7580_crtc_funcs);
++	if (ret) {
++		dev_err(drv->dev, "cannot init CRTC: %d\n", ret);
++		return ret;
++	}
++	drm_crtc_helper_add(&drv->crtc, &exynos7580_crtc_helper_funcs);
++
++	ret = drm_encoder_init(drm, &drv->encoder, &exynos7580_encoder_funcs,
++			       DRM_MODE_ENCODER_LVDS);
++	if (ret) {
++		dev_err(drv->dev, "cannot init encoder: %d\n", ret);
++		return ret;
++	}
++	drv->encoder.possible_crtcs = 1;
++	drm_encoder_helper_add(&drv->encoder,
++			       &exynos7580_encoder_helper_funcs);
++
++	ret = drm_connector_init(drm, &drv->connector,
++				 &exynos7580_connector_funcs,
++				 DRM_MODE_CONNECTOR_LVDS);
++	if (ret) {
++		dev_err(drv->dev, "cannot init connector: %d\n", ret);
++		return ret;
++	}
++	drm_connector_helper_add(&drv->connector,
++				 &exynos7580_connector_helper_funcs);
++
++	ret = drm_mode_connector_attach_encoder(&drv->connector, &drv->encoder);
++	if (ret) {
++		dev_err(drv->dev, "cannot attach encoder: %d\n", ret);
++		return ret;
++	}
++
++	ret = drm_plane_init(drm, &drv->plane, 1, &exynos7580_plane_funcs,
++			     exynos7580_plane_formats,
++			     ARRAY_SIZE(exynos7580_plane_formats), false);
++	if (ret) {
++		dev_err(drv->dev, "cannot init primary plane: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++/* ---------------------------------------------------------------------- */
++/* Vblank								  */
++/* ---------------------------------------------------------------------- */
++
++static u32 exynos7580_get_vblank_counter(struct drm_device *drm, int crtc)
++{
++	struct exynos7580_drm *drv = drm->dev_private;
++
++	return drv->vblank_count;
++}
++
++static int exynos7580_enable_vblank(struct drm_device *drm, int crtc)
++{
++	struct exynos7580_drm *drv = drm->dev_private;
++
++	exynos7580_decon_vblank(drv, true);
++	return 0;
++}
++
++static void exynos7580_disable_vblank(struct drm_device *drm, int crtc)
++{
++	struct exynos7580_drm *drv = drm->dev_private;
++
++	exynos7580_decon_vblank(drv, false);
++}
++
++/* ---------------------------------------------------------------------- */
++/* DRM driver							  */
++/* ---------------------------------------------------------------------- */
++
++static const struct file_operations exynos7580_drm_fops = {
++	.owner		= THIS_MODULE,
++	.open		= drm_open,
++	.release	= drm_release,
++	.unlocked_ioctl	= drm_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl	= drm_compat_ioctl,
++#endif
++	.poll		= drm_poll,
++	.read		= drm_read,
++	.fasync		= drm_fasync,
++	.llseek		= no_llseek,
++	.mmap		= drm_gem_cma_mmap,
++};
++
++static struct drm_driver exynos7580_drm_driver = {
++	.driver_features	= DRIVER_MODESET | DRIVER_GEM,
++	.load			= exynos7580_load,
++	.unload			= exynos7580_unload,
++	.get_vblank_counter	= exynos7580_get_vblank_counter,
++	.enable_vblank		= exynos7580_enable_vblank,
++	.disable_vblank		= exynos7580_disable_vblank,
++	.gem_free_object	= exynos7580_gem_free_object,
++	.gem_vm_ops		= &drm_gem_cma_vm_ops,
++	.dumb_create		= drm_gem_cma_dumb_create,
++	.dumb_map_offset	= drm_gem_cma_dumb_map_offset,
++	.dumb_destroy		= drm_gem_cma_dumb_destroy,
++	.fops			= &exynos7580_drm_fops,
++	.name			= DRIVER_NAME,
++	.desc			= DRIVER_DESC,
++	.date			= DRIVER_DATE,
++	.major			= DRIVER_MAJOR,
++	.minor			= DRIVER_MINOR,
++	.patchlevel		= DRIVER_PATCHLEVEL,
++};
++
++/* ---------------------------------------------------------------------- */
++/* Driver load/unload and platform glue					  */
++/* ---------------------------------------------------------------------- */
++
++static int exynos7580_load(struct drm_device *drm, unsigned long flags)
++{
++	struct platform_device *pdev = drm->platformdev;
++	struct exynos7580_drm *drv;
++	struct resource *res, dsim_res;
++	int ret, irq;
++
++	drv = kzalloc(sizeof(*drv), GFP_KERNEL);
++	if (!drv)
++		return -ENOMEM;
++
++	drv->drm = drm;
++	drv->dev = &pdev->dev;
++	mutex_init(&drv->lock);
++	mutex_init(&drv->iova_lock);
++	INIT_LIST_HEAD(&drv->iova_list);
++
++	drm->dev_private = drv;
++	platform_set_drvdata(pdev, drv);
++
++	ret = exynos7580_parse_dt(drv);
++	if (ret)
++		goto err_free;
++
++	ret = exynos7580_get_clocks(drv);
++	if (ret)
++		goto err_free;
++
++	/*
++	 * The display controller sits in the DISP power domain; runtime PM
++	 * also brings up all DECON/DSIM clocks in exynos7580_runtime_resume().
++	 * Keep one reference for the whole lifetime of the card so that SFR
++	 * accesses (including the ones done while the panel is off) are always
++	 * valid.
++	 */
++	pm_runtime_enable(drv->dev);
++	ret = pm_runtime_get_sync(drv->dev);
++	if (ret < 0) {
++		dev_err(drv->dev, "cannot power up the display domain: %d\n",
++			ret);
++		goto err_pm_disable;
++	}
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(drv->dev, "no DECON memory resource\n");
++		ret = -ENODEV;
++		goto err_pm;
++	}
++
++	drv->decon_base = devm_ioremap_resource(drv->dev, res);
++	if (IS_ERR(drv->decon_base)) {
++		ret = PTR_ERR(drv->decon_base);
++		drv->decon_base = NULL;
++		goto err_pm;
++	}
++
++	ret = of_address_to_resource(drv->dsim_np, 0, &dsim_res);
++	if (ret) {
++		dev_err(drv->dev, "no DSIM memory resource\n");
++		goto err_pm;
++	}
++	drv->dsim_base = devm_ioremap_resource(drv->dev, &dsim_res);
++	if (IS_ERR(drv->dsim_base)) {
++		ret = PTR_ERR(drv->dsim_base);
++		drv->dsim_base = NULL;
++		goto err_pm;
++	}
++
++	if (dma_set_mask(drv->dev, DMA_BIT_MASK(32)) ||
++	    dma_set_coherent_mask(drv->dev, DMA_BIT_MASK(32)))
++		dev_warn(drv->dev, "cannot set a 32 bit DMA mask\n");
++
++	/*
++	 * DECON reads pixels through the display System MMU.  If the IOMMU
++	 * driver is not available the SysMMU stays in bypass and physical
++	 * addresses are used instead (drv->use_iommu == false).
++	 */
++	if (!iovmm_activate(drv->dev))
++		drv->use_iommu = true;
++	else
++		dev_warn(drv->dev,
++			 "display IOMMU unavailable, using physical addresses\n");
++
++	/* Quiesce whatever the bootloader left enabled. */
++	exynos7580_dsim_quiesce(drv);
++	exynos7580_decon_stop(drv);
++
++	ret = exynos7580_modeset_init(drv);
++	if (ret)
++		goto err_modeset;
++
++	ret = drm_vblank_init(drm, 1);
++	if (ret) {
++		dev_err(drv->dev, "cannot init vblank: %d\n", ret);
++		goto err_modeset;
++	}
++	drv->vblank_init = true;
++
++	/*
++	 * DECON exposes three interrupt lines; only the frame done one
++	 * (interrupts[2] in the DT) is used, for vblank.  It is requested
++	 * directly instead of through drm_irq_install() because the DRM
++	 * platform bus only knows about interrupts[0] (the FIFO line).
++	 */
++	irq = platform_get_irq(pdev, 2);
++	if (irq < 0) {
++		dev_err(drv->dev, "no frame done interrupt\n");
++		ret = irq;
++		goto err_modeset;
++	}
++
++	ret = devm_request_irq(drv->dev, irq, exynos7580_decon_irq, 0,
++			       DRIVER_NAME, drm);
++	if (ret) {
++		dev_err(drv->dev, "cannot request IRQ %d: %d\n", irq, ret);
++		goto err_modeset;
++	}
++	drv->irq = irq;
++
++	drv->fbdev = drm_fbdev_cma_init(drm, 32, 1, 1);
++	if (IS_ERR(drv->fbdev)) {
++		ret = PTR_ERR(drv->fbdev);
++		drv->fbdev = NULL;
++		dev_err(drv->dev, "cannot init fbdev: %d\n", ret);
++		goto err_modeset;
++	}
++
++	dev_info(drv->dev, "DRM/KMS registered, mode %s, %s\n", drv->mode.name,
++		 drv->use_iommu ? "IOMMU" : "physical addresses");
++
++	return 0;
++
++err_modeset:
++	if (drv->vblank_init)
++		drm_vblank_cleanup(drm);
++	drm_mode_config_cleanup(drm);
++	drv->modeset_init = false;
++	if (drv->use_iommu)
++		iovmm_deactivate(drv->dev);
++err_pm:
++	pm_runtime_put_sync(drv->dev);
++err_pm_disable:
++	pm_runtime_disable(drv->dev);
++err_free:
++	platform_set_drvdata(pdev, NULL);
++	drm->dev_private = NULL;
++	kfree(drv);
++	return ret;
++}
++
++static int exynos7580_unload(struct drm_device *drm)
++{
++	struct exynos7580_drm *drv = drm->dev_private;
++	struct platform_device *pdev = drm->platformdev;
++
++	if (!drv)
++		return 0;
++
++	if (drv->display_on) {
++		exynos7580_decon_stop(drv);
++		drv->display_on = false;
++	}
++
++	if (drv->dsim_on)
++		exynos7580_dsim_disable(drv);
++
++	if (drv->irq) {
++		devm_free_irq(drv->dev, drv->irq, drm);
++		drv->irq = 0;
++	}
++
++	if (drv->fbdev) {
++		drm_fbdev_cma_fini(drv->fbdev);
++		drv->fbdev = NULL;
++	}
++
++	if (drv->vblank_init) {
++		drm_vblank_cleanup(drm);
++		drv->vblank_init = false;
++	}
++
++	if (drv->modeset_init) {
++		drm_mode_config_cleanup(drm);
++		drv->modeset_init = false;
++	}
++
++	if (drv->use_iommu)
++		iovmm_deactivate(drv->dev);
++
++	pm_runtime_put_sync(drv->dev);
++	pm_runtime_disable(drv->dev);
++
++	of_node_put(drv->dsim_np);
++
++	platform_set_drvdata(pdev, NULL);
++	drm->dev_private = NULL;
++	kfree(drv);
++
++	return 0;
++}
++
++static int exynos7580_probe(struct platform_device *pdev)
++{
++	return drm_platform_init(&exynos7580_drm_driver, pdev);
++}
++
++static int exynos7580_remove(struct platform_device *pdev)
++{
++	drm_platform_exit(&exynos7580_drm_driver, pdev);
++	return 0;
++}
++
++static const struct of_device_id exynos7580_drm_dt_match[] = {
++	{ .compatible = "samsung,exynos7580-decon-drm" },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, exynos7580_drm_dt_match);
++
++static struct platform_driver exynos7580_platform_driver = {
++	.probe		= exynos7580_probe,
++	.remove		= exynos7580_remove,
++	.driver		= {
++		.name	= DRIVER_NAME,
++		.owner	= THIS_MODULE,
++		.of_match_table = exynos7580_drm_dt_match,
++		.pm	= &exynos7580_pm_ops,
++	},
++};
++
++module_platform_driver(exynos7580_platform_driver);
++
++MODULE_AUTHOR("Nura");
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/gpu/drm/exynos7580/exynos7580_drm.h b/drivers/gpu/drm/exynos7580/exynos7580_drm.h
+new file mode 100644
+index 0000000..ea1e173
+--- /dev/null
++++ b/drivers/gpu/drm/exynos7580/exynos7580_drm.h
+@@ -0,0 +1,197 @@
++/*
++ * Samsung Exynos 7580 (universal7580 / j7elte) DRM/KMS driver
++ *
++ * DECON (display controller) CRTC + primary plane, MIPI DSIM encoder and
++ * connector, and ea8061 720x1280 panel support.
++ *
++ * The hardware is a single fixed display pipe:
++ *
++ *   DECON (0x14830000) --rgb--> DSIM (0x14800000) --mipi-dphy--> ea8061 panel
++ *
++ * Register maps and the panel command sequences are taken verbatim from the
++ * vendor fbdev driver in drivers/video/exynos/decon_7580 so that there is a
++ * single source of truth for the values (see exynos7580_decon.c and
++ * exynos7580_dsim.c for the per-function traceability notes).
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef __EXYNOS7580_DRM_H__
++#define __EXYNOS7580_DRM_H__
++
++#include <linux/clk.h>
++#include <linux/gpio.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/regulator/consumer.h>
++#include <linux/types.h>
++
++#include <drm/drmP.h>
++#include <drm/drm_crtc_helper.h>
++#include <drm/drm_fb_cma_helper.h>
++#include <drm/drm_gem_cma_helper.h>
++
++/* Vendor headers: register maps, the Exynos LCD description and the exact
++ * ea8061 initialisation byte streams. */
++#include "decon_common.h"
++
++#define EXYNOS7580_MAX_WINDOWS		3
++#define EXYNOS7580_MAX_BOARD_ACTIONS	8
++
++/* Values taken from drivers/video/exynos/decon_7580/decon_reg_7580.c */
++#define EXYNOS7580_SHADOW_OFFSET	0x7000
++
++/* VIDINTCON0 FRAMESEL0 is a two bit field, the vendor header only defines the
++ * encodings. */
++#define EXYNOS7580_VIDINTCON0_FRAMESEL0_MASK	(0x3 << 15)
++
++/* DSIM constants from drivers/video/exynos/decon_7580/dsim_reg_7580.c */
++#define EXYNOS7580_DSIM_STOP_STATE_CNT	0x7ff
++#define EXYNOS7580_DSIM_BTA_TIMEOUT	0xff
++#define EXYNOS7580_DSIM_LP_RX_TIMEOUT	0xffff
++#define EXYNOS7580_DSIM_MULTI_PACKET_CNT 0xffff
++#define EXYNOS7580_DSIM_PLL_STABLE_TIME	22200
++#define EXYNOS7580_DSIM_CMD_ALLOW_VALUE	4
++#define EXYNOS7580_DSIM_STABLE_VFP_VALUE 2
++
++/* EA8061 panel revision threshold used by the vendor driver:
++ * ea8061_init() uses SEQ_EA8061_LTPS_TIMING_REV_D when id[2] >= 0x03.
++ * The DT describes the panel as rev = <4>. */
++#define EXYNOS7580_PANEL_REV_D		0x03
++
++enum exynos7580_board_action_type {
++	EXYNOS7580_BOARD_REGULATOR_ENABLE,
++	EXYNOS7580_BOARD_REGULATOR_DISABLE,
++	EXYNOS7580_BOARD_GPIO_HIGH,
++	EXYNOS7580_BOARD_GPIO_LOW,
++	EXYNOS7580_BOARD_DELAY_USLEEP,
++	EXYNOS7580_BOARD_DELAY_MSLEEP,
++	EXYNOS7580_BOARD_DELAY_MDELAY,
++};
++
++struct exynos7580_board_action {
++	enum exynos7580_board_action_type type;
++	int gpio;
++	u32 delay[2];
++	struct regulator *regulator;
++};
++
++/* Cached IOMMU mapping of a GEM object. Scanned out buffers must stay mapped
++ * for as long as DECON can fetch them, exactly like the vendor driver's
++ * ion_iovmm_map() of a dma_buf. */
++struct exynos7580_iova {
++	struct list_head list;
++	struct drm_gem_object *obj;
++	dma_addr_t iova;
++};
++
++struct exynos7580_drm {
++	struct drm_device *drm;
++	struct device *dev;
++
++	/* Device tree data */
++	struct device_node *dsim_np;
++	struct decon_lcd lcd;
++	struct drm_display_mode mode;
++	unsigned int panel_rev;
++	int data_lanes;
++
++	/* MMIO */
++	void __iomem *decon_base;
++	void __iomem *dsim_base;
++
++	/* DECON clocks (names from the decon DT node) */
++	struct clk *decon_pclk;
++	struct clk *decon_aclk;
++	struct clk *decon_eclk;
++	struct clk *decon_vclk;
++	struct clk *decon_aclk_disp;
++	struct clk *disp_pll;
++	struct clk *bus_pll;
++	struct clk *mout_eclk_a;
++	struct clk *mout_eclk_b;
++	struct clk *mout_eclk_user;
++	struct clk *sclk_disp_eclk;
++	struct clk *dout_sclk_disp_eclk;
++	struct clk *m_decon0_eclk;
++	struct clk *d_decon0_eclk;
++	struct clk *m_decon0_vclk;
++	struct clk *d_decon0_vclk;
++	struct clk *mout_aclk_disp_200;
++	struct clk *dout_aclk_disp_200;
++	struct clk *mout_aclk_disp_200_user;
++	struct clk *d_pclk_disp;
++	struct clk *aclk_disp_200;
++	struct clk *mif_pll;
++
++	/* DSIM clocks (looked up through the dsim DT node) */
++	struct clk *dsim_pclk;
++	struct clk *dsim_esc_clk;
++	struct clk *dsim_byte_clk;
++	struct clk *dsim_rgb_vclk;
++	struct clk *dsim_pclk_disp;
++
++	/* Panel board control */
++	struct exynos7580_board_action power_on[EXYNOS7580_MAX_BOARD_ACTIONS];
++	int num_power_on;
++	struct exynos7580_board_action power_off[EXYNOS7580_MAX_BOARD_ACTIONS];
++	int num_power_off;
++	struct exynos7580_board_action reset[EXYNOS7580_MAX_BOARD_ACTIONS];
++	int num_reset;
++	int reset_gpio;
++	bool reset_gpio_valid;
++
++	/* Runtime state */
++	struct mutex lock;		/* serialises DECON/DSIM register access */
++	struct mutex iova_lock;		/* protects iova_list */
++	struct list_head iova_list;
++	unsigned long disp_pll_rate;
++	bool use_iommu;
++	bool display_on;
++	bool dsim_on;
++	bool panel_powered;
++	bool modeset_init;
++	bool vblank_init;
++	int irq;
++	u32 vblank_count;
++
++	/* DRM objects, one of each: the SoC has a single display pipe. */
++	struct drm_crtc crtc;
++	struct drm_encoder encoder;
++	struct drm_connector connector;
++	struct drm_plane plane;
++	struct drm_fbdev_cma *fbdev;
++};
++
++/* exynos7580_drm.c */
++int exynos7580_iova_get(struct exynos7580_drm *drv, struct drm_gem_object *obj,
++			dma_addr_t *iova);
++struct drm_framebuffer *exynos7580_fb_create(struct drm_device *drm,
++					     struct drm_file *file_priv,
++					     struct drm_mode_fb_cmd2 *mode_cmd);
++
++/* exynos7580_decon.c */
++void exynos7580_decon_reset(struct exynos7580_drm *drv);
++int exynos7580_decon_prepare(struct exynos7580_drm *drv,
++			     struct drm_framebuffer *fb);
++void exynos7580_decon_start(struct exynos7580_drm *drv);
++void exynos7580_decon_stop(struct exynos7580_drm *drv);
++int exynos7580_decon_set_base(struct exynos7580_drm *drv,
++			      struct drm_framebuffer *fb);
++void exynos7580_decon_disable_window(struct exynos7580_drm *drv);
++void exynos7580_decon_vblank(struct exynos7580_drm *drv, bool enable);
++irqreturn_t exynos7580_decon_irq(int irq, void *data);
++
++/* exynos7580_dsim.c */
++int exynos7580_dsim_enable(struct exynos7580_drm *drv);
++void exynos7580_dsim_disable(struct exynos7580_drm *drv);
++void exynos7580_dsim_quiesce(struct exynos7580_drm *drv);
++int exynos7580_panel_power(struct exynos7580_drm *drv, bool on);
++void exynos7580_panel_reset(struct exynos7580_drm *drv);
++int exynos7580_panel_init(struct exynos7580_drm *drv);
++void exynos7580_panel_suspend(struct exynos7580_drm *drv);
++
++#endif /* __EXYNOS7580_DRM_H__ */
+diff --git a/drivers/gpu/drm/exynos7580/exynos7580_dsim.c b/drivers/gpu/drm/exynos7580/exynos7580_dsim.c
+new file mode 100644
+index 0000000..d592335
+--- /dev/null
++++ b/drivers/gpu/drm/exynos7580/exynos7580_dsim.c
+@@ -0,0 +1,989 @@
++/*
++ * Samsung Exynos 7580 MIPI DSIM (DSI master + D-PHY) and ea8061 panel support
++ *
++ * This file is a straight port of the vendor dsim driver and the ea8061 panel
++ * driver:
++ *
++ *   drivers/video/exynos/decon_7580/dsim_reg_7580.c  register sequences
++ *   drivers/video/exynos/decon_7580/dsim_drv.c       power/clock sequencing
++ *   drivers/video/exynos/decon_7580/panels/ea8061_lcd_ctrl.c  panel init
++ *   drivers/video/exynos/decon_7580/panels/ea8061_param.h     panel bytes
++ *
++ * The only structural difference is that command transfers poll the DSIM
++ * interrupt status register instead of waiting on the vendor interrupt
++ * completions.  DSIM interrupts are therefore left masked; INTSRC is a raw
++ * status register and is updated regardless of INTMSK.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <video/mipi_display.h>
++
++#include "dsim_common.h"
++#include "panels/ea8061_param.h"
++#include "regs-dsim.h"
++#include "exynos7580_drm.h"
++
++static inline u32 dsim_read(struct exynos7580_drm *drv, u32 reg)
++{
++	return readl(drv->dsim_base + reg);
++}
++
++static inline void dsim_write(struct exynos7580_drm *drv, u32 reg, u32 val)
++{
++	writel(val, drv->dsim_base + reg);
++}
++
++static inline void dsim_write_mask(struct exynos7580_drm *drv, u32 reg,
++				   u32 val, u32 mask)
++{
++	u32 old = dsim_read(drv, reg);
++
++	writel((val & mask) | (old & ~mask), drv->dsim_base + reg);
++}
++
++/*
++ * D-PHY timing table, copied verbatim from dsim_reg_7580.c (dphy_timing[]).
++ * Columns: bps, clk_prepare, clk_zero, clk_post, clk_trail, hs_prepare,
++ *          hs_zero, hs_trail, lpx, hs_exit.
++ */
++static const u32 dphy_timing[][10] = {
++	{1500, 13, 65, 17, 13, 14, 24, 16, 11, 18},
++	{1490, 13, 65, 17, 13, 14, 24, 16, 11, 18},
++	{1480, 13, 64, 17, 13, 14, 24, 16, 11, 18},
++	{1470, 13, 64, 17, 13, 14, 24, 16, 11, 18},
++	{1460, 13, 63, 17, 13, 13, 24, 16, 10, 18},
++	{1450, 13, 63, 17, 13, 13, 23, 16, 10, 18},
++	{1440, 13, 63, 17, 13, 13, 23, 16, 10, 18},
++	{1430, 12, 62, 17, 13, 13, 23, 16, 10, 17},
++	{1420, 12, 62, 17, 13, 13, 23, 16, 10, 17},
++	{1410, 12, 61, 16, 13, 13, 23, 16, 10, 17},
++	{1400, 12, 61, 16, 13, 13, 23, 16, 10, 17},
++	{1390, 12, 60, 16, 12, 13, 22, 15, 10, 17},
++	{1380, 12, 60, 16, 12, 13, 22, 15, 10, 17},
++	{1370, 12, 59, 16, 12, 13, 22, 15, 10, 17},
++	{1360, 12, 59, 16, 12, 13, 22, 15, 10, 17},
++	{1350, 12, 59, 16, 12, 12, 22, 15, 10, 16},
++	{1340, 12, 58, 16, 12, 12, 21, 15, 10, 16},
++	{1330, 11, 58, 16, 12, 12, 21, 15, 9, 16},
++	{1320, 11, 57, 16, 12, 12, 21, 15, 9, 16},
++	{1310, 11, 57, 16, 12, 12, 21, 15, 9, 16},
++	{1300, 11, 56, 16, 12, 12, 21, 15, 9, 16},
++	{1290, 11, 56, 16, 12, 12, 21, 15, 9, 16},
++	{1280, 11, 56, 15, 11, 12, 20, 14, 9, 16},
++	{1270, 11, 55, 15, 11, 12, 20, 14, 9, 15},
++	{1260, 11, 55, 15, 11, 12, 20, 14, 9, 15},
++	{1250, 11, 54, 15, 11, 11, 20, 14, 9, 15},
++	{1240, 11, 54, 15, 11, 11, 20, 14, 9, 15},
++	{1230, 11, 53, 15, 11, 11, 19, 14, 9, 15},
++	{1220, 10, 53, 15, 11, 11, 19, 14, 9, 15},
++	{1210, 10, 52, 15, 11, 11, 19, 14, 9, 15},
++	{1200, 10, 52, 15, 11, 11, 19, 14, 9, 15},
++	{1190, 10, 52, 15, 11, 11, 19, 14, 8, 14},
++	{1180, 10, 51, 15, 11, 11, 19, 13, 8, 14},
++	{1170, 10, 51, 15, 10, 11, 18, 13, 8, 14},
++	{1160, 10, 50, 15, 10, 11, 18, 13, 8, 14},
++	{1150, 10, 50, 15, 10, 11, 18, 13, 8, 14},
++	{1140, 10, 49, 14, 10, 10, 18, 13, 8, 14},
++	{1130, 10, 49, 14, 10, 10, 18, 13, 8, 14},
++	{1120, 10, 49, 14, 10, 10, 17, 13, 8, 14},
++	{1110, 9, 48, 14, 10, 10, 17, 13, 8, 13},
++	{1100, 9, 48, 14, 10, 10, 17, 13, 8, 13},
++	{1090, 9, 47, 14, 10, 10, 17, 13, 8, 13},
++	{1080, 9, 47, 14, 10, 10, 17, 13, 8, 13},
++	{1070, 9, 46, 14, 10, 10, 17, 12, 8, 13},
++	{1060, 9, 46, 14, 10, 10, 16, 12, 7, 13},
++	{1050, 9, 45, 14, 9, 10, 16, 12, 7, 13},
++	{1040, 9, 45, 14, 9, 10, 16, 12, 7, 13},
++	{1030, 9, 45, 14, 9, 9, 16, 12, 7, 12},
++	{1020, 9, 44, 14, 9, 9, 16, 12, 7, 12},
++	{1010, 8, 44, 13, 9, 9, 15, 12, 7, 12},
++	{1000, 8, 43, 13, 9, 9, 15, 12, 7, 12},
++	{990, 8, 43, 13, 9, 9, 15, 12, 7, 12},
++	{980, 8, 42, 13, 9, 9, 15, 12, 7, 12},
++	{970, 8, 42, 13, 9, 9, 15, 12, 7, 12},
++	{960, 8, 42, 13, 9, 9, 15, 11, 7, 12},
++	{950, 8, 41, 13, 9, 9, 14, 11, 7, 11},
++	{940, 8, 41, 13, 8, 9, 14, 11, 7, 11},
++	{930, 8, 40, 13, 8, 8, 14, 11, 6, 11},
++	{920, 8, 40, 13, 8, 8, 14, 11, 6, 11},
++	{910, 8, 39, 13, 8, 8, 14, 11, 6, 11},
++	{900, 7, 39, 13, 8, 8, 13, 11, 6, 11},
++	{890, 7, 38, 13, 8, 8, 13, 11, 6, 11},
++	{880, 7, 38, 12, 8, 8, 13, 11, 6, 11},
++	{870, 7, 38, 12, 8, 8, 13, 11, 6, 10},
++	{860, 7, 37, 12, 8, 8, 13, 11, 6, 10},
++	{850, 7, 37, 12, 8, 8, 13, 10, 6, 10},
++	{840, 7, 36, 12, 8, 8, 12, 10, 6, 10},
++	{830, 7, 36, 12, 8, 8, 12, 10, 6, 10},
++	{820, 7, 35, 12, 7, 7, 12, 10, 6, 10},
++	{810, 7, 35, 12, 7, 7, 12, 10, 6, 10},
++	{800, 7, 35, 12, 7, 7, 12, 10, 6, 10},
++	{790, 6, 34, 12, 7, 7, 11, 10, 5, 9},
++	{780, 6, 34, 12, 7, 7, 11, 10, 5, 9},
++	{770, 6, 33, 12, 7, 7, 11, 10, 5, 9},
++	{760, 6, 33, 12, 7, 7, 11, 10, 5, 9},
++	{750, 6, 32, 12, 7, 7, 11, 9, 5, 9},
++	{740, 6, 32, 11, 7, 7, 11, 9, 5, 9},
++	{730, 6, 31, 11, 7, 7, 10, 9, 5, 9},
++	{720, 6, 31, 11, 7, 6, 10, 9, 5, 9},
++	{710, 6, 31, 11, 6, 6, 10, 9, 5, 8},
++	{700, 6, 30, 11, 6, 6, 10, 9, 5, 8},
++	{690, 5, 30, 11, 6, 6, 10, 9, 5, 8},
++	{680, 5, 29, 11, 6, 6, 9, 9, 5, 8},
++	{670, 5, 29, 11, 6, 6, 9, 9, 5, 8},
++	{660, 5, 28, 11, 6, 6, 9, 9, 4, 8},
++	{650, 5, 28, 11, 6, 6, 9, 9, 4, 8},
++	{640, 5, 28, 11, 6, 6, 9, 8, 4, 8},
++	{630, 5, 27, 11, 6, 6, 9, 8, 4, 7},
++	{620, 5, 27, 11, 6, 6, 8, 8, 4, 7},
++	{610, 5, 26, 10, 6, 5, 8, 8, 4, 7},
++	{600, 5, 26, 10, 6, 5, 8, 8, 4, 7},
++	{590, 5, 25, 10, 5, 5, 8, 8, 4, 7},
++	{580, 4, 25, 10, 5, 5, 8, 8, 4, 7},
++	{570, 4, 24, 10, 5, 5, 7, 8, 4, 7},
++	{560, 4, 24, 10, 5, 5, 7, 8, 4, 7},
++	{550, 4, 24, 10, 5, 5, 7, 8, 4, 6},
++	{540, 4, 23, 10, 5, 5, 7, 8, 4, 6},
++	{530, 4, 23, 10, 5, 5, 7, 7, 3, 6},
++	{520, 4, 22, 10, 5, 5, 7, 7, 3, 6},
++	{510, 4, 22, 10, 5, 5, 6, 7, 3, 6},
++	{500, 4, 21, 10, 5, 4, 6, 7, 3, 6},
++	{490, 4, 21, 10, 5, 4, 6, 7, 3, 6},
++	{480, 4, 21, 9, 4, 4, 6, 7, 3, 6},
++	{360, 2, 15, 9, 3, 3, 4, 6, 2, 4},
++};
++
++/* b_dphyctl for escape clocks 7..20 MHz (dsim_reg_7580.c:b_dphyctl[]) */
++static const u32 b_dphyctl[14] = {
++	0x0af, 0x0c8, 0x0e1, 0x0fa,
++	0x113, 0x12c, 0x145, 0x15e, 0x177,
++	0x190, 0x1a9, 0x1c2, 0x1db, 0x1f4
++};
++
++static void dsim_function_reset(struct exynos7580_drm *drv)
++{
++	dsim_write_mask(drv, DSIM_SWRST, ~0, DSIM_SWRST_FUNCRST);
++}
++
++static void dsim_sw_reset(struct exynos7580_drm *drv)
++{
++	dsim_write_mask(drv, DSIM_SWRST, ~0, DSIM_SWRST_RESET);
++}
++
++static void dsim_clear_int(struct exynos7580_drm *drv, u32 bits)
++{
++	dsim_write(drv, DSIM_INTSRC, bits);
++}
++
++/* dsim_reg_set_int(id, 0): mask every interrupt source we care about. */
++static void dsim_irq_mask(struct exynos7580_drm *drv)
++{
++	u32 mask = DSIM_INTMSK_SFR_PL_FIFO_EMPTY |
++		   DSIM_INTMSK_SFR_PH_FIFO_EMPTY |
++		   DSIM_INTMSK_FRAME_DONE |
++		   DSIM_INTMSK_RX_DATA_DONE |
++		   DSIM_INTMSK_RX_ECC;
++
++	dsim_write_mask(drv, DSIM_INTMSK, ~0, mask);
++}
++
++/* dsim_reg_calculate_pms() */
++static int dsim_calculate_pms(struct dsim_pll_param *pll)
++{
++	u32 p_div, m_div, s_div;
++	u32 target_freq, fin_pll, voc_out, fout_cal;
++	u32 fin = 26;
++	u32 fout_max = 2500;
++
++	target_freq = pll->pll_freq;
++	pll->pll_freq = 0;
++
++	for (p_div = 1; p_div <= 63; p_div++) {
++		for (m_div = 64; m_div <= 1023; m_div++) {
++			for (s_div = 0; s_div <= 5; s_div++) {
++				fin_pll = fin / p_div;
++				voc_out = (m_div * fin) / p_div;
++				fout_cal = (m_div * fin) /
++					(p_div * (1 << s_div));
++
++				if (fin_pll < 4 || fin_pll > 12)
++					continue;
++				if (voc_out < 1250 || voc_out > 2500)
++					continue;
++				if (fout_cal < 40 || fout_cal > 2500)
++					continue;
++				if (fout_cal < target_freq)
++					continue;
++				if (fout_cal <= fout_max) {
++					fout_max = fout_cal;
++					pll->p = p_div;
++					pll->m = m_div;
++					pll->s = s_div;
++					pll->pll_freq = fout_cal;
++				}
++			}
++		}
++	}
++
++	if (!pll->pll_freq) {
++		pr_err("exynos7580-dsim: cannot compute PLL PMS for %u MHz\n",
++		       target_freq);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/* dsim_reg_get_dphy_timing() */
++static int dsim_get_dphy_timing(u32 hs_clk, u32 esc_clk,
++				struct dphy_timing_value *t)
++{
++	int i;
++
++	for (i = ARRAY_SIZE(dphy_timing) - 1; i >= 0; i--) {
++		if (dphy_timing[i][0] < hs_clk)
++			continue;
++
++		t->bps = dphy_timing[i][0];
++		t->clk_prepare = dphy_timing[i][1];
++		t->clk_zero = dphy_timing[i][2];
++		t->clk_post = dphy_timing[i][3];
++		t->clk_trail = dphy_timing[i][4];
++		t->hs_prepare = dphy_timing[i][5];
++		t->hs_zero = dphy_timing[i][6];
++		t->hs_trail = dphy_timing[i][7];
++		t->lpx = dphy_timing[i][8];
++		t->hs_exit = dphy_timing[i][9];
++		break;
++	}
++
++	if (i < 0) {
++		pr_err("exynos7580-dsim: no D-PHY timing for %u Mbps\n", hs_clk);
++		return -EINVAL;
++	}
++
++	if (esc_clk < 7 || esc_clk > 20) {
++		pr_err("exynos7580-dsim: invalid escape clock %u MHz\n", esc_clk);
++		return -EINVAL;
++	}
++
++	t->b_dphyctl = b_dphyctl[esc_clk - 7];
++
++	return 0;
++}
++
++/* dsim_reg_set_dphy_timing_values() */
++static void dsim_set_dphy_timing(struct exynos7580_drm *drv,
++				 struct dphy_timing_value *t)
++{
++	dsim_write(drv, DSIM_PHYTIMING,
++		   DSIM_PHYTIMING_M_TLPXCTL(t->lpx) |
++		   DSIM_PHYTIMING_M_THSEXITCTL(t->hs_exit));
++
++	dsim_write(drv, DSIM_PHYTIMING1,
++		   DSIM_PHYTIMING1_M_TCLKPRPRCTL(t->clk_prepare) |
++		   DSIM_PHYTIMING1_M_TCLKZEROCTL(t->clk_zero) |
++		   DSIM_PHYTIMING1_M_TCLKPOSTCTL(t->clk_post) |
++		   DSIM_PHYTIMING1_M_TCLKTRAILCTL(t->clk_trail));
++
++	dsim_write(drv, DSIM_PHYTIMING2,
++		   DSIM_PHYTIMING2_M_THSPRPRCTL(t->hs_prepare) |
++		   DSIM_PHYTIMING2_M_THSZEROCTL(t->hs_zero) |
++		   DSIM_PHYTIMING2_M_THSTRAILCTL(t->hs_trail));
++
++	dsim_write_mask(drv, DSIM_PHYCTRL,
++			DSIM_PHYCTRL_B_DPHYCTL0(t->b_dphyctl),
++			DSIM_PHYCTRL_B_DPHYCTL0_MASK);
++}
++
++/* dsim_reg_set_porch() */
++static void dsim_set_porch(struct exynos7580_drm *drv)
++{
++	struct decon_lcd *lcd = &drv->lcd;
++	u32 val, mask;
++
++	if (lcd->mode == DECON_VIDEO_MODE) {
++		val = DSIM_MVPORCH_CMD_ALLOW(EXYNOS7580_DSIM_CMD_ALLOW_VALUE) |
++		      DSIM_MVPORCH_STABLE_VFP(EXYNOS7580_DSIM_STABLE_VFP_VALUE) |
++		      DSIM_MVPORCH_VBP(lcd->vbp);
++		mask = DSIM_MVPORCH_CMD_ALLOW_MASK | DSIM_MVPORCH_VBP_MASK |
++		       DSIM_MVPORCH_STABLE_VFP_MASK;
++		dsim_write_mask(drv, DSIM_MVPORCH, val, mask);
++
++		dsim_write(drv, DSIM_MHPORCH,
++			   DSIM_MHPORCH_HFP(lcd->hfp) |
++			   DSIM_MHPORCH_HBP(lcd->hbp));
++
++		dsim_write_mask(drv, DSIM_MSYNC,
++				DSIM_MSYNC_VSA(lcd->vsa) |
++				DSIM_MSYNC_HSA(lcd->hsa),
++				DSIM_MSYNC_VSA_MASK | DSIM_MSYNC_HSA_MASK);
++	}
++
++	val = DSIM_MDRESOL_VRESOL(lcd->yres) |
++	      DSIM_MDRESOL_HRESOL(lcd->xres) | DSIM_MDRESOL_SHADOW_EN;
++	mask = DSIM_MDRESOL_VRESOL_MASK | DSIM_MDRESOL_HRESOL_MASK |
++	       DSIM_MDRESOL_SHADOW_EN;
++	dsim_write_mask(drv, DSIM_MDRESOL, val, mask);
++}
++
++/* dsim_reg_set_config() */
++static void dsim_set_config(struct exynos7580_drm *drv, int lanes)
++{
++	u32 val, mask;
++
++	if (drv->lcd.mode == DECON_VIDEO_MODE) {
++		val = DSIM_CONFIG_VIDEO_MODE;
++	} else {
++		val = 0;
++		val &= ~DSIM_CONFIG_CLKLANE_STOP_START;
++	}
++
++	val |= DSIM_CONFIG_BURST_MODE | DSIM_CONFIG_EOT_R03_DISABLE |
++	       DSIM_CONFIG_HFP_DISABLE |
++	       DSIM_CONFIG_NUM_OF_DATA_LANE(lanes - 1) |
++	       DSIM_CONFIG_PIXEL_FORMAT(DSIM_PIXEL_FORMAT_RGB24);
++
++	mask = DSIM_CONFIG_NONCONTINUOUS_CLOCK_LANE |
++	       DSIM_CONFIG_CLKLANE_STOP_START |
++	       DSIM_CONFIG_EOT_R03_DISABLE |
++	       DSIM_CONFIG_BURST_MODE | DSIM_CONFIG_VIDEO_MODE |
++	       DSIM_CONFIG_HFP_DISABLE | DSIM_CONFIG_PIXEL_FORMAT_MASK |
++	       DSIM_CONFIG_NUM_OF_DATA_LANE_MASK;
++
++	dsim_write_mask(drv, DSIM_CONFIG, val, mask);
++
++	/* video mode uses a continuous clock lane */
++	dsim_write_mask(drv, DSIM_CONFIG,
++			drv->lcd.mode == DECON_VIDEO_MODE ? 0 : ~0,
++			DSIM_CONFIG_NONCONTINUOUS_CLOCK_LANE);
++}
++
++/* dsim_reg_init() */
++static void dsim_hw_init(struct exynos7580_drm *drv)
++{
++	dsim_function_reset(drv);
++
++	dsim_write_mask(drv, DSIM_ESCMODE,
++			DSIM_ESCMODE_STOP_STATE_CNT(EXYNOS7580_DSIM_STOP_STATE_CNT),
++			DSIM_ESCMODE_STOP_STATE_CNT_MASK);
++	dsim_write_mask(drv, DSIM_TIMEOUT,
++			DSIM_TIMEOUT_BTA_TOUT(EXYNOS7580_DSIM_BTA_TIMEOUT),
++			DSIM_TIMEOUT_BTA_TOUT_MASK);
++	dsim_write_mask(drv, DSIM_TIMEOUT,
++			DSIM_TIMEOUT_LPDR_TOUT(EXYNOS7580_DSIM_LP_RX_TIMEOUT),
++			DSIM_TIMEOUT_LPDR_TOUT_MASK);
++	dsim_write_mask(drv, DSIM_MULTI_PKT,
++			DSIM_MULTI_PKT_CNT(EXYNOS7580_DSIM_MULTI_PACKET_CNT),
++			DSIM_MULTI_PKT_CNT_MASK);
++
++	dsim_write_mask(drv, DSIM_MDRESOL, ~0, DSIM_MDRESOL_SHADOW_EN);
++	dsim_set_porch(drv);
++	dsim_set_config(drv, drv->data_lanes);
++}
++
++static int dsim_wait_pll_stable(struct exynos7580_drm *drv)
++{
++	int cnt = 1000;
++
++	dsim_clear_int(drv, DSIM_INTSRC_PLL_STABLE);
++	dsim_write_mask(drv, DSIM_PLLCTRL, ~0, DSIM_PLLCTRL_PLL_EN);
++
++	while (--cnt) {
++		if (dsim_read(drv, DSIM_STATUS) & DSIM_STATUS_PLL_STABLE)
++			return 0;
++		udelay(10);
++	}
++
++	dev_err(drv->dev, "DSIM PLL did not lock\n");
++	return -EBUSY;
++}
++
++static bool dsim_lane_stop_state(struct exynos7580_drm *drv)
++{
++	u32 val = dsim_read(drv, DSIM_STATUS);
++
++	return (val & DSIM_STATUS_STOP_STATE_DAT(0xf)) &&
++	       ((val & DSIM_STATUS_STOP_STATE_CLK) ||
++		(val & DSIM_STATUS_TX_READY_HS_CLK));
++}
++
++static int dsim_wait_lane_stop_state(struct exynos7580_drm *drv)
++{
++	int cnt = 100;
++
++	do {
++		if (dsim_lane_stop_state(drv))
++			return 0;
++		udelay(10);
++	} while (--cnt);
++
++	dev_err(drv->dev, "DSIM lanes did not reach stop state\n");
++	return -EBUSY;
++}
++
++static int dsim_wait_hs_clk_ready(struct exynos7580_drm *drv)
++{
++	int cnt = 1000;
++	u32 val = dsim_read(drv, DSIM_CONFIG);
++
++	if (val & DSIM_CONFIG_NONCONTINUOUS_CLOCK_LANE)
++		return 0;
++
++	do {
++		if (dsim_read(drv, DSIM_STATUS) & DSIM_STATUS_TX_READY_HS_CLK)
++			return 0;
++		udelay(10);
++	} while (--cnt);
++
++	dev_err(drv->dev, "DSIM HS clock did not become ready\n");
++	return -EBUSY;
++}
++
++/*
++ * Configure D-PHY PLL, byte clock, escape clock and lane escape clocks
++ * (dsim_reg_set_clocks()/dsim_reg_enable_clocks()).
++ */
++static int dsim_clocks(struct exynos7580_drm *drv, bool enable)
++{
++	struct dsim_pll_param pll = { .pll_freq = drv->lcd.hs_clk };
++	struct dphy_timing_value t;
++	u32 lanes = DSIM_LANE_CLOCK | ((1 << drv->data_lanes) - 1) << 1;
++	u32 byte_clk, esc_div;
++	int ret;
++
++	if (!enable) {
++		dsim_write_mask(drv, DSIM_CLKCTRL, 0,
++				DSIM_CLKCTRL_LANE_ESCCLK_EN_MASK);
++		dsim_write_mask(drv, DSIM_CLKCTRL, 0,
++				DSIM_CLKCTRL_ESCCLK_EN |
++				DSIM_CLKCTRL_ESC_PRESCALER_MASK);
++		dsim_write_mask(drv, DSIM_CLKCTRL, 0,
++				DSIM_CLKCTRL_BYTECLK_EN);
++		dsim_write_mask(drv, DSIM_PLLCTRL, 0, DSIM_PLLCTRL_PLL_EN);
++		return 0;
++	}
++
++	/* byte clock source is the D-PHY PLL */
++	dsim_write_mask(drv, DSIM_CLKCTRL, 0, DSIM_CLKCTRL_BYTE_CLK_SRC_MASK);
++
++	ret = dsim_calculate_pms(&pll);
++	if (ret)
++		return ret;
++
++	dsim_write_mask(drv, DSIM_PLLCTRL,
++			((pll.p & 0x3f) << 14) | ((pll.m & 0x1ff) << 4) |
++			((pll.s & 0x7) << 1), DSIM_PLLCTRL_PMS_MASK);
++	dsim_write(drv, DSIM_PLLTMR, EXYNOS7580_DSIM_PLL_STABLE_TIME);
++
++	byte_clk = pll.pll_freq / 8;
++
++	esc_div = byte_clk / drv->lcd.esc_clk;
++	if ((byte_clk / esc_div) > drv->lcd.esc_clk)
++		esc_div++;
++
++	ret = dsim_get_dphy_timing(pll.pll_freq,
++				   byte_clk / esc_div, &t);
++	if (ret)
++		return ret;
++	dsim_set_dphy_timing(drv, &t);
++
++	/* vendor PLL/mPHY magic values, dsim_reg_7580.c */
++	dsim_write_mask(drv, DSIM_PLLCTRL1, DSIM_PLLCTRL1_M_PLL0_DEFAULT,
++			DSIM_PLLCTRL1_M_PLL0_DEFAULT_MASK);
++	dsim_write(drv, DSIM_PHYCTRL_M1, DSIM_PHYCTRL_M1_PLL_LOCK);
++
++	ret = dsim_wait_pll_stable(drv);
++	if (ret)
++		return ret;
++
++	dsim_write_mask(drv, DSIM_CLKCTRL, ~0, DSIM_CLKCTRL_BYTECLK_EN);
++	dsim_write_mask(drv, DSIM_CLKCTRL,
++			DSIM_CLKCTRL_ESCCLK_EN |
++			DSIM_CLKCTRL_ESC_PRESCALER(esc_div),
++			DSIM_CLKCTRL_ESCCLK_EN |
++			DSIM_CLKCTRL_ESC_PRESCALER_MASK);
++	dsim_write_mask(drv, DSIM_CLKCTRL,
++			DSIM_CLKCTRL_LANE_ESCCLK_EN(lanes),
++			DSIM_CLKCTRL_LANE_ESCCLK_EN_MASK);
++
++	dev_dbg(drv->dev, "DSIM PLL %u MHz (p %u m %u s %u), byte %u MHz, esc div %u\n",
++		pll.pll_freq, pll.p, pll.m, pll.s, byte_clk, esc_div);
++
++	return 0;
++}
++
++/* dsim_reg_set_lanes() */
++static int dsim_set_lanes(struct exynos7580_drm *drv, bool enable)
++{
++	u32 lanes = DSIM_LANE_CLOCK | ((1 << drv->data_lanes) - 1) << 1;
++
++	dsim_write_mask(drv, DSIM_CONFIG, enable ? ~0 : 0,
++			DSIM_CONFIG_LANE_ENx(lanes));
++	udelay(300);
++
++	if (enable)
++		return dsim_wait_lane_stop_state(drv);
++
++	return 0;
++}
++
++/* dsim_reg_set_standby() */
++static void dsim_set_standby(struct exynos7580_drm *drv, bool enable)
++{
++	u32 val = DSIM_MDRESOL_VRESOL(drv->lcd.yres) |
++		  DSIM_MDRESOL_HRESOL(drv->lcd.xres);
++	u32 mask = DSIM_MDRESOL_VRESOL_MASK | DSIM_MDRESOL_HRESOL_MASK;
++
++	if (enable)
++		val |= DSIM_MDRESOL_STAND_BY;
++	mask |= DSIM_MDRESOL_STAND_BY;
++
++	dsim_write_mask(drv, DSIM_MDRESOL, val, mask);
++}
++
++/* dsim_reg_set_hs_clock() */
++static int dsim_set_hs_clock(struct exynos7580_drm *drv, bool enable)
++{
++	if (enable) {
++		/* HS transfer mode for both command and pixel data */
++		dsim_write_mask(drv, DSIM_ESCMODE, 0, DSIM_ESCMODE_CMD_LPDT);
++		dsim_write_mask(drv, DSIM_ESCMODE, 0, DSIM_ESCMODE_TX_LPDT);
++
++		dsim_set_standby(drv, true);
++
++		/* vendor workaround for a 2-cycle miss issue */
++		dsim_function_reset(drv);
++
++		dsim_write_mask(drv, DSIM_CLKCTRL, ~0,
++				DSIM_CLKCTRL_TX_REQUEST_HSCLK);
++
++		return dsim_wait_hs_clk_ready(drv);
++	}
++
++	dsim_set_standby(drv, false);
++	dsim_write_mask(drv, DSIM_CLKCTRL, 0, DSIM_CLKCTRL_TX_REQUEST_HSCLK);
++
++	return 0;
++}
++
++/*
++ * Wait until the given FIFO reports empty through the raw status register.
++ * Same bits the vendor waits on through its interrupt completions.
++ */
++static int dsim_wait_fifo(struct exynos7580_drm *drv, bool payload)
++{
++	u32 bit = payload ? DSIM_INTSRC_SFR_PL_FIFO_EMPTY :
++			    DSIM_INTSRC_SFR_PH_FIFO_EMPTY;
++	int cnt = 10000;	/* 100 ms */
++
++	do {
++		if (dsim_read(drv, DSIM_INTSRC) & bit) {
++			dsim_clear_int(drv, bit);
++			return 0;
++		}
++		udelay(10);
++	} while (--cnt);
++
++	dev_err(drv->dev, "DSIM %s FIFO empty timeout (INTSRC %08x)\n",
++		payload ? "payload" : "packet header",
++		dsim_read(drv, DSIM_INTSRC));
++	return -ETIMEDOUT;
++}
++
++static void dsim_write_payload(struct exynos7580_drm *drv, const u8 *data,
++			       int len)
++{
++	int i;
++
++	for (i = 0; i < len; i += 4) {
++		u32 payload = data[i];
++
++		if (i + 1 < len)
++			payload |= data[i + 1] << 8;
++		if (i + 2 < len)
++			payload |= data[i + 2] << 16;
++		if (i + 3 < len)
++			payload |= data[i + 3] << 24;
++
++		dsim_write(drv, DSIM_PAYLOAD, payload);
++	}
++}
++
++/*
++ * MIPI DCS write, equivalent to ea8061_lcd_ctrl.c:dsim_write_hl_data() ->
++ * dsim_drv.c:dsim_write_data().
++ */
++static int dsim_dcs_write(struct exynos7580_drm *drv, const u8 *cmd, u32 len)
++{
++	int ret;
++
++	if (!drv->dsim_on) {
++		dev_err(drv->dev, "DSIM is not running, cannot send DCS %02x\n",
++			cmd[0]);
++		return -EINVAL;
++	}
++
++	if (len == 1 || len == 2) {
++		u32 data_id = (len == 1) ? MIPI_DSI_DCS_SHORT_WRITE :
++					   MIPI_DSI_DCS_SHORT_WRITE_PARAM;
++
++		dsim_clear_int(drv, DSIM_INTSRC_SFR_PH_FIFO_EMPTY);
++		dsim_write(drv, DSIM_PKTHDR,
++			   DSIM_PKTHDR_ID(data_id) | DSIM_PKTHDR_DATA0(cmd[0]) |
++			   (len == 2 ? DSIM_PKTHDR_DATA1(cmd[1]) : 0));
++
++		return dsim_wait_fifo(drv, false);
++	}
++
++	dsim_clear_int(drv, DSIM_INTSRC_SFR_PL_FIFO_EMPTY |
++		       DSIM_INTSRC_SFR_PH_FIFO_EMPTY);
++
++	dsim_write_payload(drv, cmd, len);
++
++	dsim_write(drv, DSIM_PKTHDR,
++		   DSIM_PKTHDR_ID(MIPI_DSI_DCS_LONG_WRITE) |
++		   DSIM_PKTHDR_DATA0(len & 0xff) |
++		   DSIM_PKTHDR_DATA1((len >> 8) & 0xff));
++
++	ret = dsim_wait_fifo(drv, true);
++	if (ret)
++		return ret;
++
++	return dsim_wait_fifo(drv, false);
++}
++
++/* ---------------------------------------------------------------------- */
++/* Panel board control (decon_board.c equivalent)			  */
++/* ---------------------------------------------------------------------- */
++
++static void exynos7580_board_run(struct exynos7580_drm *drv,
++				 struct exynos7580_board_action *acts, int num)
++{
++	int i;
++
++	for (i = 0; i < num; i++) {
++		struct exynos7580_board_action *a = &acts[i];
++		int ret;
++
++		switch (a->type) {
++		case EXYNOS7580_BOARD_REGULATOR_ENABLE:
++			if (a->regulator) {
++				ret = regulator_enable(a->regulator);
++				if (ret)
++					dev_err(drv->dev, "cannot enable regulator: %d\n",
++						ret);
++			}
++			break;
++		case EXYNOS7580_BOARD_REGULATOR_DISABLE:
++			if (a->regulator)
++				regulator_disable(a->regulator);
++			break;
++		case EXYNOS7580_BOARD_GPIO_HIGH:
++		case EXYNOS7580_BOARD_GPIO_LOW:
++			if (drv->reset_gpio_valid)
++				gpio_set_value_cansleep(drv->reset_gpio,
++					a->type == EXYNOS7580_BOARD_GPIO_HIGH);
++			break;
++		case EXYNOS7580_BOARD_DELAY_USLEEP:
++			usleep_range(a->delay[0], a->delay[1]);
++			break;
++		case EXYNOS7580_BOARD_DELAY_MSLEEP:
++			msleep(a->delay[0]);
++			break;
++		case EXYNOS7580_BOARD_DELAY_MDELAY:
++			mdelay(a->delay[0]);
++			break;
++		}
++	}
++}
++
++int exynos7580_panel_power(struct exynos7580_drm *drv, bool on)
++{
++	if (drv->panel_powered == on)
++		return 0;
++
++	drv->panel_powered = on;
++
++	if (on)
++		exynos7580_board_run(drv, drv->power_on, drv->num_power_on);
++	else
++		exynos7580_board_run(drv, drv->power_off, drv->num_power_off);
++
++	return 0;
++}
++
++void exynos7580_panel_reset(struct exynos7580_drm *drv)
++{
++	if (!drv->reset_gpio_valid) {
++		dev_warn(drv->dev, "no panel reset GPIO described\n");
++		return;
++	}
++
++	exynos7580_board_run(drv, drv->reset, drv->num_reset);
++}
++
++/* ---------------------------------------------------------------------- */
++/* ea8061 panel							  */
++/* ---------------------------------------------------------------------- */
++
++static int panel_write(struct exynos7580_drm *drv, const unsigned char *seq,
++		       u32 len)
++{
++	int ret = dsim_dcs_write(drv, seq, len);
++	int retry = 5;
++
++	while (ret && --retry) {
++		dev_dbg(drv->dev, "retrying DCS %02x\n", seq[0]);
++		ret = dsim_dcs_write(drv, seq, len);
++	}
++
++	if (ret)
++		dev_err(drv->dev, "DCS write %02x failed: %d\n", seq[0], ret);
++
++	return ret;
++}
++
++#define PANEL_SEQ(drv, seq) panel_write(drv, seq, ARRAY_SIZE(seq))
++
++/*
++ * ea8061_lcd_ctrl.c:ea8061_init().  The vendor applies a runtime-computed
++ * gamma/AID/ELVSS table read from the panel MTP; that path is not implemented
++ * here (see parity/reports/drm-driver.md) so the panel keeps its OTP default
++ * gamma and brightness.
++ */
++int exynos7580_panel_init(struct exynos7580_drm *drv)
++{
++	int ret;
++
++	usleep_range(5000, 6000);
++
++	ret = PANEL_SEQ(drv, SEQ_TEST_KEY_ON_F0);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_TEST_KEY_ON_FC);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_EA8061_LTPS_STOP);
++	if (ret)
++		return ret;
++
++	if (drv->panel_rev >= EXYNOS7580_PANEL_REV_D)
++		ret = PANEL_SEQ(drv, SEQ_EA8061_LTPS_TIMING_REV_D);
++	else
++		ret = PANEL_SEQ(drv, SEQ_EA8061_LTPS_TIMING);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_EA8061_LTPS_UPDATE);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_EA8061_SCAN_DIRECTION);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_EA8061_AID_SET_DEFAULT);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_EA8061_SLEW_CONTROL);
++	if (ret)
++		return ret;
++
++	/* EL_ON toggling with the manual gate, ea8061_init() */
++	ret = PANEL_SEQ(drv, SEQ_GP_01);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_F3_ON);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_SLEEP_OUT);
++	if (ret)
++		return ret;
++
++	msleep(20);
++
++	ret = PANEL_SEQ(drv, SEQ_GP_02);
++	if (ret || PANEL_SEQ(drv, SEQ_F3_08))
++		return -EIO;
++	usleep_range(150, 160);
++
++	ret = PANEL_SEQ(drv, SEQ_GP_02);
++	if (ret || PANEL_SEQ(drv, SEQ_F3_OFF))
++		return -EIO;
++	usleep_range(100, 110);
++
++	ret = PANEL_SEQ(drv, SEQ_GP_02);
++	if (ret || PANEL_SEQ(drv, SEQ_F3_08))
++		return -EIO;
++	usleep_range(150, 160);
++
++	ret = PANEL_SEQ(drv, SEQ_GP_02);
++	if (ret || PANEL_SEQ(drv, SEQ_F3_OFF))
++		return -EIO;
++	usleep_range(100, 110);
++
++	ret = PANEL_SEQ(drv, SEQ_SLEEP_IN);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_GP_01);
++	if (ret || PANEL_SEQ(drv, SEQ_F3_OFF))
++		return -EIO;
++
++	ret = PANEL_SEQ(drv, SEQ_SLEEP_OUT);
++	if (ret)
++		return ret;
++
++	msleep(120);
++
++	/* Vendor applies brightness/gamma here; OTP defaults are kept. */
++
++	ret = PANEL_SEQ(drv, SEQ_DISPLAY_ON);
++	if (ret)
++		return ret;
++
++	ret = PANEL_SEQ(drv, SEQ_TEST_KEY_OFF_FC);
++	if (ret)
++		return ret;
++
++	return PANEL_SEQ(drv, SEQ_TEST_KEY_OFF_F0);
++}
++
++/* ea8061_lcd_ctrl.c:ea8061_exit() */
++void exynos7580_panel_suspend(struct exynos7580_drm *drv)
++{
++	PANEL_SEQ(drv, SEQ_DISPLAY_OFF);
++	msleep(35);
++	PANEL_SEQ(drv, SEQ_SLEEP_IN);
++	msleep(150);
++}
++
++/* ---------------------------------------------------------------------- */
++/* DSIM enable/disable						  */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * dsim_drv.c:dsim_enable(), minus the vendor DPHY power hook (empty there) and
++ * with polling command transfers.
++ */
++int exynos7580_dsim_enable(struct exynos7580_drm *drv)
++{
++	int ret;
++
++	mutex_lock(&drv->lock);
++
++	if (drv->dsim_on) {
++		mutex_unlock(&drv->lock);
++		return 0;
++	}
++
++	exynos7580_panel_power(drv, true);
++
++	dsim_hw_init(drv);
++
++	ret = dsim_clocks(drv, true);
++	if (ret)
++		goto err_clocks;
++
++	clk_prepare_enable(drv->dsim_esc_clk);
++	clk_prepare_enable(drv->dsim_byte_clk);
++
++	ret = dsim_set_lanes(drv, true);
++	if (ret)
++		goto err_lanes;
++
++	exynos7580_panel_reset(drv);
++
++	ret = dsim_set_hs_clock(drv, true);
++	if (ret)
++		goto err_hs;
++
++	/* DSIM interrupts stay masked: command transfers poll INTSRC. */
++	dsim_irq_mask(drv);
++
++	drv->dsim_on = true;
++
++	/* Must happen with the HS link already up, as in the vendor driver. */
++	ret = exynos7580_panel_init(drv);
++	if (ret) {
++		drv->dsim_on = false;
++		goto err_hs;
++	}
++
++	mutex_unlock(&drv->lock);
++
++	dev_info(drv->dev, "MIPI DSIM up: %d lanes, hs %u MHz, esc %u MHz\n",
++		 drv->data_lanes, drv->lcd.hs_clk, drv->lcd.esc_clk);
++
++	return 0;
++
++err_hs:
++	dsim_set_lanes(drv, false);
++err_lanes:
++	clk_disable_unprepare(drv->dsim_byte_clk);
++	clk_disable_unprepare(drv->dsim_esc_clk);
++err_clocks:
++	dsim_clocks(drv, false);
++	dsim_sw_reset(drv);
++	exynos7580_panel_power(drv, false);
++
++	mutex_unlock(&drv->lock);
++
++	dev_err(drv->dev, "failed to bring up DSIM: %d\n", ret);
++	return ret;
++}
++
++/*
++ * Put DSIM back into a defined idle state at probe time, whatever the
++ * bootloader left behind.  Requires the DSIM pclk to be running.
++ */
++void exynos7580_dsim_quiesce(struct exynos7580_drm *drv)
++{
++	dsim_irq_mask(drv);
++	dsim_write_mask(drv, DSIM_CLKCTRL, 0,
++			DSIM_CLKCTRL_TX_REQUEST_HSCLK);
++	dsim_write_mask(drv, DSIM_CONFIG, 0, DSIM_CONFIG_LANE_ENx(0x1f));
++	dsim_clocks(drv, false);
++	dsim_sw_reset(drv);
++}
++
++/* dsim_drv.c:dsim_disable() */
++void exynos7580_dsim_disable(struct exynos7580_drm *drv)
++{
++	mutex_lock(&drv->lock);
++
++	if (!drv->dsim_on) {
++		mutex_unlock(&drv->lock);
++		return;
++	}
++
++	exynos7580_panel_suspend(drv);
++
++	dsim_irq_mask(drv);
++	dsim_set_hs_clock(drv, false);
++	dsim_set_lanes(drv, false);
++	dsim_clocks(drv, false);
++	dsim_sw_reset(drv);
++
++	clk_disable_unprepare(drv->dsim_byte_clk);
++	clk_disable_unprepare(drv->dsim_esc_clk);
++
++	drv->dsim_on = false;
++
++	exynos7580_panel_power(drv, false);
++
++	mutex_unlock(&drv->lock);
++}

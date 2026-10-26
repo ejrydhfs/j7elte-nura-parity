@@ -1,0 +1,129 @@
+# arm objdump scan of libGLES_mali.so (r7p0)
+## import __android_log_print (27 call sites)
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	262be4	262be4:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	262bf8	262bf8:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	262dbc	262dbc:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	263350	263350:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	26377c	26377c:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	263b90	263b90:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	263df4	263df4:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	263e5c	263e5c:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	263edc	263edc:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	26401c	26401c:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	264134	264134:	bl	2154d0 <__android_log_print@plt>
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	264244	264244:	bl	2154d0 <__android_log_print@plt>
+  egl_color_buffer_set_age@@Base	42f0fc	42f0fc:	bl	2154d0 <__android_log_print@plt>
+  _ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base	460b3c	460b3c:	bl	2154d0 <__android_log_print@plt>
+  _ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base	460b7c	460b7c:	bl	2154d0 <__android_log_print@plt>
+  _ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base	460bb0	460bb0:	bl	2154d0 <__android_log_print@plt>
+  _ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base	460bdc	460bdc:	bl	2154d0 <__android_log_print@plt>
+  _ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base	460c04	460c04:	bl	2154d0 <__android_log_print@plt>
+  egl_color_buffer_map@@Base	464684	464684:	bl	2154d0 <__android_log_print@plt>
+  eglGetCurrentDisplay@@Base	472d58	472d58:	bl	2154d0 <__android_log_print@plt>
+  eglGetCurrentDisplay@@Base	472e74	472e74:	bl	2154d0 <__android_log_print@plt>
+  eglGetCurrentDisplay@@Base	472f68	472f68:	bl	2154d0 <__android_log_print@plt>
+  glViewport@@Base	49f0ec	49f0ec:	bl	2154d0 <__android_log_print@plt>
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	4dca5c	4dca5c:	bl	2154d0 <__android_log_print@plt>
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	4dcb6c	4dcb6c:	bl	2154d0 <__android_log_print@plt>
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	50e850	50e850:	bl	2154d0 <__android_log_print@plt>
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	50e86c	50e86c:	bl	2154d0 <__android_log_print@plt>
+## import __android_log_write (2 call sites)
+  egl_color_buffer_is_secure@@Base	26ba3c	26ba3c:	bl	21586c <__android_log_write@plt>
+  egl_color_buffer_is_secure@@Base	26ba6c	26ba6c:	b	21586c <__android_log_write@plt>
+## import atrace_begin_body (2 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	266c44	266c44:	bl	2157f4 <atrace_begin_body@plt>
+  eglCreateWindowSurface@@Base	47387c	47387c:	bl	2157f4 <atrace_begin_body@plt>
+## import atrace_setup (4 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	266c38	266c38:	bl	2157e8 <atrace_setup@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	266c58	266c58:	bl	2157e8 <atrace_setup@plt>
+  eglCreateWindowSurface@@Base	473870	473870:	bl	2157e8 <atrace_setup@plt>
+  eglCreateWindowSurface@@Base	4738a4	4738a4:	bl	2157e8 <atrace_setup@plt>
+## import close (24 call sites)
+  egl_winsys_get_implementation@@Base	265248	265248:	bl	215710 <close@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	265444	265444:	bl	215710 <close@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	265618	265618:	bl	215710 <close@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	265634	265634:	bl	215710 <close@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	266a18	266a18:	bl	215710 <close@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	266a5c	266a5c:	bl	215710 <close@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	266b08	266b08:	bl	215710 <close@plt>
+  eglSurfaceAttrib@@Base	46ee68	46ee68:	bl	215710 <close@plt>
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	50e87c	50e87c:	b	215710 <close@plt>
+  _ZN5clang3vfs10FileSystemD1Ev@@Base	e1e008	e1e008:	bl	215710 <close@plt>
+  _ZN5clang3vfs10FileSystemD1Ev@@Base	e1e078	e1e078:	bl	215710 <close@plt>
+  _ZN5clang3vfs10FileSystemD1Ev@@Base	e1e4d8	e1e4d8:	bl	215710 <close@plt>
+  _ZN4llvm12MemoryBuffer7getFileENS_5TwineExbb@@Base	126f374	126f374:	bl	215710 <close@plt>
+  _ZN4llvm3sys2fs9copy_fileERKNS_5TwineES4_@@Base	1272dc0	1272dc0:	bl	215710 <close@plt>
+  _ZN4llvm3sys2fs9copy_fileERKNS_5TwineES4_@@Base	1272e58	1272e58:	bl	215710 <close@plt>
+  _ZN4llvm3sys2fs9copy_fileERKNS_5TwineES4_@@Base	1272e60	1272e60:	bl	215710 <close@plt>
+  _ZN4llvm3sys2fs14identify_magicERKNS_5TwineERNS1_10file_magicE@@Base	12738b4	12738b4:	bl	215710 <close@plt>
+  _ZN4llvm3sys2fs18mapped_file_region4initEiby@@Base	127475c	127475c:	bl	215710 <close@plt>
+  _ZN4llvm3sys30argumentsFitWithinSystemLimitsENS_8ArrayRefIPKcEE@@Base	1277d50	1277d50:	bl	215710 <close@plt>
+  _ZN4llvm3sys30argumentsFitWithinSystemLimitsENS_8ArrayRefIPKcEE@@Base	1277f0c	1277f0c:	bl	215710 <close@plt>
+  _ZN4llvm14raw_fd_ostreamD1Ev@@Base	12a0158	12a0158:	bl	215710 <close@plt>
+  _ZN4llvm14raw_fd_ostream5closeEv@@Base	12a0304	12a0304:	bl	215710 <close@plt>
+  _ZN4llvm19getDataFileStreamerERKNSt3__112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEEPS6_@@Base	12a99a4	12a99a4:	bl	215710 <close@plt>
+  _ZN4llvm19getDataFileStreamerERKNSt3__112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEEPS6_@@Base	12a99dc	12a99dc:	bl	215710 <close@plt>
+## import dlopen (1 call sites)
+  osup_dlopen@@Base	50f028	50f028:	bl	217bd0 <dlopen@plt>
+## import dlsym (1 call sites)
+  osup_dlsym@@Base	50f06c	50f06c:	bl	217be8 <dlsym@plt>
+## import execve (1 call sites)
+  _ZN4llvm3sys14ExecuteAndWaitENS_9StringRefEPPKcS4_PPKS1_jjPNSt3__112basic_stringIcNS8_11char_traitsIcEENS8_9allocatorIcEEEEPb@@Base	1276df8	1276df8:	bl	23476c <execve@plt>
+## import fork (1 call sites)
+  _ZN4llvm3sys14ExecuteAndWaitENS_9StringRefEPPKcS4_PPKS1_jjPNSt3__112basic_stringIcNS8_11char_traitsIcEENS8_9allocatorIcEEEEPb@@Base	1276798	1276798:	bl	23473c <fork@plt>
+## import hw_get_module (1 call sites)
+  stdlibp_neon_fast_aligned_memcpy_64@@Base	263bd0	263bd0:	bl	2155b4 <hw_get_module@plt>
+## import ioctl (3 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	2654a4	2654a4:	bl	215740 <ioctl@plt>
+  _ZN4llvm3sys7Process18StandardOutColumnsEv@@Base	1276310	1276310:	bl	215740 <ioctl@plt>
+  _ZN4llvm3sys7Process18StandardErrColumnsEv@@Base	1276388	1276388:	bl	215740 <ioctl@plt>
+## import ion_alloc_fd (1 call sites)
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	50e810	50e810:	bl	217b10 <ion_alloc_fd@plt>
+## import ion_close (1 call sites)
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	50e824	50e824:	bl	217b1c <ion_close@plt>
+## import ion_open (1 call sites)
+  _ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base	50e7e4	50e7e4:	bl	217b04 <ion_open@plt>
+## import mmap (1 call sites)
+  _ZN4llvm3sys2fs18mapped_file_region4initEiby@@Base	1274720	1274720:	bl	2345ec <mmap@plt>
+## import mmap64 (2 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	266034	266034:	bl	215794 <mmap64@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	2661a8	2661a8:	bl	215794 <mmap64@plt>
+## import munmap (6 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	26608c	26608c:	bl	2157a0 <munmap@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	2660a0	2660a0:	bl	2157a0 <munmap@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	2661e4	2661e4:	bl	2157a0 <munmap@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	26624c	26624c:	b	2157a0 <munmap@plt>
+  LLVMAddSimplifyLibCallsPass@@Base	2663a8	2663a8:	b	2157a0 <munmap@plt>
+  _ZN4llvm3sys2fs18mapped_file_regionD1Ev@@Base	127490c	127490c:	bl	2157a0 <munmap@plt>
+## import open (5 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	265550	265550:	bl	21574c <open@plt>
+  _ZN4llvm3sys2fs15openFileForReadERKNS_5TwineERi@@Base	1272edc	1272edc:	bl	21574c <open@plt>
+  _ZN4llvm3sys2fs16openFileForWriteERKNS_5TwineERiNS1_9OpenFlagsEj@@Base	1272f9c	1272f9c:	bl	21574c <open@plt>
+  _ZN4llvm3sys2fs18mapped_file_regionC1ERKNS_5TwineENS2_7mapmodeEyyRNSt3__110error_codeE@@Base	12747e4	12747e4:	bl	21574c <open@plt>
+  _ZN4llvm3sys30argumentsFitWithinSystemLimitsENS_8ArrayRefIPKcEE@@Base	1277d28	1277d28:	bl	21574c <open@plt>
+## import prctl (10 call sites)
+  egl_color_buffer_is_secure@@Base	26b160	26b160:	bl	215830 <prctl@plt>
+  egl_color_buffer_is_secure@@Base	26e458	26e458:	bl	215830 <prctl@plt>
+  egl_color_buffer_is_secure@@Base	26e754	26e754:	bl	215830 <prctl@plt>
+  LLVMGetBufferStart@@Base	29055c	29055c:	bl	215830 <prctl@plt>
+  LLVMGetBufferStart@@Base	2909d4	2909d4:	bl	215830 <prctl@plt>
+  LLVMGetBufferStart@@Base	290c9c	290c9c:	bl	215830 <prctl@plt>
+  LLVMGetBufferStart@@Base	2949d0	2949d0:	bl	215830 <prctl@plt>
+  osup_thread_setname@@Base	50eac0	50eac0:	bl	215830 <prctl@plt>
+  osup_thread_getname@@Base	50eb30	50eb30:	bl	215830 <prctl@plt>
+  osup_thread_getname@@Base	50eb80	50eb80:	bl	215830 <prctl@plt>
+## import read (1 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	2668a8	2668a8:	bl	2157ac <read@plt>
+## import write (5 call sites)
+  LLVMAddSimplifyLibCallsPass@@Base	266c7c	266c7c:	bl	215800 <write@plt>
+  eglCreateWindowSurface@@Base	47383c	47383c:	bl	215800 <write@plt>
+  _ZN4llvm18report_fatal_errorERKNS_5TwineEb@@Base	1267fc0	1267fc0:	bl	215800 <write@plt>
+  _ZN4llvm3sys2fs9copy_fileERKNS_5TwineES4_@@Base	1272e30	1272e30:	bl	215800 <write@plt>
+  _ZN4llvm14raw_fd_ostream10write_implEPKcj@@Base	12a0268	12a0268:	bl	215800 <write@plt>
+
+# key string literal refs
+## invalid gralloc handle (at %p) @ 0x12d85ac (0)
+## The DDK was built for 0x%x r%dp%d status range [%d..%d], but none of the GPUs matched: @ 0x12d889e (0)
+## /dev/mali @ 0x12d8900 (0)
+## Mali-T720 @ 0x12d89b4 (0)
+## In file: hardware/samsung_slsi/MaliT720_r7p0_Insel/product/base/src/mali_base_kbase.c  line: 262 @ 0x12d8a00 (0)

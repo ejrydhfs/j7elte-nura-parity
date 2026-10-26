@@ -1,0 +1,190 @@
+diff --git a/device/archived/linux-samsung-j7elte/0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch b/device/archived/linux-samsung-j7elte/0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch
+new file mode 100644
+index 0000000..31cb04c
+--- /dev/null
++++ b/device/archived/linux-samsung-j7elte/0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch
+@@ -0,0 +1,41 @@
++diff --git a/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c b/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c
++index e50b2b77..709c319a 100644
++--- a/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c
+++++ b/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c
++@@ -3624,9 +3624,34 @@ int fimc_is_sec_fw_sel_eeprom(struct device *dev, int id, bool headerOnly)
++ 
++ 	fp = filp_open(fw_path, O_RDONLY, 0);
++ 	if (IS_ERR(fp)) {
++-		err("Camera: Failed open phone firmware");
++-		ret = -EIO;
+++		const struct firmware *fw_blob = NULL;
+++		const u8 *fw_data;
+++		size_t fw_size;
+++
++ 		fp = NULL;
+++		info("Camera: %s is not available, trying request_firmware\n",
+++			fw_path);
+++		ret = request_firmware(&fw_blob, sysfs_finfo.load_fw_name, dev);
+++		if (ret) {
+++			err("Camera: Failed to load phone firmware(%d)", ret);
+++			ret = -EIO;
+++			goto read_phone_fw_exit;
+++		}
+++
+++		fw_data = fw_blob->data;
+++		fw_size = fw_blob->size;
+++		if (fw_size > FIMC_IS_HEADER_VER_SIZE) {
+++			strncpy(phone_fw_version,
+++				(const char *)fw_data + fw_size - 11,
+++				FIMC_IS_HEADER_VER_SIZE);
+++			strncpy(sysfs_pinfo.header_ver,
+++				(const char *)fw_data + fw_size - 11,
+++				FIMC_IS_HEADER_VER_SIZE);
+++			info("Camera: phone fw version: %s\n", phone_fw_version);
+++		}
+++
+++		release_firmware(fw_blob);
+++		ret = 0;
++ 		goto read_phone_fw_exit;
++ 	}
++ 
+diff --git a/device/archived/linux-samsung-j7elte/0001-j7elte-bt-pinctrl.patch b/device/archived/linux-samsung-j7elte/0001-j7elte-bt-pinctrl.patch
+new file mode 100644
+index 0000000..d64c057
+--- /dev/null
++++ b/device/archived/linux-samsung-j7elte/0001-j7elte-bt-pinctrl.patch
+@@ -0,0 +1,94 @@
++diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi
++index e29ca762..c203bf05 100644
++--- a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi
+++++ b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi
++@@ -392,6 +392,14 @@
++ 
++ 	pinctrl-0= <&sleep7>;
++ 
+++	bt_en_j7: bt-en {
+++		samsung,pins = "gpc4-2";
+++		samsung,pin-function = <1>;
+++		samsung,pin-pud = <0>;
+++		samsung,pin-con-pdn = <3>;
+++		samsung,pin-pud-pdn = <0>;
+++	};
+++
++ 	sleep7: sleep-state {
++ 
++ 		PIN_SLP(gpc4-0, INPUT, NONE);	/* TSP_SDA_1P8 */
++diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi
++index 11dce44d..5fb39279 100644
++--- a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi
+++++ b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi
++@@ -254,6 +254,13 @@
++ &pinctrl_7 {
++ 	pinctrl-names = "sleep";
++ 	pinctrl-0= <&sleep7>;
+++	bt_en_j7: bt-en {
+++		samsung,pins = "gpc4-2";
+++		samsung,pin-function = <1>;
+++		samsung,pin-pud = <0>;
+++		samsung,pin-con-pdn = <3>;
+++		samsung,pin-pud-pdn = <0>;
+++	};
++ 	sleep7: sleep-state {
++ 		PIN_SLP(gpc4-0, INPUT, NONE);	/* TSP_SDA_1P8 */
++ 		PIN_SLP(gpc4-1, INPUT, NONE);	/* TSP_SCL_1P8 */
++diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi
++index 5fbfd6b6..7268a849 100644
++--- a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi
+++++ b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi
++@@ -256,6 +256,13 @@
++ &pinctrl_7 {
++ 	pinctrl-names = "sleep";
++ 	pinctrl-0= <&sleep7>;
+++	bt_en_j7: bt-en {
+++		samsung,pins = "gpc4-2";
+++		samsung,pin-function = <1>;
+++		samsung,pin-pud = <0>;
+++		samsung,pin-con-pdn = <3>;
+++		samsung,pin-pud-pdn = <0>;
+++	};
++ 	sleep7: sleep-state {
++ 		PIN_SLP(gpc4-0, INPUT, NONE);	/* TSP_SDA_1P8 */
++ 		PIN_SLP(gpc4-1, INPUT, NONE);	/* TSP_SCL_1P8 */
++diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
++index 153e52f2..e49b6edf 100644
++--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
+++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
++@@ -1226,7 +1226,7 @@
++ 				&gpa2 2 0x1	/*BT_WAKE*/
++ 				&gpa2 6 0xF	/*BT_HOST_WAKE*/ >;
++ 		pinctrl-names = "default";
++-		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en>;
+++		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en_j7>;
++ 		status = "okay";
++ 	};
++ 	input_booster {
++diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
++index 6a327be3..bc629d06 100644
++--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
+++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
++@@ -1223,7 +1223,7 @@
++ 				&gpa2 2 0x1	/*BT_WAKE*/
++ 				&gpa2 6 0xF	/*BT_HOST_WAKE*/ >;
++ 		pinctrl-names = "default";
++-		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en>;
+++		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en_j7>;
++ 		status = "okay";
++ 	};
++ 	input_booster {
++diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
++index e2e312d7..3ea9b75a 100644
++--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
+++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
++@@ -1223,7 +1223,7 @@
++ 				&gpa2 2 0x1	/*BT_WAKE*/
++ 				&gpa2 6 0xF	/*BT_HOST_WAKE*/ >;
++ 		pinctrl-names = "default";
++-		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en>;
+++		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en_j7>;
++ 		status = "okay";
++ 	};
++ 	input_booster {
+diff --git a/device/archived/linux-samsung-j7elte/APKBUILD b/device/archived/linux-samsung-j7elte/APKBUILD
+index 87d4aa5..89d73fa 100644
+--- a/device/archived/linux-samsung-j7elte/APKBUILD
++++ b/device/archived/linux-samsung-j7elte/APKBUILD
+@@ -32,6 +32,8 @@ _config="config-$_flavor.$arch"
+ source="
+ 	$pkgname-$_commit.tar.gz::https://github.com/LineageOS/$_repository/archive/$_commit.tar.gz
+ 	$_config
++	0001-j7elte-bt-pinctrl.patch
++	0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch
+ 	gcc8-fix-put-user.patch
+ 	gcc10-extern_YYLOC_global_declaration.patch
+ 	linux3.7to4.5-ARM64-remove-Sun-Solaris-style-flag-on-section.patch
+@@ -67,7 +69,9 @@ package() {
+ 
+ sha512sums="
+ b01b78378bb072ab42f6e2c0751a052b99b06c4516d32df4551d97614717be4a30c24ba0b8ddc3cb043b6f04b3c2d408ede490e48402d1ad497831bb0830dbe7  linux-samsung-j7elte-2a746c1bc1a41eae05988c153f527c8a5dc72d07.tar.gz
+-23e49e4993a98684717beaca7ea44f2cd4e0079460e573acc93237aa8b1d55115c72a22c0f16f3b8638c5b82ab57ea71ee8c043bf61d89f7cb190711e87d0156  config-samsung-j7elte.aarch64
++4351f8627aa8915b5d941bd347858704e98141140aad9e4f80747c7496f5f31c40d24778c982621d39059f0d9fac28a9749ca90f97e86cfb293c19f49b06d6e3  config-samsung-j7elte.aarch64
++a5d09aa51d41cdbf4995e2fc05d99a48c9bd505ce90aed9954c1110672e52e9688071b421b18698d87e0c37a2169db2cc85b6f9637e23e8c1c009abc8e1a9bb9  0001-j7elte-bt-pinctrl.patch
++767b7afd817d067803fcf3f75dd004f6e15c340349269efa59a14d2eba53ba8146f3c781175de8047bc792cd6475dc9b1d44ea336a6c34b8fd09fbb59c18673f  0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch
+ 197d40a214ada87fcb2dfc0ae4911704b9a93354b75179cd6b4aadbb627a37ec262cf516921c84a8b1806809b70a7b440cdc8310a4a55fca5d2c0baa988e3967  gcc8-fix-put-user.patch
+ 2b48f1bf0e3f70703d2cdafc47d5e615cc7c56c70bec56b2e3297d3fa4a7a1321d649a8679614553dde8fe52ff1051dae38d5990e3744c9ca986d92187dcdbeb  gcc10-extern_YYLOC_global_declaration.patch
+ 75545ccd0082a119b9ad95fcef3523c939a5c946f8f3a5c3dde15cee1502f6c1011050a0ad5359426f018bb7ceea1c97a28c7665941bc89f365c8d11065ce0f6  linux3.7to4.5-ARM64-remove-Sun-Solaris-style-flag-on-section.patch
+diff --git a/device/archived/linux-samsung-j7elte/linux3.7to4.5-ARM64-remove-Sun-Solaris-style-flag-on-section.patch b/device/archived/linux-samsung-j7elte/linux3.7to4.5-ARM64-remove-Sun-Solaris-style-flag-on-section.patch
+index f61312e..b20adc2 100644
+--- a/device/archived/linux-samsung-j7elte/linux3.7to4.5-ARM64-remove-Sun-Solaris-style-flag-on-section.patch
++++ b/device/archived/linux-samsung-j7elte/linux3.7to4.5-ARM64-remove-Sun-Solaris-style-flag-on-section.patch
+@@ -1 +1,12 @@
+-../../.shared-patches/linux/linux3.7to4.5-ARM64-remove-Sun-Solaris-style-flag-on-section.patch
+\ No newline at end of file
++diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
++index d2f2cedf..7e2cbc74 100644
++--- a/arch/arm64/mm/proc.S
+++++ b/arch/arm64/mm/proc.S
++@@ -171,7 +171,6 @@ ENTRY(cpu_do_switch_mm)
++ 	ret
++ ENDPROC(cpu_do_switch_mm)
++ 
++-	.section ".text.init", #alloc, #execinstr
++ 
++ /*
++  *	__cpu_setup

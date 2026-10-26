@@ -1,0 +1,82 @@
+#!/sbin/openrc-run
+# SIPC5 RIL client for the Samsung Galaxy J7 (j7elte).
+#
+# Stock Android runs rild + libsec-ril.so (bionic, not installable here).  This
+# service runs j7elte-ril, which speaks the recovered subset of the same
+# protocol on /dev/umts_ipc0 and /dev/umts_rfs0:
+#
+#   * opens both channels, so the kernel sends INIT_END to the CP
+#     (otherwise the CP retries PHONE_START forever),
+#   * re-issues IOCTL_MODEM_BOOT_OFF when the CP is ONLINE on the wire but the
+#     kernel still reports OFFLINE (a RIL started after j7elte-cbd) -- without
+#     that, misc_write() rejects every message with -EPERM,
+#   * sends SMS_DEVICE_READY plus the MISC/NET/SEC queries (IMEI, versions,
+#     operator, registration state, PIN state) and decodes the answers,
+#   * then stays resident, logging unsolicited messages, and exits non-zero on
+#     POLLHUP (CP crash) so this service is restarted.
+#
+# Calls/SMS/data are NOT implemented yet: see parity/reports/ril-re.md.
+
+# shellcheck disable=SC2034  # read by openrc-run
+description="SIPC5 RIL client for the SS310AP baseband (j7elte)"
+# shellcheck disable=SC2034
+description_stop="Detach from the baseband (channels closed, CP keeps running)"
+
+: "${J7ELTE_RIL_IPC_DEV:=/dev/umts_ipc0}"
+: "${J7ELTE_RIL_RFS_DEV:=/dev/umts_rfs0}"
+: "${J7ELTE_RIL_TIMEOUT:=5}"
+: "${J7ELTE_RIL_EXTRA_ARGS:=-v}"
+: "${J7ELTE_RIL_COMMAND:=info}"
+
+PIDFILE=/run/j7elte-ril.pid
+
+depend() {
+	need localmount
+	after j7elte-cbd
+	# Without j7elte-cbd the CP stays powered down; do not hard-fail if the
+	# admin disabled it, the command below will report it.
+	use net
+}
+
+start() {
+	if [ ! -c "${J7ELTE_RIL_IPC_DEV}" ]; then
+		eerror "${J7ELTE_RIL_IPC_DEV} not found: CONFIG_SEC_MODEM_V1 /"
+		eerror "CONFIG_SEC_MODEM_SS310AP must be built in and the modem"
+		eerror "node must have probed (dmesg | grep 'mif:')"
+		return 1
+	fi
+
+	set -- -i "${J7ELTE_RIL_IPC_DEV}" \
+		-r "${J7ELTE_RIL_RFS_DEV}" \
+		-t "${J7ELTE_RIL_TIMEOUT}" \
+		-d "${J7ELTE_RIL_COMMAND}"
+	# shellcheck disable=SC2086
+	set -- "$@" ${J7ELTE_RIL_EXTRA_ARGS}
+
+	ebegin "Starting the SIPC5 RIL client"
+	start-stop-daemon --start --quiet --background --make-pidfile \
+		--pidfile "${PIDFILE}" --exec /usr/bin/j7elte-ril -- "$@"
+	eend $?
+
+	# Give the query set a moment so a broken protocol shows up in the
+	# service status instead of a silently idle daemon.
+	sleep 3
+	if [ -s "${PIDFILE}" ] && ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+		eerror "j7elte-ril exited; see 'dmesg | grep mif:' and run"
+		eerror "'j7elte-ril -v info' in the foreground"
+		return 1
+	fi
+	return 0
+}
+
+stop() {
+	ebegin "Stopping the SIPC5 RIL client"
+	if [ -s "${PIDFILE}" ]; then
+		start-stop-daemon --stop --quiet --pidfile "${PIDFILE}" \
+			--retry TERM/5
+		rm -f "${PIDFILE}"
+	fi
+	eend 0
+	# Closing the channels does not power the CP down and the kernel keeps
+	# cp_boot_done set, so a restart only re-opens the devices.
+}

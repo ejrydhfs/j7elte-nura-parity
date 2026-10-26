@@ -1,0 +1,47 @@
+
+parity/userspace/gpu/blob/libGLES_mali.so:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+0046e380 <eglDestroySurface@@Base+0xc4>:
+  46e380:	cmp	r0, #0
+  46e384:	beq	46e3e0 <eglDestroySurface@@Base+0x124>
+  46e388:	ldrb	r0, [r8, #154]	; 0x9a
+  46e38c:	cmp	r0, #1
+  46e390:	beq	46e3e0 <eglDestroySurface@@Base+0x124>
+  46e394:	mov	r0, r6
+  46e398:	mov	r6, #1
+  46e39c:	bl	215734 <pthread_mutex_unlock@plt>
+  46e3a0:	mov	r0, r8
+  46e3a4:	mov	r1, sl
+  46e3a8:	bl	46d624 <eglCopyBuffers@@Base+0x6f4>
+  46e3ac:	str	r5, [r4, #12]
+  46e3b0:	ldr	ip, [r7, #60]	; 0x3c
+  46e3b4:	movw	r8, #553	; 0x229
+  46e3b8:	add	r1, sp, #24
+  46e3bc:	mov	r2, #24
+  46e3c0:	str	r8, [r1, #-24]!	; 0xffffffe8
+  46e3c4:	add	r0, ip, #44	; 0x2c
+  46e3c8:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  46e3cc:	mov	r0, r9
+  46e3d0:	bl	215734 <pthread_mutex_unlock@plt>
+  46e3d4:	mov	r0, r7
+  46e3d8:	bl	4692bc <eglQueryContext@@Base+0x398>
+  46e3dc:	b	46e314 <eglDestroySurface@@Base+0x58>
+  46e3e0:	movw	r1, #12301	; 0x300d
+  46e3e4:	mov	r0, r6
+  46e3e8:	mov	r6, #0
+  46e3ec:	str	r1, [r4, #12]
+  46e3f0:	bl	215734 <pthread_mutex_unlock@plt>
+  46e3f4:	b	46e3cc <eglDestroySurface@@Base+0x110>
+  46e3f8:	strd	r4, [sp, #-24]!	; 0xffffffe8
+  46e3fc:	mov	r5, r0
+  46e400:	mov	r4, r1
+  46e404:	strd	r6, [sp, #8]
+  46e408:	mov	r7, r2
+  46e40c:	mov	r6, r3
+  46e410:	str	r8, [sp, #16]
+  46e414:	str	lr, [sp, #20]
+  46e418:	ldr	r0, [r1, #20]
+  46e41c:	cmp	r0, #0

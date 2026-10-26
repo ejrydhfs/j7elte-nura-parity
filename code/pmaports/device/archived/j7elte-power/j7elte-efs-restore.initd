@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+# Restore the SM5703 fuelgauge capacity_max calibration that the stock ROM
+# keeps in /efs/Battery/batt_capacity_max (stock Android does this in
+# /system/bin/lpm).  The helper mounts the EFS partition read-only, writes the
+# value to /sys/class/power_supply/battery/batt_capacity_max, unmounts again,
+# and exits 0 for every expected failure (no EFS partition, no fuelgauge), so
+# this service can never fail the boot.
+#
+# OpenRC equivalent of j7elte-efs-restore.service.
+
+description="Restore battery capacity_max from EFS (j7elte)"
+command="/usr/libexec/j7elte-power/restore-capacity-max"
+command_args=""
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	need localmount
+	after udev-settle
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run
+}

@@ -1,0 +1,57 @@
+# Maintainer: j7elte parity work <parity@example.invalid>
+#
+# Minimal still-frame capture client for the FIMC-IS2 pipeline of the
+# Samsung Galaxy J7 (j7elte, Exynos 7580).  The kernel driver
+# (CONFIG_VIDEO_EXYNOS_FIMC_IS, linux-samsung-j7elte) exposes Samsung's
+# camera-HAL video nodes (exynos-fimc-is-ss0/ss1, 30s/30c, 31s/31c, i0s, scp)
+# rather than a media-controller graph, so a generic V4L2 client cannot use
+# it.  j7elte-cam drives those nodes directly, copies SCP frames out and writes
+# them as PPM/raw.  It is a diagnostic/imager tool, not a camera HAL: there
+# is no JPEG encoder.  An optional bounded AE loop (--ae) drives exposure and
+# gain through the shot metadata (ctl.aa/ctl.sensor) that the firmware reads;
+# --awb forwards a white balance mode.  See parity/reports/camera-ae.md.
+#
+# Runtime requirements:
+#   - firmware-samsung-j7elte installed (/lib/firmware/fimc_is_fw2_3l2.bin,
+#     setfile_3l2.bin, setfile_5e3.bin, fimc_is_fd.bin)
+#   - the user must be able to open /dev/video* (group "video")
+# See parity/reports/camera-userspace.md.
+pkgname=j7elte-cam
+pkgver=1.0.0
+pkgrel=0
+pkgdesc="FIMC-IS still-frame capture client for the Samsung Galaxy J7 (j7elte)"
+url="https://postmarketos.org"
+arch="aarch64"
+# j7elte-cam-meta.h is a verbatim copy of Samsung's fimc-is-metadata.h,
+# which is dual-licensed GPL-2.0-only / Apache-2.0 (see its header);
+# Apache-2.0 is the branch used by the combined work.
+license="MIT AND Apache-2.0"
+# The tool is useless without the FIMC-IS firmware/setfiles.
+depends="firmware-samsung-j7elte"
+# <linux/videodev2.h> and <linux/media.h>: build-base/musl-dev do NOT
+# provide the kernel uapi headers, so they must be requested explicitly.
+makedepends="linux-headers"
+options="!check"
+subpackages=""
+builddir="$srcdir"
+source="
+	Makefile
+	j7elte-cam.c
+	j7elte-cam-ioctl.h
+	j7elte-cam-meta.h
+"
+
+build() {
+	make CC="$CC" CFLAGS="$CFLAGS" CPPFLAGS="$CPPFLAGS" LDFLAGS="$LDFLAGS"
+}
+
+package() {
+	make install DESTDIR="$pkgdir" PREFIX=/usr
+}
+
+sha512sums="
+4d60b62f7b78b7b43206b6bfffe370e2ae4d830305a7dc9a54cc193f605b8ff510636d1cc881bf3a680b96c0dbdcf788ab5fc3fe8654918061999606f7e29787  Makefile
+5ebfcaa0fd018045afa07fb8bab4d60e979c8f610f457a9dcada047530a3106936b0d2fc5dcd32746ee6c359e543962de41826fde1e78a16c2a448ef04ce0585  j7elte-cam.c
+6a3634432478884b5f109048d11bdd01c24ba5ad1a139733233caae8788e87c291b848927c76d49e4e469288245e66582bb8464df29d1db0ced0b898e9a57523  j7elte-cam-ioctl.h
+10b159ecfa6404fdba8d261e4c6fb262775193de53a305cd509a3825bc3c69fdc63cd3929ede9ea9a1b88b644c012cd4fa5e27319e82a3348cb1c917ff1ffb6b  j7elte-cam-meta.h
+"

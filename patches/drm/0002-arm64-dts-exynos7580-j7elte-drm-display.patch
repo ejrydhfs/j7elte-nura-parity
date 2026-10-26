@@ -1,0 +1,60 @@
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
+index 153e52f2..328aff73 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
+@@ -1011,6 +1011,7 @@
+ 		compatible = "samsung,exynos5430-ion";
+ 	};
+ 	decon_fb@14830000 {
++		compatible = "samsung,exynos7580-decon-drm";
+ 		/* XEINT7, GPIO & pin control */
+ 		gpios = <&gpd0 7 0xf>;
+ 		psr_mode = <0>;		/* 0: video mode, 1: DP command mode, 2: MIPI command mode */
+@@ -1020,6 +1021,7 @@
+ 		status = "okay";
+ 	};
+ 	dsim_0: dsim@14800000 {
++		compatible = "samsung,exynos7580-dsim";
+ 		lcd_info = <&ea8061>;
+ 		decon_board = <&decon_board_list>;
+ 		/* lcd reset, power_P, power_N */
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
+index 6a327be3..58ac712a 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
+@@ -1007,6 +1007,7 @@
+ 		compatible = "samsung,exynos5430-ion";
+ 	};
+ 	decon_fb@14830000 {
++		compatible = "samsung,exynos7580-decon-drm";
+ 		/* XEINT7, GPIO & pin control */
+ 		gpios = <&gpd0 7 0xf>;
+ 		psr_mode = <0>;		/* 0: video mode, 1: DP command mode, 2: MIPI command mode */
+@@ -1016,6 +1017,7 @@
+ 		status = "okay";
+ 	};
+ 	dsim_0: dsim@14800000 {
++		compatible = "samsung,exynos7580-dsim";
+ 		lcd_info = <&ea8061>;
+ 		decon_board = <&decon_board_list>;
+ 		/* lcd reset, power_P, power_N */
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
+index e2e312d7..c32b82d4 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
+@@ -1007,6 +1007,7 @@
+ 		compatible = "samsung,exynos5430-ion";
+ 	};
+ 	decon_fb@14830000 {
++		compatible = "samsung,exynos7580-decon-drm";
+ 		/* XEINT7, GPIO & pin control */
+ 		gpios = <&gpd0 7 0xf>;
+ 		psr_mode = <0>;		/* 0: video mode, 1: DP command mode, 2: MIPI command mode */
+@@ -1016,6 +1017,7 @@
+ 		status = "okay";
+ 	};
+ 	dsim_0: dsim@14800000 {
++		compatible = "samsung,exynos7580-dsim";
+ 		lcd_info = <&ea8061>;
+ 		decon_board = <&decon_board_list>;
+ 		/* lcd reset, power_P, power_N */

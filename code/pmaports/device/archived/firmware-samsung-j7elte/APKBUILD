@@ -1,0 +1,43 @@
+# Maintainer: ROM/Nura parity integration (SM-J700M / j7elte)
+# Blobs extracted from the stock Samsung ROM J700MUBU2BRC2 (AP tar).
+# Rebuild firmware.tar.gz with ./extract-firmware.sh <AP-tar.md5>.
+pkgname=firmware-samsung-j7elte
+pkgver=1
+pkgrel=0
+pkgdesc="Proprietary firmware for the Samsung Galaxy J7 (j7elte, Exynos 7580)"
+url="https://opensource.samsung.com"
+arch="aarch64"
+license="proprietary"
+options="!check !archcheck !spdx !strip !tracedeps pmb:cross-native"
+source="firmware.tar.gz"
+builddir="$srcdir"
+
+package() {
+	local _fw="$pkgdir/lib/firmware"
+	local _wifidir="$_fw/postmarketos/samsung-j7elte"
+
+	# Wi-Fi: Broadcom bcmdhd opens these by absolute path
+	# (CONFIG_BCMDHD_FW_PATH / CONFIG_BCMDHD_NVRAM_PATH in linux-samsung-j7elte).
+	install -Dm644 "$srcdir"/bcmdhd_sta.bin   "$_wifidir/bcmdhd_sta.bin"
+	install -Dm644 "$srcdir"/bcmdhd_apsta.bin "$_wifidir/bcmdhd_apsta.bin"
+	install -Dm644 "$srcdir"/bcmdhd_mfg.bin   "$_wifidir/bcmdhd_mfg.bin"
+	install -Dm644 "$srcdir"/nvram_net.txt    "$_wifidir/nvram_net.txt"
+	install -Dm644 "$srcdir"/nvram_mfg.txt    "$_wifidir/nvram_mfg.txt"
+
+	# Bluetooth: BCM43438 patch RAM, consumed by BlueZ hciattach bcm43xx
+	# (scans /lib/firmware for <ReadLocalName>*.hcd). Both the ROM filename and
+	# the bare "BCM43438A1.hcd" name are installed.
+	install -Dm644 "$srcdir"/bcm43438A1_V0051.0230.hcd "$_wifidir/BCM43438A1.hcd"
+	install -Dm644 "$srcdir"/bcm43438A1_V0051.0230.hcd "$_wifidir/bcm43438A1_V0051.0230.hcd"
+
+	# Camera (FIMC-IS) and video codec (MFC): request_firmware() names resolve
+	# to /lib/firmware/<name>.
+	local f
+	for f in fimc_is_fw2_3l2.bin setfile_3l2.bin setfile_5e3.bin fimc_is_fd.bin mfc_fw.bin; do
+		install -Dm644 "$srcdir/$f" "$_fw/$f"
+	done
+}
+
+sha512sums="
+369340c6bcf8171adb559adc3b61d8605bbd0bce5010d9aae56a0ea49415b880ba63643d52c198f6a857617e67aaea41efe0858ed184b026c6313fa67da09b1b  firmware.tar.gz
+"

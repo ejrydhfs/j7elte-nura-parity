@@ -1,0 +1,35 @@
+# /etc/conf.d/j7elte-cbd
+#
+# CP (baseband) boot parameters for the Samsung Galaxy J7 (j7elte).
+# Read by both the OpenRC service and the systemd unit.
+
+# Modem boot device created by drivers/misc/modem_v1 (iodev "umts_boot0").
+J7ELTE_CBD_BOOT_DEV=/dev/umts_boot0
+
+# NV image sent as boot stage 3.  Stock cbd uses /efs/nv_data.bin on the EFS
+# partition; if it is missing j7elte-cbd sends a zero-filled default NV of the
+# size declared in the CP image's TOC (stock behaviour) and the modem has no
+# IMEI until NV is restored.
+J7ELTE_CBD_NV=/efs/nv_data.bin
+
+# Raw CP image.  Leave empty to search /dev/disk/by-partlabel/RADIO,
+# /dev/block/platform/13540000.dwmmc0/by-name/RADIO, /dev/mbin0,
+# /dev/block/mmcblk0p5 and /lib/firmware/postmarketos/samsung-j7elte/modem.bin.
+# J7ELTE_CBD_EXTRA_ARGS="-C /path/to/modem.bin"
+
+# Per-command response timeout from the CP bootloader, in seconds.
+J7ELTE_CBD_TIMEOUT=30
+
+# Mount the EFS partition on /efs before booting (needed for the real NV).
+J7ELTE_CBD_MOUNT_EFS=yes
+# Explicit EFS block device; empty = search by-partlabel / by-name.
+J7ELTE_EFS_DEV=
+
+# Stay resident after booting and watch the CP (stock cbd runs as a daemon).
+# The watcher has no ramdump support: on a CP crash it exits non-zero so the
+# service manager can restart the whole sequence.
+J7ELTE_CBD_DAEMON=yes
+
+# Extra arguments, e.g. "-v" for verbose logging or "--no-xmit-boot" to skip
+# the BOOT image upload while debugging.
+J7ELTE_CBD_EXTRA_ARGS=

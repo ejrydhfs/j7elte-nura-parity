@@ -1,0 +1,24 @@
+[Unit]
+Description=CP firmware loader for the SS310AP baseband (j7elte)
+Documentation=file:///etc/conf.d/j7elte-cbd
+ConditionPathExists=/dev/umts_boot0
+ConditionPathExists=!/etc/j7elte-cbd.disabled
+After=dev-mmcblk0.device local-fs.target
+Before=ModemManager.service ofono.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/conf.d/j7elte-cbd
+ExecStart=/usr/bin/j7elte-cbd --daemon \
+	-B ${J7ELTE_CBD_BOOT_DEV} \
+	-N ${J7ELTE_CBD_NV} \
+	-T ${J7ELTE_CBD_TIMEOUT} \
+	$J7ELTE_CBD_EXTRA_ARGS
+# Exit code 1 means "no CP image / boot failed"; restarting is only useful
+# after the RADIO partition has been fixed, so do not spin.
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+description="Samsung Galaxy J7 (j7elte) automatic headset jack routing"
+command="/usr/bin/j7elte-audio-jack"
+command_args="--config /etc/j7elte-audio-jack.conf"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	after alsa sound
+	use logger
+}

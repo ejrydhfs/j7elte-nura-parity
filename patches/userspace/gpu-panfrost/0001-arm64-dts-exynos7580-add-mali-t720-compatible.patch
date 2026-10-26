@@ -1,0 +1,35 @@
+From: Nura GPU bring-up <gpu@nura.local>
+Subject: [PATCH] arm64: dts: exynos7580: add arm,mali-t720 to the GPU node
+
+The Mali-T720 node only advertises the generic "arm,mali" compatible
+string, which is what Samsung's kbase driver matches.  A Panfrost-class
+driver binds on the model-specific "arm,mali-t720" (mainline panfrost's
+dt_match entry, drivers/gpu/drm/panfrost/panfrost_drv.c:1167).
+
+Adding the string as the *second* compatible keeps kbase's behaviour
+exactly as it is today: of_match_table matching is per-string, and a
+built-in kbase is registered and bound before any loadable GPU driver.
+Nothing changes until kbase is disabled and a panfrost driver is built.
+
+The other properties such a driver needs (clock names, power-domain
+format) are not changed here: they require the kbase cutover and are
+documented in parity/userspace/gpu/panfrost/design.md section 8.
+
+Signed-off-by: Nura GPU bring-up <gpu@nura.local>
+---
+ arch/arm64/boot/dts/exynos7580.dtsi | 3 ++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+--- a/arch/arm64/boot/dts/exynos7580.dtsi
++++ b/arch/arm64/boot/dts/exynos7580.dtsi
+@@ -1064,7 +1064,9 @@
+ 	};
+ 
+ 	mali@0x11400000 {
+-		compatible = "arm,mali";
++		/* "arm,mali" first: kbase keeps binding.  The second string
++		 * lets a Panfrost-class driver bind once kbase is disabled. */
++		compatible = "arm,mali", "arm,mali-t720";
+ 		reg = <0x0 0x11400000 0x0 0x5000>;
+ 		interrupts = <0 282 0>, <0 283 0>, <0 281 0>;
+ 		interrupt-names = "JOB", "MMU", "GPU";

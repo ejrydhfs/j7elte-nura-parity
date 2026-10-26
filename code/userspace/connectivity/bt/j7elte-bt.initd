@@ -1,0 +1,138 @@
+#!/sbin/openrc-run
+# Attach the Broadcom BCM43438 Bluetooth controller on the j7elte.
+#
+# The controller sits on UART port 3 (BT_UPORT 3 in
+# drivers/bluetooth/bcm43xx.c; DT alias uart3 = serial_3), i.e. /dev/ttySAC3,
+# and is a plain H4 device: patch RAM must be downloaded by userspace.  On
+# Linux 3.10 there is no hci_bcm/btbcm driver, so btattach alone is not enough
+# -- hciattach's bcm43xx backend resets the chip, matches the firmware by the
+# controller's local name and downloads it.
+#
+# The platform driver registers its rfkill switch soft-blocked
+# (rfkill_init_sw_state(..., 0) followed by rfkill_set_sw_state(..., true) in
+# bcm43xx.c), and only unblocking it drives BT_EN high.  So the order is:
+#   rfkill unblock bluetooth -> hciattach -> bluetoothd
+#
+# Firmware (firmware-samsung-j7elte) installs BCM43438A1.hcd under
+# /lib/firmware/postmarketos/samsung-j7elte/; Alpine's hciattach searches
+# /lib/firmware recursively for "<local name>*.hcd" (bluez patch 004).
+#
+# This service is enabled in the default runlevel by its package, unless
+# /etc/j7elte-bt.disabled exists.  To disable permanently:
+#   touch /etc/j7elte-bt.disabled && rc-service j7elte-bt stop
+#   rc-update del j7elte-bt default
+
+# shellcheck disable=SC2034  # read by openrc-run
+description="Broadcom BCM43438 Bluetooth HCI attach (j7elte)"
+# shellcheck disable=SC2034
+description_stop="Detach the BCM43438 Bluetooth HCI transport (j7elte)"
+
+: "${J7ELTE_BT_UART:=/dev/ttySAC3}"
+: "${J7ELTE_BT_TYPE:=bcm43xx}"
+: "${J7ELTE_BT_INIT_SPEED:=115200}"
+: "${J7ELTE_BT_SPEED:=115200}"
+: "${J7ELTE_BT_FLOW:=flow}"
+: "${J7ELTE_BT_TIMEOUT:=30}"
+: "${J7ELTE_BT_RETRIES:=3}"
+: "${J7ELTE_BT_RETRY_DELAY:=1}"
+
+HCIATTACH=/usr/bin/hciattach
+RFKILL=/usr/sbin/rfkill
+PIDFILE=/run/j7elte-bt.pid
+LOCKFILE=/etc/j7elte-bt.disabled
+
+depend() {
+	need localmount
+	after udev-settle coldplug
+	before bluetooth
+}
+
+# hciattach runs with -n so the attach process stays in the foreground and can
+# be supervised; hci0 only exists while that process holds the N_HCI line
+# discipline.
+_attach_ok() {
+	[ -e /sys/class/bluetooth/hci0 ] || return 1
+	[ -s "${PIDFILE}" ] || return 1
+	kill -0 "$(cat "${PIDFILE}")" 2>/dev/null
+}
+
+_stop_attach() {
+	if [ -s "${PIDFILE}" ]; then
+		start-stop-daemon --stop --quiet --pidfile "${PIDFILE}" \
+			--retry TERM/5/KILL/5
+		rm -f "${PIDFILE}"
+	fi
+	return 0
+}
+
+start() {
+	if [ -e "${LOCKFILE}" ]; then
+		ewarn "j7elte-bt disabled by ${LOCKFILE}; not attaching"
+		return 0
+	fi
+
+	if [ ! -x "${HCIATTACH}" ]; then
+		eerror "${HCIATTACH} not found (install bluez-deprecated)"
+		return 1
+	fi
+
+	if [ ! -c "${J7ELTE_BT_UART}" ]; then
+		eerror "${J7ELTE_BT_UART} not found; is CONFIG_SERIAL_SAMSUNG UART 3 enabled?"
+		return 1
+	fi
+
+	ebegin "Unblocking the Bluetooth rfkill switch"
+	if ! "${RFKILL}" unblock bluetooth; then
+		eend 1 "rfkill unblock bluetooth failed; did bcm43xx probe?"
+		return 1
+	fi
+	eend 0
+
+	attempt=1
+	waited=0
+	while [ "${attempt}" -le "${J7ELTE_BT_RETRIES}" ]; do
+		ebegin "Attaching ${J7ELTE_BT_TYPE} on ${J7ELTE_BT_UART} at ${J7ELTE_BT_SPEED} (attempt ${attempt}/${J7ELTE_BT_RETRIES})"
+		_stop_attach
+		start-stop-daemon --start --quiet --background --make-pidfile \
+			--pidfile "${PIDFILE}" --exec "${HCIATTACH}" -- \
+			-n -t "${J7ELTE_BT_TIMEOUT}" -s "${J7ELTE_BT_INIT_SPEED}" \
+			"${J7ELTE_BT_UART}" "${J7ELTE_BT_TYPE}" \
+			"${J7ELTE_BT_SPEED}" "${J7ELTE_BT_FLOW}"
+
+		waited=0
+		while [ "${waited}" -lt "${J7ELTE_BT_TIMEOUT}" ]; do
+			_attach_ok && break
+			sleep 1
+			waited=$((waited + 1))
+		done
+
+		if _attach_ok; then
+			eend 0
+			break
+		fi
+
+		eend 1
+		_stop_attach
+		attempt=$((attempt + 1))
+		if [ "${attempt}" -le "${J7ELTE_BT_RETRIES}" ]; then
+			sleep "${J7ELTE_BT_RETRY_DELAY}"
+		fi
+	done
+
+	if ! _attach_ok; then
+		eerror "hciattach did not create hci0 after ${J7ELTE_BT_RETRIES} attempt(s)"
+		eerror "Check dmesg for '[BT]' messages and that BCM43438A1.hcd is installed"
+		return 1
+	fi
+
+	# bluez-openrc provides this service; it also takes care of D-Bus.
+	ebegin "Starting bluetoothd"
+	rc-service bluetooth start
+	eend $?
+}
+
+stop() {
+	ebegin "Detaching Bluetooth HCI transport from ${J7ELTE_BT_UART}"
+	_stop_attach
+	eend 0
+}

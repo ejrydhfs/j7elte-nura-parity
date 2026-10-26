@@ -1,0 +1,68 @@
+# Battery charge limit and capacity_max restore for the Samsung Galaxy J7
+# (SM-J700F/M, "j7elte", Exynos 7580 / SM5703).
+#
+# The vendor 3.10 kernel already exposes the standard power_supply class
+# ("battery", "ac", "usb", "wireless"), so UPower gets level and charging state
+# without any helper.  What userspace was missing:
+#  * the stock ROM's /efs/Battery/batt_capacity_max calibration restore
+#    (/system/bin/lpm does this on Android),
+#  * any way to set a charge limit; the kernel has no
+#    charge_control_end_threshold, only the sec_battery batt_slate_mode knob.
+pkgname=j7elte-power
+pkgver=1.0
+pkgrel=0
+pkgdesc="Battery charge limit and capacity_max restore for Samsung Galaxy J7 (j7elte)"
+url="https://postmarketos.org"
+arch="aarch64"
+license="MIT"
+depends=""
+install="$pkgname.post-install"
+source="
+	j7elte-power.c
+	j7elte-power.conf
+	j7elte-power.service
+	j7elte-efs-restore.service
+	j7elte-power.initd
+	j7elte-efs-restore.initd
+	j7elte-power.post-install
+	restore-capacity-max.sh
+"
+builddir="$srcdir"
+
+build() {
+	${CC:-cc} $CFLAGS -std=c11 -D_GNU_SOURCE -Wall -Wextra \
+		-o j7elte-power j7elte-power.c $LDFLAGS
+}
+
+package() {
+	install -Dm755 j7elte-power \
+		"$pkgdir"/usr/bin/j7elte-power
+	install -Dm755 restore-capacity-max.sh \
+		"$pkgdir"/usr/libexec/j7elte-power/restore-capacity-max
+	install -Dm644 j7elte-power.conf \
+		"$pkgdir"/etc/j7elte-power.conf
+	install -Dm644 j7elte-power.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-power.service
+	install -Dm644 j7elte-efs-restore.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-efs-restore.service
+
+	# OpenRC is the default service manager on this pmOS port; the systemd
+	# units are installed alongside for systemd images.  The .post-install
+	# script enables the restore service in whichever manager exists and
+	# leaves the opt-in charge-limit daemon disabled.
+	install -Dm755 j7elte-efs-restore.initd \
+		"$pkgdir"/etc/init.d/j7elte-efs-restore
+	install -Dm755 j7elte-power.initd \
+		"$pkgdir"/etc/init.d/j7elte-power
+}
+
+sha512sums="
+39c794087231ebd1f4b74fb0b26bc21e12270d81ffe655f78b6397722e701f3f1a78886fbae467ed31248bcd6a2c7cacd0f993fee251798af2a493f1f605f60e  j7elte-power.c
+dce24255f1ec266120784886c026ebdd78c354f287ae39300da67230dd0b465e2caaf19aafa55102a8a9200831c35daf2147a2e355231beeb3b9ea1e0a58f29a  j7elte-power.conf
+404b353564d5bbdd1d5f26c269a0347fd640615090453d98a7f668259362ac33954b1ebf039525f5dea3d10492e077460e7b637af3a1a561ff4bac7a7e93c82c  j7elte-power.service
+9cd74e5e84ed6da39d5e7ad1b1385c1a2af5cf18ea344abdd2cb86b414d6b9ddf563d21158deb15f1804703edbb05ba611ce5b13a8f56a01d7a835a5c61e55dc  j7elte-efs-restore.service
+502b6d856797078b27dd1469d6dab6e99baae8b90ea24291fb711d96175e6e0beb851841ef5fa00a6f276604dabc8862dbe07b8a015cc783a74d87df4803f37b  j7elte-power.initd
+d28874a4f58129641ce7e03ed64dc9caab1c27f0e403dd3c014990718ee6d1a9c43d77a031909f9116ef942de9098352cd1f19af678e33d4aba9204afc36c338  j7elte-efs-restore.initd
+397d791eafa3e7ae8453df0285c9d0e140062140fc87d85a254803867be771e00484958dcf48ddb94f6c4cfcb0ef97de500ad81d7534e19723b8fc0456e7c2e8  j7elte-power.post-install
+5d46f303e231323dc199588c322e75a9992698974730a4f9685e8c6d6a955d48b652d057439a814d14b975f0062dc6565ad46f048a33bac1195a492255f84bf9  restore-capacity-max.sh
+"

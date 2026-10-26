@@ -1,0 +1,46 @@
+# Archived: unmaintained
+# Reference: <https://postmarketos.org/devicepkg>
+#
+# Userspace bridge for the Broadcom BCM4752 GPS of the Samsung Galaxy J7
+# (j7elte).  The kernel side (linux-samsung-j7elte) already provides
+# /sys/class/sec/gps/GPS_PWR_EN/value and leaves /dev/ttySAC0 free; see
+# parity/reports/gps.md and parity/reports/gps-userspace.md.
+maintainer=""
+pkgname=j7elte-gpsd
+pkgver=1.0
+pkgrel=0
+pkgdesc="BCM4752 GPS NMEA bridge for the Samsung Galaxy J7 (j7elte)"
+url="https://postmarketos.org"
+license="MIT"
+arch="aarch64"
+options="!check !archcheck"
+depends=""
+makedepends=""
+install=""
+subpackages=""
+source="
+	j7elte-gpsd.c
+	j7elte-gpsd.conf
+	j7elte-gpsd.initd
+	j7elte-gpsd.service
+"
+
+build() {
+	$CC $CPPFLAGS $CFLAGS -std=c11 -Wall -Wextra -Wshadow \
+		-o j7elte-gpsd j7elte-gpsd.c $LDFLAGS
+}
+
+package() {
+	install -Dm755 j7elte-gpsd "$pkgdir"/usr/sbin/j7elte-gpsd
+	install -Dm644 j7elte-gpsd.conf "$pkgdir"/etc/j7elte-gpsd.conf
+	install -Dm755 j7elte-gpsd.initd "$pkgdir"/etc/init.d/j7elte-gpsd
+	install -Dm644 j7elte-gpsd.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-gpsd.service
+}
+
+sha512sums="
+ 85374e6197db55665a7ced832bbde59eae4bf6813aeb8b40e8d0de20781776fcaa1badbfcebe45b4c3dc4f4d766b805c986bc711c3066220b41270dad55e2e26  j7elte-gpsd.c
+ b429a5ba3dd611358c3c81ad2aa201fc591c0e10853e6ed733a2e9429fc21fd55f1c92866b74fbbce8fef5eea297019e3ac0dcfd734b9bbbc2d707d16d9e73b7  j7elte-gpsd.conf
+ 1f74e7ecf589e2bb0867273208eeaca6e9358b573d71208ad57e373124a5f4074db6e2041f64de942a14942425582bccdcdfecdb3097bc45c87e13c967138a76  j7elte-gpsd.initd
+ 6a26976cbbe1bcdfa2ff914d53ec8a8f49c7ed9277cf2a4d2ef2de72967e18f1b86110da2f9364b6a7ee29281599f9ec9e6629b16c5c83eddb89d26d9a0f2f48  j7elte-gpsd.service
+"

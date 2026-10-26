@@ -1,0 +1,21 @@
+[Unit]
+Description=SIPC5 RIL client for the Samsung J7 (j7elte) baseband
+After=dev-umts_ipc0.device dev-umts_rfs0.device
+Wants=dev-umts_ipc0.device
+
+[Service]
+Type=simple
+# Defaults first; the file is read afterwards, so /etc/conf.d/j7elte-ril can
+# override all four.  The unquoted variables are whitespace-split by systemd,
+# so J7ELTE_RIL_EXTRA_ARGS can hold several flags.
+Environment=J7ELTE_RIL_IPC_DEV=/dev/umts_ipc0
+Environment=J7ELTE_RIL_RFS_DEV=/dev/umts_rfs0
+Environment=J7ELTE_RIL_TIMEOUT=5
+Environment=J7ELTE_RIL_COMMAND=info
+EnvironmentFile=-/etc/conf.d/j7elte-ril
+ExecStart=/usr/bin/j7elte-ril -i $J7ELTE_RIL_IPC_DEV -r $J7ELTE_RIL_RFS_DEV -t $J7ELTE_RIL_TIMEOUT -d $J7ELTE_RIL_COMMAND $J7ELTE_RIL_EXTRA_ARGS
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

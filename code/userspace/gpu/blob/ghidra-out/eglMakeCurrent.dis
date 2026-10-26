@@ -1,0 +1,656 @@
+
+parity/userspace/gpu/blob/libGLES_mali.so:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+00471ff4 <eglMakeCurrent@@Base>:
+  471ff4:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  471ff8:	strd	r6, [sp, #8]
+  471ffc:	mov	r7, r0
+  472000:	strd	r8, [sp, #16]
+  472004:	mov	r9, r1
+  472008:	mov	r8, r3
+  47200c:	strd	sl, [sp, #24]
+  472010:	mov	fp, r2
+  472014:	str	lr, [sp, #32]
+  472018:	sub	sp, sp, #60	; 0x3c
+  47201c:	bl	471c58 <egl_connect_native_window_to_egl@@Base+0x2f4>
+  472020:	mov	r6, r0
+  472024:	mov	r0, #9
+  472028:	bl	215818 <osup_mutex_static_get@plt>
+  47202c:	cmp	r6, #0
+  472030:	beq	472104 <eglMakeCurrent@@Base+0x110>
+  472034:	mov	sl, r0
+  472038:	mov	r0, r7
+  47203c:	bl	469210 <eglQueryContext@@Base+0x2ec>
+  472040:	movw	r3, #12296	; 0x3008
+  472044:	str	r0, [r6, #12]
+  472048:	cmp	r0, r3
+  47204c:	beq	472104 <eglMakeCurrent@@Base+0x110>
+  472050:	clz	r2, r9
+  472054:	clz	r1, fp
+  472058:	lsr	ip, r2, #5
+  47205c:	lsr	lr, r1, #5
+  472060:	clz	r4, r8
+  472064:	lsr	r3, r4, #5
+  472068:	and	r4, ip, lr
+  47206c:	ands	r2, r4, r3
+  472070:	sub	r5, r0, #12288	; 0x3000
+  472074:	clz	r0, r5
+  472078:	lsr	r5, r0, #5
+  47207c:	str	r2, [sp, #20]
+  472080:	bne	47218c <eglMakeCurrent@@Base+0x198>
+  472084:	cmp	r5, #0
+  472088:	beq	472104 <eglMakeCurrent@@Base+0x110>
+  47208c:	cmp	r8, #0
+  472090:	moveq	r4, #0
+  472094:	andne	r4, r4, #1
+  472098:	cmp	r4, #0
+  47209c:	beq	472128 <eglMakeCurrent@@Base+0x134>
+  4720a0:	mov	r0, sl
+  4720a4:	bl	215728 <pthread_mutex_lock@plt>
+  4720a8:	ldr	r1, [r7, #8]
+  4720ac:	cmp	r1, #1
+  4720b0:	beq	4721dc <eglMakeCurrent@@Base+0x1e8>
+  4720b4:	ldr	ip, [sp, #20]
+  4720b8:	movw	r8, #12289	; 0x3001
+  4720bc:	mov	r5, r4
+  4720c0:	str	r8, [r6, #12]
+  4720c4:	mov	r4, ip
+  4720c8:	str	ip, [sp, #24]
+  4720cc:	mov	r0, sl
+  4720d0:	bl	215734 <pthread_mutex_unlock@plt>
+  4720d4:	ldr	sl, [sp, #20]
+  4720d8:	cmp	sl, #0
+  4720dc:	beq	4720f0 <eglMakeCurrent@@Base+0xfc>
+  4720e0:	ldr	ip, [sp, #24]
+  4720e4:	ldr	r1, [ip, #8]
+  4720e8:	cmp	r1, #2
+  4720ec:	beq	47217c <eglMakeCurrent@@Base+0x188>
+  4720f0:	cmp	r5, #0
+  4720f4:	beq	472108 <eglMakeCurrent@@Base+0x114>
+  4720f8:	mov	r0, r7
+  4720fc:	bl	4692bc <eglQueryContext@@Base+0x398>
+  472100:	b	472108 <eglMakeCurrent@@Base+0x114>
+  472104:	mov	r4, #0
+  472108:	mov	r0, r4
+  47210c:	add	sp, sp, #60	; 0x3c
+  472110:	ldrd	r4, [sp]
+  472114:	ldrd	r6, [sp, #8]
+  472118:	ldrd	r8, [sp, #16]
+  47211c:	ldrd	sl, [sp, #24]
+  472120:	add	sp, sp, #32
+  472124:	pop	{pc}		; (ldr pc, [sp], #4)
+  472128:	orr	r1, lr, r3
+  47212c:	orrs	ip, ip, r1
+  472130:	bne	47216c <eglMakeCurrent@@Base+0x178>
+  472134:	mov	r0, sl
+  472138:	str	ip, [sp, #24]
+  47213c:	bl	215728 <pthread_mutex_lock@plt>
+  472140:	ldr	r0, [r7, #8]
+  472144:	ldr	r3, [sp, #24]
+  472148:	cmp	r0, #1
+  47214c:	movwne	r0, #12289	; 0x3001
+  472150:	movne	r4, r3
+  472154:	strne	r0, [r6, #12]
+  472158:	beq	472210 <eglMakeCurrent@@Base+0x21c>
+  47215c:	mov	r6, #0
+  472160:	str	r6, [sp, #20]
+  472164:	str	r6, [sp, #24]
+  472168:	b	4720cc <eglMakeCurrent@@Base+0xd8>
+  47216c:	movw	sl, #12297	; 0x3009
+  472170:	mov	r5, ip
+  472174:	str	sl, [r6, #12]
+  472178:	b	4720f0 <eglMakeCurrent@@Base+0xfc>
+  47217c:	ldr	r0, [sp, #24]
+  472180:	mov	r1, #0
+  472184:	bl	4692f4 <eglQueryContext@@Base+0x3d0>
+  472188:	b	4720f0 <eglMakeCurrent@@Base+0xfc>
+  47218c:	ldr	r4, [r6]
+  472190:	cmp	r4, #0
+  472194:	beq	4722e0 <eglMakeCurrent@@Base+0x2ec>
+  472198:	mov	r0, sl
+  47219c:	bl	215728 <pthread_mutex_lock@plt>
+  4721a0:	ldr	r0, [r6, #8]
+  4721a4:	cmp	r0, #0
+  4721a8:	beq	4721b8 <eglMakeCurrent@@Base+0x1c4>
+  4721ac:	ldrb	r2, [r0, #154]	; 0x9a
+  4721b0:	cmp	r2, #1
+  4721b4:	beq	4722a0 <eglMakeCurrent@@Base+0x2ac>
+  4721b8:	mov	r0, r6
+  4721bc:	mov	r1, #0
+  4721c0:	bl	471990 <egl_connect_native_window_to_egl@@Base+0x2c>
+  4721c4:	cmp	r0, #0
+  4721c8:	bne	4722ac <eglMakeCurrent@@Base+0x2b8>
+  4721cc:	movw	lr, #12291	; 0x3003
+  4721d0:	mov	r4, r0
+  4721d4:	str	lr, [r6, #12]
+  4721d8:	b	47215c <eglMakeCurrent@@Base+0x168>
+  4721dc:	str	r1, [sp, #24]
+  4721e0:	mov	r0, r7
+  4721e4:	mov	r1, r8
+  4721e8:	bl	4685a0 <eglChooseConfig@@Base+0xd08>
+  4721ec:	cmp	r0, #12288	; 0x3000
+  4721f0:	str	r0, [r6, #12]
+  4721f4:	ldr	r0, [sp, #24]
+  4721f8:	beq	47230c <eglMakeCurrent@@Base+0x318>
+  4721fc:	ldr	fp, [sp, #20]
+  472200:	mov	r5, r4
+  472204:	str	fp, [sp, #24]
+  472208:	mov	r4, fp
+  47220c:	b	4720cc <eglMakeCurrent@@Base+0xd8>
+  472210:	mov	r0, r7
+  472214:	mov	r1, r9
+  472218:	str	r3, [sp, #24]
+  47221c:	bl	46d6dc <eglCopyBuffers@@Base+0x7ac>
+  472220:	ldr	r2, [sp, #24]
+  472224:	cmp	r0, #12288	; 0x3000
+  472228:	str	r0, [r6, #12]
+  47222c:	movne	r4, r2
+  472230:	bne	47215c <eglMakeCurrent@@Base+0x168>
+  472234:	cmp	fp, r9
+  472238:	beq	472608 <eglMakeCurrent@@Base+0x614>
+  47223c:	mov	r0, r7
+  472240:	mov	r1, fp
+  472244:	bl	46d6dc <eglCopyBuffers@@Base+0x7ac>
+  472248:	cmp	r0, #12288	; 0x3000
+  47224c:	str	r0, [r6, #12]
+  472250:	movne	r4, #0
+  472254:	strne	r4, [sp, #32]
+  472258:	beq	472748 <eglMakeCurrent@@Base+0x754>
+  47225c:	mov	r3, #0
+  472260:	mov	r6, r3
+  472264:	mov	r4, r3
+  472268:	str	r3, [sp, #20]
+  47226c:	str	r3, [sp, #24]
+  472270:	mov	r0, r9
+  472274:	bl	46d79c <eglCopyBuffers@@Base+0x86c>
+  472278:	ldr	r9, [sp, #32]
+  47227c:	cmp	r9, #0
+  472280:	beq	47228c <eglMakeCurrent@@Base+0x298>
+  472284:	mov	r0, fp
+  472288:	bl	46d79c <eglCopyBuffers@@Base+0x86c>
+  47228c:	cmp	r6, #0
+  472290:	beq	4720cc <eglMakeCurrent@@Base+0xd8>
+  472294:	mov	r0, r8
+  472298:	bl	46864c <eglChooseConfig@@Base+0xdb4>
+  47229c:	b	4720cc <eglMakeCurrent@@Base+0xd8>
+  4722a0:	mov	r0, r6
+  4722a4:	mov	r1, #0
+  4722a8:	bl	471990 <egl_connect_native_window_to_egl@@Base+0x2c>
+  4722ac:	ldr	r4, [r7, #8]
+  4722b0:	cmp	r4, #2
+  4722b4:	movne	r4, #1
+  4722b8:	beq	472654 <eglMakeCurrent@@Base+0x660>
+  4722bc:	ldr	r8, [sp, #20]
+  4722c0:	cmp	r4, #0
+  4722c4:	mov	fp, #12288	; 0x3000
+  4722c8:	mov	r4, #1
+  4722cc:	str	fp, [r6, #12]
+  4722d0:	and	r8, r8, r5
+  4722d4:	mov	r5, r8
+  4722d8:	beq	4720f0 <eglMakeCurrent@@Base+0xfc>
+  4722dc:	b	47215c <eglMakeCurrent@@Base+0x168>
+  4722e0:	ldr	r1, [r7, #8]
+  4722e4:	cmp	r1, #2
+  4722e8:	bne	4722bc <eglMakeCurrent@@Base+0x2c8>
+  4722ec:	mov	r0, r7
+  4722f0:	mov	r1, r5
+  4722f4:	bl	4692f4 <eglQueryContext@@Base+0x3d0>
+  4722f8:	clz	r3, r0
+  4722fc:	lsr	r9, r3, #5
+  472300:	mov	r4, #0
+  472304:	str	r9, [sp, #20]
+  472308:	b	4722bc <eglMakeCurrent@@Base+0x2c8>
+  47230c:	ldrb	r2, [r8, #46]	; 0x2e
+  472310:	str	r0, [sp, #28]
+  472314:	mov	r4, r0
+  472318:	ldr	lr, [sp, #20]
+  47231c:	cmp	r2, #0
+  472320:	str	lr, [sp, #32]
+  472324:	mov	ip, lr
+  472328:	beq	472364 <eglMakeCurrent@@Base+0x370>
+  47232c:	ldr	r3, [r6]
+  472330:	cmp	r8, r3
+  472334:	beq	4723d8 <eglMakeCurrent@@Base+0x3e4>
+  472338:	movw	lr, #12290	; 0x3002
+  47233c:	mov	r4, #0
+  472340:	str	lr, [r6, #12]
+  472344:	str	r4, [sp, #24]
+  472348:	ldr	r3, [sp, #28]
+  47234c:	cmp	r3, #0
+  472350:	bne	472294 <eglMakeCurrent@@Base+0x2a0>
+  472354:	mov	r6, #1
+  472358:	cmp	ip, #0
+  47235c:	beq	472278 <eglMakeCurrent@@Base+0x284>
+  472360:	b	472270 <eglMakeCurrent@@Base+0x27c>
+  472364:	ldr	r3, [r6]
+  472368:	cmp	r3, #0
+  47236c:	mov	r2, r3
+  472370:	beq	47276c <eglMakeCurrent@@Base+0x778>
+  472374:	str	ip, [sp, #20]
+  472378:	ldr	ip, [r2]
+  47237c:	mov	r1, #0
+  472380:	ldr	r0, [r2, #12]
+  472384:	str	ip, [sp, #24]
+  472388:	bl	47d2f8 <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x11d4>
+  47238c:	cmp	r0, #0
+  472390:	ldr	ip, [sp, #20]
+  472394:	bne	472660 <eglMakeCurrent@@Base+0x66c>
+  472398:	ldr	lr, [r6, #8]
+  47239c:	cmp	lr, #0
+  4723a0:	beq	4723b0 <eglMakeCurrent@@Base+0x3bc>
+  4723a4:	ldrb	r3, [lr, #154]	; 0x9a
+  4723a8:	cmp	r3, #1
+  4723ac:	beq	472660 <eglMakeCurrent@@Base+0x66c>
+  4723b0:	ldr	r4, [sp, #24]
+  4723b4:	movw	r1, #12291	; 0x3003
+  4723b8:	str	r1, [r6, #12]
+  4723bc:	cmp	r7, r4
+  4723c0:	cmpne	r4, #0
+  4723c4:	movne	r4, #1
+  4723c8:	moveq	r4, #0
+  4723cc:	str	r4, [sp, #20]
+  4723d0:	mov	r4, #0
+  4723d4:	b	472348 <eglMakeCurrent@@Base+0x354>
+  4723d8:	cmp	r4, #0
+  4723dc:	bne	472368 <eglMakeCurrent@@Base+0x374>
+  4723e0:	ldrb	r1, [r9, #153]	; 0x99
+  4723e4:	cmp	r1, #1
+  4723e8:	beq	47281c <eglMakeCurrent@@Base+0x828>
+  4723ec:	ldrb	lr, [fp, #153]	; 0x99
+  4723f0:	cmp	lr, #1
+  4723f4:	beq	4728a0 <eglMakeCurrent@@Base+0x8ac>
+  4723f8:	ldr	r2, [r6]
+  4723fc:	cmp	r2, #0
+  472400:	bne	472374 <eglMakeCurrent@@Base+0x380>
+  472404:	mov	r4, #1
+  472408:	str	r2, [sp, #20]
+  47240c:	str	r2, [sp, #36]	; 0x24
+  472410:	str	r2, [sp, #24]
+  472414:	ldr	r3, [fp, #144]	; 0x90
+  472418:	str	ip, [sp, #44]	; 0x2c
+  47241c:	ldr	lr, [r9, #144]	; 0x90
+  472420:	ldr	r0, [r8, #12]
+  472424:	ldr	r2, [fp]
+  472428:	str	r3, [sp, #40]	; 0x28
+  47242c:	ldr	r3, [r9]
+  472430:	ubfx	lr, lr, #0, #22
+  472434:	ldr	r1, [fp, #36]	; 0x24
+  472438:	ldr	ip, [r9, #36]	; 0x24
+  47243c:	stmib	sp, {r3, lr}
+  472440:	ldr	lr, [sp, #40]	; 0x28
+  472444:	str	ip, [sp]
+  472448:	ubfx	r3, lr, #0, #22
+  47244c:	bl	47d1b8 <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x1094>
+  472450:	ldr	r0, [r9, #20]
+  472454:	ldr	r2, [sp, #44]	; 0x2c
+  472458:	cmp	r0, #0
+  47245c:	beq	472494 <eglMakeCurrent@@Base+0x4a0>
+  472460:	str	r2, [sp, #40]	; 0x28
+  472464:	bl	215578 <egl_color_buffer_get_rotation@plt>
+  472468:	mov	r2, r0
+  47246c:	mov	r1, #0
+  472470:	ldr	r0, [r8, #12]
+  472474:	bl	47d28c <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x1168>
+  472478:	ldr	r0, [r9, #20]
+  47247c:	bl	215e54 <egl_color_buffer_get_y_inversion@plt>
+  472480:	mov	r2, r0
+  472484:	mov	r1, #0
+  472488:	ldr	r0, [r8, #12]
+  47248c:	bl	47d32c <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x1208>
+  472490:	ldr	r2, [sp, #40]	; 0x28
+  472494:	ldr	r0, [fp, #20]
+  472498:	cmp	r0, #0
+  47249c:	beq	4724d4 <eglMakeCurrent@@Base+0x4e0>
+  4724a0:	str	r2, [sp, #40]	; 0x28
+  4724a4:	bl	215578 <egl_color_buffer_get_rotation@plt>
+  4724a8:	mov	r2, r0
+  4724ac:	mov	r1, #1
+  4724b0:	ldr	r0, [r8, #12]
+  4724b4:	bl	47d28c <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x1168>
+  4724b8:	ldr	r0, [fp, #20]
+  4724bc:	bl	215e54 <egl_color_buffer_get_y_inversion@plt>
+  4724c0:	mov	r2, r0
+  4724c4:	mov	r1, #1
+  4724c8:	ldr	r0, [r8, #12]
+  4724cc:	bl	47d32c <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x1208>
+  4724d0:	ldr	r2, [sp, #40]	; 0x28
+  4724d4:	ldr	r1, [r9, #12]
+  4724d8:	cmp	r1, #4
+  4724dc:	beq	4728ec <eglMakeCurrent@@Base+0x8f8>
+  4724e0:	ldr	r0, [fp, #12]
+  4724e4:	cmp	r0, #4
+  4724e8:	beq	4728bc <eglMakeCurrent@@Base+0x8c8>
+  4724ec:	mov	r0, r8
+  4724f0:	str	r8, [r6]
+  4724f4:	str	r2, [sp, #40]	; 0x28
+  4724f8:	bl	46862c <eglChooseConfig@@Base+0xd94>
+  4724fc:	ldr	r1, [r7, #76]	; 0x4c
+  472500:	ldr	ip, [sp, #40]	; 0x28
+  472504:	add	r2, r1, #1
+  472508:	str	r2, [r7, #76]	; 0x4c
+  47250c:	ldr	r0, [r6, #4]
+  472510:	cmp	fp, r0
+  472514:	beq	472538 <eglMakeCurrent@@Base+0x544>
+  472518:	ldr	lr, [sp, #36]	; 0x24
+  47251c:	cmp	fp, #0
+  472520:	str	fp, [r6, #4]
+  472524:	clz	r3, lr
+  472528:	lsr	r1, r3, #5
+  47252c:	moveq	r1, #0
+  472530:	cmp	r1, #0
+  472534:	bne	472850 <eglMakeCurrent@@Base+0x85c>
+  472538:	ldr	lr, [r6, #8]
+  47253c:	cmp	r9, lr
+  472540:	beq	472564 <eglMakeCurrent@@Base+0x570>
+  472544:	ldr	r3, [sp, #20]
+  472548:	str	r9, [r6, #8]
+  47254c:	eor	r1, r3, #1
+  472550:	cmp	r9, fp
+  472554:	moveq	r1, #0
+  472558:	andne	r1, r1, #1
+  47255c:	cmp	r1, #0
+  472560:	bne	472878 <eglMakeCurrent@@Base+0x884>
+  472564:	ldrb	r0, [r8, #47]	; 0x2f
+  472568:	cmp	r0, #0
+  47256c:	beq	4725ac <eglMakeCurrent@@Base+0x5b8>
+  472570:	cmp	r9, #0
+  472574:	beq	472918 <eglMakeCurrent@@Base+0x924>
+  472578:	mov	r1, r9
+  47257c:	add	r2, sp, #48	; 0x30
+  472580:	str	ip, [sp, #20]
+  472584:	mov	r0, r7
+  472588:	add	r3, sp, #52	; 0x34
+  47258c:	bl	46e3f8 <eglDestroySurface@@Base+0x13c>
+  472590:	ldr	ip, [sp, #20]
+  472594:	ldr	r1, [sp, #48]	; 0x30
+  472598:	ldr	r2, [sp, #52]	; 0x34
+  47259c:	ldr	r0, [r8, #12]
+  4725a0:	str	ip, [sp, #20]
+  4725a4:	bl	47d15c <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x1038>
+  4725a8:	ldr	ip, [sp, #20]
+  4725ac:	cmp	r4, #1
+  4725b0:	mov	lr, #1
+  4725b4:	mov	r4, #0
+  4725b8:	strb	lr, [r8, #46]	; 0x2e
+  4725bc:	strb	r4, [r8, #47]	; 0x2f
+  4725c0:	beq	472804 <eglMakeCurrent@@Base+0x810>
+  4725c4:	ldr	r0, [pc, #1052]	; 4729e8 <eglMakeCurrent@@Base+0x9f4>
+  4725c8:	add	r4, pc, r0
+  4725cc:	ldr	lr, [r4]
+  4725d0:	cmp	lr, #1
+  4725d4:	bls	4727c8 <eglMakeCurrent@@Base+0x7d4>
+  4725d8:	ldr	r1, [sp, #24]
+  4725dc:	mov	r6, #0
+  4725e0:	ldr	r4, [pc, #1028]	; 4729ec <eglMakeCurrent@@Base+0x9f8>
+  4725e4:	cmp	r7, r1
+  4725e8:	cmpne	r1, r6
+  4725ec:	add	r3, pc, r4
+  4725f0:	movne	r1, #1
+  4725f4:	moveq	r1, #0
+  4725f8:	mov	r4, #1
+  4725fc:	str	r1, [sp, #20]
+  472600:	str	r6, [r3]
+  472604:	b	472348 <eglMakeCurrent@@Base+0x354>
+  472608:	ldr	lr, [sp, #20]
+  47260c:	str	lr, [sp, #32]
+  472610:	ldr	r0, [r9, #12]
+  472614:	cmp	r0, #1
+  472618:	beq	472798 <eglMakeCurrent@@Base+0x7a4>
+  47261c:	ldr	ip, [fp, #12]
+  472620:	cmp	ip, #1
+  472624:	beq	472780 <eglMakeCurrent@@Base+0x78c>
+  472628:	mov	r0, r7
+  47262c:	mov	r1, r8
+  472630:	bl	4685a0 <eglChooseConfig@@Base+0xd08>
+  472634:	cmp	r0, #12288	; 0x3000
+  472638:	str	r0, [r6, #12]
+  47263c:	beq	4727a8 <eglMakeCurrent@@Base+0x7b4>
+  472640:	mov	r6, #0
+  472644:	mov	r4, r6
+  472648:	str	r6, [sp, #24]
+  47264c:	str	r6, [sp, #20]
+  472650:	b	472270 <eglMakeCurrent@@Base+0x27c>
+  472654:	mov	r0, sl
+  472658:	bl	215734 <pthread_mutex_unlock@plt>
+  47265c:	b	4722ec <eglMakeCurrent@@Base+0x2f8>
+  472660:	ldr	r0, [r6]
+  472664:	mov	r1, #0
+  472668:	str	ip, [sp, #20]
+  47266c:	bl	468684 <eglChooseConfig@@Base+0xdec>
+  472670:	ldr	r3, [r6, #4]
+  472674:	mov	r2, #0
+  472678:	ldr	ip, [sp, #20]
+  47267c:	str	r2, [r6]
+  472680:	cmp	r3, r2
+  472684:	beq	472964 <eglMakeCurrent@@Base+0x970>
+  472688:	cmp	r9, r3
+  47268c:	cmpne	fp, r3
+  472690:	beq	4726a4 <eglMakeCurrent@@Base+0x6b0>
+  472694:	mov	r0, r3
+  472698:	bl	46d87c <eglCopyBuffers@@Base+0x94c>
+  47269c:	ldr	r3, [r6, #4]
+  4726a0:	ldr	ip, [sp, #20]
+  4726a4:	cmp	fp, r3
+  4726a8:	ldr	r0, [r6, #8]
+  4726ac:	beq	472958 <eglMakeCurrent@@Base+0x964>
+  4726b0:	rsb	lr, r0, fp
+  4726b4:	clz	r1, lr
+  4726b8:	lsr	r2, r1, #5
+  4726bc:	str	r2, [sp, #36]	; 0x24
+  4726c0:	cmp	r0, #0
+  4726c4:	streq	r0, [sp, #20]
+  4726c8:	beq	47270c <eglMakeCurrent@@Base+0x718>
+  4726cc:	cmp	r0, r3
+  4726d0:	beq	472990 <eglMakeCurrent@@Base+0x99c>
+  4726d4:	cmp	r9, r0
+  4726d8:	cmpne	fp, r0
+  4726dc:	beq	4726f0 <eglMakeCurrent@@Base+0x6fc>
+  4726e0:	str	ip, [sp, #20]
+  4726e4:	bl	46d87c <eglCopyBuffers@@Base+0x94c>
+  4726e8:	ldr	r3, [r6, #4]
+  4726ec:	ldr	ip, [sp, #20]
+  4726f0:	cmp	r9, r3
+  4726f4:	beq	47299c <eglMakeCurrent@@Base+0x9a8>
+  4726f8:	ldr	r1, [r6, #8]
+  4726fc:	rsb	r2, r1, r9
+  472700:	clz	lr, r2
+  472704:	lsr	r0, lr, #5
+  472708:	str	r0, [sp, #20]
+  47270c:	cmp	r4, #0
+  472710:	beq	472414 <eglMakeCurrent@@Base+0x420>
+  472714:	mov	r4, #0
+  472718:	str	ip, [sp, #40]	; 0x28
+  47271c:	mov	ip, #0
+  472720:	ldr	r0, [r8, #12]
+  472724:	mov	r2, ip
+  472728:	mov	r1, ip
+  47272c:	str	ip, [sp]
+  472730:	mov	r3, ip
+  472734:	str	ip, [sp, #4]
+  472738:	str	ip, [sp, #8]
+  47273c:	bl	47d1b8 <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x1094>
+  472740:	ldr	r2, [sp, #40]	; 0x28
+  472744:	b	4724ec <eglMakeCurrent@@Base+0x4f8>
+  472748:	ldr	r0, [fp, #20]
+  47274c:	cmp	r0, #0
+  472750:	beq	472970 <eglMakeCurrent@@Base+0x97c>
+  472754:	bl	215b24 <egl_color_buffer_is_secure@plt>
+  472758:	cmp	r0, #1
+  47275c:	beq	47292c <eglMakeCurrent@@Base+0x938>
+  472760:	mov	r1, #1
+  472764:	str	r1, [sp, #32]
+  472768:	b	472610 <eglMakeCurrent@@Base+0x61c>
+  47276c:	str	r3, [sp, #20]
+  472770:	mov	r4, #1
+  472774:	str	r3, [sp, #36]	; 0x24
+  472778:	str	r3, [sp, #24]
+  47277c:	b	472718 <eglMakeCurrent@@Base+0x724>
+  472780:	ldrb	r3, [fp, #156]	; 0x9c
+  472784:	cmp	r3, #0
+  472788:	beq	472628 <eglMakeCurrent@@Base+0x634>
+  47278c:	movw	r0, #12290	; 0x3002
+  472790:	str	r0, [r6, #12]
+  472794:	b	47225c <eglMakeCurrent@@Base+0x268>
+  472798:	ldrb	lr, [r9, #156]	; 0x9c
+  47279c:	cmp	lr, #1
+  4727a0:	bne	47261c <eglMakeCurrent@@Base+0x628>
+  4727a4:	b	47278c <eglMakeCurrent@@Base+0x798>
+  4727a8:	ldrb	r1, [r8, #46]	; 0x2e
+  4727ac:	mov	r2, #0
+  4727b0:	mov	ip, #1
+  4727b4:	mov	r4, r2
+  4727b8:	str	r2, [sp, #28]
+  4727bc:	cmp	r1, r2
+  4727c0:	bne	47232c <eglMakeCurrent@@Base+0x338>
+  4727c4:	b	4723e0 <eglMakeCurrent@@Base+0x3ec>
+  4727c8:	ldr	r3, [pc, #544]	; 4729f0 <eglMakeCurrent@@Base+0x9fc>
+  4727cc:	ldr	r4, [pc, r3]
+  4727d0:	cmp	r4, #1
+  4727d4:	bne	4729c8 <eglMakeCurrent@@Base+0x9d4>
+  4727d8:	ldr	r2, [sp, #24]
+  4727dc:	ldr	r6, [pc, #528]	; 4729f4 <eglMakeCurrent@@Base+0xa00>
+  4727e0:	ldr	lr, [r8, #12]
+  4727e4:	cmp	r7, r2
+  4727e8:	cmpne	r2, #0
+  4727ec:	add	r0, pc, r6
+  4727f0:	movne	r2, #1
+  4727f4:	moveq	r2, #0
+  4727f8:	str	r2, [sp, #20]
+  4727fc:	str	lr, [r0]
+  472800:	b	472348 <eglMakeCurrent@@Base+0x354>
+  472804:	ldr	r3, [pc, #492]	; 4729f8 <eglMakeCurrent@@Base+0xa04>
+  472808:	add	r1, pc, r3
+  47280c:	ldr	r6, [r1]
+  472810:	add	r2, r6, #1
+  472814:	str	r2, [r1]
+  472818:	b	4725c4 <eglMakeCurrent@@Base+0x5d0>
+  47281c:	ldr	r0, [r6, #8]
+  472820:	cmp	r9, r0
+  472824:	beq	4723ec <eglMakeCurrent@@Base+0x3f8>
+  472828:	ldr	r2, [r6, #4]
+  47282c:	cmp	r9, r2
+  472830:	beq	4723ec <eglMakeCurrent@@Base+0x3f8>
+  472834:	mov	r2, #0
+  472838:	movw	r0, #12290	; 0x3002
+  47283c:	mov	r4, r2
+  472840:	str	r0, [r6, #12]
+  472844:	mov	r6, #1
+  472848:	str	r2, [sp, #24]
+  47284c:	b	472358 <eglMakeCurrent@@Base+0x364>
+  472850:	mov	r0, fp
+  472854:	str	ip, [sp, #36]	; 0x24
+  472858:	bl	46d7e0 <eglCopyBuffers@@Base+0x8b0>
+  47285c:	ldr	ip, [r7, #76]	; 0x4c
+  472860:	mov	r2, #1
+  472864:	add	r0, ip, r2
+  472868:	ldr	ip, [sp, #36]	; 0x24
+  47286c:	str	r0, [r7, #76]	; 0x4c
+  472870:	strb	r2, [fp, #153]	; 0x99
+  472874:	b	472538 <eglMakeCurrent@@Base+0x544>
+  472878:	mov	r0, r9
+  47287c:	str	ip, [sp, #20]
+  472880:	bl	46d7e0 <eglCopyBuffers@@Base+0x8b0>
+  472884:	ldr	r6, [r7, #76]	; 0x4c
+  472888:	mov	ip, #1
+  47288c:	add	r2, r6, ip
+  472890:	str	r2, [r7, #76]	; 0x4c
+  472894:	strb	ip, [r9, #153]	; 0x99
+  472898:	ldr	ip, [sp, #20]
+  47289c:	b	472564 <eglMakeCurrent@@Base+0x570>
+  4728a0:	ldr	r3, [r6, #8]
+  4728a4:	cmp	fp, r3
+  4728a8:	beq	4723f8 <eglMakeCurrent@@Base+0x404>
+  4728ac:	ldr	r1, [r6, #4]
+  4728b0:	cmp	fp, r1
+  4728b4:	bne	472834 <eglMakeCurrent@@Base+0x840>
+  4728b8:	b	4723f8 <eglMakeCurrent@@Base+0x404>
+  4728bc:	ldrb	r3, [fp, #152]	; 0x98
+  4728c0:	cmp	r3, #0
+  4728c4:	bne	4724ec <eglMakeCurrent@@Base+0x4f8>
+  4728c8:	ldr	ip, [pc, #300]	; 4729fc <eglMakeCurrent@@Base+0xa08>
+  4728cc:	str	r2, [sp, #40]	; 0x28
+  4728d0:	mov	r1, #1
+  4728d4:	mov	r3, fp
+  4728d8:	ldr	r0, [r8, #12]
+  4728dc:	ldr	r2, [pc, ip]
+  4728e0:	bl	47d2f4 <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x11d0>
+  4728e4:	ldr	r2, [sp, #40]	; 0x28
+  4728e8:	b	4724ec <eglMakeCurrent@@Base+0x4f8>
+  4728ec:	ldrb	r1, [r9, #152]	; 0x98
+  4728f0:	cmp	r1, #0
+  4728f4:	bne	4724e0 <eglMakeCurrent@@Base+0x4ec>
+  4728f8:	str	r2, [sp, #40]	; 0x28
+  4728fc:	ldr	r2, [pc, #252]	; 472a00 <eglMakeCurrent@@Base+0xa0c>
+  472900:	mov	r3, r9
+  472904:	ldr	r0, [r8, #12]
+  472908:	ldr	r2, [pc, r2]
+  47290c:	bl	47d2f4 <_ZN4llvm21llvm_is_multithreadedEv@@Base+0x11d0>
+  472910:	ldr	r2, [sp, #40]	; 0x28
+  472914:	b	4724e0 <eglMakeCurrent@@Base+0x4ec>
+  472918:	str	r9, [sp, #48]	; 0x30
+  47291c:	mov	r1, r9
+  472920:	mov	r2, r9
+  472924:	str	r9, [sp, #52]	; 0x34
+  472928:	b	47259c <eglMakeCurrent@@Base+0x5a8>
+  47292c:	ldr	r0, [r9, #20]
+  472930:	cmp	r0, #0
+  472934:	beq	4729a8 <eglMakeCurrent@@Base+0x9b4>
+  472938:	bl	215b24 <egl_color_buffer_is_secure@plt>
+  47293c:	cmp	r0, #0
+  472940:	bne	472760 <eglMakeCurrent@@Base+0x76c>
+  472944:	movw	lr, #12290	; 0x3002
+  472948:	mov	ip, #1
+  47294c:	str	lr, [r6, #12]
+  472950:	str	ip, [sp, #32]
+  472954:	b	47225c <eglMakeCurrent@@Base+0x268>
+  472958:	mov	lr, #1
+  47295c:	str	lr, [sp, #36]	; 0x24
+  472960:	b	4726c0 <eglMakeCurrent@@Base+0x6cc>
+  472964:	str	r3, [sp, #36]	; 0x24
+  472968:	ldr	r0, [r6, #8]
+  47296c:	b	4726c0 <eglMakeCurrent@@Base+0x6cc>
+  472970:	ldr	ip, [r7, #24]
+  472974:	mov	r1, #12992	; 0x32c0
+  472978:	ldr	r0, [fp, #16]
+  47297c:	ldr	r3, [ip, #76]	; 0x4c
+  472980:	blx	r3
+  472984:	cmn	r0, #1
+  472988:	bne	472758 <eglMakeCurrent@@Base+0x764>
+  47298c:	b	472760 <eglMakeCurrent@@Base+0x76c>
+  472990:	mov	r0, #0
+  472994:	str	r0, [sp, #20]
+  472998:	b	47270c <eglMakeCurrent@@Base+0x718>
+  47299c:	mov	r3, #1
+  4729a0:	str	r3, [sp, #20]
+  4729a4:	b	47270c <eglMakeCurrent@@Base+0x718>
+  4729a8:	ldr	r2, [r7, #24]
+  4729ac:	mov	r1, #12992	; 0x32c0
+  4729b0:	ldr	r0, [r9, #16]
+  4729b4:	ldr	r4, [r2, #76]	; 0x4c
+  4729b8:	blx	r4
+  4729bc:	cmn	r0, #1
+  4729c0:	bne	47293c <eglMakeCurrent@@Base+0x948>
+  4729c4:	b	472944 <eglMakeCurrent@@Base+0x950>
+  4729c8:	ldr	r1, [sp, #24]
+  4729cc:	mov	r4, #1
+  4729d0:	cmp	r7, r1
+  4729d4:	cmpne	r1, #0
+  4729d8:	movne	r1, #1
+  4729dc:	moveq	r1, #0
+  4729e0:	str	r1, [sp, #20]
+  4729e4:	b	472348 <eglMakeCurrent@@Base+0x354>
+  4729e8:			; <UNDEFINED> instruction: 0x01277350
+  4729ec:			; <UNDEFINED> instruction: 0x01271c10
+  4729f0:			; <UNDEFINED> instruction: 0x01271a30
+  4729f4:			; <UNDEFINED> instruction: 0x0127713c
+  4729f8:			; <UNDEFINED> instruction: 0x01277110
+  4729fc:			; <UNDEFINED> instruction: 0x012650e8
+  472a00:	strheq	r5, [r6, -ip]!
+
+00472a04 <eglGetCurrentContext@@Base>:
+  472a04:	str	r4, [sp, #-8]!
+  472a08:	str	lr, [sp, #4]
+  472a0c:	bl	471c58 <egl_connect_native_window_to_egl@@Base+0x2f4>

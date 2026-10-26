@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# The capacity_max restore must always run at boot; the charge-limit daemon is
+# opt-in (charge_limit=0 by default) and is not enabled here.
+
+post_install() {
+	if [ -d /etc/runlevels ] && command -v rc-update >/dev/null 2>&1; then
+		rc-update add j7elte-efs-restore default >/dev/null 2>&1 || true
+	elif command -v systemctl >/dev/null 2>&1; then
+		systemctl enable j7elte-efs-restore.service >/dev/null 2>&1 || true
+	fi
+}
+
+pre_deinstall() {
+	if [ -d /etc/runlevels ] && command -v rc-update >/dev/null 2>&1; then
+		rc-update del j7elte-efs-restore default >/dev/null 2>&1 || true
+		rc-update del j7elte-power default >/dev/null 2>&1 || true
+	elif command -v systemctl >/dev/null 2>&1; then
+		systemctl disable j7elte-efs-restore.service >/dev/null 2>&1 || true
+		systemctl disable j7elte-power.service >/dev/null 2>&1 || true
+	fi
+}

@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+# OpenRC service for the BCM4752 GPS bridge (Samsung Galaxy J7 / j7elte).
+#
+# j7elte-gpsd never forks, so start-stop-daemon backgrounds it and records
+# the pid itself.
+
+description="BCM4752 GPS NMEA bridge"
+command="/usr/sbin/j7elte-gpsd"
+command_background="true"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+[ -f /etc/j7elte-gpsd.conf ] && . /etc/j7elte-gpsd.conf
+: "${J7ELTE_GPSD_OPTS:=--device /dev/ttySAC0 --baud 921600 --gpio /sys/class/sec/gps/GPS_PWR_EN/value --power-delay 250}"
+command_args="$J7ELTE_GPSD_OPTS"
+
+depend() {
+	after localmount
+	before gpsd
+	provide gps
+	keyword -prefix
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/j7elte-gpsd
+}

@@ -1,0 +1,24 @@
+diff --git a/device/archived/device-samsung-j7elte/APKBUILD b/device/archived/device-samsung-j7elte/APKBUILD
+index 57d7f98..26c0236 100644
+--- a/device/archived/device-samsung-j7elte/APKBUILD
++++ b/device/archived/device-samsung-j7elte/APKBUILD
+@@ -11,6 +11,19 @@ arch="aarch64"
+ options="!check !archcheck"
+ depends="
+ 	linux-samsung-j7elte
++	firmware-samsung-j7elte
++	j7elte-audio-jack
++	j7elte-audio-ucm
++	j7elte-bt
++	j7elte-cam
++	j7elte-cbd
++	j7elte-fde
++	j7elte-gpsd
++	j7elte-gpu-soft
++	j7elte-power
++	j7elte-ril
++	j7elte-sensors
++	j7elte-wifi
+ 	mkbootimg
+ 	postmarketos-base
+ "

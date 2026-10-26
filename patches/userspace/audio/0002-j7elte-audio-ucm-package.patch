@@ -1,0 +1,751 @@
+diff --git a/device/archived/j7elte-audio-ucm/APKBUILD b/device/archived/j7elte-audio-ucm/APKBUILD
+new file mode 100644
+index 0000000..a1e93c2
+--- /dev/null
++++ b/device/archived/j7elte-audio-ucm/APKBUILD
+@@ -0,0 +1,49 @@
++# Audio routing configuration for the Samsung Galaxy J7 (j7elte).
++#
++# Installs an ALSA UCM2 profile for the ASoC sound card
++# "Universal7580-I2S" (COD3022X codec + S2801X aux codec), derived from
++# the stock ROM mixer graph.  Also installs the ROM's Android HAL jack
++# configuration for reference.
++#
++# Control names were cross-checked against the Nura kernel sources; see
++# parity/reports/audio-userspace.md.
++
++pkgname=j7elte-audio-ucm
++pkgver=0.1
++pkgrel=0
++pkgdesc="ALSA UCM2 profile and jack mixer data for Samsung Galaxy J7 (j7elte)"
++url="https://postmarketos.org"
++arch="aarch64"
++# UCM routes are derived from the stock Samsung ROM mixer_paths.xml.
++license="proprietary"
++options="!check !archcheck"
++depends="alsa-ucm-conf"
++
++source="
++	Universal7580-I2S.conf
++	HiFi.conf
++	VoiceCall.conf
++	jack_alsa_mixer.json
++"
++
++build() {
++	:
++}
++
++package() {
++	install -Dm644 "$srcdir"/Universal7580-I2S.conf \
++		"$pkgdir"/usr/share/alsa/ucm2/conf.d/Universal7580-I2S/Universal7580-I2S.conf
++	install -Dm644 "$srcdir"/HiFi.conf \
++		"$pkgdir"/usr/share/alsa/ucm2/j7elte/HiFi.conf
++	install -Dm644 "$srcdir"/VoiceCall.conf \
++		"$pkgdir"/usr/share/alsa/ucm2/j7elte/VoiceCall.conf
++	install -Dm644 "$srcdir"/jack_alsa_mixer.json \
++		"$pkgdir"/usr/share/j7elte-audio/jack_alsa_mixer.json
++}
++
++sha512sums="
++8789d5411a0daf1dbbbcd41b25c828f4564dff1afb532bde029f196c033207adea06229d8f9281b9fd15f0bb126f5a048b6df68de1b47e0b87355759d41571b3  HiFi.conf
++986bbf48daa3159b236528de1b56a5bc4e2ea064bbc30adca4d564e5de9aa50bbebf8c783ac235dca414a05547997a7b709dc573e1fa75910e1acf64bd1fbb4e  Universal7580-I2S.conf
++bf9f399ad254ee04e629435c16361aa6def0ce85b68cceb802726f4a88dc484ed5fcbbc6e2192b797684d96b656c42bef948d9db5d2400d11b49b8463f91d31a  VoiceCall.conf
++1fae831c79ad1f592003b43222a15a019db964c7513e5dde72ca2d921d4cea2f497198c841e7d9af84f8341ed5891492c75ed42d2be21c62d88041686eeb3ee7  jack_alsa_mixer.json
++"
+diff --git a/device/archived/j7elte-audio-ucm/HiFi.conf b/device/archived/j7elte-audio-ucm/HiFi.conf
+new file mode 100644
+index 0000000..0f09249
+--- /dev/null
++++ b/device/archived/j7elte-audio-ucm/HiFi.conf
+@@ -0,0 +1,296 @@
++# HiFi use case for the Universal7580-I2S card (j7elte).
++#
++# Control names:
++#   - un-prefixed        : COD3022X codec (sound/soc/codecs/cod3022x.c)
++#   - "S2801 <name>"     : S2801X aux codec (sound/soc/codecs/s2801x.c);
++#                          ASoC adds the "S2801" name_prefix from
++#                          snd_soc_codec_conf in
++#                          sound/soc/samsung/universal7580-cod3022x.c
++#   - MXxx / XX On       : DAPM switches of the COD3022X codec
++#
++# Playback and capture PCM are DAI link 0 ("i2s0-pri", codec DAI
++# "cod3022x-aif"), i.e. hw:${CardId},0 for both directions.
++
++Syntax 3
++
++SectionVerb {
++	EnableSequence [
++		# Stock ROM reset state (mixer_paths.xml top-level <ctl> set).
++		cset "name='S2801 Mixer En' 'Off'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'Off'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'Off'"
++		cset "name='S2801 CH2 Mixer En' 'Off'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'Off'"
++		cset "name='S2801 RMIX2 En' 'Off'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='S2801 CH1 DOUT Select' 'DMIX_OUT'"
++		cset "name='S2801 CH2 DOUT Select' 'DMIX_OUT'"
++		cset "name='S2801 CH3 DOUT Select' 'DMIX_OUT'"
++		cset "name='MonoMix Mode' 'Disable'"
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' off"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++	]
++
++	DisableSequence [
++		cset "name='S2801 Mixer En' 'Off'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'Off'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'Off'"
++		cset "name='S2801 CH2 Mixer En' 'Off'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'Off'"
++		cset "name='S2801 RMIX2 En' 'Off'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' off"
++	]
++}
++
++# ---------------------------------------------------------------- playback
++
++SectionDevice."Earpiece" {
++	Comment "Earpiece (handset) playback"
++
++	EnableSequence [
++		# route-ap-tx
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'Off'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='MonoMix Mode' 'Disable'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-codec-disable-analog-bypass
++		cset "name='HPL Mixer ADCL Switch' off"
++		cset "name='HPL Mixer ADCR Switch' off"
++		cset "name='HPR Mixer ADCL Switch' off"
++		cset "name='HPR Mixer ADCR Switch' off"
++		cset "name='EP Mixer ADCL Switch' off"
++		cset "name='EP Mixer ADCR Switch' off"
++		cset "name='SPK Mixer ADCL Switch' off"
++		cset "name='SPK Mixer ADCR Switch' off"
++		# dev-handset
++		cset "name='HP HP On' off"
++		cset "name='SPK SPK On' off"
++		cset "name='EP EP On' on"
++		# gain-media-handset
++		cset "name='S2801 MIX1_LVL' 0"
++		cset "name='DAC Gain' 116"
++		cset "name='Earphone Volume' 0"
++	]
++
++	DisableSequence [
++		cset "name='EP EP On' off"
++		cset "name='HP HP On' off"
++		cset "name='SPK SPK On' off"
++	]
++
++	Value {
++		PlaybackPriority 200
++		PlaybackPCM "hw:${CardId},0"
++		PlaybackChannels 2
++		PlaybackRate 48000
++	}
++}
++
++SectionDevice."Speaker" {
++	Comment "Loudspeaker playback"
++
++	EnableSequence [
++		# route-ap-tx
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'Off'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='MonoMix Mode' 'Disable'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-codec-disable-analog-bypass
++		cset "name='HPL Mixer ADCL Switch' off"
++		cset "name='HPL Mixer ADCR Switch' off"
++		cset "name='HPR Mixer ADCL Switch' off"
++		cset "name='HPR Mixer ADCR Switch' off"
++		cset "name='EP Mixer ADCL Switch' off"
++		cset "name='EP Mixer ADCR Switch' off"
++		cset "name='SPK Mixer ADCL Switch' off"
++		cset "name='SPK Mixer ADCR Switch' off"
++		# dev-speaker
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' on"
++		# gain-media-speaker
++		cset "name='S2801 MIX1_LVL' 0"
++		cset "name='DAC Gain' 121"
++		cset "name='Speaker Volume' 3"
++	]
++
++	DisableSequence [
++		cset "name='SPK SPK On' off"
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++	]
++
++	Value {
++		PlaybackPriority 100
++		PlaybackPCM "hw:${CardId},0"
++		PlaybackChannels 2
++		PlaybackRate 48000
++	}
++}
++
++SectionDevice."Headphones" {
++	Comment "Headphone / headset playback"
++
++	EnableSequence [
++		# route-ap-tx
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'Off'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='MonoMix Mode' 'Disable'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-codec-disable-analog-bypass
++		cset "name='HPL Mixer ADCL Switch' off"
++		cset "name='HPL Mixer ADCR Switch' off"
++		cset "name='HPR Mixer ADCL Switch' off"
++		cset "name='HPR Mixer ADCR Switch' off"
++		cset "name='EP Mixer ADCL Switch' off"
++		cset "name='EP Mixer ADCR Switch' off"
++		cset "name='SPK Mixer ADCL Switch' off"
++		cset "name='SPK Mixer ADCR Switch' off"
++		# dev-headset
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' off"
++		cset "name='HP HP On' on"
++		# gain-media-headset
++		cset "name='S2801 MIX1_LVL' 0"
++		cset "name='DAC Gain' 121"
++		cset "name='Headphone Volume' 36"
++	]
++
++	DisableSequence [
++		cset "name='HP HP On' off"
++		cset "name='SPK SPK On' off"
++		cset "name='EP EP On' off"
++	]
++
++	Value {
++		PlaybackPriority 300
++		PlaybackPCM "hw:${CardId},0"
++		PlaybackChannels 2
++		PlaybackRate 48000
++	}
++}
++
++# ----------------------------------------------------------------- capture
++
++SectionDevice."Mic" {
++	Comment "Main (bottom) microphone capture"
++
++	EnableSequence [
++		# route-ap-rx
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 CH1 DOUT Select' 'AIF4IN'"
++		# dev-main-mic
++		cset "name='ADCL Mixer MIC1L Switch' 1"
++		cset "name='ADCL Mixer MIC2L Switch' 0"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 1"
++		cset "name='ADCR Mixer MIC2R Switch' 0"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='MIC2 MIC2 On' off"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' on"
++		# gain-media-mic
++		cset "name='MIC1 Volume' 11"
++		cset "name='MIC1 Boost Volume' 2"
++		cset "name='ADC Left Gain' 127"
++		cset "name='ADC Right Gain' 127"
++	]
++
++	DisableSequence [
++		# dev-codec-in-disable
++		cset "name='ADCL Mixer MIC1L Switch' 0"
++		cset "name='ADCL Mixer MIC2L Switch' 0"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 0"
++		cset "name='ADCR Mixer MIC2R Switch' 0"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='MIC2 MIC2 On' off"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' off"
++	]
++
++	Value {
++		CapturePriority 100
++		CapturePCM "hw:${CardId},0"
++		CaptureChannels 2
++		CaptureRate 48000
++	}
++}
++
++SectionDevice."Headset Mic" {
++	Comment "Headset microphone capture"
++
++	EnableSequence [
++		# route-ap-rx
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 CH1 DOUT Select' 'AIF4IN'"
++		# dev-headset-mic
++		cset "name='ADCL Mixer MIC1L Switch' 0"
++		cset "name='ADCL Mixer MIC2L Switch' 1"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 0"
++		cset "name='ADCR Mixer MIC2R Switch' 1"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' off"
++		cset "name='MIC2 MIC2 On' on"
++		# gain-media-headset-mic
++		cset "name='MIC2 Volume' 11"
++		cset "name='MIC2 Boost Volume' 2"
++		cset "name='ADC Left Gain' 127"
++		cset "name='ADC Right Gain' 127"
++	]
++
++	DisableSequence [
++		cset "name='ADCL Mixer MIC1L Switch' 0"
++		cset "name='ADCL Mixer MIC2L Switch' 0"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 0"
++		cset "name='ADCR Mixer MIC2R Switch' 0"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='MIC2 MIC2 On' off"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' off"
++	]
++
++	Value {
++		CapturePriority 200
++		CapturePCM "hw:${CardId},0"
++		CaptureChannels 2
++		CaptureRate 48000
++	}
++}
+diff --git a/device/archived/j7elte-audio-ucm/Universal7580-I2S.conf b/device/archived/j7elte-audio-ucm/Universal7580-I2S.conf
+new file mode 100644
+index 0000000..4782592
+--- /dev/null
++++ b/device/archived/j7elte-audio-ucm/Universal7580-I2S.conf
+@@ -0,0 +1,20 @@
++# ALSA Use Case Manager configuration for Samsung Galaxy J7 (j7elte)
++# Sound card: ASoC card name / driver "Universal7580-I2S"
++# (sound/soc/samsung/universal7580-cod3022x.c, COD3022X + S2801X aux codec)
++#
++# Derived from the stock ROM mixer graph
++# (/etc/mixer_paths.xml, J700MUBU2BRC2).  Every control name below is
++# registered by the Nura kernel driver; see
++# parity/reports/audio-userspace.md for the cross-check.
++
++Syntax 3
++
++SectionUseCase."HiFi" {
++	File "/j7elte/HiFi.conf"
++	Comment "Music playback, capture, headset and headphone routing"
++}
++
++SectionUseCase."VoiceCall" {
++	File "/j7elte/VoiceCall.conf"
++	Comment "Voice call routing through the CP (modem) DAI"
++}
+diff --git a/device/archived/j7elte-audio-ucm/VoiceCall.conf b/device/archived/j7elte-audio-ucm/VoiceCall.conf
+new file mode 100644
+index 0000000..6f9b748
+--- /dev/null
++++ b/device/archived/j7elte-audio-ucm/VoiceCall.conf
+@@ -0,0 +1,343 @@
++# VoiceCall use case for the Universal7580-I2S card (j7elte).
++#
++# Uses DAI link 2 ("cp" / "voice call", codec DAI "cod3022x-aif2"),
++# exposed as hw:${CardId},2.  Control sequences are the stock ROM
++# incall_nb-* / gain-incall_nb-* paths.
++#
++# NOTE: on this vendor kernel the CP link uses the "snd-soc-dummy"
++# platform, i.e. no in-kernel modem/voice PCM backend is attached.
++# The mixer graph below is complete and matches the ROM, but audible
++# call audio additionally needs a modem audio driver/userspace stack
++# that postmarketOS does not currently provide for j7elte.
++
++Syntax 3
++
++SectionVerb {
++	EnableSequence [
++		cset "name='S2801 Mixer En' 'Off'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'Off'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'Off'"
++		cset "name='S2801 CH2 Mixer En' 'Off'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'Off'"
++		cset "name='S2801 RMIX2 En' 'Off'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='MonoMix Mode' 'Disable'"
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' off"
++	]
++
++	DisableSequence [
++		cset "name='S2801 Mixer En' 'Off'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'Off'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'Off'"
++		cset "name='S2801 CH2 Mixer En' 'Off'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'Off'"
++		cset "name='S2801 RMIX2 En' 'Off'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' off"
++	]
++}
++
++SectionDevice."Earpiece" {
++	Comment "Earpiece voice call"
++
++	EnableSequence [
++		# route-cp
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'On'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'On'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'On'"
++		cset "name='S2801 RMIX2 En' 'On'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='S2801 CH1 DOUT Select' 'RMIX_OUT'"
++		cset "name='S2801 CH2 DOUT Select' 'AIF4IN'"
++		cset "name='MonoMix Mode' 'L'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-codec-disable-analog-bypass
++		cset "name='HPL Mixer ADCL Switch' off"
++		cset "name='HPL Mixer ADCR Switch' off"
++		cset "name='HPR Mixer ADCL Switch' off"
++		cset "name='HPR Mixer ADCR Switch' off"
++		cset "name='EP Mixer ADCL Switch' off"
++		cset "name='EP Mixer ADCR Switch' off"
++		cset "name='SPK Mixer ADCL Switch' off"
++		cset "name='SPK Mixer ADCR Switch' off"
++		# dev-handset
++		cset "name='HP HP On' off"
++		cset "name='SPK SPK On' off"
++		cset "name='EP EP On' on"
++		# gain-incall_nb-handset
++		cset "name='S2801 MIX1_LVL' 0"
++		cset "name='S2801 MIX2_LVL' 0"
++		cset "name='DAC Gain' 127"
++		cset "name='Earphone Volume' 0"
++	]
++
++	DisableSequence [
++		cset "name='EP EP On' off"
++		cset "name='HP HP On' off"
++		cset "name='SPK SPK On' off"
++	]
++
++	Value {
++		PlaybackPriority 200
++		PlaybackPCM "hw:${CardId},2"
++		PlaybackChannels 2
++		PlaybackRate 8000
++	}
++}
++
++SectionDevice."Speaker" {
++	Comment "Speaker voice call"
++
++	EnableSequence [
++		# route-cp
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'On'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'On'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'On'"
++		cset "name='S2801 RMIX2 En' 'On'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='S2801 CH1 DOUT Select' 'RMIX_OUT'"
++		cset "name='S2801 CH2 DOUT Select' 'AIF4IN'"
++		cset "name='MonoMix Mode' 'L'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-codec-disable-analog-bypass
++		cset "name='HPL Mixer ADCL Switch' off"
++		cset "name='HPL Mixer ADCR Switch' off"
++		cset "name='HPR Mixer ADCL Switch' off"
++		cset "name='HPR Mixer ADCR Switch' off"
++		cset "name='EP Mixer ADCL Switch' off"
++		cset "name='EP Mixer ADCR Switch' off"
++		cset "name='SPK Mixer ADCL Switch' off"
++		cset "name='SPK Mixer ADCR Switch' off"
++		# dev-speaker
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' on"
++		# gain-incall_nb-speaker
++		cset "name='S2801 MIX1_LVL' 0"
++		cset "name='S2801 MIX2_LVL' 0"
++		cset "name='DAC Gain' 127"
++		cset "name='Speaker Volume' 3"
++	]
++
++	DisableSequence [
++		cset "name='SPK SPK On' off"
++		cset "name='HP HP On' off"
++		cset "name='EP EP On' off"
++	]
++
++	Value {
++		PlaybackPriority 100
++		PlaybackPCM "hw:${CardId},2"
++		PlaybackChannels 2
++		PlaybackRate 8000
++	}
++}
++
++SectionDevice."Headphones" {
++	Comment "Headphone voice call"
++
++	EnableSequence [
++		# route-cp
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'On'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'On'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'On'"
++		cset "name='S2801 RMIX2 En' 'On'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='S2801 CH1 DOUT Select' 'RMIX_OUT'"
++		cset "name='S2801 CH2 DOUT Select' 'AIF4IN'"
++		cset "name='MonoMix Mode' 'L'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-codec-disable-analog-bypass
++		cset "name='HPL Mixer ADCL Switch' off"
++		cset "name='HPL Mixer ADCR Switch' off"
++		cset "name='HPR Mixer ADCL Switch' off"
++		cset "name='HPR Mixer ADCR Switch' off"
++		cset "name='EP Mixer ADCL Switch' off"
++		cset "name='EP Mixer ADCR Switch' off"
++		cset "name='SPK Mixer ADCL Switch' off"
++		cset "name='SPK Mixer ADCR Switch' off"
++		# dev-headset
++		cset "name='EP EP On' off"
++		cset "name='SPK SPK On' off"
++		cset "name='HP HP On' on"
++		# gain-incall_nb-headset
++		cset "name='S2801 MIX1_LVL' 0"
++		cset "name='S2801 MIX2_LVL' 0"
++		cset "name='DAC Gain' 122"
++		cset "name='Headphone Volume' 36"
++	]
++
++	DisableSequence [
++		cset "name='HP HP On' off"
++		cset "name='SPK SPK On' off"
++		cset "name='EP EP On' off"
++	]
++
++	Value {
++		PlaybackPriority 300
++		PlaybackPCM "hw:${CardId},2"
++		PlaybackChannels 2
++		PlaybackRate 8000
++	}
++}
++
++SectionDevice."Mic" {
++	Comment "Main microphone voice call capture"
++
++	EnableSequence [
++		# route-cp
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'On'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'On'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'On'"
++		cset "name='S2801 RMIX2 En' 'On'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='S2801 CH1 DOUT Select' 'RMIX_OUT'"
++		cset "name='S2801 CH2 DOUT Select' 'AIF4IN'"
++		cset "name='MonoMix Mode' 'L'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-dual-mic == dev-main-mic
++		cset "name='ADCL Mixer MIC1L Switch' 1"
++		cset "name='ADCL Mixer MIC2L Switch' 0"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 1"
++		cset "name='ADCR Mixer MIC2R Switch' 0"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='MIC2 MIC2 On' off"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' on"
++		# gain-incall_nb-handset-mic
++		cset "name='S2801 RMIX1_LVL' 0"
++		cset "name='S2801 RMIX2_LVL' 0"
++		cset "name='MIC1 Volume' 11"
++		cset "name='MIC1 Boost Volume' 2"
++		cset "name='ADC Left Gain' 127"
++		cset "name='ADC Right Gain' 127"
++	]
++
++	DisableSequence [
++		cset "name='ADCL Mixer MIC1L Switch' 0"
++		cset "name='ADCL Mixer MIC2L Switch' 0"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 0"
++		cset "name='ADCR Mixer MIC2R Switch' 0"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='MIC2 MIC2 On' off"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' off"
++	]
++
++	Value {
++		CapturePriority 100
++		CapturePCM "hw:${CardId},2"
++		CaptureChannels 2
++		CaptureRate 8000
++	}
++}
++
++SectionDevice."Headset Mic" {
++	Comment "Headset microphone voice call capture"
++
++	EnableSequence [
++		# route-cp
++		cset "name='S2801 Mixer En' 'On'"
++		cset "name='S2801 SRC1 En' 'Off'"
++		cset "name='S2801 SRC2 En' 'On'"
++		cset "name='S2801 SRC3 En' 'Off'"
++		cset "name='S2801 CH1 Mixer En' 'On'"
++		cset "name='S2801 CH2 Mixer En' 'On'"
++		cset "name='S2801 CH3 Mixer En' 'Off'"
++		cset "name='S2801 CH4 Mixer En' 'Off'"
++		cset "name='S2801 RMIX1 En' 'On'"
++		cset "name='S2801 RMIX2 En' 'On'"
++		cset "name='S2801 CH3 Rec En' 'Off'"
++		cset "name='S2801 CH1 DOUT Select' 'RMIX_OUT'"
++		cset "name='S2801 CH2 DOUT Select' 'AIF4IN'"
++		cset "name='MonoMix Mode' 'L'"
++		cset "name='Chargepump Mode' 'CLASS-G-A'"
++		cset "name='DNC Max Gain' 24"
++		# dev-headset-mic
++		cset "name='ADCL Mixer MIC1L Switch' 0"
++		cset "name='ADCL Mixer MIC2L Switch' 1"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 0"
++		cset "name='ADCR Mixer MIC2R Switch' 1"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' off"
++		cset "name='MIC2 MIC2 On' on"
++		# gain-incall_nb-headset-mic
++		cset "name='S2801 RMIX1_LVL' 0"
++		cset "name='S2801 RMIX2_LVL' 0"
++		cset "name='MIC2 Volume' 11"
++		cset "name='MIC2 Boost Volume' 1"
++		cset "name='ADC Left Gain' 139"
++		cset "name='ADC Right Gain' 139"
++	]
++
++	DisableSequence [
++		cset "name='ADCL Mixer MIC1L Switch' 0"
++		cset "name='ADCL Mixer MIC2L Switch' 0"
++		cset "name='ADCL Mixer LINELL Switch' 0"
++		cset "name='ADCL Mixer LINERL Switch' 0"
++		cset "name='ADCR Mixer MIC1R Switch' 0"
++		cset "name='ADCR Mixer MIC2R Switch' 0"
++		cset "name='ADCR Mixer LINELR Switch' 0"
++		cset "name='ADCR Mixer LINERR Switch' 0"
++		cset "name='MIC2 MIC2 On' off"
++		cset "name='LINEIN LINEIN On' off"
++		cset "name='MIC1 MIC1 On' off"
++	]
++
++	Value {
++		CapturePriority 200
++		CapturePCM "hw:${CardId},2"
++		CaptureChannels 2
++		CaptureRate 8000
++	}
++}
+diff --git a/device/archived/j7elte-audio-ucm/jack_alsa_mixer.json b/device/archived/j7elte-audio-ucm/jack_alsa_mixer.json
+new file mode 100644
+index 0000000..dd5ffd9
+--- /dev/null
++++ b/device/archived/j7elte-audio-ucm/jack_alsa_mixer.json
+@@ -0,0 +1,13 @@
++[
++  {
++    "device" : "configure",
++    "params" :
++    [
++      {"name" : "loopback",   "value" : "2"       },
++      {"name" : "device",     "value" : "alsa"    },
++      {"name" : "samplerate", "value" : "48000"   },
++      {"name" : "period",     "value" : "960"     },
++      {"name" : "nperiods",   "value" : "2"      }
++    ]
++  }
++]

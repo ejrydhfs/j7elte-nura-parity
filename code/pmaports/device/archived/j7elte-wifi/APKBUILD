@@ -1,0 +1,51 @@
+# Maintainer: ROM/Nura parity integration (SM-J700M / j7elte)
+#
+# Configuration-only package: the bcmdhd driver is built into
+# linux-samsung-j7elte (CONFIG_BCM4343=y) and registers wlan0 itself.  This
+# package provides the wpa_supplicant template and the /efs/wifi directory the
+# driver uses to persist a generated per-device MAC.
+pkgname=j7elte-wifi
+pkgver=0.1
+pkgrel=0
+pkgdesc="Wi-Fi userspace configuration for the built-in bcmdhd driver (Samsung Galaxy J7)"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+options="!check"
+depends="wpa_supplicant"
+install="$pkgname.post-install"
+source="wpa_supplicant.conf
+	j7elte-wifi.initd
+	j7elte-wifi.confd
+	j7elte-wifi.tmpfiles
+	j7elte-wifi.post-install
+	"
+builddir="$srcdir"
+
+package() {
+	install -Dm644 "$srcdir"/wpa_supplicant.conf \
+		"$pkgdir"/etc/wpa_supplicant/wpa_supplicant.conf
+
+	# OpenRC: provision /efs/wifi before anything brings wlan0 up.
+	install -Dm755 "$srcdir"/j7elte-wifi.initd \
+		"$pkgdir"/etc/init.d/j7elte-wifi
+	install -Dm644 "$srcdir"/j7elte-wifi.confd \
+		"$pkgdir"/etc/conf.d/j7elte-wifi
+
+	# systemd: same directory, via systemd-tmpfiles.
+	install -Dm644 "$srcdir"/j7elte-wifi.tmpfiles \
+		"$pkgdir"/usr/lib/tmpfiles.d/j7elte-wifi.conf
+
+	# bcmdhd writes /efs/wifi/.mac.info with O_CREAT; the parent directory
+	# must exist or the generated MAC is discarded and the shared NVRAM MAC
+	# is used (dhd_custom_cis.c:dhd_set_macaddr_from_file).
+	install -d -m 0755 "$pkgdir"/efs/wifi
+}
+
+sha512sums="
+79652524d1ddeb823794df70190f458b9b9c122831c88713afc0b0d0b5880a85d9bf9f86c1ae68a8d74779777c23ec3e48b3c91078a33b7e0a47979e465a76db  wpa_supplicant.conf
+1ef40be14502b37e8f82a720acf5396677ca13c10095cf130f6390f28e17da7d69a1d8029feb91a1a13357ac5764d42b429d9f361289b849b11f768ecb63a326  j7elte-wifi.initd
+a0abe483dbdede54a47ccb83517fa228a248343b4baa80f0aaf53e78ea307d8d6630962388ad00cbea13daaa58f200b10687d616bece7d3e277ec6b3ecebad37  j7elte-wifi.confd
+c58cf2e39856e84c54ed31a26290c1e8be6cd04f0016593618076343b3ce0d6c297bf13adfd61d30606308c55977fdc338c06a1ab2fad987188cc561d29a579a  j7elte-wifi.tmpfiles
+d04efd4e21d29897a5879d2a56c1c66f2f315e67421a88ceed4da09ff3e803acc960515cd6b1c6f080cb62ff105377c5d5f3589386faf2b7f6a45ce316d22714  j7elte-wifi.post-install
+"

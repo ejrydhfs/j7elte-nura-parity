@@ -1,0 +1,119 @@
+#!/sbin/openrc-run
+# CP (baseband) boot for the Samsung Galaxy J7 (j7elte, Exynos 7580 + SS310AP).
+#
+# The kernel side (drivers/misc/modem_v1 + drivers/misc/mcu) creates
+# /dev/umts_boot0, /dev/umts_ipc0, /dev/umts_rfs0 and rmnet0-7 at probe time;
+# what is missing on a stock postmarketOS install is the CP loader that streams
+# the modem firmware from the RADIO partition into the baseband over the
+# shared-memory boot channel.  Stock Android uses /sbin/cbd (bionic, cannot run
+# here); this service runs j7elte-cbd, a reimplementation of the verified part
+# of it.
+#
+# Without a RIL (/dev/umts_ipc0 + /dev/umts_rfs0 opened by something), the CP
+# boots and then waits for the AP's INIT_END: PHONE_START is retried by the CP
+# but no calls/SMS/data work.  That is expected and logged by the kernel.
+
+# shellcheck disable=SC2034  # read by openrc-run
+description="Download CP firmware into the SS310AP baseband (j7elte)"
+# shellcheck disable=SC2034
+description_stop="Leave the SS310AP running (no CP power-off ioctl is issued)"
+
+: "${J7ELTE_CBD_BOOT_DEV:=/dev/umts_boot0}"
+: "${J7ELTE_CBD_NV:=/efs/nv_data.bin}"
+: "${J7ELTE_CBD_TIMEOUT:=30}"
+: "${J7ELTE_CBD_EXTRA_ARGS:=}"
+: "${J7ELTE_CBD_MOUNT_EFS:=yes}"
+: "${J7ELTE_EFS_DEV:=}"
+: "${J7ELTE_CBD_DAEMON:=yes}"
+
+PIDFILE=/run/j7elte-cbd.pid
+LOCKFILE=/etc/j7elte-cbd.disabled
+EFS_MOUNT=/efs
+
+depend() {
+	need localmount
+	after udev-settle
+}
+
+_mount_efs() {
+	[ "${J7ELTE_CBD_MOUNT_EFS}" = "yes" ] || return 0
+	grep -qs " ${EFS_MOUNT} " /proc/mounts && return 0
+
+	dev="${J7ELTE_EFS_DEV}"
+	if [ -z "${dev}" ]; then
+		for cand in /dev/disk/by-partlabel/EFS \
+			    /dev/block/platform/13540000.dwmmc0/by-name/EFS; do
+			if [ -b "${cand}" ]; then
+				dev="${cand}"
+				break
+			fi
+		done
+	fi
+	if [ -z "${dev}" ]; then
+		ewarn "EFS partition not found; the CP will boot with a default NV"
+		ewarn "set J7ELTE_EFS_DEV in /etc/conf.d/j7elte-cbd to mount it"
+		return 0
+	fi
+
+	ebegin "Mounting ${dev} on ${EFS_MOUNT}"
+	mkdir -p "${EFS_MOUNT}"
+	mount -t ext4 -o nosuid,nodev,noatime "${dev}" "${EFS_MOUNT}"
+	eend $? "mounting ${dev} failed; continuing with a default NV"
+}
+
+start() {
+	if [ -e "${LOCKFILE}" ]; then
+		ewarn "j7elte-cbd disabled by ${LOCKFILE}; not booting the CP"
+		return 0
+	fi
+
+	if [ ! -c "${J7ELTE_CBD_BOOT_DEV}" ]; then
+		eerror "${J7ELTE_CBD_BOOT_DEV} not found: CONFIG_SEC_MODEM_V1 /"
+		eerror "CONFIG_SEC_MODEM_SS310AP must be built in and the modem"
+		eerror "device tree node must have probed (check dmesg for 'mif:')"
+		return 1
+	fi
+
+	_mount_efs
+
+	set -- -tss310 -bm -mm \
+		-B "${J7ELTE_CBD_BOOT_DEV}" \
+		-N "${J7ELTE_CBD_NV}" \
+		-T "${J7ELTE_CBD_TIMEOUT}"
+	[ "${J7ELTE_CBD_DAEMON}" = "yes" ] && set -- "$@" -d
+	# shellcheck disable=SC2086
+	set -- "$@" ${J7ELTE_CBD_EXTRA_ARGS}
+
+	ebegin "Booting the SS310AP baseband"
+	start-stop-daemon --start --quiet --background --make-pidfile \
+		--pidfile "${PIDFILE}" --exec /usr/bin/j7elte-cbd -- "$@"
+	eend $?
+
+	# The kernel logs "mif: shmem: ... CP_START" when the firmware started;
+	# give it a moment so that a broken image is visible in the service
+	# status instead of silently succeeding.
+	sleep 3
+	if [ "${J7ELTE_CBD_DAEMON}" = "yes" ]; then
+		if [ -s "${PIDFILE}" ] && ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+			eerror "j7elte-cbd exited; see 'dmesg | grep mif:'"
+			return 1
+		fi
+	else
+		# Without --daemon the loader exits after the CP booted; there is
+		# no process to supervise, so drop the stale pidfile.
+		rm -f "${PIDFILE}"
+	fi
+	return 0
+}
+
+stop() {
+	ebegin "Stopping the CP loader"
+	if [ -s "${PIDFILE}" ]; then
+		start-stop-daemon --stop --quiet --pidfile "${PIDFILE}" \
+			--retry TERM/5
+		rm -f "${PIDFILE}"
+	fi
+	eend 0
+	# Deliberately no IOCTL_MODEM_OFF: the baseband is left running for
+	# the next RIL connection.
+}

@@ -1,0 +1,41 @@
+diff --git a/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c b/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c
+index e50b2b77..709c319a 100644
+--- a/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c
++++ b/drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c
+@@ -3624,9 +3624,34 @@ int fimc_is_sec_fw_sel_eeprom(struct device *dev, int id, bool headerOnly)
+ 
+ 	fp = filp_open(fw_path, O_RDONLY, 0);
+ 	if (IS_ERR(fp)) {
+-		err("Camera: Failed open phone firmware");
+-		ret = -EIO;
++		const struct firmware *fw_blob = NULL;
++		const u8 *fw_data;
++		size_t fw_size;
++
+ 		fp = NULL;
++		info("Camera: %s is not available, trying request_firmware\n",
++			fw_path);
++		ret = request_firmware(&fw_blob, sysfs_finfo.load_fw_name, dev);
++		if (ret) {
++			err("Camera: Failed to load phone firmware(%d)", ret);
++			ret = -EIO;
++			goto read_phone_fw_exit;
++		}
++
++		fw_data = fw_blob->data;
++		fw_size = fw_blob->size;
++		if (fw_size > FIMC_IS_HEADER_VER_SIZE) {
++			strncpy(phone_fw_version,
++				(const char *)fw_data + fw_size - 11,
++				FIMC_IS_HEADER_VER_SIZE);
++			strncpy(sysfs_pinfo.header_ver,
++				(const char *)fw_data + fw_size - 11,
++				FIMC_IS_HEADER_VER_SIZE);
++			info("Camera: phone fw version: %s\n", phone_fw_version);
++		}
++
++		release_firmware(fw_blob);
++		ret = 0;
+ 		goto read_phone_fw_exit;
+ 	}
+ 

@@ -1,0 +1,60 @@
+# Maintainer: ROM/Nura parity integration (SM-J700M / j7elte)
+#
+# CP (baseband) loader for the Shannon SS310AP modem on the Exynos 7580.
+#
+# The kernel side is already at parity (see parity/reports/modem.md): the
+# drivers/misc/modem_v1 SHMEM link exposes /dev/umts_boot0 and the CP image is
+# pushed by userspace through it.  Stock Android does that with /sbin/cbd,
+# which is a bionic binary and cannot run on musl.  This package builds
+# j7elte-cbd, a reimplementation of the evidenced part of cbd:
+#
+#   * parses the "TOC" container of the RADIO partition (BOOT/MAIN/NV),
+#   * uploads BOOT with IOCTL_MODEM_XMIT_BOOT into the shmem boot region,
+#   * powers the CP (IOCTL_MODEM_ON/BOOT_ON/DL_START) and streams the TOC
+#     header, MAIN and NV with the CP bootloader's 0x9xxx/0xAxxx frame
+#     protocol on /dev/umts_boot0,
+#   * waits for CMD_PHONE_START (IOCTL_MODEM_BOOT_OFF) and finalises.
+#
+# It does NOT provide a RIL: calls/SMS/data still need an implementation of
+# the SIPC5 FMT/RFS channels (see parity/reports/ril-userspace.md).
+pkgname=j7elte-cbd
+pkgver=0.1
+pkgrel=0
+pkgdesc="CP firmware loader (stock cbd replacement) for the Samsung Galaxy J7 baseband"
+url="https://postmarketos.org"
+arch="aarch64"
+license="MIT"
+options="!check"
+source="j7elte-cbd.c
+	j7elte-cbd.initd
+	j7elte-cbd.confd
+	j7elte-cbd.service
+	"
+builddir="$srcdir"
+
+build() {
+	${CC:-cc} $CFLAGS -std=c11 -D_GNU_SOURCE -Wall -Wextra \
+		-Wno-unused-parameter -O2 \
+		-o j7elte-cbd j7elte-cbd.c $LDFLAGS
+}
+
+package() {
+	install -Dm755 j7elte-cbd "$pkgdir"/usr/bin/j7elte-cbd
+
+	# OpenRC (default pmOS service manager on this port).
+	install -Dm755 "$srcdir"/j7elte-cbd.initd \
+		"$pkgdir"/etc/init.d/j7elte-cbd
+	install -Dm644 "$srcdir"/j7elte-cbd.confd \
+		"$pkgdir"/etc/conf.d/j7elte-cbd
+
+	# Optional systemd equivalent; it reads the same /etc/conf.d file.
+	install -Dm644 "$srcdir"/j7elte-cbd.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-cbd.service
+}
+
+sha512sums="
+efa40afcde257fa568a24ddf82978276c9eee2cdabc20b1daadae0d46d2f3ac12b4a5f7b771901b7f7f5340ddb797b67bb0ac5a897ea2433ef4394a1d60e2d87  j7elte-cbd.c
+1d486dd917fb425befef8edfb6219349604792a8d06d34be91cd0fb2e07ecbcce86a11824f2cdc0af2706bb14395745a02e529c35ef6fafcc1c5b5d33cab7b45  j7elte-cbd.initd
+115903a64608dbfdc9ec7752f882b9f3fb76da5c539091d8c9caccac774c9c69447ea3a2498e474f00cbe90eb6f9e67c7a372e6bb505c97d2cba37986481058c  j7elte-cbd.confd
+69ea154bf2f40bc300903817ff2a26b903f929de1a1c504f41b27f86ff3c2781a2a83d78f5f30ce21114c5ab1872f6d721b7ad1442153ca6545bb56f9acbab8d  j7elte-cbd.service
+"

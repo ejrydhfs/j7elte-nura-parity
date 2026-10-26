@@ -1,0 +1,66 @@
+# Enable full disk encryption unlock on the Samsung Galaxy J7 (j7elte).
+#
+# The unlock flow itself is generic postmarketOS tooling, this package only
+# supplies what is missing on this device:
+#
+#   * unl0kr as the FDE unlocker, pinned as a dependency. Nothing in the
+#     j7elte device package pulls an unlocker in, and postmarketos-initramfs
+#     only asks for the virtual "postmarketos-fde-unlocker"; depending on
+#     unl0kr directly makes an "--fde" install ask for the passphrase
+#     without relying on that provider resolution.
+#   * /etc/unl0kr.conf.d/50-j7elte.conf - fbdev/animation tuning for the
+#     720x1280 DECON framebuffer (CONFIG_DRM is not set on j7elte).
+#   * a /hooks script that unblanks /dev/fb0, restores a zero backlight and
+#     logs the input devices right before unl0kr runs.
+#   * /usr/bin/j7elte-fde-check - read-only prerequisites check.
+#
+# initramfs regeneration is handled by the postmarketos-mkinitfs trigger on
+# /usr/share/mkinitfs-triggers, no post-install script is needed.
+maintainer="j7elte FDE"
+pkgname=j7elte-fde
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="FDE unlock (unl0kr) support for Samsung Galaxy J7 (j7elte)"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+depends="
+	unl0kr
+	postmarketos-initramfs
+	postmarketos-mkinitfs
+	"
+# No tests, and nothing here is architecture specific.
+options="!check !archcheck"
+source="
+	50-j7elte.conf
+	40-j7elte-fde.files
+	50-j7elte-fde-fb.sh
+	j7elte-fde-check
+	"
+
+build() {
+	:
+}
+
+package() {
+	install -Dm644 "$srcdir"/50-j7elte.conf \
+		"$pkgdir"/etc/unl0kr.conf.d/50-j7elte.conf
+	install -Dm644 "$srcdir"/40-j7elte-fde.files \
+		"$pkgdir"/usr/share/mkinitfs/files-extra/40-j7elte-fde.files
+	install -Dm755 "$srcdir"/50-j7elte-fde-fb.sh \
+		"$pkgdir"/usr/share/mkinitfs/hooks/50-j7elte-fde-fb.sh
+	install -Dm755 "$srcdir"/j7elte-fde-check \
+		"$pkgdir"/usr/bin/j7elte-fde-check
+
+	# Touching this directory makes the postmarketos-mkinitfs trigger run
+	# mkinitfs, so the unlocker + drop-in end up in the initramfs.
+	install -Dm644 /dev/null \
+		"$pkgdir"/usr/share/mkinitfs-triggers/j7elte-fde
+}
+
+sha512sums="
+cc4754262ad20a46cb39c55b5ae094e1012639055160f6b4c47aa6c8f095bea2446cbacf6b32d5e96d06b0c6cfba8f7a1b03992202b259e2390175e9f7f69d3e  50-j7elte.conf
+fb92c678db5eb8515f91778de37ecb9d96c6a134dbd1abbecb194dfa3ccd3adc053ab3321ce0ea95daa814028167bd0e242dff05a96a084798081a167695d963  40-j7elte-fde.files
+b394a8392cd5dc71e85ccd6063efc2f84d8d19afecef81054208f2ef6014fd3532dcbba3f14d192f99ec76c1e38dd3dbfddfd9ddb3c5329b4dd42e6c14a9aaa0  50-j7elte-fde-fb.sh
+97a6fbd2091a7840116bc4eab0c067831e88464078f9b19a02a688a96bd1e71204f93e1273632d68e15bc33cbd02e653b689d057b3064340fd7e1c53628b27fa  j7elte-fde-check
+"

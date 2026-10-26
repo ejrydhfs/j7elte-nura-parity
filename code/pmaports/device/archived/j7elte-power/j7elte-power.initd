@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+# Battery charge limit for the Samsung Galaxy J7 (j7elte).
+#
+# Opt-in: set charge_limit in /etc/j7elte-power.conf and run
+#   rc-update add j7elte-power default && rc-service j7elte-power start
+# The daemon exits 0 immediately when both charge_limit and
+# persist_capacity_max are disabled, so adding it to a runlevel without
+# configuration is harmless.
+#
+# OpenRC equivalent of j7elte-power.service.
+
+description="Battery charge limit (Samsung Galaxy J7 / j7elte)"
+command="/usr/bin/j7elte-power"
+command_args="--config /etc/j7elte-power.conf"
+command_background="true"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	need localmount
+	after j7elte-efs-restore
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run
+}

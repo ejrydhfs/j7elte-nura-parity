@@ -1,0 +1,425 @@
+diff --git a/device/archived/j7elte-fde/40-j7elte-fde.files b/device/archived/j7elte-fde/40-j7elte-fde.files
+new file mode 100644
+index 0000000..5d030ab
+--- /dev/null
++++ b/device/archived/j7elte-fde/40-j7elte-fde.files
+@@ -0,0 +1,9 @@
++# Files that must exist inside the initramfs for the j7elte FDE drop-in to be
++# picked up by unl0kr. /etc/unl0kr.conf and the unl0kr/libinput/udev files are
++# already listed in main/unl0kr/unl0kr.files; this list only adds the
++# device specific drop-in.
++#
++# j7elte is a boot.img device (deviceinfo_create_initfs_extra is unset), so
++# mkinitfs merges files-extra into the single initramfs
++# (postmarketos-mkinitfs cmd/mkinitfs/main.go:135).
++/etc/unl0kr.conf.d/50-j7elte.conf
+diff --git a/device/archived/j7elte-fde/50-j7elte-fde-fb.sh b/device/archived/j7elte-fde/50-j7elte-fde-fb.sh
+new file mode 100755
+index 0000000..ee3b1a1
+--- /dev/null
++++ b/device/archived/j7elte-fde/50-j7elte-fde-fb.sh
+@@ -0,0 +1,64 @@
++#!/bin/sh
++# j7elte: make the DECON framebuffer and the touch panel usable for unl0kr.
++#
++# Runs from /hooks (init_2nd.sh:run_hooks /hooks) after udev has been started
++# and before unlock_root_partition(), i.e. immediately before unl0kr is
++# exec'd by fde-unlock. It must never fail the boot: every step is best
++# effort and the script always exits 0.
++#
++# Why this is needed on j7elte specifically:
++#  - /dev/fb0 is created unconditionally by the DECON driver at probe
++#    (drivers/video/exynos/decon_7580/decon_core.c:4591 register_framebuffer),
++#    but if anything blanked it (VT console sleep is enabled in this config)
++#    unl0kr would draw into a powered-down panel.
++#  - the panel backlight is a DECON/panel backlight device
++#    (/sys/class/backlight/panel) and a zero brightness here means the unlock
++#    UI is invisible even though it renders.
++#  - there is no hardware keyboard (CONFIG_KEYBOARD_GPIO is only the volume
++#    and power keys), so the touchscreen is the only way to enter the
++#    passphrase; log what libinput will see for easier debugging.
++
++LOG_PREFIX="j7elte-fde"
++log() { echo "$LOG_PREFIX: $*"; }
++
++# --- framebuffer -----------------------------------------------------------
++if [ -e /dev/fb0 ]; then
++	model="$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)"
++	log "framebuffer /dev/fb0 present (virtual_size=${model:-unknown})"
++
++	# Unblank. DECON's fb_blank(FB_BLANK_UNBLANK) re-runs the panel
++	# power-on sequence, so only touch it when it is actually blanked.
++	blank="/sys/class/graphics/fb0/blank"
++	if [ -r "$blank" ] && [ "$(cat "$blank" 2>/dev/null)" != "0" ]; then
++		log "unblanking framebuffer (was $(cat "$blank" 2>/dev/null))"
++		echo 0 > "$blank" 2>/dev/null
++	fi
++else
++	log "WARNING: /dev/fb0 missing - unl0kr cannot draw the unlock screen"
++fi
++
++# --- backlight -------------------------------------------------------------
++for bl in /sys/class/backlight/*; do
++	[ -r "$bl/brightness" ] || continue
++	brightness="$(cat "$bl/brightness" 2>/dev/null)"
++	log "backlight ${bl##*/}: brightness=${brightness}"
++	if [ "$brightness" = "0" ]; then
++		max="$(cat "$bl/max_brightness" 2>/dev/null)"
++		if [ -n "$max" ] && [ "$max" != "0" ]; then
++			log "backlight ${bl##*/} is off, restoring to max ($max)"
++			echo "$max" > "$bl/brightness" 2>/dev/null
++		fi
++	fi
++done
++
++# --- input -----------------------------------------------------------------
++found=0
++for ev in /dev/input/event*; do
++	[ -e "$ev" ] || continue
++	found=$((found + 1))
++	name="$(cat "/sys/class/input/${ev##*/}/device/name" 2>/dev/null)"
++	log "input $ev: ${name:-unknown}"
++done
++[ "$found" -gt 0 ] || log "WARNING: no /dev/input/event* - cannot enter the passphrase"
++
++exit 0
+diff --git a/device/archived/j7elte-fde/50-j7elte.conf b/device/archived/j7elte-fde/50-j7elte.conf
+new file mode 100644
+index 0000000..c7496d1
+--- /dev/null
++++ b/device/archived/j7elte-fde/50-j7elte.conf
+@@ -0,0 +1,19 @@
++# unl0kr drop-in for Samsung Galaxy J7 (j7elte).
++#
++# unl0kr reads, in this order (unl0kr/main.c):
++#   /usr/share/unl0kr/unl0kr.conf
++#   /usr/share/unl0kr/unl0kr.conf.d/*
++#   /etc/unl0kr.conf
++#   /etc/unl0kr.conf.d/*          <-- this file
++# so nothing here replaces the user's /etc/unl0kr.conf.
++#
++# Display: DECON fbdev (/dev/fb0, 720x1280), CONFIG_DRM is not set, so the
++# fbdev backend is the only one available and unl0kr autodetects it.
++# The [quirks] fbdev_force_refresh=true workaround is NOT used: it exists for
++# DRM simpledrm emulation, which this kernel does not have; real DECON fbdev
++# gets a refcounted vblank and does not need the per-frame full refresh.
++
++[general]
++# Every LVGL frame is a full 720x1280x4 = 3.5 MiB memcpy on this SoC;
++# skipping the unlock-screen animations keeps the boot responsive.
++animations=false
+diff --git a/device/archived/j7elte-fde/APKBUILD b/device/archived/j7elte-fde/APKBUILD
+new file mode 100644
+index 0000000..edf7bc3
+--- /dev/null
++++ b/device/archived/j7elte-fde/APKBUILD
+@@ -0,0 +1,66 @@
++# Enable full disk encryption unlock on the Samsung Galaxy J7 (j7elte).
++#
++# The unlock flow itself is generic postmarketOS tooling, this package only
++# supplies what is missing on this device:
++#
++#   * unl0kr as the FDE unlocker, pinned as a dependency. Nothing in the
++#     j7elte device package pulls an unlocker in, and postmarketos-initramfs
++#     only asks for the virtual "postmarketos-fde-unlocker"; depending on
++#     unl0kr directly makes an "--fde" install ask for the passphrase
++#     without relying on that provider resolution.
++#   * /etc/unl0kr.conf.d/50-j7elte.conf - fbdev/animation tuning for the
++#     720x1280 DECON framebuffer (CONFIG_DRM is not set on j7elte).
++#   * a /hooks script that unblanks /dev/fb0, restores a zero backlight and
++#     logs the input devices right before unl0kr runs.
++#   * /usr/bin/j7elte-fde-check - read-only prerequisites check.
++#
++# initramfs regeneration is handled by the postmarketos-mkinitfs trigger on
++# /usr/share/mkinitfs-triggers, no post-install script is needed.
++maintainer="j7elte FDE"
++pkgname=j7elte-fde
++pkgver=0.1.0
++pkgrel=0
++pkgdesc="FDE unlock (unl0kr) support for Samsung Galaxy J7 (j7elte)"
++url="https://postmarketos.org"
++arch="noarch"
++license="MIT"
++depends="
++	unl0kr
++	postmarketos-initramfs
++	postmarketos-mkinitfs
++	"
++# No tests, and nothing here is architecture specific.
++options="!check !archcheck"
++source="
++	50-j7elte.conf
++	40-j7elte-fde.files
++	50-j7elte-fde-fb.sh
++	j7elte-fde-check
++	"
++
++build() {
++	:
++}
++
++package() {
++	install -Dm644 "$srcdir"/50-j7elte.conf \
++		"$pkgdir"/etc/unl0kr.conf.d/50-j7elte.conf
++	install -Dm644 "$srcdir"/40-j7elte-fde.files \
++		"$pkgdir"/usr/share/mkinitfs/files-extra/40-j7elte-fde.files
++	install -Dm755 "$srcdir"/50-j7elte-fde-fb.sh \
++		"$pkgdir"/usr/share/mkinitfs/hooks/50-j7elte-fde-fb.sh
++	install -Dm755 "$srcdir"/j7elte-fde-check \
++		"$pkgdir"/usr/bin/j7elte-fde-check
++
++	# Touching this directory makes the postmarketos-mkinitfs trigger run
++	# mkinitfs, so the unlocker + drop-in end up in the initramfs.
++	install -Dm644 /dev/null \
++		"$pkgdir"/usr/share/mkinitfs-triggers/j7elte-fde
++}
++
++sha512sums="
++cc4754262ad20a46cb39c55b5ae094e1012639055160f6b4c47aa6c8f095bea2446cbacf6b32d5e96d06b0c6cfba8f7a1b03992202b259e2390175e9f7f69d3e  50-j7elte.conf
++fb92c678db5eb8515f91778de37ecb9d96c6a134dbd1abbecb194dfa3ccd3adc053ab3321ce0ea95daa814028167bd0e242dff05a96a084798081a167695d963  40-j7elte-fde.files
++b394a8392cd5dc71e85ccd6063efc2f84d8d19afecef81054208f2ef6014fd3532dcbba3f14d192f99ec76c1e38dd3dbfddfd9ddb3c5329b4dd42e6c14a9aaa0  50-j7elte-fde-fb.sh
++97a6fbd2091a7840116bc4eab0c067831e88464078f9b19a02a688a96bd1e71204f93e1273632d68e15bc33cbd02e653b689d057b3064340fd7e1c53628b27fa  j7elte-fde-check
++"
+diff --git a/device/archived/j7elte-fde/j7elte-fde-check b/device/archived/j7elte-fde/j7elte-fde-check
+new file mode 100755
+index 0000000..497b191
+--- /dev/null
++++ b/device/archived/j7elte-fde/j7elte-fde-check
+@@ -0,0 +1,237 @@
++#!/bin/sh
++# j7elte-fde-check - read-only prerequisites check for unlocking a LUKS root
++# from the postmarketOS initramfs with unl0kr on the Samsung Galaxy J7
++# (j7elte, Exynos 7580).
++#
++# Usage:
++#   j7elte-fde-check              verify everything, exit 1 on a hard failure
++#   j7elte-fde-check --regenerate verify, then rebuild the initramfs (root)
++#   j7elte-fde-check --quiet      only print failures and the summary
++#
++# The checks map 1:1 to the requirements of the generic pmOS unlock flow:
++#   init_functions.sh:unlock_root_partition()
++#     -> fde-unlock <part>                    (/usr/bin/fde-unlock, unl0kr)
++#     -> unl0kr | cryptsetup open <part> root -
++# so the kernel needs dm-crypt + XTS, the initramfs needs unl0kr + cryptsetup,
++# and the UI needs a working framebuffer plus a touch/input device.
++
++set -u
++
++PROG=j7elte-fde-check
++# PIT (session/tmp-artifacts/modemcp/j7elte.pit, entry 13):
++#   BOOT = 65536 sectors * 512 B = 32 MiB
++BOOT_PART_BYTES=$((32 * 1024 * 1024))
++# 90 % of the BOOT partition: above this the boot.img is at risk of not
++# fitting after a kernel/initramfs update.
++BOOT_WARN_BYTES=$((BOOT_PART_BYTES / 10 * 9))
++
++QUIET=0
++REGENERATE=0
++
++for arg in "$@"; do
++	case "$arg" in
++	--regenerate) REGENERATE=1 ;;
++	--quiet) QUIET=1 ;;
++	-h | --help)
++		sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
++		exit 0
++		;;
++	*)
++		echo "$PROG: unknown argument '$arg' (try --help)" >&2
++		exit 2
++		;;
++	esac
++done
++
++FAIL=0
++WARNINGS=0
++CHECKS=0
++
++ok() {
++	CHECKS=$((CHECKS + 1))
++	[ "$QUIET" = 1 ] && return 0
++	printf '  [ ok ] %s\n' "$*"
++}
++
++bad() {
++	CHECKS=$((CHECKS + 1))
++	FAIL=$((FAIL + 1))
++	printf '  [FAIL] %s\n' "$*"
++}
++
++warn() {
++	CHECKS=$((CHECKS + 1))
++	WARNINGS=$((WARNINGS + 1))
++	printf '  [warn] %s\n' "$*"
++}
++
++section() {
++	[ "$QUIET" = 1 ] && return 0
++	printf '\n%s\n' "$*"
++}
++
++kernel_config() {
++	for f in /boot/config-samsung-j7elte /boot/config-*; do
++		[ -f "$f" ] && {
++			echo "$f"
++			return 0
++		}
++	done
++	if [ -r /proc/config.gz ] && command -v zcat >/dev/null 2>&1; then
++		zcat /proc/config.gz > /tmp/j7elte-fde-check.config 2>/dev/null &&
++			{
++				echo /tmp/j7elte-fde-check.config
++				return 0
++			}
++	fi
++	return 1
++}
++
++# check_sym <config> <SYMBOL> <expected value>
++check_sym() {
++	if grep -qx "$2=$3" "$1"; then
++		ok "$2=$3"
++	else
++		bad "$2=$3 missing from $(basename "$1")"
++	fi
++}
++
++section "== Kernel (dm-crypt + initramfs + fbdev + input) =="
++CONFIG_FILE="$(kernel_config)"
++if [ -z "$CONFIG_FILE" ]; then
++	warn "kernel config not found (/boot/config-*), skipping kernel checks"
++else
++	ok "kernel config: $CONFIG_FILE"
++	# LUKS/dm-crypt; must be built in, the initramfs cannot load modules
++	# before the root filesystem (and this kernel ships no modules at all).
++	for sym in CONFIG_BLK_DEV_DM CONFIG_DM_CRYPT CONFIG_CRYPTO_AES \
++		CONFIG_CRYPTO_XTS CONFIG_CRYPTO_CBC CONFIG_CRYPTO_SHA256; do
++		check_sym "$CONFIG_FILE" "$sym" y
++	done
++	# initramfs itself
++	for sym in CONFIG_BLK_DEV_INITRD CONFIG_RD_GZIP CONFIG_DEVTMPFS; do
++		check_sym "$CONFIG_FILE" "$sym" y
++	done
++	# display + input for unl0kr
++	for sym in CONFIG_FB CONFIG_EXYNOS_DECON_FB CONFIG_INPUT_EVDEV \
++		CONFIG_VT CONFIG_LCD_CLASS_DEVICE CONFIG_BACKLIGHT_CLASS_DEVICE; do
++		check_sym "$CONFIG_FILE" "$sym" y
++	done
++	if grep -qx 'CONFIG_TOUCHSCREEN_MELFAS_MMS438=y' "$CONFIG_FILE" ||
++		grep -qx 'CONFIG_TOUCHSCREEN_IST30XXC=y' "$CONFIG_FILE"; then
++		ok "touchscreen driver built in"
++	else
++		bad "no built-in Melfas/Imagis touchscreen driver"
++	fi
++fi
++
++section "== Framebuffer =="
++if [ -e /dev/fb0 ]; then
++	ok "/dev/fb0 present"
++	if [ -r /sys/class/graphics/fb0/virtual_size ]; then
++		ok "framebuffer virtual_size=$(cat /sys/class/graphics/fb0/virtual_size)"
++	fi
++	[ -r /sys/class/graphics/fb0/blank ] &&
++		ok "framebuffer blank state=$(cat /sys/class/graphics/fb0/blank)"
++else
++	bad "/dev/fb0 missing - unl0kr cannot draw the unlock screen"
++fi
++
++if [ -d /sys/class/backlight/panel ]; then
++	ok "backlight panel: brightness=$(cat /sys/class/backlight/panel/brightness 2>/dev/null)/$(cat /sys/class/backlight/panel/max_brightness 2>/dev/null)"
++else
++	warn "no /sys/class/backlight/panel (screen may stay dark)"
++fi
++
++section "== Input =="
++input_count=0
++for ev in /dev/input/event*; do
++	[ -e "$ev" ] || continue
++	input_count=$((input_count + 1))
++	name="$(cat "/sys/class/input/${ev##*/}/device/name" 2>/dev/null)"
++	ok "input $ev: ${name:-unknown}"
++done
++[ "$input_count" -gt 0 ] ||
++	bad "no /dev/input/event* - the passphrase cannot be entered"
++
++section "== Unlocker =="
++if command -v unl0kr >/dev/null 2>&1; then
++	ok "unl0kr: $(command -v unl0kr)"
++else
++	bad "unl0kr not installed (apk add j7elte-fde)"
++fi
++if command -v fde-unlock >/dev/null 2>&1; then
++	ok "fde-unlock: $(command -v fde-unlock)"
++else
++	warn "fde-unlock not found (provided by unl0kr>=3.0 keyscript mode)"
++fi
++if [ -f /etc/unl0kr.conf.d/50-j7elte.conf ]; then
++	ok "/etc/unl0kr.conf.d/50-j7elte.conf installed"
++else
++	warn "j7elte unl0kr drop-in not installed"
++fi
++
++section "== Root filesystem =="
++root_src="$(awk '$2 == "/" { print $1; exit }' /proc/mounts 2>/dev/null)"
++if [ -n "$root_src" ]; then
++	ok "root device: $root_src"
++fi
++case "$root_src" in
++/dev/mapper/*)
++	name="${root_src#/dev/mapper/}"
++	if command -v cryptsetup >/dev/null 2>&1 &&
++		cryptsetup status "$name" >/dev/null 2>&1; then
++		ok "root is a dm-crypt mapping ($name)"
++	else
++		warn "root is $root_src but cryptsetup cannot report its status"
++	fi
++	;;
++*)
++	if command -v blkid >/dev/null 2>&1 &&
++		blkid 2>/dev/null | grep -q 'crypto_LUKS'; then
++		ok "LUKS container found (root not unlocked via /dev/mapper)"
++	else
++		warn "root is not encrypted: full disk encryption requires reinstalling with 'pmbootstrap install --fde --add j7elte-fde'"
++	fi
++	;;
++esac
++
++section "== boot.img size (BOOT partition is 32 MiB) =="
++if [ -f /boot/boot.img ]; then
++	size="$(wc -c < /boot/boot.img)"
++	if [ "$size" -gt "$BOOT_PART_BYTES" ]; then
++		bad "/boot/boot.img is $size B > ${BOOT_PART_BYTES} B BOOT partition"
++	elif [ "$size" -gt "$BOOT_WARN_BYTES" ]; then
++		warn "/boot/boot.img is $size B (${BOOT_WARN_BYTES} B soft limit, $BOOT_PART_BYTES B partition)"
++	else
++		ok "/boot/boot.img is $size B of $BOOT_PART_BYTES B"
++	fi
++else
++	warn "/boot/boot.img not found (only generated by mkinitfs/boot-deploy)"
++fi
++
++if [ "$REGENERATE" = 1 ]; then
++	section "== Regenerating initramfs =="
++	if [ "$(id -u)" != "0" ]; then
++		bad "--regenerate requires root"
++	else
++		if mkinitfs; then
++			ok "mkinitfs finished"
++		else
++			bad "mkinitfs failed"
++		fi
++		if [ -f /boot/boot.img ]; then
++			size="$(wc -c < /boot/boot.img)"
++			if [ "$size" -le "$BOOT_PART_BYTES" ]; then
++				ok "new boot.img is $size B (fits $BOOT_PART_BYTES B)"
++			else
++				bad "new boot.img is $size B > $BOOT_PART_BYTES B"
++			fi
++		fi
++	fi
++fi
++
++printf '\n%s: %d checks, %d warning(s), %d failure(s)\n' \
++	"$PROG" "$CHECKS" "$WARNINGS" "$FAIL"
++[ "$FAIL" -eq 0 ] || exit 1
++exit 0

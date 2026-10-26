@@ -1,0 +1,48 @@
+#!/sbin/openrc-run
+# Provision the directory that bcmdhd uses to persist a per-device MAC.
+#
+# With CONFIG_WIFI_BROADCOM_COB=y the driver compiles READ_MACADDR and calls
+# dhd_set_macaddr_from_file() (drivers/net/wireless/bcmdhd_1_77_nn/
+# dhd_custom_cis.c) before it preinitialises the dongle.  The file is
+# /efs/wifi/.mac.info; when it is missing the driver generates a MAC and
+# writes it back, but if the directory does not exist the write fails and the
+# shared NVRAM MAC (00:90:4c:c5:12:38) is used on every device.
+#
+# This service only creates the directory.  It never writes a MAC itself and
+# does nothing when a real EFS partition is mounted on /efs.
+
+# shellcheck disable=SC2034  # read by openrc-run
+description="bcmdhd per-device MAC state directory (j7elte)"
+# shellcheck disable=SC2034
+description_check="Check the bcmdhd MAC state directory"
+
+: "${J7ELTE_WIFI_MAC_STATE_DIR:=/efs/wifi}"
+
+depend() {
+	need localmount
+	before wpa_supplicant networkmanager
+}
+
+start() {
+	ebegin "Preparing ${J7ELTE_WIFI_MAC_STATE_DIR}"
+
+	if grep -q ' /efs ' /proc/mounts; then
+		ewarn "/efs is a mount point (real EFS?); not touching ${J7ELTE_WIFI_MAC_STATE_DIR}"
+		eend 0
+		return 0
+	fi
+
+	if [ -d "${J7ELTE_WIFI_MAC_STATE_DIR}" ]; then
+		eend 0
+		return 0
+	fi
+
+	mkdir -p "${J7ELTE_WIFI_MAC_STATE_DIR}"
+	ret=$?
+	if [ ${ret} -eq 0 ]; then
+		chmod 0755 "${J7ELTE_WIFI_MAC_STATE_DIR}"
+		eend 0
+	else
+		eend 1 "Failed to create ${J7ELTE_WIFI_MAC_STATE_DIR}"
+	fi
+}
