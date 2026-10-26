@@ -1,0 +1,2 @@
+obj-m := panfrost7580.o
+ccflags-y += -I$(src)/..

@@ -1,0 +1,3 @@
+# systemd-tmpfiles equivalent of the j7elte-wifi OpenRC service: make sure
+# bcmdhd can persist its generated per-device MAC (/efs/wifi/.mac.info).
+d /efs/wifi 0755 root root -

@@ -1,0 +1,55 @@
+From 6167ac8683d2a6f90744d3187f5523d97f28e019 Mon Sep 17 00:00:00 2001
+From: nura <nura@localhost>
+Date: Sat, 24 Oct 2026 23:50:52 -0500
+Subject: [PATCH 2/3] gallium/panfrost: make JM context setup and submit
+ backend-neutral
+
+Use the optional pan_kmod submit_job/jm_ctx_create/jm_ctx_destroy hooks when
+the backend provides them, and wait on the context sync object through
+pan_kmod instead of drmSyncobjWait.  Behaviour on the DRM backend is
+unchanged; a kbase backend has no per-context kernel object and returns
+handle 0.
+---
+ src/gallium/drivers/panfrost/pan_jm.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_jm.c b/src/gallium/drivers/panfrost/pan_jm.c
+index 066b2f0..04ae55d 100644
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -1121,6 +1121,16 @@ GENX(jm_init_context)(struct panfrost_context *ctx)
+    else
+       prio = PANFROST_JM_CTX_PRIORITY_MEDIUM;
+ 
++   if (dev->kmod.dev->ops->jm_ctx_create) {
++      uint32_t handle = 0;
++      int ret = dev->kmod.dev->ops->jm_ctx_create(dev->kmod.dev, &handle,
++                                                  (uint16_t)prio);
++      if (ret)
++         return -1;
++      ctx->jm.handle = handle;
++      return 0;
++   }
++
+    struct drm_panfrost_jm_ctx_create args = {
+       .priority = prio,
+    };
+@@ -1151,8 +1161,13 @@ GENX(jm_cleanup_context)(struct panfrost_context *ctx)
+        * job still queued would fault and hit the scheduler timeout. The
+        * context syncobj is the out-fence of the last job submitted.
+        */
+-      drmSyncobjWait(panfrost_device_fd(dev), &ctx->syncobj, 1, INT64_MAX, 0,
+-                     NULL);
++      pan_kmod_sync_wait(dev->kmod.dev, &ctx->syncobj, 1, INT64_MAX,
++                         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++      return;
++   }
++
++   if (dev->kmod.dev->ops->jm_ctx_destroy) {
++      dev->kmod.dev->ops->jm_ctx_destroy(dev->kmod.dev, ctx->jm.handle);
+       return;
+    }
+ 
+-- 
+2.56.0
+

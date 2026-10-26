@@ -1,0 +1,24 @@
+[Unit]
+Description=Samsung Galaxy J7 (j7elte) evdev sensor proxy
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=dbus
+BusName=net.hadess.SensorProxy
+ExecStart=/usr/bin/j7elte-sensors
+Restart=on-failure
+RestartSec=2
+
+# The daemon only needs the bus socket and the input/sysfs interfaces.
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

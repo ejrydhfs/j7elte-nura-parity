@@ -1,0 +1,237 @@
+#!/bin/sh
+# j7elte-fde-check - read-only prerequisites check for unlocking a LUKS root
+# from the postmarketOS initramfs with unl0kr on the Samsung Galaxy J7
+# (j7elte, Exynos 7580).
+#
+# Usage:
+#   j7elte-fde-check              verify everything, exit 1 on a hard failure
+#   j7elte-fde-check --regenerate verify, then rebuild the initramfs (root)
+#   j7elte-fde-check --quiet      only print failures and the summary
+#
+# The checks map 1:1 to the requirements of the generic pmOS unlock flow:
+#   init_functions.sh:unlock_root_partition()
+#     -> fde-unlock <part>                    (/usr/bin/fde-unlock, unl0kr)
+#     -> unl0kr | cryptsetup open <part> root -
+# so the kernel needs dm-crypt + XTS, the initramfs needs unl0kr + cryptsetup,
+# and the UI needs a working framebuffer plus a touch/input device.
+
+set -u
+
+PROG=j7elte-fde-check
+# PIT (session/tmp-artifacts/modemcp/j7elte.pit, entry 13):
+#   BOOT = 65536 sectors * 512 B = 32 MiB
+BOOT_PART_BYTES=$((32 * 1024 * 1024))
+# 90 % of the BOOT partition: above this the boot.img is at risk of not
+# fitting after a kernel/initramfs update.
+BOOT_WARN_BYTES=$((BOOT_PART_BYTES / 10 * 9))
+
+QUIET=0
+REGENERATE=0
+
+for arg in "$@"; do
+	case "$arg" in
+	--regenerate) REGENERATE=1 ;;
+	--quiet) QUIET=1 ;;
+	-h | --help)
+		sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+		exit 0
+		;;
+	*)
+		echo "$PROG: unknown argument '$arg' (try --help)" >&2
+		exit 2
+		;;
+	esac
+done
+
+FAIL=0
+WARNINGS=0
+CHECKS=0
+
+ok() {
+	CHECKS=$((CHECKS + 1))
+	[ "$QUIET" = 1 ] && return 0
+	printf '  [ ok ] %s\n' "$*"
+}
+
+bad() {
+	CHECKS=$((CHECKS + 1))
+	FAIL=$((FAIL + 1))
+	printf '  [FAIL] %s\n' "$*"
+}
+
+warn() {
+	CHECKS=$((CHECKS + 1))
+	WARNINGS=$((WARNINGS + 1))
+	printf '  [warn] %s\n' "$*"
+}
+
+section() {
+	[ "$QUIET" = 1 ] && return 0
+	printf '\n%s\n' "$*"
+}
+
+kernel_config() {
+	for f in /boot/config-samsung-j7elte /boot/config-*; do
+		[ -f "$f" ] && {
+			echo "$f"
+			return 0
+		}
+	done
+	if [ -r /proc/config.gz ] && command -v zcat >/dev/null 2>&1; then
+		zcat /proc/config.gz > /tmp/j7elte-fde-check.config 2>/dev/null &&
+			{
+				echo /tmp/j7elte-fde-check.config
+				return 0
+			}
+	fi
+	return 1
+}
+
+# check_sym <config> <SYMBOL> <expected value>
+check_sym() {
+	if grep -qx "$2=$3" "$1"; then
+		ok "$2=$3"
+	else
+		bad "$2=$3 missing from $(basename "$1")"
+	fi
+}
+
+section "== Kernel (dm-crypt + initramfs + fbdev + input) =="
+CONFIG_FILE="$(kernel_config)"
+if [ -z "$CONFIG_FILE" ]; then
+	warn "kernel config not found (/boot/config-*), skipping kernel checks"
+else
+	ok "kernel config: $CONFIG_FILE"
+	# LUKS/dm-crypt; must be built in, the initramfs cannot load modules
+	# before the root filesystem (and this kernel ships no modules at all).
+	for sym in CONFIG_BLK_DEV_DM CONFIG_DM_CRYPT CONFIG_CRYPTO_AES \
+		CONFIG_CRYPTO_XTS CONFIG_CRYPTO_CBC CONFIG_CRYPTO_SHA256; do
+		check_sym "$CONFIG_FILE" "$sym" y
+	done
+	# initramfs itself
+	for sym in CONFIG_BLK_DEV_INITRD CONFIG_RD_GZIP CONFIG_DEVTMPFS; do
+		check_sym "$CONFIG_FILE" "$sym" y
+	done
+	# display + input for unl0kr
+	for sym in CONFIG_FB CONFIG_EXYNOS_DECON_FB CONFIG_INPUT_EVDEV \
+		CONFIG_VT CONFIG_LCD_CLASS_DEVICE CONFIG_BACKLIGHT_CLASS_DEVICE; do
+		check_sym "$CONFIG_FILE" "$sym" y
+	done
+	if grep -qx 'CONFIG_TOUCHSCREEN_MELFAS_MMS438=y' "$CONFIG_FILE" ||
+		grep -qx 'CONFIG_TOUCHSCREEN_IST30XXC=y' "$CONFIG_FILE"; then
+		ok "touchscreen driver built in"
+	else
+		bad "no built-in Melfas/Imagis touchscreen driver"
+	fi
+fi
+
+section "== Framebuffer =="
+if [ -e /dev/fb0 ]; then
+	ok "/dev/fb0 present"
+	if [ -r /sys/class/graphics/fb0/virtual_size ]; then
+		ok "framebuffer virtual_size=$(cat /sys/class/graphics/fb0/virtual_size)"
+	fi
+	[ -r /sys/class/graphics/fb0/blank ] &&
+		ok "framebuffer blank state=$(cat /sys/class/graphics/fb0/blank)"
+else
+	bad "/dev/fb0 missing - unl0kr cannot draw the unlock screen"
+fi
+
+if [ -d /sys/class/backlight/panel ]; then
+	ok "backlight panel: brightness=$(cat /sys/class/backlight/panel/brightness 2>/dev/null)/$(cat /sys/class/backlight/panel/max_brightness 2>/dev/null)"
+else
+	warn "no /sys/class/backlight/panel (screen may stay dark)"
+fi
+
+section "== Input =="
+input_count=0
+for ev in /dev/input/event*; do
+	[ -e "$ev" ] || continue
+	input_count=$((input_count + 1))
+	name="$(cat "/sys/class/input/${ev##*/}/device/name" 2>/dev/null)"
+	ok "input $ev: ${name:-unknown}"
+done
+[ "$input_count" -gt 0 ] ||
+	bad "no /dev/input/event* - the passphrase cannot be entered"
+
+section "== Unlocker =="
+if command -v unl0kr >/dev/null 2>&1; then
+	ok "unl0kr: $(command -v unl0kr)"
+else
+	bad "unl0kr not installed (apk add j7elte-fde)"
+fi
+if command -v fde-unlock >/dev/null 2>&1; then
+	ok "fde-unlock: $(command -v fde-unlock)"
+else
+	warn "fde-unlock not found (provided by unl0kr>=3.0 keyscript mode)"
+fi
+if [ -f /etc/unl0kr.conf.d/50-j7elte.conf ]; then
+	ok "/etc/unl0kr.conf.d/50-j7elte.conf installed"
+else
+	warn "j7elte unl0kr drop-in not installed"
+fi
+
+section "== Root filesystem =="
+root_src="$(awk '$2 == "/" { print $1; exit }' /proc/mounts 2>/dev/null)"
+if [ -n "$root_src" ]; then
+	ok "root device: $root_src"
+fi
+case "$root_src" in
+/dev/mapper/*)
+	name="${root_src#/dev/mapper/}"
+	if command -v cryptsetup >/dev/null 2>&1 &&
+		cryptsetup status "$name" >/dev/null 2>&1; then
+		ok "root is a dm-crypt mapping ($name)"
+	else
+		warn "root is $root_src but cryptsetup cannot report its status"
+	fi
+	;;
+*)
+	if command -v blkid >/dev/null 2>&1 &&
+		blkid 2>/dev/null | grep -q 'crypto_LUKS'; then
+		ok "LUKS container found (root not unlocked via /dev/mapper)"
+	else
+		warn "root is not encrypted: full disk encryption requires reinstalling with 'pmbootstrap install --fde --add j7elte-fde'"
+	fi
+	;;
+esac
+
+section "== boot.img size (BOOT partition is 32 MiB) =="
+if [ -f /boot/boot.img ]; then
+	size="$(wc -c < /boot/boot.img)"
+	if [ "$size" -gt "$BOOT_PART_BYTES" ]; then
+		bad "/boot/boot.img is $size B > ${BOOT_PART_BYTES} B BOOT partition"
+	elif [ "$size" -gt "$BOOT_WARN_BYTES" ]; then
+		warn "/boot/boot.img is $size B (${BOOT_WARN_BYTES} B soft limit, $BOOT_PART_BYTES B partition)"
+	else
+		ok "/boot/boot.img is $size B of $BOOT_PART_BYTES B"
+	fi
+else
+	warn "/boot/boot.img not found (only generated by mkinitfs/boot-deploy)"
+fi
+
+if [ "$REGENERATE" = 1 ]; then
+	section "== Regenerating initramfs =="
+	if [ "$(id -u)" != "0" ]; then
+		bad "--regenerate requires root"
+	else
+		if mkinitfs; then
+			ok "mkinitfs finished"
+		else
+			bad "mkinitfs failed"
+		fi
+		if [ -f /boot/boot.img ]; then
+			size="$(wc -c < /boot/boot.img)"
+			if [ "$size" -le "$BOOT_PART_BYTES" ]; then
+				ok "new boot.img is $size B (fits $BOOT_PART_BYTES B)"
+			else
+				bad "new boot.img is $size B > $BOOT_PART_BYTES B"
+			fi
+		fi
+	fi
+fi
+
+printf '\n%s: %d checks, %d warning(s), %d failure(s)\n' \
+	"$PROG" "$CHECKS" "$WARNINGS" "$FAIL"
+[ "$FAIL" -eq 0 ] || exit 1
+exit 0

@@ -1,0 +1,44 @@
+# Maintainer: ROM/Nura parity integration (SM-J700M / j7elte)
+#
+# Userspace bring-up for the BCM43438 Bluetooth controller on UART 3
+# (/dev/ttySAC3).  The kernel has CONFIG_BT_HCIUART(_H4)=y but no hci_bcm /
+# btbcm driver, so hciattach must download the patch RAM from
+# /lib/firmware/postmarketos/samsung-j7elte/BCM43438A1.hcd.
+pkgname=j7elte-bt
+pkgver=0.1
+pkgrel=0
+pkgdesc="BCM43438 Bluetooth UART attach (hciattach) for the Samsung Galaxy J7"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+options="!check"
+# bluez-openrc supplies /etc/init.d/bluetooth, which this service starts after
+# the HCI transport is attached.  hciattach ships in bluez-deprecated;
+# /usr/sbin/rfkill is in util-linux-misc.
+depends="bluez bluez-deprecated bluez-openrc util-linux-misc"
+install="$pkgname.post-install"
+source="j7elte-bt.initd
+	j7elte-bt.confd
+	j7elte-bt.service
+	j7elte-bt.post-install
+	"
+builddir="$srcdir"
+
+package() {
+	install -Dm755 "$srcdir"/j7elte-bt.initd \
+		"$pkgdir"/etc/init.d/j7elte-bt
+	install -Dm644 "$srcdir"/j7elte-bt.confd \
+		"$pkgdir"/etc/conf.d/j7elte-bt
+
+	# Optional systemd equivalent; on OpenRC images the init script above is
+	# used.  Both read /etc/conf.d/j7elte-bt.
+	install -Dm644 "$srcdir"/j7elte-bt.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-bt.service
+}
+
+sha512sums="
+bcd2d43b543f6a41c4c0a1b219846ce3591f2546e017ac4d4adc5ed4d8c2e15f79308e302845fa5866b6368c133630a53cc0692696a1a19e337b6df6577724f7  j7elte-bt.initd
+89bafe5e5ae79bf7266728db5d329728fa2519d7701648bc12ddadb341d56d8f5256e643fadae006735a68cfbee5d613fe329cce06a5f1edfd09490d64b103dc  j7elte-bt.confd
+d1b8c9a8d38f4e15f3e8471c5ee3095f703f9b726f9c4c2aa3384d7e09ac00409df96022292357bfa2e58f5fcb98a574e52890ba609eb3fd24cf1d514bcb6ed6  j7elte-bt.service
+f386625ea6cf9ef49b7a3ef23e5fe268b504ce3f1a8b1a8e30c5a180d081c0233a16f6cbc043a9ae66aacb5cce836e364c26a2bf2ee62d41c2065aedef68df2f  j7elte-bt.post-install
+"

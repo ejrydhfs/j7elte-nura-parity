@@ -1,0 +1,98 @@
+# ROM GL/HAL stack extracted from ../../../../system.raw into /run/media/asdf/30620d0d-1e41-4d55-af08-b4de2fb9c517/j7elte-session/parity/userspace/gpu/re-hybris/romroot
+# paths are the on-device ones; image root == /system
+
+## system/bin/linker
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 601ffb95aec1d509e755e1ee0b27dea996c77e36a78a9b7239af7027d8c37aa2
+NEEDED <none>
+
+## egl_extract/libGLES_mali.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 62e10725f1077ffa483224de5a83c14a0a0ccdccb51cd094177b7bd1630be317
+NEEDED libz.so libdl.so libhardware.so libui.so libutils.so libcutils.so libbinder.so liblog.so libc++.so libion.so libc.so libm.so 
+
+## system/lib/hw/gralloc.exynos5.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 9a8223432a1e1231860ecd001df0ef9fd879d6ed8699770190bca63c03ca5635
+NEEDED liblog.so libcutils.so libion.so libutils.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/hw/hwcomposer.exynos5.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 6d46e5d5e283802f0d90a2842f77fedf4617c1d3df701d8fee85fee0f0e2ce36
+NEEDED liblog.so libcutils.so libEGL.so libGLESv1_CM.so libhardware.so libhardware_legacy.so libutils.so libsync.so libexynosv4l2.so libexynosutils.so libhwcutils.so libdisplay.so libhdmi.so libmpp.so libexynosgscaler.so libExynosHWCService.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libc.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 204785e4dafadfc0c8195e5663aa18be24b41d38aa4f7005cd94005d4d8a29be
+NEEDED libdl.so 
+
+## system/lib/libdl.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 391cae6ad2d31de26a7cb9e53471053f891c9d9899ff6106061d01277380eee7
+NEEDED <none>
+
+## system/lib/libhardware.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 ec1843a7a416ca2b65106458922e66a9a57ed0a23be1563b3ec5f0e85f559405
+NEEDED libcutils.so liblog.so libdl.so libc++.so libc.so libm.so 
+
+## system/lib/libion.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 e28b2d6e76c8acec73f085b6613c6596a7b8e49b8ccc5c97cf714b3208e389c5
+NEEDED liblog.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libui.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 c5ad8c1d1fa1b6aa845c1faa0c6caf67ba8c2c39daa3d9575f13e2082df31de5
+NEEDED libcutils.so libhardware.so libsync.so libutils.so liblog.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libbinder.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 40bbe649cf9d9dc9f232134243794c40e1059beb755c7fde0cca6b7e755c7784
+NEEDED liblog.so libcutils.so libutils.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libc++.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 ec564695859380abe2892826e9ac0c3abbf7666dd105833c2e43e866da8feef7
+NEEDED libdl.so libc.so libm.so 
+
+## system/lib/libEGL.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 288e70cface1293931113edbf5efe3c9447a4664c87f66be13506169dfb676f6
+NEEDED libcutils.so libutils.so liblog.so libGLES_trace.so libdl.so libc++.so libc.so libm.so 
+
+## system/lib/libGLESv1_CM.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 06b642c51959f8d76a62f7f53b15e927b1eea2289e3343f8e15373eba8a9e8b4
+NEEDED libutils.so libcutils.so liblog.so libEGL.so libdl.so libc++.so libc.so libm.so 
+
+## system/lib/libGLESv2.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 a8638d8c72755a9c8d4fcf403cb2f5894d1c61570cbbc43fd478f644666c5286
+NEEDED libcutils.so libutils.so liblog.so libEGL.so libdl.so libc++.so libc.so libm.so 
+
+## system/lib/libexynosutils.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 f0c81a28ae725f7ff40d5850f244173e69c70724a82185615fda9cd587b739f4
+NEEDED liblog.so libutils.so libcutils.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libexynosv4l2.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 d24c7199e11c10fdf70483126a542e24557e40f96c3393b3b3d0bacdd3b4876d
+NEEDED liblog.so libutils.so libexynosutils.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libdisplay.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 0bf9991aee6296f14ae2c5b4b83a3c783df0a9608f95826a7e2ca705e4af935b
+NEEDED liblog.so libutils.so libcutils.so libexynosutils.so libexynosv4l2.so libsync.so libhwcutils.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libmpp.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 c46e4bf90665d147f42a95dfffc7962e8e7dd8c8db7b7b96ec0a373ff5edeb5c
+NEEDED liblog.so libutils.so libcutils.so libexynosutils.so libexynosv4l2.so libexynosgscaler.so libc++.so libdl.so libc.so libm.so 
+
+## system/lib/libExynosHWCService.so
+  Class=ELF32   Data=2's complement, little endian   Type=DYN (Shared object file)   Machine=ARM   Flags=0x5000000, Version5 EABI 
+sha256 38fe320701633ea609506899ff70e44054ad8419bd78353cf8f8a8bed82211c5
+NEEDED liblog.so libcutils.so libhardware_legacy.so libutils.so libbinder.so libexynosv4l2.so libhdmi.so libhwcutils.so libsync.so libc++.so libdl.so libc.so libm.so 
+

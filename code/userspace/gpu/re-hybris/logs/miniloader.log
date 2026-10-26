@@ -1,0 +1,38 @@
+miniloader: loading /run/media/asdf/30620d0d-1e41-4d55-af08-b4de2fb9c517/j7elte-session/parity/userspace/gpu/re-hybris/egl_extract/libGLES_mali.so
+miniloader: image @0x20000000 maxend 0x016f07f8 dynsym 15008 aps2 0x001e2504+0x0001dd40 plt 0x00200244+0x00015248
+miniloader: APS2 relocs produced=96168 expected=96168
+miniloader: relocs RELATIVE=88977 ABS32=6437 GLOB_DAT=754 JUMP_SLOT=10825 other=0
+miniloader: constructors skipped (pass 'ctors' as 2nd arg to run)
+exports eglGetDisplay=0x20469910 eglQueryString=0x2046ae14 eglGetProcAddress=0x2046af1c eglInitialize=0x204699a8
+eglGetDisplay(EGL_DEFAULT_DISPLAY) = 0x44802580
+eglQueryString(NO_DISPLAY, EGL_CLIENT_APIS) = (null)
+eglQueryString(NO_DISPLAY, EGL_EXTENSIONS)[0..63] = 
+eglQueryString(dpy, EGL_VENDOR) = (null)
+eglQueryString(dpy, EGL_VERSION) = (null)
+eglGetProcAddress(glGetString)=0x00000000 eglGetDisplay=0x00000000
+miniloader: open("/dev/mali0", flags=524290, caller=0x20265554)
+miniloader: blob opened /dev/mali0 -> fake fd 42
+miniloader: fstat(fd=42) -> char device
+miniloader: ioctl(42, cmd=0xc0108000, size=16, caller=0x202654a8) hdr{id=0(UKP_FUNC_ID_CHECK_VERSION) ret=0} words: 0x0000000a 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+miniloader: mmap(len=4096 prot=0 flags=1 fd=42) -> -1
+  -> fake device mapping 0x4480d900
+miniloader: ioctl(42, cmd=0xc0108212, size=16, caller=0x202654a8) hdr{id=530(KBASE_FUNC_SET_FLAGS) ret=541467456} words: 0x00000000 0x00000000 0x44802510 0x00000000 0x00000000 0x00000000
+miniloader: close(fd=42)
+miniloader: fstat(fd=0) -> -1
+miniloader: logw[mali] ==>[INIT] () CDBG: In file: hardware/samsung_slsi/MaliT720_r7p0_Insel/product/cdbg/src/mali_cdbg_env.c  line: 586 cdbgp_populate_from_system_environment
+Initialization of a handle to the system environment failed (3)
+
+miniloader: logw[mali] ERROR: The DDK is not compatible with any of the Mali GPUs on the system.
+The DDK was built for 0x720 r1p0 status range [0..15], but none of the GPUs matched:
+
+miniloader: open("/dev/mali0", flags=524290, caller=0x20265554)
+miniloader: blob opened /dev/mali0 -> fake fd 42
+miniloader: fstat(fd=42) -> char device
+miniloader: ioctl(42, cmd=0xc0108000, size=16, caller=0x202654a8) hdr{id=0(UKP_FUNC_ID_CHECK_VERSION) ret=1} words: 0x0000000a 0x407ff981 0x00000000 0x00000000 0x00000000 0x00000000
+miniloader: mmap(len=4096 prot=0 flags=1 fd=42) -> -1
+  -> fake device mapping 0x44815b68
+miniloader: ioctl(42, cmd=0xc0108212, size=16, caller=0x202654a8) hdr{id=530(KBASE_FUNC_SET_FLAGS) ret=1082129056} words: 0x00000000 0x00000000 0x216e9968 0x00000000 0x00000000 0x00000000
+miniloader: close(fd=42)
+eglInitialize(dpy) = 0 version -1.-1
+eglGetError() = 0x0x00003000
+miniloader: done (no kernel driver touched, no acceleration claimed)

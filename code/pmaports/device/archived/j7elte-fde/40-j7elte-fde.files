@@ -1,0 +1,9 @@
+# Files that must exist inside the initramfs for the j7elte FDE drop-in to be
+# picked up by unl0kr. /etc/unl0kr.conf and the unl0kr/libinput/udev files are
+# already listed in main/unl0kr/unl0kr.files; this list only adds the
+# device specific drop-in.
+#
+# j7elte is a boot.img device (deviceinfo_create_initfs_extra is unset), so
+# mkinitfs merges files-extra into the single initramfs
+# (postmarketos-mkinitfs cmd/mkinitfs/main.go:135).
+/etc/unl0kr.conf.d/50-j7elte.conf

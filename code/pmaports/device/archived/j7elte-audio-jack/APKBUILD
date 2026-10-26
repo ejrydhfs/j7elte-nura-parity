@@ -1,0 +1,51 @@
+# Automatic audio jack routing for the Samsung Galaxy J7 (j7elte).
+#
+# The vendor sec_jack driver (drivers/misc/sec_jack.c) reports the jack
+# type through /sys/class/switch/h2w/state and a kobject uevent, but
+# registers no snd_jack kcontrol, so ALSA UCM / PipeWire cannot switch
+# routes on plug.  This daemon listens for the switch uevent, debounces
+# it and applies the matching UCM2 device of the j7elte-audio-ucm profile
+# (Speaker / Headphones / Headset Mic) via alsaucm, with an amixer
+# fallback.
+#
+# See parity/reports/audio-jack.md and parity/reports/audio-userspace.md.
+
+pkgname=j7elte-audio-jack
+pkgver=0.1
+pkgrel=0
+pkgdesc="Automatic headset jack routing for Samsung Galaxy J7 (j7elte)"
+url="https://postmarketos.org"
+arch="aarch64"
+license="GPL-3.0-or-later"
+depends="alsa-utils j7elte-audio-ucm"
+options="!check"
+builddir="$srcdir"
+
+source="
+	j7elte-audio-jack.c
+	j7elte-audio-jack.conf
+	j7elte-audio-jack.initd
+	j7elte-audio-jack.service
+"
+
+build() {
+	$CC $CFLAGS -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra \
+		-o j7elte-audio-jack "$srcdir"/j7elte-audio-jack.c $LDFLAGS
+}
+
+package() {
+	install -Dm755 j7elte-audio-jack "$pkgdir"/usr/bin/j7elte-audio-jack
+	install -Dm644 j7elte-audio-jack.conf \
+		"$pkgdir"/etc/j7elte-audio-jack.conf
+	install -Dm755 j7elte-audio-jack.initd \
+		"$pkgdir"/etc/init.d/j7elte-audio-jack
+	install -Dm644 j7elte-audio-jack.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-audio-jack.service
+}
+
+sha512sums="
+ac3ece873ebffdd4a9e5852b0474da7a4b93c841b74336f76a2982a74739b70d71d73c24b9f7334779e17cf14289ffdcda96a84ccc358514b251737dd7cd2f6f  j7elte-audio-jack.c
+c9c0683f993f577154b8bb8efd879f81a595e6ecf9d9abd64f00279aa1e599d81cc7a97a11553e2d14b507f130fbcab0801a9bf5824b8f95d840715e61a82e62  j7elte-audio-jack.conf
+970dd0564908a914000ac35a2d4aa5899f02cda18bf5af2df0b55084400c7323faee4618721c47c7146e4a2c385574e94ef7ca13d93c35795159df7ea0e78dd2  j7elte-audio-jack.initd
+a537581c72ecc369d787fff554196fc3b80639a60f8c4a26ead6b45165be9dabbe66933eb5e54c09ea98fa336d7e8f1bc8a9224b3f126c70a01d432407348bb7  j7elte-audio-jack.service
+"

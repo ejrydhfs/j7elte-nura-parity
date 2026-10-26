@@ -1,0 +1,1274 @@
+/* j7elte-audio-jack - automatic headset jack routing for the Samsung
+ * Galaxy J7 (j7elte, Exynos 7580 / COD3022X + S2801X).
+ *
+ * The vendor kernel driver drivers/misc/sec_jack.c does not register an
+ * ALSA jack kcontrol (no snd_jack), so neither UCM, PipeWire nor
+ * WirePlumber can see a plug event.  It does register two Android
+ * "switch" class devices:
+ *
+ *   /sys/class/switch/h2w/state       jack type (enum sec_jack_type)
+ *   /sys/class/switch/send_end/state  headset button state
+ *
+ * and emits a KOBJ_CHANGE uevent with SWITCH_NAME/SWITCH_STATE on every
+ * state change (drivers/switch/switch_class.c).  This daemon subscribes
+ * to that uevent stream (NETLINK_KOBJECT_UEVENT, no udev dependency),
+ * falls back to polling the sysfs attribute if uevents are unavailable,
+ * debounces the result and applies the matching ALSA UCM2 device of the
+ * profile shipped by j7elte-audio-ucm.
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <linux/netlink.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define PROG "j7elte-audio-jack"
+
+#define DEFAULT_CONFIG "/etc/j7elte-audio-jack.conf"
+#define DEFAULT_ALSACUM "/usr/bin/alsaucm"
+#define DEFAULT_AMIXER "/usr/bin/amixer"
+#define STATE_MAX 7
+#define MAX_STR 128
+
+/* enum sec_jack_type, include/linux/sec_jack.h:20-25 */
+#define JACK_NONE 0
+#define JACK_HEADSET_4POLE 1
+#define JACK_HEADSET_3POLE 2
+#define JACK_EXTERNAL_ANTENNA 4
+
+struct cfg {
+	char *card;
+	char *verb;
+	char *switch_name;
+	char *state_file;
+	char *alsaucm;
+	char *amixer;
+	char *hook;
+	char *out[STATE_MAX + 1];
+	char *in[STATE_MAX + 1];
+	int settle_ms;
+	int poll_ms;
+	int retry_ms;
+	int cmd_timeout_ms;
+	bool verify;
+};
+
+static volatile sig_atomic_t g_stop;
+static volatile sig_atomic_t g_reload;
+
+static void on_signal(int sig)
+{
+	if (sig == SIGHUP)
+		g_reload = 1;
+	else
+		g_stop = 1;
+}
+
+static void logmsg(const char *fmt, ...)
+{
+	struct timespec ts;
+	struct tm tm;
+	va_list ap;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	localtime_r(&ts.tv_sec, &tm);
+	fprintf(stderr, "%s %02d:%02d:%02d.%03ld ", PROG, tm.tm_hour, tm.tm_min,
+		tm.tm_sec, ts.tv_nsec / 1000000);
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc('\n', stderr);
+	fflush(stderr);
+}
+
+static long now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static char *xstrdup(const char *s)
+{
+	char *p = strdup(s);
+
+	if (!p) {
+		logmsg("out of memory");
+		exit(1);
+	}
+	return p;
+}
+
+static void set_str(char **dst, const char *val)
+{
+	free(*dst);
+	*dst = xstrdup(val);
+}
+
+static char *trim(char *s)
+{
+	char *end;
+
+	while (*s == ' ' || *s == '\t')
+		s++;
+	end = s + strlen(s);
+	while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' ||
+			   end[-1] == '\n'))
+		*--end = '\0';
+	return s;
+}
+
+/* ------------------------------------------------------------------ config */
+
+static void cfg_defaults(struct cfg *c)
+{
+	memset(c, 0, sizeof(*c));
+	c->card = xstrdup("hw:0");
+	c->verb = xstrdup("HiFi");
+	c->switch_name = xstrdup("h2w");
+	c->state_file = xstrdup("");
+	c->alsaucm = xstrdup(DEFAULT_ALSACUM);
+	c->amixer = xstrdup(DEFAULT_AMIXER);
+	c->hook = xstrdup("");
+	c->settle_ms = 300;
+	c->poll_ms = 5000;
+	c->retry_ms = 5000;
+	c->cmd_timeout_ms = 5000;
+	c->verify = true;
+
+	/* Jack type -> UCM device.  Both 3-pole and 4-pole plugs are
+	 * playback on the headphone outputs; only the 4-pole one has a
+	 * microphone, hence "Headset Mic".  State 4 is the stock
+	 * external-antenna detection; treat it as "no headset" so audio
+	 * cannot be routed into a non-existent transducer.
+	 */
+	c->out[JACK_NONE] = xstrdup("Speaker");
+	c->in[JACK_NONE] = xstrdup("Mic");
+	c->out[JACK_HEADSET_4POLE] = xstrdup("Headphones");
+	c->in[JACK_HEADSET_4POLE] = xstrdup("Headset Mic");
+	c->out[JACK_HEADSET_3POLE] = xstrdup("Headphones");
+	c->in[JACK_HEADSET_3POLE] = xstrdup("Mic");
+	c->out[JACK_EXTERNAL_ANTENNA] = xstrdup("Speaker");
+	c->in[JACK_EXTERNAL_ANTENNA] = xstrdup("Mic");
+}
+
+static void cfg_free(struct cfg *c)
+{
+	int i;
+
+	free(c->card);
+	free(c->verb);
+	free(c->switch_name);
+	free(c->state_file);
+	free(c->alsaucm);
+	free(c->amixer);
+	free(c->hook);
+	for (i = 0; i <= STATE_MAX; i++) {
+		free(c->out[i]);
+		free(c->in[i]);
+	}
+	memset(c, 0, sizeof(*c));
+}
+
+static bool parse_bool(const char *v)
+{
+	return !strcmp(v, "1") || !strcmp(v, "yes") || !strcmp(v, "true") ||
+	       !strcmp(v, "on");
+}
+
+static int parseInt(const char *key, const char *v, int min, int max)
+{
+	char *end = NULL;
+	long n = strtol(v, &end, 10);
+
+	if (end == v || (end && *end) || n < min || n > max) {
+		logmsg("config: invalid value '%s' for %s (want %d..%d), ignored",
+		       v, key, min, max);
+		return -1;
+	}
+	return (int)n;
+}
+
+static void cfg_key(struct cfg *c, const char *key, const char *val)
+{
+	int state, n;
+	char extra;
+
+	if (!strcmp(key, "card")) {
+		set_str(&c->card, val);
+	} else if (!strcmp(key, "verb")) {
+		set_str(&c->verb, val);
+	} else if (!strcmp(key, "switch")) {
+		set_str(&c->switch_name, val);
+	} else if (!strcmp(key, "state_file")) {
+		set_str(&c->state_file, val);
+	} else if (!strcmp(key, "alsaucm")) {
+		set_str(&c->alsaucm, val);
+	} else if (!strcmp(key, "amixer")) {
+		set_str(&c->amixer, val);
+	} else if (!strcmp(key, "hook")) {
+		set_str(&c->hook, val);
+	} else if (!strcmp(key, "settle_ms")) {
+		n = parseInt(key, val, 0, 60000);
+		if (n >= 0)
+			c->settle_ms = n;
+	} else if (!strcmp(key, "poll_ms")) {
+		n = parseInt(key, val, 0, 3600000);
+		if (n >= 0)
+			c->poll_ms = n;
+	} else if (!strcmp(key, "retry_ms")) {
+		n = parseInt(key, val, 100, 3600000);
+		if (n >= 0)
+			c->retry_ms = n;
+	} else if (!strcmp(key, "cmd_timeout_ms")) {
+		n = parseInt(key, val, 100, 300000);
+		if (n >= 0)
+			c->cmd_timeout_ms = n;
+	} else if (!strcmp(key, "verify")) {
+		c->verify = parse_bool(val);
+	} else if (sscanf(key, "out_%d%c", &state, &extra) == 1 &&
+		   state >= 0 && state <= STATE_MAX) {
+		set_str(&c->out[state], val);
+	} else if (sscanf(key, "in_%d%c", &state, &extra) == 1 &&
+		   state >= 0 && state <= STATE_MAX) {
+		set_str(&c->in[state], val);
+	} else {
+		logmsg("config: unknown key '%s', ignored", key);
+	}
+}
+
+static int cfg_load(struct cfg *c, const char *path)
+{
+	FILE *f;
+	char line[512];
+	int lineno = 0;
+
+	f = fopen(path, "r");
+	if (!f) {
+		logmsg("cannot open config %s: %s (using defaults)", path,
+		       strerror(errno));
+		return -1;
+	}
+	while (fgets(line, sizeof(line), f)) {
+		char *s, *eq, *hash;
+
+		lineno++;
+		s = trim(line);
+		if (!*s || *s == '#')
+			continue;
+		hash = strchr(s, '#');
+		if (hash && (hash == s || hash[-1] == ' ' || hash[-1] == '\t')) {
+			*hash = '\0';
+			s = trim(s);
+			if (!*s)
+				continue;
+		}
+		eq = strchr(s, '=');
+		if (!eq) {
+			logmsg("config %s:%d: missing '=', ignored", path, lineno);
+			continue;
+		}
+		*eq = '\0';
+		cfg_key(c, trim(s), trim(eq + 1));
+	}
+	fclose(f);
+	return 0;
+}
+
+static const char *dev_for(const struct cfg *c, int state, bool out)
+{
+	const char *v;
+
+	if (state < 0 || state > STATE_MAX)
+		state = JACK_NONE;
+	v = out ? c->out[state] : c->in[state];
+	if (!v)
+		v = out ? c->out[JACK_NONE] : c->in[JACK_NONE];
+	return v;
+}
+
+/* --------------------------------------------------------- command helper */
+
+/* Append at most outlen-1 bytes, always NUL-terminating; returns new used. */
+static size_t append(char *out, size_t outlen, size_t used, const char *src,
+		     size_t n)
+{
+	size_t room;
+
+	if (!out || outlen == 0)
+		return 0;
+	room = outlen - 1 - used;
+	if (n > room)
+		n = room;
+	memcpy(out + used, src, n);
+	used += n;
+	out[used] = '\0';
+	return used;
+}
+
+/* Run argv capturing stdout+stderr into out (bounded).  stdin_data (if not
+ * NULL) is written to the child's stdin.  Returns the child's exit status,
+ * -1 on spawn/wait failure, -2 if the command had to be killed on timeout. */
+static int spawn_capture(char *const argv[], const char *stdin_data, char *out,
+			 size_t outlen, int timeout_ms)
+{
+	int opipe[2] = { -1, -1 };
+	int ipipe[2] = { -1, -1 };
+	long deadline = now_ms() + timeout_ms;
+	pid_t pid;
+	int status = 0;
+	size_t used = 0;
+	bool killed = false;
+
+	if (out && outlen)
+		out[0] = '\0';
+	if (pipe(opipe) < 0)
+		return -1;
+	if (stdin_data && pipe(ipipe) < 0) {
+		close(opipe[0]);
+		close(opipe[1]);
+		return -1;
+	}
+
+	pid = fork();
+	if (pid < 0) {
+		close(opipe[0]);
+		close(opipe[1]);
+		if (stdin_data) {
+			close(ipipe[0]);
+			close(ipipe[1]);
+		}
+		return -1;
+	}
+	if (pid == 0) {
+		int devnull;
+
+		if (stdin_data) {
+			if (dup2(ipipe[0], STDIN_FILENO) < 0)
+				_exit(126);
+			close(ipipe[0]);
+			close(ipipe[1]);
+		} else {
+			devnull = open("/dev/null", O_RDONLY);
+			if (devnull >= 0) {
+				if (dup2(devnull, STDIN_FILENO) < 0)
+					_exit(126);
+				close(devnull);
+			}
+		}
+		if (dup2(opipe[1], STDOUT_FILENO) < 0 ||
+		    dup2(opipe[1], STDERR_FILENO) < 0)
+			_exit(126);
+		close(opipe[0]);
+		close(opipe[1]);
+		execv(argv[0], argv);
+		_exit(127);
+	}
+
+	close(opipe[1]);
+	if (stdin_data) {
+		size_t len = strlen(stdin_data);
+		size_t off = 0;
+
+		close(ipipe[0]);
+		while (off < len) {
+			ssize_t n = write(ipipe[1], stdin_data + off, len - off);
+
+			if (n < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			off += (size_t)n;
+		}
+		close(ipipe[1]);
+	}
+
+	for (;;) {
+		struct pollfd pfd;
+		long left = deadline - now_ms();
+		char buf[512];
+		ssize_t n;
+		int pr;
+
+		if (left <= 0) {
+			kill(pid, SIGKILL);
+			killed = true;
+			break;
+		}
+		pfd.fd = opipe[0];
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		pr = poll(&pfd, 1, (int)left);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (pr == 0) {
+			kill(pid, SIGKILL);
+			killed = true;
+			break;
+		}
+		n = read(opipe[0], buf, sizeof(buf));
+		if (n > 0) {
+			used = append(out, outlen, used, buf, (size_t)n);
+			continue;
+		}
+		if (n == 0)
+			break;
+		if (errno == EINTR)
+			continue;
+		break;
+	}
+	close(opipe[0]);
+
+	while (waitpid(pid, &status, 0) < 0) {
+		if (errno != EINTR)
+			return -1;
+	}
+	if (killed) {
+		logmsg("command %s timed out after %d ms and was killed",
+		       argv[0], timeout_ms);
+		return -2;
+	}
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	return -1;
+}
+
+static void log_cmd_output(const char *what, const char *out)
+{
+	const char *p = out;
+	char line[256];
+
+	if (!out || !*out)
+		return;
+	while (*p) {
+		size_t n = strcspn(p, "\n");
+		size_t k = n < sizeof(line) - 1 ? n : sizeof(line) - 1;
+
+		memcpy(line, p, k);
+		line[k] = '\0';
+		if (*line)
+			logmsg("%s: %s", what, line);
+		p += n;
+		if (*p == '\n')
+			p++;
+	}
+}
+
+/* ------------------------------------------------------------ mixer query */
+
+static int find_values(const char *out, char *val, size_t vlen)
+{
+	const char *p = out;
+
+	while ((p = strstr(p, "values="))) {
+		const char *ls = p;
+		const char *q;
+		size_t i = 0;
+
+		while (ls > out && ls[-1] != '\n')
+			ls--;
+		q = ls;
+		while (*q == ' ' || *q == '\t')
+			q++;
+		if (*q == ':') {
+			p += strlen("values=");
+			while (*p == ' ' || *p == '\t')
+				p++;
+			while (*p && *p != '\n' && *p != ',' && *p != '\r' &&
+			       i + 1 < vlen) {
+				val[i++] = *p++;
+			}
+			while (i > 0 && (val[i - 1] == ' ' || val[i - 1] == '\t'))
+				i--;
+			val[i] = '\0';
+			return i > 0 ? 0 : -1;
+		}
+		p += strlen("values=");
+	}
+	return -1;
+}
+
+/* 1 = on, 0 = off, -1 = unavailable/unparsable. */
+static int mixer_on(struct cfg *c, const char *ctrl, char *errbuf,
+		    size_t errlen)
+{
+	char *argv[] = { c->amixer, "-c", c->card, "cget", (char *)ctrl, NULL };
+	char val[MAX_STR];
+	int rc;
+
+	rc = spawn_capture(argv, NULL, errbuf, errlen, c->cmd_timeout_ms);
+	if (rc != 0)
+		return -1;
+	if (find_values(errbuf, val, sizeof(val)) < 0)
+		return -1;
+	if (!strcmp(val, "on") || !strcmp(val, "On") || !strcmp(val, "1"))
+		return 1;
+	if (!strcmp(val, "off") || !strcmp(val, "Off") || !strcmp(val, "0"))
+		return 0;
+	return -1;
+}
+
+struct verify_out {
+	const char *dev;
+	const char *on;
+	const char *off_a;
+	const char *off_b;
+};
+
+static const struct verify_out verify_out_tbl[] = {
+	{ "Speaker", "SPK SPK On", "HP HP On", "EP EP On" },
+	{ "Headphones", "HP HP On", "SPK SPK On", "EP EP On" },
+	{ "Earpiece", "EP EP On", "HP HP On", "SPK SPK On" },
+};
+
+struct verify_in {
+	const char *dev;
+	const char *on;
+	const char *off;
+};
+
+static const struct verify_in verify_in_tbl[] = {
+	{ "Mic", "MIC1 MIC1 On", "MIC2 MIC2 On" },
+	{ "Headset Mic", "MIC2 MIC2 On", "MIC1 MIC1 On" },
+};
+
+static int check_switch(struct cfg *c, const char *ctrl, int want_on)
+{
+	char err[2048];
+	int q = mixer_on(c, ctrl, err, sizeof(err));
+
+	if (q < 0)
+		return 0; /* inconclusive, do not force the fallback */
+	if (q != want_on) {
+		logmsg("route check: %s is %s, expected %s", ctrl,
+		       q ? "on" : "off", want_on ? "on" : "off");
+		return -1;
+	}
+	return 0;
+}
+
+/* Returns 0 if the mixer matches out/in, -1 on a confirmed mismatch. */
+static int verify_route(struct cfg *c, const char *out, const char *in)
+{
+	size_t i;
+	int rc = 0;
+
+	for (i = 0; i < sizeof(verify_out_tbl) / sizeof(verify_out_tbl[0]); i++) {
+		if (strcmp(verify_out_tbl[i].dev, out))
+			continue;
+		rc |= check_switch(c, verify_out_tbl[i].on, 1);
+		rc |= check_switch(c, verify_out_tbl[i].off_a, 0);
+		rc |= check_switch(c, verify_out_tbl[i].off_b, 0);
+	}
+	for (i = 0; i < sizeof(verify_in_tbl) / sizeof(verify_in_tbl[0]); i++) {
+		if (strcmp(verify_in_tbl[i].dev, in))
+			continue;
+		rc |= check_switch(c, verify_in_tbl[i].on, 1);
+		rc |= check_switch(c, verify_in_tbl[i].off, 0);
+	}
+	return rc ? -1 : 0;
+}
+
+/* ----------------------------------------------------------------- route */
+
+struct amix {
+	const char *ctl;
+	const char *val;
+};
+
+/* amixer-only fallback, mirroring the UCM2 sequences in
+ * /usr/share/alsa/ucm2/j7elte/HiFi.conf.  Used when alsaucm is missing,
+ * fails, or the resulting mixer state does not verify. */
+static const struct amix fb_common_playback[] = {
+	{ "S2801 Mixer En", "On" },
+	{ "S2801 CH1 Mixer En", "On" },
+	{ "S2801 CH2 Mixer En", "Off" },
+	{ "S2801 CH3 Mixer En", "Off" },
+	{ "S2801 CH4 Mixer En", "Off" },
+	{ "MonoMix Mode", "Disable" },
+	{ "Chargepump Mode", "CLASS-G-A" },
+	{ "DNC Max Gain", "24" },
+	{ "HPL Mixer ADCL Switch", "off" },
+	{ "HPL Mixer ADCR Switch", "off" },
+	{ "HPR Mixer ADCL Switch", "off" },
+	{ "HPR Mixer ADCR Switch", "off" },
+	{ "EP Mixer ADCL Switch", "off" },
+	{ "EP Mixer ADCR Switch", "off" },
+	{ "SPK Mixer ADCL Switch", "off" },
+	{ "SPK Mixer ADCR Switch", "off" },
+	{ "S2801 MIX1_LVL", "0" },
+	{ "DAC Gain", "121" },
+};
+
+static const struct amix fb_out_gates[] = {
+	{ "HP HP On", "off" },
+	{ "EP EP On", "off" },
+	{ "SPK SPK On", "off" },
+};
+
+static const struct amix fb_capture_common[] = {
+	{ "S2801 CH1 DOUT Select", "AIF4IN" },
+	{ "LINEIN LINEIN On", "off" },
+};
+
+static const struct amix fb_cap_mic[] = {
+	{ "ADCL Mixer MIC1L Switch", "1" },
+	{ "ADCL Mixer MIC2L Switch", "0" },
+	{ "ADCL Mixer LINELL Switch", "0" },
+	{ "ADCL Mixer LINERL Switch", "0" },
+	{ "ADCR Mixer MIC1R Switch", "1" },
+	{ "ADCR Mixer MIC2R Switch", "0" },
+	{ "ADCR Mixer LINELR Switch", "0" },
+	{ "ADCR Mixer LINERR Switch", "0" },
+	{ "MIC2 MIC2 On", "off" },
+	{ "MIC1 MIC1 On", "on" },
+	{ "MIC1 Volume", "11" },
+	{ "MIC1 Boost Volume", "2" },
+};
+
+static const struct amix fb_cap_headset_mic[] = {
+	{ "ADCL Mixer MIC1L Switch", "0" },
+	{ "ADCL Mixer MIC2L Switch", "1" },
+	{ "ADCL Mixer LINELL Switch", "0" },
+	{ "ADCL Mixer LINERL Switch", "0" },
+	{ "ADCR Mixer MIC1R Switch", "0" },
+	{ "ADCR Mixer MIC2R Switch", "1" },
+	{ "ADCR Mixer LINELR Switch", "0" },
+	{ "ADCR Mixer LINERR Switch", "0" },
+	{ "MIC1 MIC1 On", "off" },
+	{ "MIC2 MIC2 On", "on" },
+	{ "MIC2 Volume", "11" },
+	{ "MIC2 Boost Volume", "2" },
+};
+
+static int amixer_set(struct cfg *c, const char *ctl, const char *val)
+{
+	char *argv[] = { c->amixer, "-q", "-c", c->card, "sset", (char *)ctl,
+			 (char *)val, NULL };
+	char out[1024];
+	int rc;
+
+	rc = spawn_capture(argv, NULL, out, sizeof(out), c->cmd_timeout_ms);
+	if (rc != 0) {
+		logmsg("fallback: amixer %s=%s failed (rc=%d)", ctl, val, rc);
+		if (out[0])
+			log_cmd_output("amixer", out);
+		return -1;
+	}
+	return 0;
+}
+
+static void run_amix_list(struct cfg *c, const struct amix *list, size_t n,
+			  const char *why)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		if (amixer_set(c, list[i].ctl, list[i].val) < 0)
+			logmsg("fallback (%s): could not set %s", why,
+			       list[i].ctl);
+	}
+}
+
+static int fallback_apply(struct cfg *c, const char *out, const char *in)
+{
+	logmsg("applying amixer fallback for out='%s' in='%s'", out, in);
+
+	run_amix_list(c, fb_common_playback,
+		      sizeof(fb_common_playback) / sizeof(fb_common_playback[0]),
+		      "playback");
+	run_amix_list(c, fb_out_gates,
+		      sizeof(fb_out_gates) / sizeof(fb_out_gates[0]),
+		      "output gates");
+
+	if (!strcmp(out, "Speaker")) {
+		amixer_set(c, "SPK SPK On", "on");
+		amixer_set(c, "Speaker Volume", "3");
+	} else if (!strcmp(out, "Headphones")) {
+		amixer_set(c, "HP HP On", "on");
+		amixer_set(c, "Headphone Volume", "36");
+	} else if (!strcmp(out, "Earpiece")) {
+		amixer_set(c, "EP EP On", "on");
+		amixer_set(c, "Earphone Volume", "0");
+	} else {
+		logmsg("fallback: unknown output device '%s'", out);
+		return -1;
+	}
+
+	run_amix_list(c, fb_capture_common,
+		      sizeof(fb_capture_common) / sizeof(fb_capture_common[0]),
+		      "capture");
+	if (!strcmp(in, "Mic")) {
+		run_amix_list(c, fb_cap_mic,
+			      sizeof(fb_cap_mic) / sizeof(fb_cap_mic[0]),
+			      "main mic");
+	} else if (!strcmp(in, "Headset Mic")) {
+		run_amix_list(c, fb_cap_headset_mic,
+			      sizeof(fb_cap_headset_mic) /
+				      sizeof(fb_cap_headset_mic[0]),
+			      "headset mic");
+	} else {
+		logmsg("fallback: unknown input device '%s'", in);
+		return -1;
+	}
+	return 0;
+}
+
+static void run_hook(struct cfg *c, int state, const char *out, const char *in)
+{
+	char statebuf[16];
+	char *argv[] = { c->hook, statebuf, (char *)out, (char *)in, NULL };
+	char buf[1024];
+	int rc;
+
+	if (!c->hook || !*c->hook)
+		return;
+	snprintf(statebuf, sizeof(statebuf), "%d", state);
+	rc = spawn_capture(argv, NULL, buf, sizeof(buf), c->cmd_timeout_ms);
+	if (rc != 0) {
+		logmsg("hook '%s' failed (rc=%d)", c->hook, rc);
+		if (buf[0])
+			log_cmd_output("hook", buf);
+	} else if (buf[0]) {
+		log_cmd_output("hook", buf);
+	}
+}
+
+/* alsaucm's batch parser (alsa-utils alsaucm/usecase.c, parse_line())
+ * splits on whitespace unless a token starts with '"' or '\''.  UCM
+ * device names such as "Headset Mic" contain a space, so every value is
+ * quoted.  A name containing a double quote or a newline cannot be
+ * represented and is rejected instead of being silently mangled. */
+static bool valid_ucm_name(const char *s)
+{
+	return s && *s && !strchr(s, '"') && !strchr(s, '\n') &&
+	       !strchr(s, '\r');
+}
+
+static void build_batch(const struct cfg *c, int state, char *batch,
+			size_t batchlen)
+{
+	snprintf(batch, batchlen,
+		 "set _verb \"%s\"\n"
+		 "set _enadev \"%s\"\n"
+		 "set _enadev \"%s\"\n",
+		 c->verb, dev_for(c, state, true), dev_for(c, state, false));
+}
+
+static int uevent_parse(const struct cfg *c, const char *buf, size_t len);
+
+static int self_test(void)
+{
+	static const char ev_4pole[] =
+		"change@/devices/virtual/switch/h2w\0"
+		"ACTION=change\0"
+		"DEVPATH=/devices/virtual/switch/h2w\0"
+		"SUBSYSTEM=switch\0"
+		"SWITCH_NAME=h2w\0"
+		"SWITCH_STATE=1\0";
+	static const char ev_other[] =
+		"change@/devices/virtual/switch/send_end\0"
+		"ACTION=change\0"
+		"SUBSYSTEM=switch\0"
+		"SWITCH_NAME=send_end\0"
+		"SWITCH_STATE=1\0";
+	static const char ev_add[] =
+		"add@/devices/virtual/switch/h2w\0"
+		"ACTION=add\0"
+		"SUBSYSTEM=switch\0"
+		"SWITCH_NAME=h2w\0"
+		"SWITCH_STATE=2\0";
+	static const char amix_bool[] =
+		"numid=12,iface=MIXER,name='HP HP On'\n"
+		"  ; type=BOOLEAN,access=rw------,values=1\n"
+		"  : values=on\n";
+	char buf[1024], val[MAX_STR];
+	struct cfg c;
+	int fails = 0;
+	int r;
+
+#define CHECK(cond, what)                                                     \
+	do {                                                                  \
+		if (!(cond)) {                                                \
+			printf("FAIL: %s\n", what);                            \
+			fails++;                                              \
+		} else {                                                      \
+			printf("ok: %s\n", what);                             \
+		}                                                             \
+	} while (0)
+
+	cfg_defaults(&c);
+
+	CHECK(!strcmp(dev_for(&c, JACK_NONE, true), "Speaker"), "state 0 -> Speaker");
+	CHECK(!strcmp(dev_for(&c, JACK_NONE, false), "Mic"), "state 0 -> Mic");
+	CHECK(!strcmp(dev_for(&c, JACK_HEADSET_4POLE, true), "Headphones"),
+	      "state 1 -> Headphones");
+	CHECK(!strcmp(dev_for(&c, JACK_HEADSET_4POLE, false), "Headset Mic"),
+	      "state 1 -> Headset Mic");
+	CHECK(!strcmp(dev_for(&c, JACK_HEADSET_3POLE, true), "Headphones"),
+	      "state 2 -> Headphones");
+	CHECK(!strcmp(dev_for(&c, JACK_HEADSET_3POLE, false), "Mic"),
+	      "state 2 -> Mic");
+	CHECK(!strcmp(dev_for(&c, JACK_EXTERNAL_ANTENNA, true), "Speaker"),
+	      "state 4 -> Speaker");
+	CHECK(!strcmp(dev_for(&c, 7, false), "Mic"), "unknown state -> Mic");
+
+	build_batch(&c, JACK_HEADSET_4POLE, buf, sizeof(buf));
+	CHECK(!strcmp(buf,
+		      "set _verb \"HiFi\"\nset _enadev \"Headphones\"\n"
+		      "set _enadev \"Headset Mic\"\n"),
+	      "UCM2 batch for 4-pole (names quoted for alsaucm)");
+	CHECK(valid_ucm_name("Headset Mic") && !valid_ucm_name("Head\"set"),
+	      "UCM name validation");
+
+	r = uevent_parse(&c, ev_4pole, sizeof(ev_4pole) - 1);
+	CHECK(r == 1, "uevent: h2w state 1 parsed");
+	r = uevent_parse(&c, ev_other, sizeof(ev_other) - 1);
+	CHECK(r == -1, "uevent: send_end ignored");
+	r = uevent_parse(&c, ev_add, sizeof(ev_add) - 1);
+	CHECK(r == -1, "uevent: non-change action ignored");
+
+	CHECK(find_values(amix_bool, val, sizeof(val)) == 0 &&
+		      !strcmp(val, "on"),
+	      "amixer values line parsed (boolean on)");
+	CHECK(find_values("  ; type=BOOLEAN,values=1\n  : values=off\n", val,
+			  sizeof(val)) == 0 &&
+		      !strcmp(val, "off"),
+	      "amixer values line parsed (boolean off)");
+	CHECK(find_values("  : values=121\n", val, sizeof(val)) == 0 &&
+		      !strcmp(val, "121"),
+	      "amixer values line parsed (integer)");
+	CHECK(find_values("numid=1,iface=MIXER\n", val, sizeof(val)) == -1,
+	      "amixer output without a values line rejected");
+
+	cfg_free(&c);
+	printf("SELFTEST %s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
+	return fails ? 1 : 0;
+#undef CHECK
+}
+
+static int apply_state(struct cfg *c, int state, bool dry)
+{
+	const char *out = dev_for(c, state, true);
+	const char *in = dev_for(c, state, false);
+	char batch[1024];
+	char *argv[] = { c->alsaucm, "-c", c->card, "-b", "-", NULL };
+	char buf[4096];
+	int rc;
+
+	if (!valid_ucm_name(c->verb) || !valid_ucm_name(out) ||
+	    !valid_ucm_name(in)) {
+		logmsg("invalid UCM name (verb='%s' out='%s' in='%s')",
+		       c->verb, out, in);
+		return -1;
+	}
+	build_batch(c, state, batch, sizeof(batch));
+
+	if (dry) {
+		printf("state=%d out='%s' in='%s'\n%s", state, out, in, batch);
+		return 0;
+	}
+
+	logmsg("jack state %d: out='%s' in='%s'", state, out, in);
+	rc = spawn_capture(argv, batch, buf, sizeof(buf), c->cmd_timeout_ms);
+	if (buf[0])
+		log_cmd_output("alsaucm", buf);
+
+	if (rc == 0) {
+		if (!c->verify) {
+			run_hook(c, state, out, in);
+			return 0;
+		}
+		if (verify_route(c, out, in) == 0) {
+			run_hook(c, state, out, in);
+			return 0;
+		}
+		logmsg("alsaucm route did not verify, trying amixer fallback");
+	} else {
+		logmsg("alsaucm failed (rc=%d), trying amixer fallback", rc);
+	}
+
+	if (fallback_apply(c, out, in) != 0)
+		return -1;
+	if (c->verify && verify_route(c, out, in) != 0) {
+		logmsg("fallback route did not verify either");
+		return -1;
+	}
+	run_hook(c, state, out, in);
+	return 0;
+}
+
+/* ------------------------------------------------------------- jack input */
+
+static void state_path(const struct cfg *c, char *path, size_t pathlen)
+{
+	if (c->state_file && *c->state_file)
+		snprintf(path, pathlen, "%s", c->state_file);
+	else
+		snprintf(path, pathlen, "/sys/class/switch/%s/state",
+			 c->switch_name);
+}
+
+static int read_jack_state(const struct cfg *c)
+{
+	char path[256];
+	FILE *f;
+	int v = -1;
+
+	state_path(c, path, sizeof(path));
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	if (fscanf(f, "%d", &v) != 1)
+		v = -1;
+	fclose(f);
+	return v;
+}
+
+/* Subscribe to the kernel's kobject uevent stream.  Requires CAP_NET_ADMIN
+ * (i.e. root); returns -1 if unavailable, in which case the caller polls. */
+static int uevent_open(void)
+{
+	struct sockaddr_nl sa;
+	int fd, rcvbuf = 256 * 1024;
+
+	fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+	if (fd < 0) {
+		logmsg("netlink uevent socket: %s", strerror(errno));
+		return -1;
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	sa.nl_groups = 1;
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		logmsg("netlink uevent bind: %s", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	return fd;
+}
+
+/* Returns the new jack state if the message is a change of our switch,
+ * -1 otherwise. */
+static int uevent_parse(const struct cfg *c, const char *buf, size_t len)
+{
+	const char *p = buf;
+	const char *subsystem = NULL;
+	const char *sw_name = NULL;
+	const char *sw_state = NULL;
+	bool action_change = false;
+
+	while (p < buf + len) {
+		size_t n = strnlen(p, (size_t)(buf + len - p));
+
+		if (n == (size_t)(buf + len - p))
+			break;
+		if (!strncmp(p, "ACTION=change", 13))
+			action_change = true;
+		else if (!strncmp(p, "SUBSYSTEM=", 10))
+			subsystem = p + 10;
+		else if (!strncmp(p, "SWITCH_NAME=", 12))
+			sw_name = p + 12;
+		else if (!strncmp(p, "SWITCH_STATE=", 13))
+			sw_state = p + 13;
+		p += n + 1;
+	}
+
+	if (!action_change || !subsystem || strcmp(subsystem, "switch"))
+		return -1;
+	if (!sw_name || strcmp(sw_name, c->switch_name))
+		return -1;
+	if (!sw_state)
+		return -1;
+	return atoi(sw_state);
+}
+
+static void usage(const char *argv0)
+{
+	printf("Usage: %s [options]\n"
+	       "  -c, --config PATH  configuration file (default %s)\n"
+	       "  -s, --state N      apply jack state N once, print the route, exit\n"
+	       "  -o, --once         read the current state, apply it once, exit\n"
+	       "  -n, --dry-run      print the commands instead of running them\n"
+	       "  -v, --verbose      verbose logging\n"
+	       "  -T, --self-test    run internal parser/mapping checks, exit\n"
+	       "  -h, --help         this help\n"
+	       "Jack states: 0=none, 1=4-pole headset, 2=3-pole headphone,\n"
+	       "             4=external antenna (treated as none)\n",
+	       argv0, DEFAULT_CONFIG);
+}
+
+int main(int argc, char **argv)
+{
+	static const struct option opts[] = {
+		{ "config", required_argument, NULL, 'c' },
+		{ "state", required_argument, NULL, 's' },
+		{ "once", no_argument, NULL, 'o' },
+		{ "dry-run", no_argument, NULL, 'n' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "self-test", no_argument, NULL, 'T' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 },
+	};
+	struct cfg cfg;
+	const char *cfgpath = DEFAULT_CONFIG;
+	int opt, forced_state = -1;
+	bool once = false, dry = false, verbose = false, run_selftest = false;
+	int nlfd, cur, desired, applied = -1;
+	int pending = -1;
+	long pending_deadline = 0;
+	long next_retry = 0;
+	int apply_failures = 0;
+	long last_state_err = 0;
+	struct sigaction sa;
+
+	while ((opt = getopt_long(argc, argv, "c:s:onvTh", opts, NULL)) != -1) {
+		switch (opt) {
+		case 'c':
+			cfgpath = optarg;
+			break;
+		case 's':
+			forced_state = parseInt("--state", optarg, 0, STATE_MAX);
+			if (forced_state < 0)
+				return 2;
+			break;
+		case 'o':
+			once = true;
+			break;
+		case 'n':
+			dry = true;
+			break;
+		case 'v':
+			verbose = true;
+			break;
+		case 'T':
+			run_selftest = true;
+			break;
+		case 'h':
+			usage(argv[0]);
+			return 0;
+		default:
+			usage(argv[0]);
+			return 2;
+		}
+	}
+	(void)verbose;
+	if (run_selftest)
+		return self_test();
+
+	cfg_defaults(&cfg);
+	cfg_load(&cfg, cfgpath);
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_signal;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
+
+	if (forced_state >= 0) {
+		int rc = apply_state(&cfg, forced_state, dry);
+
+		cfg_free(&cfg);
+		return rc == 0 ? 0 : 1;
+	}
+	if (once) {
+		int v = read_jack_state(&cfg);
+
+		if (v < 0) {
+			logmsg("cannot read jack state (switch '%s')",
+			       cfg.switch_name);
+			cfg_free(&cfg);
+			return 1;
+		}
+		int rc = apply_state(&cfg, v, dry);
+
+		cfg_free(&cfg);
+		return rc == 0 ? 0 : 1;
+	}
+
+	nlfd = uevent_open();
+	if (nlfd < 0)
+		logmsg("falling back to polling every %d ms",
+		       cfg.poll_ms > 500 ? 500 : cfg.poll_ms);
+
+	cur = read_jack_state(&cfg);
+	desired = cur;
+	if (cur < 0) {
+		logmsg("jack switch '%s' not present yet; waiting",
+		       cfg.switch_name);
+	} else if (apply_state(&cfg, cur, false) == 0) {
+		applied = cur;
+	} else {
+		logmsg("initial route application failed; will retry");
+		next_retry = now_ms() + cfg.retry_ms;
+	}
+	{
+		char path[256];
+
+		state_path(&cfg, path, sizeof(path));
+		logmsg("watching %s", path);
+	}
+
+	while (!g_stop) {
+		struct pollfd pfd;
+		int timeout = cfg.poll_ms > 0 ? cfg.poll_ms : -1;
+		long now;
+
+		if (nlfd < 0)
+			timeout = cfg.poll_ms > 0
+					  ? (cfg.poll_ms < 500 ? cfg.poll_ms : 500)
+					  : 500;
+		if (pending >= 0) {
+			long left = pending_deadline - now_ms();
+
+			if (left < 0)
+				left = 0;
+			if (timeout < 0 || left < timeout)
+				timeout = (int)left;
+		}
+		if (desired != applied && next_retry != 0) {
+			long left = next_retry - now_ms();
+
+			if (left < 0)
+				left = 0;
+			if (timeout < 0 || left < timeout)
+				timeout = (int)left;
+		}
+
+		pfd.fd = nlfd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		if (poll(&pfd, 1, timeout) > 0 && nlfd >= 0 &&
+		    (pfd.revents & POLLIN)) {
+			char buf[4096];
+			ssize_t n = recv(nlfd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+
+			if (n > 0) {
+				int s = uevent_parse(&cfg, buf, (size_t)n);
+
+				buf[n] = '\0';
+				if (s >= 0) {
+					logmsg("uevent: jack state %d", s);
+					if (s == cur && pending < 0)
+						continue;
+					pending = s;
+					pending_deadline = now_ms() + cfg.settle_ms;
+				}
+			} else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+				logmsg("uevent recv: %s", strerror(errno));
+			}
+		}
+
+		/* Periodic re-read: covers missed uevents, a switch device
+		 * that appears late, and manual mixer changes. */
+		now = now_ms();
+		if (pending < 0 && (cfg.poll_ms > 0)) {
+			int s = read_jack_state(&cfg);
+
+			if (s >= 0) {
+				if (s != cur) {
+					pending = s;
+					pending_deadline = now + cfg.settle_ms;
+				}
+			} else if (now - last_state_err > 60000) {
+				logmsg("jack switch '%s' unavailable",
+				       cfg.switch_name);
+				last_state_err = now;
+			}
+		}
+
+		/* Debounce: the state must still be the same after settle_ms. */
+		if (pending >= 0 && now >= pending_deadline) {
+			int s = read_jack_state(&cfg);
+
+			if (s == pending) {
+				cur = s;
+				desired = s;
+				pending = -1;
+				next_retry = 0;
+				apply_failures = 0;
+			} else if (s >= 0) {
+				pending = s;
+				pending_deadline = now + cfg.settle_ms;
+			} else {
+				pending = -1;
+			}
+		}
+
+		if (desired != applied && desired >= 0 && now >= next_retry) {
+			if (apply_state(&cfg, desired, false) == 0) {
+				applied = desired;
+				next_retry = 0;
+				apply_failures = 0;
+			} else {
+				apply_failures++;
+				/* Boot-time races (card not probed yet) are
+				 * retried quickly; a persistent failure is
+				 * backed off to 5 minutes instead of
+				 * rewriting the mixer every retry_ms. */
+				if (apply_failures >= 3) {
+					logmsg("applying state %d failed %d times; "
+					       "next retry in 300000 ms",
+					       desired, apply_failures);
+					next_retry = now + 300000;
+				} else {
+					logmsg("applying state %d failed; "
+					       "retrying in %d ms",
+					       desired, cfg.retry_ms);
+					next_retry = now + cfg.retry_ms;
+				}
+			}
+		}
+
+		if (g_reload) {
+			struct cfg fresh;
+
+			g_reload = 0;
+			logmsg("SIGHUP: reloading config");
+			cfg_defaults(&fresh);
+			cfg_load(&fresh, cfgpath);
+			cfg_free(&cfg);
+			cfg = fresh;
+			if (nlfd >= 0) {
+				close(nlfd);
+				nlfd = uevent_open();
+			}
+			cur = read_jack_state(&cfg);
+			desired = cur;
+			applied = -1;
+			pending = -1;
+			next_retry = 0;
+			apply_failures = 0;
+		}
+	}
+
+	if (nlfd >= 0)
+		close(nlfd);
+	logmsg("exiting");
+	cfg_free(&cfg);
+	return 0;
+}

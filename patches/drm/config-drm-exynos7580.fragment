@@ -1,0 +1,19 @@
+#
+# Enable the DRM/KMS display stack for the Exynos 7580 (j7elte).
+# Apply on top of the pmaports config-samsung-j7elte.aarch64, then run olddefconfig.
+#
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_KMS_CMA_HELPER=y
+CONFIG_DRM_EXYNOS7580=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+
+# CMA is needed for GEM/dumb buffers (fbdev + compositors).
+# Stock config has CONFIG_CMA_SIZE_MBYTES=0 (no default CMA area).
+CONFIG_CMA_SIZE_MBYTES=32
+
+# The vendor fbdev display stack drives the same DECON/DSIM hardware.
+# CONFIG_EXYNOS_DECON_EXYNOS7580 is not set
+# CONFIG_EXYNOS_MIPI_DSI is not set
+# CONFIG_EXYNOS_DECON_LCD is not set
+# CONFIG_PANEL_EA8061_DYNAMIC is not set

@@ -1,0 +1,6 @@
+# /etc/conf.d/j7elte-wifi
+#
+# Directory the built-in bcmdhd driver writes its generated per-device MAC to
+# (/efs/wifi/.mac.info).  Override only if /efs is mounted read-only or a real
+# EFS partition is available elsewhere.
+J7ELTE_WIFI_MAC_STATE_DIR=/efs/wifi

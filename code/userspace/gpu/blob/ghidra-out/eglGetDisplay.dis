@@ -1,0 +1,69 @@
+
+parity/userspace/gpu/blob/libGLES_mali.so:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+00469910 <eglGetDisplay@@Base>:
+  469910:	str	r4, [sp, #-8]!
+  469914:	mov	r4, r0
+  469918:	str	lr, [sp, #4]
+  46991c:	bl	215b54 <egl_winsys_get_implementation@plt>
+  469920:	mov	r1, r0
+  469924:	ldr	lr, [sp, #4]
+  469928:	mov	r0, r4
+  46992c:	mov	r2, #0
+  469930:	ldr	r4, [sp]
+  469934:	add	sp, sp, #8
+  469938:	b	469654 <eglQueryContext@@Base+0x730>
+  46993c:	strd	r4, [sp, #-16]!
+  469940:	mov	r4, r0
+  469944:	mov	r5, r2
+  469948:	str	r6, [sp, #8]
+  46994c:	mov	r6, r1
+  469950:	str	lr, [sp, #12]
+  469954:	bl	471c58 <egl_connect_native_window_to_egl@@Base+0x2f4>
+  469958:	movw	r3, #12609	; 0x3141
+  46995c:	cmp	r4, r3
+  469960:	bne	469988 <eglGetDisplay@@Base+0x78>
+  469964:	bl	215b54 <egl_winsys_get_implementation@plt>
+  469968:	mov	r1, r0
+  46996c:	mov	r2, r5
+  469970:	ldr	lr, [sp, #12]
+  469974:	mov	r0, r6
+  469978:	ldrd	r4, [sp]
+  46997c:	ldr	r6, [sp, #8]
+  469980:	add	sp, sp, #16
+  469984:	b	469654 <eglQueryContext@@Base+0x730>
+  469988:	mov	r2, r0
+  46998c:	movw	r1, #12300	; 0x300c
+  469990:	mov	r0, #0
+  469994:	str	r1, [r2, #12]
+  469998:	ldrd	r4, [sp]
+  46999c:	ldr	r6, [sp, #8]
+  4699a0:	add	sp, sp, #12
+  4699a4:	pop	{pc}		; (ldr pc, [sp], #4)
+
+004699a8 <eglInitialize@@Base>:
+  4699a8:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  4699ac:	mov	r4, r0
+  4699b0:	strd	r8, [sp, #16]
+  4699b4:	mov	r9, r1
+  4699b8:	mov	r8, r2
+  4699bc:	str	lr, [sp, #32]
+  4699c0:	strd	r6, [sp, #8]
+  4699c4:	strd	sl, [sp, #24]
+  4699c8:	sub	sp, sp, #20
+  4699cc:	bl	471c58 <egl_connect_native_window_to_egl@@Base+0x2f4>
+  4699d0:	mov	r5, r0
+  4699d4:	mov	r0, #8
+  4699d8:	bl	215818 <osup_mutex_static_get@plt>
+  4699dc:	mov	r3, #0
+  4699e0:	cmp	r5, #0
+  4699e4:	str	r3, [sp, #12]
+  4699e8:	beq	469a64 <eglInitialize@@Base+0xbc>
+  4699ec:	ldr	r7, [pc, #2072]	; 46a20c <eglInitialize@@Base+0x864>
+  4699f0:	mov	r1, #12288	; 0x3000
+  4699f4:	mov	fp, r0
+  4699f8:	mov	r0, #7
+  4699fc:	str	r1, [r5, #12]

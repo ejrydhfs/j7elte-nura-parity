@@ -1,0 +1,71 @@
+diff --git a/device/archived/j7elte-gpu-soft/10-fbdev.conf b/device/archived/j7elte-gpu-soft/10-fbdev.conf
+new file mode 100644
+index 0000000..efed5fd
+--- /dev/null
++++ b/device/archived/j7elte-gpu-soft/10-fbdev.conf
+@@ -0,0 +1,15 @@
++Section "Device"
++    Identifier "Fbdev"
++    Driver     "fbdev"
++    Option     "fbdev" "/dev/fb0"
++EndSection
++
++Section "Monitor"
++    Identifier "Panel"
++EndSection
++
++Section "Screen"
++    Identifier "Screen0"
++    Device     "Fbdev"
++    Monitor    "Panel"
++EndSection
+diff --git a/device/archived/j7elte-gpu-soft/APKBUILD b/device/archived/j7elte-gpu-soft/APKBUILD
+new file mode 100644
+index 0000000..dcc8151
+--- /dev/null
++++ b/device/archived/j7elte-gpu-soft/APKBUILD
+@@ -0,0 +1,33 @@
++# Maintainer: j7elte parity work <parity@example.invalid>
++#
++# Software OpenGL for j7elte.  The 3.10 kernel exposes kbase (/dev/mali0),
++# not a DRM render node, and the ROM's libGLES_mali.so is 32-bit
++# Android/bionic.  Mesa Panfrost therefore cannot bind.  This package
++# provides the only working 3D path: Mesa llvmpipe/swrast through an Xorg
++# fbdev server.  It is CPU rendering, not Mali acceleration.
++pkgname=j7elte-gpu-soft
++pkgver=1
++pkgrel=0
++pkgdesc="Software OpenGL (Mesa llvmpipe) on fbdev for the Galaxy J7 (j7elte)"
++url="https://postmarketos.org"
++arch="aarch64"
++license="MIT"
++options="!check !archcheck"
++depends="mesa-dri-gallium xf86-video-fbdev xorg-server"
++source="
++	10-fbdev.conf
++	j7elte-softgl.sh
++"
++builddir="$srcdir"
++
++package() {
++	install -Dm644 "$srcdir/10-fbdev.conf" \
++		"$pkgdir/etc/X11/xorg.conf.d/10-fbdev.conf"
++	install -Dm644 "$srcdir/j7elte-softgl.sh" \
++		"$pkgdir/etc/profile.d/j7elte-softgl.sh"
++}
++
++sha512sums="
++738cc58dc3449da8288adc6a80c90180ddad49265e75bb36b0497c33afaf92d9474b3c45dc3c97ec87733b0311577060d4aa4e3cf2e5d3d1ca8bc8caa8dbfe7a  10-fbdev.conf
++141e1e5738cb34d4bc2800eb24fc5898b42391ae6885f8a9763841af5d9fa4f55c3c43fc9e27c0fc41be219f8954decad104abca16fc7bde2b269b37dcc93a45  j7elte-softgl.sh
++"
+diff --git a/device/archived/j7elte-gpu-soft/j7elte-softgl.sh b/device/archived/j7elte-gpu-soft/j7elte-softgl.sh
+new file mode 100644
+index 0000000..365ee1b
+--- /dev/null
++++ b/device/archived/j7elte-gpu-soft/j7elte-softgl.sh
+@@ -0,0 +1,5 @@
++# j7elte: the kernel exposes kbase (/dev/mali0), not a DRM render node, and the
++# ROM's libGLES_mali.so is 32-bit Android/bionic.  There is no usable hardware
++# GL driver for Nura, so force Mesa's llvmpipe software rasterizer.
++# Remove this file after a hardware GL/DRM driver is available.
++export LIBGL_ALWAYS_SOFTWARE=1

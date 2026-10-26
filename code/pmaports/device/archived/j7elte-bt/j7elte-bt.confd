@@ -1,0 +1,28 @@
+# /etc/conf.d/j7elte-bt
+#
+# Parameters for the BCM43438 HCI attach on the Samsung Galaxy J7 (j7elte).
+# This file is read by both the OpenRC service and the systemd unit.
+
+# UART that carries HCI: kernel BT_UPORT 3, DT alias uart3 = serial_3.
+J7ELTE_BT_UART=/dev/ttySAC3
+
+# hciattach backend.  bcm43xx downloads the BCM43438 patch RAM; there is no
+# hci_bcm/btbcm driver in this 3.10 kernel, so do not use plain btattach.
+J7ELTE_BT_TYPE=bcm43xx
+
+# Line speed used while resetting the controller.
+J7ELTE_BT_INIT_SPEED=115200
+
+# Operating line speed after the patch RAM has been downloaded.  115200 is the
+# safe default; BCM43438 supports 3000000 once hci0 comes up reliably.
+J7ELTE_BT_SPEED=115200
+
+# Hardware flow control: flow or noflow.
+J7ELTE_BT_FLOW=flow
+
+# hciattach initialisation timeout in seconds.
+J7ELTE_BT_TIMEOUT=30
+
+# OpenRC service only: attach attempts and pause between them.
+J7ELTE_BT_RETRIES=3
+J7ELTE_BT_RETRY_DELAY=1

@@ -1,0 +1,3742 @@
+// SPDX-License-Identifier: MIT
+/*
+ * j7elte-ril - SIPC5 FMT/RFS client for the Samsung Galaxy J7
+ *              (SM-J700F/M, "j7elte", Exynos 7580 + Shannon SS310AP).
+ *
+ * Scope
+ * -----
+ * Stock Android telephony on this device is:
+ *
+ *   framework -> libril.so -> libsec-ril.so -> /dev/umts_ipc0 (SIPC5 FMT)
+ *                                           -> /dev/umts_rfs0 (SIPC5 RFS)
+ *                                           -> /dev/umts_boot0 (SIPC5 BOOT)
+ *
+ * The baseband boot half (BOOT channel) is j7elte-cbd.  This program is the
+ * other half for the parts of the FMT protocol that could be recovered from
+ * the stock binary: opening the two IPC channels (which is what makes the
+ * kernel send INIT_END to the CP), the Samsung "IpcProtocol" message header,
+ * and the request/response subset below.  Everything is traced; see
+ * parity/reports/ril-re.md for the address of every constant.
+ *
+ * Protocol, in one paragraph
+ * --------------------------
+ * The kernel (drivers/misc/modem_v1) owns the SIPC5 *link* layer: each
+ * write(2) to /dev/umts_ipc0 becomes exactly one SIPC5 frame with
+ * cfg=0xFC, ch=0xEB (SIPC5_CH_ID_FMT_0), len=4+count, padded to 8 bytes.
+ * 0xFC (not 0xF8) because shmem_start_download() sets ld->aligned from
+ * LINK_ATTR_BOOT_ALIGNED when cbd issues IOCTL_MODEM_DL_START and nothing
+ * clears it (link_device_shmem.c:1771-1775).  read(2) returns the frame
+ * payload with the link header and padding removed (modem_io_device.c
+ * misc_write/misc_read + rx_fmt_ipc).  Userspace therefore speaks the
+ * Samsung *message* layer only: a 7-byte header followed by a payload,
+ *
+ *     offset 0  u16 len      total message length, header included
+ *     offset 2  u8  msg_seq  set by IpcProtocol::SetMsgSequence (0x1a42d2)
+ *     offset 3  u8  ack_seq  always 0
+ *     offset 4  u8  main_cmd
+ *     offset 5  u8  sub_cmd
+ *     offset 6  u8  cmd_type (1 EXEC, 2 GET, 3 SET, 4 CFRM, 5 EVENT)
+ *
+ * which is exactly struct sipc_fmt_hdr (drivers/misc/modem_v1/modem_prj.h:205).
+ * The builders leave msg_seq zero; the stock send path
+ * (IpcProtocol::SetMsgSequence -> GenerateMsgSequence, 0x1a42d2/0x1a34fe)
+ * overwrites byte 2 with an incrementing 8-bit counter just before send.
+ * This program does the same (first message gets 0).
+ * A message may be split over several SIPC5 frames; the u16 at offset 0 is
+ * the reassembly key (libsec-ril IpcProtocol::GetIpcMessage, 0x1a2ef4).
+ *
+ * What is implemented (all byte-for-byte from the stock builders)
+ * --------------------------------------------------------------
+ *   SMS_DEVICE_READY        04 07 03             IpcTxSetDeviceReady   0x1afa78
+ *   MISC_GET_BASEBAND_VER   0a 01 02 ff          IpcTxBaseBandVersion  0x1c22b4
+ *   MISC_GET_ERI_VER        0a 01 02 40          IpcTxGetERIVersion    0x1c2340
+ *   MISC_GET_SERIAL_NUMBER  0a 03 02 <kind>      IpcTxGetSerialNumber  0x1c21f4
+ *   MISC_GET_TIME_INFO      0a 05 02             IpcTxGetTimeInfo      0x1c2830
+ *   MISC_GET_DEVICE_CAPA    0a 2d 02             IpcTxGetDeviceCapa    0x1c5708
+ *   SEC_GET_PIN_STATUS      05 01 02             IpcTxGetPinStatus     0x1cb844
+ *   SEC_SET_SIM_POWER       05 0d 03 <on>        IpcTxSetSimPower      0x1ccb10
+ *   NET_GET_OPERATOR        08 03 02             IpcTxNetGetOperator   0x1c75b0
+ *   NET_GET_VOICE_REG       08 05 02 ff 02       IpcTxNetGetVoiceReg   0x1c74bc
+ *   NET_GET_DATA_REG        08 05 02 ff 03       IpcTxNetGetDataReg    0x1c7534
+ *   PWR_RADIO_POWER         01 07 01 <s> <s>     IpcTxRadioPower       0x1cb350
+ *   PWR_MODEM_POWER_OFF     01 02 01             IpcTxModemPowerOff    0x1ae6a8
+ *   CALL_RELEASE            02 03 01             IpcTxCallRelease      0x1b5b38
+ *   CALL_ANSWER             02 04 01             IpcTxCallAnswer       0x1b58dc
+ *   CALL_GET_CALL_LIST      02 06 02             IpcTxCallGetCallList  0x1b5568
+ *   SMS_GET_SMSC_ADDRESS    04 0a 02             IpcTxGetSmscAddress   0x1cd594
+ *   SMS_SET_SMSC_ADDRESS    04 0a 03 <12 bytes>  IpcTxSetSmscAddress   0x1afa10
+ *   GPRS_GET_PDP_CONTEXT    0d 04 02             IpcTxGetPdpContext    0x1a7a4c
+ *   GPRS_DEFINE_PDP_CONTEXT 0d 01 03 <127 bytes> IpcTxDefinePdpContext 0x1b95bc
+ *   GPRS_SET_PDP_CONTEXT    0d 04 03 <105 bytes> IpcTxSetPdpContext    0x1b96ac
+ *   GPRS_PS_ATTACH          0d 03 03 <3 bytes>   IpcTxPsAttach         0x1b9828
+ *   CALL_OUTGOING_B         02 01 01 <94 bytes>  IpcTxCallOriginate B  0x1b543d
+ *   CALL_LIST_SET           02 06 03 <variable>  IpcTxCallSetCallList  0x1b55d5
+ *   CALL_MODIFY             02 30 01 <variable>  IpcTxCallModify       0x1b5949
+ *   CALL_MODIFY_CONFIRM     02 32 01 <variable>  IpcTxCallModifyConfirm 0x1b5a45
+ *   CALL_TIME              02 0d 03/02 <30/2>    IpcTxCallSet/GetCallTime 0x1b60ed/0x1b6171
+ *   CALL_E911_CB_MODE       02 10 03 <1 byte>    IpcTxCallSetEmergencyCbMode 0x1b6075
+ *   CALL_E911_STATUS        02 17 03 <2 bytes>   0x1b6319
+ *   CALL_SRVCC              02 14 03 <1 byte>    0x1b63a5
+ *   CALL_BLOCK_STATUS       02 18 03 <1 byte>    0x1b6609
+ *   CALL_TRANSFER           0c 81 03 <351 bytes> 0x1b6679
+ *   CALL_CANCEL_TRANSFER    0c 82 03 <1 byte>    0x1b6865
+ *   CALL_MANAGE             0c 07 03 <85 bytes>  0x1b5ba5
+ *   SND_AUDIO_PATH          09 03 03 <2 bytes>   IpcTxSndSetAudioPath 0x1ce085
+ *   SMS_SEND_MSG            04 01 01 11+N         IpcTxSendSms         0x1cd280
+ *   SMS_READ_MSG            04 03 02 10           IpcTxGetReadMsg      0x1af9c6
+ *   SMS_DELETE_MSG          04 05 01 10           IpcTxDeleteMsg       0x1af934
+ *   SMS_DELIVERY_ACK        04 06 01 12           IpcTxDeliveryReport  0x1cd340
+ *   SMS_WRITE_TO_SIM        04 04 01 268-byte w   IpcTxWriteSmsToSim   0x1cd110
+ *   GPRS_IPV6_CONFIG        0d 09 03 <17 bytes>   0x1b9c68
+ *   GPRS_MOBILE_DATA        0d 1d 03 <2 bytes>    0x1a7b68
+ *
+ * The last three family entries are state-changing; the builders are
+ * reproduced exactly but this tool has no call/PDP state model.
+ *
+ * Response decoding is limited to what was traced as well: the message
+ * header (main/sub/type names), the IMEI/MEID reply
+ * (IpcProtocol40::IpcRxMiscSerialNumber, 0x1ac220), the PIN/lock reply,
+ * the registration reply, and the SMSC address reply (IpcRxSmsc
+ * 0x1cda20).  Call-list and PDP records are printed as a hex dump instead
+ * of being guessed at.
+ *
+ * sms-send encodes a GSM 03.40 SMS-SUBMIT itself (7-bit alphabet, one part,
+ * validated against the spec example); sms-send-tpdu takes a ready TPDU.
+ * listen auto-acks incoming SMS with 04/06 (--no-auto-ack disables it).
+ *
+ * Not implemented (see the report): the unresolved call-list entry field
+ * table, the E911 RAT converter slot, the remaining GPRS switch arms, SIM
+ * APDU/phonebook/STK and the RFS file protocol.  Bodies the CP sends back
+ * for call-list/PDP records are printed raw where their field semantics were
+ * not recovered.
+ *
+ * Hardware note: nothing here was executed against a real baseband.  The
+ * logic is verified by --selftest (exact frame bytes + a mock CP over a
+ * socketpair), by --dry-run, and by the kernel-side analysis.
+ */
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <inttypes.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ------------------------------------------------------------------ */
+/* Kernel ABI: drivers/misc/modem_v1                                   */
+/* ------------------------------------------------------------------ */
+/* modem_prj.h:84 - IOCTL_MODEM_STATUS is _IO('o', 0x27); the handler
+ * (modem_io_device.c:657) *returns* mc->phone_state, so the value is the
+ * ioctl return, not an output argument.                                   */
+#define IOCTL_MODEM_STATUS	_IO('o', 0x27)
+#define IOCTL_MODEM_BOOT_OFF	_IO('o', 0x23)
+
+/* modem_prj.h:143-151 - enum modem_state */
+#define STATE_OFFLINE		0
+#define STATE_CRASH_RESET	1
+#define STATE_CRASH_EXIT	2
+#define STATE_BOOTING		3
+#define STATE_ONLINE		4
+#define STATE_NV_REBUILDING	5
+#define STATE_LOADER_DONE	6
+#define STATE_SIM_ATTACH	7
+#define STATE_SIM_DETACH	8
+#define STATE_CRASH_WATCHDOG	9
+
+/* ------------------------------------------------------------------ */
+/* Samsung IpcProtocol constants (libsec-ril.so, traced)              */
+/* ------------------------------------------------------------------ */
+#define IPC_HDR_LEN		7
+/* GetIpcMessage (0x1a2ef4) clamps a single message to 0x2000 bytes. */
+#define IPC_MAX_MSG		0x2000
+
+/* main_cmd - IpcProtocol41::GetMainCommandName, 0x1bb148
+ * (name strings at .rodata 0x22872c..0x228825, 0x22b998..0x22b9f6) */
+#define IPC_MAIN_PWR		0x01
+#define IPC_MAIN_CALL		0x02
+#define IPC_MAIN_SMS		0x04
+#define IPC_MAIN_PB		0x06
+#define IPC_MAIN_NET		0x08
+#define IPC_MAIN_MISC		0x0a
+#define IPC_MAIN_SND		0x09
+#define IPC_MAIN_SS		0x0c
+#define IPC_MAIN_GPRS		0x0d
+#define IPC_MAIN_SAT		0x0e
+#define IPC_MAIN_CFG		0x0f
+#define IPC_MAIN_IMEI		0x10
+#define IPC_MAIN_GPS		0x11
+#define IPC_MAIN_FACTORY	0x13
+#define IPC_MAIN_RFS		0x15
+#define IPC_MAIN_EMBMS		0x17
+#define IPC_MAIN_MMS		0x18
+#define IPC_MAIN_MODEM_TEST	0x1f
+#define IPC_MAIN_DOMESTIC	0x20
+#define IPC_MAIN_QMI_HIDDEN	0x22
+#define IPC_MAIN_PROSE		0x24
+#define IPC_MAIN_JPN		0x30
+#define IPC_MAIN_QMIIMS		0x40
+#define IPC_MAIN_IIL		0x70
+#define IPC_MAIN_GEN		0x80
+
+/* cmd_type - IpcProtocol41::GetCmdTypeName, 0x1bb0fc
+ * (strings "EXEC"/"GET"/"SET"/"CFRM"/"EVENT" at 0x228727..0x228739) */
+#define IPC_TYPE_EXEC		1
+#define IPC_TYPE_GET		2
+#define IPC_TYPE_SET		3
+#define IPC_TYPE_CFRM		4
+#define IPC_TYPE_EVENT		5
+
+/* DeviceInfoType -> wire kind, Ipc41PacketBuilder::
+ * BuildIpcMiscMobileEquipmentSerialNumber, 0x1d3bec */
+#define IPC_DEVINFO_IMEI	1
+#define IPC_DEVINFO_MEID	2
+#define IPC_DEVINFO_KIND3	3	/* 8 bytes, hex-encoded on the CP side   */
+#define IPC_DEVINFO_KIND4	4	/* 0x10 on the wire                      */
+#define IPC_DEVINFO_KIND5	5	/* 0x20                                  */
+#define IPC_DEVINFO_KIND6	6	/* 0x40 (ERI)                            */
+#define IPC_DEVINFO_KIND7	7	/* 0x80                                  */
+
+/* RadioPowerState, IpcTxRadioPower (0x1cb350): state 1 => payload 01 00,
+ * state 2 => payload 02 02. */
+#define IPC_RADIO_ON		1
+#define IPC_RADIO_OFF		2
+
+/* static request descriptors ------------------------------------------ */
+struct ipc_req {
+	uint8_t main, sub, type;
+	const char *name;
+	uint8_t payload[4];
+	size_t plen;
+};
+
+static const struct ipc_req req_device_ready = {
+	IPC_MAIN_SMS, 0x07, IPC_TYPE_SET, "SMS_DEVICE_READY", {0}, 0 };
+static const struct ipc_req req_baseband_ver = {
+	IPC_MAIN_MISC, 0x01, IPC_TYPE_GET, "MISC_GET_BASEBAND_VERSION", {0xff}, 1 };
+static const struct ipc_req req_eri_ver = {
+	IPC_MAIN_MISC, 0x01, IPC_TYPE_GET, "MISC_GET_ERI_VERSION", {0x40}, 1 };
+static const struct ipc_req req_time_info = {
+	IPC_MAIN_MISC, 0x05, IPC_TYPE_GET, "MISC_GET_TIME_INFO", {0}, 0 };
+static const struct ipc_req req_device_capa = {
+	IPC_MAIN_MISC, 0x2d, IPC_TYPE_GET, "MISC_GET_DEVICE_CAPA", {0}, 0 };
+static const struct ipc_req req_pin_status = {
+	0x05 /* SEC */, 0x01, IPC_TYPE_GET, "SEC_GET_PIN_STATUS", {0}, 0 };
+static const struct ipc_req req_operator = {
+	IPC_MAIN_NET, 0x03, IPC_TYPE_GET, "NET_GET_OPERATOR", {0}, 0 };
+static const struct ipc_req req_voice_reg = {
+	IPC_MAIN_NET, 0x05, IPC_TYPE_GET, "NET_GET_VOICE_REG_STATE",
+	{0xff, 0x02}, 2 };
+static const struct ipc_req req_data_reg = {
+	IPC_MAIN_NET, 0x05, IPC_TYPE_GET, "NET_GET_DATA_REG_STATE",
+	{0xff, 0x03}, 2 };
+static const struct ipc_req req_modem_off = {
+	IPC_MAIN_PWR, 0x02, IPC_TYPE_EXEC, "PWR_MODEM_POWER_OFF", {0}, 0 };
+
+/* Call/SMS/GPRS requests.  Every triple below was read from the
+ * IpcProtocol41 instruction streams (the class IpcModem::CreateProtocol
+ * instantiates for a v5 modem; the IpcProtocol40 twins agree on main/sub/
+ * type but differ in some body lengths).  See the comment on each function
+ * for the builder address and the exact stores that fix main/sub/type. */
+static const struct ipc_req req_call_release = {
+	IPC_MAIN_CALL, 0x03, IPC_TYPE_EXEC, "CALL_RELEASE", {0}, 0 };
+static const struct ipc_req req_call_answer = {
+	IPC_MAIN_CALL, 0x04, IPC_TYPE_EXEC, "CALL_ANSWER", {0}, 0 };
+static const struct ipc_req req_call_get_list = {
+	IPC_MAIN_CALL, 0x06, IPC_TYPE_GET, "CALL_GET_CALL_LIST", {0}, 0 };
+static const struct ipc_req req_sms_send = {
+	IPC_MAIN_SMS, 0x01, IPC_TYPE_EXEC, "SMS_SEND_MSG", {0}, 0 };
+static const struct ipc_req req_sms_read = {
+	IPC_MAIN_SMS, 0x03, IPC_TYPE_GET, "SMS_READ_MSG", {0}, 0 };
+static const struct ipc_req req_sms_delete = {
+	IPC_MAIN_SMS, 0x05, IPC_TYPE_EXEC, "SMS_DELETE_MSG", {0}, 0 };
+static const struct ipc_req req_sms_ack = {
+	IPC_MAIN_SMS, 0x06, IPC_TYPE_EXEC, "SMS_DELIVERY_ACK", {0}, 0 };
+static const struct ipc_req req_sms_get_smsc = {
+	IPC_MAIN_SMS, 0x0a, IPC_TYPE_GET, "SMS_GET_SMSC_ADDRESS", {0}, 0 };
+static const struct ipc_req req_sms_set_smsc = {
+	IPC_MAIN_SMS, 0x0a, IPC_TYPE_SET, "SMS_SET_SMSC_ADDRESS", {0}, 0 };
+static const struct ipc_req req_pdp_get = {
+	IPC_MAIN_GPRS, 0x04, IPC_TYPE_GET, "GPRS_GET_PDP_CONTEXT", {0}, 0 };
+static const struct ipc_req req_pdp_define = {
+	IPC_MAIN_GPRS, 0x01, IPC_TYPE_SET, "GPRS_DEFINE_PDP_CONTEXT", {0}, 0 };
+static const struct ipc_req req_pdp_set = {
+	IPC_MAIN_GPRS, 0x04, IPC_TYPE_SET, "GPRS_SET_PDP_CONTEXT", {0}, 0 };
+static const struct ipc_req req_ps_attach = {
+	IPC_MAIN_GPRS, 0x03, IPC_TYPE_SET, "GPRS_PS_ATTACH", {0}, 0 };
+static const struct ipc_req req_ipv6_config = {
+	IPC_MAIN_GPRS, 0x09, IPC_TYPE_SET, "GPRS_IPV6_CONFIG", {0}, 0 };
+static const struct ipc_req req_mobile_data = {
+	IPC_MAIN_GPRS, 0x1d, IPC_TYPE_SET, "GPRS_MOBILE_DATA", {0}, 0 };
+
+/* Remaining call builders, verified from spec/calls.md §2 and re-read
+ * against the instruction listings. */
+static const struct ipc_req req_call_originate = {
+	IPC_MAIN_CALL, 0x01, IPC_TYPE_EXEC, "CALL_OUTGOING", {0}, 0 };
+static const struct ipc_req req_call_hold = {
+	IPC_MAIN_CALL, 0x13, IPC_TYPE_EXEC, "CALL_HOLD", {0}, 0 };
+static const struct ipc_req req_call_cont_dtmf = {
+	IPC_MAIN_CALL, 0x08, IPC_TYPE_SET, "CALL_CONT_DTMF", {0}, 0 };
+static const struct ipc_req req_call_burst_dtmf = {
+	IPC_MAIN_CALL, 0x07, IPC_TYPE_EXEC, "CALL_BURST_DTMF", {0}, 0 };
+static const struct ipc_req req_call_flash = {
+	IPC_MAIN_CALL, 0x11, IPC_TYPE_SET, "CALL_FLASH", {0}, 0 };
+static const struct ipc_req req_call_voice_privacy_get = {
+	IPC_MAIN_CALL, 0x0c, IPC_TYPE_GET, "CALL_VOICE_PRIVACY_GET",
+	{0x01}, 1 };
+static const struct ipc_req req_call_voice_privacy_set = {
+	IPC_MAIN_CALL, 0x0c, IPC_TYPE_SET, "CALL_VOICE_PRIVACY_SET", {0}, 0 };
+static const struct ipc_req req_call_dial_b = {
+	IPC_MAIN_CALL, 0x01, IPC_TYPE_EXEC, "CALL_OUTGOING_B", {0}, 0 };
+static const struct ipc_req req_call_list_set = {
+	IPC_MAIN_CALL, 0x06, IPC_TYPE_SET, "CALL_LIST_SET", {0}, 0 };
+static const struct ipc_req req_call_modify = {
+	IPC_MAIN_CALL, 0x30, IPC_TYPE_EXEC, "CALL_MODIFY", {0}, 0 };
+static const struct ipc_req req_call_modify_conf = {
+	IPC_MAIN_CALL, 0x32, IPC_TYPE_EXEC, "CALL_MODIFY_CONFIRM", {0}, 0 };
+static const struct ipc_req req_call_time_set = {
+	IPC_MAIN_CALL, 0x0d, IPC_TYPE_SET, "CALL_TIME_SET", {0}, 0 };
+static const struct ipc_req req_call_time_get = {
+	IPC_MAIN_CALL, 0x0d, IPC_TYPE_GET, "CALL_TIME_GET", {0}, 0 };
+static const struct ipc_req req_call_total_time_get = {
+	IPC_MAIN_CALL, 0x0d, IPC_TYPE_GET, "CALL_TOTAL_TIME_GET",
+	{0x07, 0x00}, 2 };
+static const struct ipc_req req_call_e911_cb = {
+	IPC_MAIN_CALL, 0x10, IPC_TYPE_SET, "CALL_E911_CB_MODE", {0}, 0 };
+static const struct ipc_req req_call_e911_status = {
+	IPC_MAIN_CALL, 0x17, IPC_TYPE_SET, "CALL_E911_STATUS", {0}, 0 };
+static const struct ipc_req req_call_srvcc = {
+	IPC_MAIN_CALL, 0x14, IPC_TYPE_SET, "CALL_SRVCC", {0}, 0 };
+static const struct ipc_req req_call_block = {
+	IPC_MAIN_CALL, 0x18, IPC_TYPE_SET, "CALL_BLOCK_STATUS", {0}, 0 };
+static const struct ipc_req req_call_transfer = {
+	IPC_MAIN_SS, 0x81, IPC_TYPE_SET, "CALL_TRANSFER", {0}, 0 };
+static const struct ipc_req req_call_cancel_transfer = {
+	IPC_MAIN_SS, 0x82, IPC_TYPE_SET, "CALL_CANCEL_TRANSFER", {0}, 0 };
+static const struct ipc_req req_call_manage = {
+	IPC_MAIN_SS, 0x07, IPC_TYPE_SET, "CALL_MANAGE", {0}, 0 };
+static const struct ipc_req req_snd_audio_path = {
+	IPC_MAIN_SND, 0x03, IPC_TYPE_SET, "SND_AUDIO_PATH", {0}, 0 };
+
+/* ------------------------------------------------------------------ */
+/* small helpers                                                      */
+/* ------------------------------------------------------------------ */
+static bool opt_verbose;
+static bool opt_json;
+static bool opt_auto_ack = true;
+static unsigned opt_timeout_ms = 5000;
+
+static volatile sig_atomic_t sigint_seen;
+
+static void on_sigint(int sig)
+{
+	(void)sig;
+	sigint_seen = 1;
+}
+
+static void logmsg(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (!opt_verbose)
+		return;
+	va_start(ap, fmt);
+	fputs("j7elte-ril: ", stderr);
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+	va_end(ap);
+}
+
+static void errmsg(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	fputs("j7elte-ril: ", stderr);
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+	va_end(ap);
+}
+
+static const char *main_name(uint8_t m)
+{
+	switch (m) {
+	case IPC_MAIN_PWR:	return "PWR";
+	case IPC_MAIN_CALL:	return "CALL";
+	case IPC_MAIN_SMS:	return "SMS";
+	case IPC_MAIN_PB:	return "PB";
+	case IPC_MAIN_NET:	return "NET";
+	case IPC_MAIN_MISC:	return "MISC";
+	case IPC_MAIN_SND:	return "SND";
+	case IPC_MAIN_SS:	return "SS";
+	case IPC_MAIN_GPRS:	return "GPRS";
+	case IPC_MAIN_SAT:	return "SAT";
+	case IPC_MAIN_CFG:	return "CFG";
+	case IPC_MAIN_IMEI:	return "IMEI";
+	case IPC_MAIN_GPS:	return "GPS";
+	case IPC_MAIN_FACTORY:	return "FACTORY";
+	case IPC_MAIN_RFS:	return "RFS";
+	case IPC_MAIN_EMBMS:	return "EMBMS";
+	case IPC_MAIN_MMS:	return "MMS_PROVISION";
+	case IPC_MAIN_MODEM_TEST:return "MODEM_TEST";
+	case IPC_MAIN_DOMESTIC:	return "DOMESTIC";
+	case IPC_MAIN_QMI_HIDDEN:return "QMI_HIDDENMENU";
+	case IPC_MAIN_PROSE:	return "PROSE";
+	case IPC_MAIN_JPN:	return "JPN";
+	case IPC_MAIN_QMIIMS:	return "QMIIMS";
+	case IPC_MAIN_IIL:	return "IIL";
+	case IPC_MAIN_GEN:	return "GEN";
+	case 0x05:		return "SEC";
+	case 0x12:		return "SAP";
+	case 0x14:		return "OMADM";
+	default:		return "?";
+	}
+}
+
+static const char *type_name(uint8_t t)
+{
+	switch (t) {
+	case IPC_TYPE_EXEC:	return "EXEC";
+	case IPC_TYPE_GET:	return "GET";
+	case IPC_TYPE_SET:	return "SET";
+	case IPC_TYPE_CFRM:	return "CFRM";
+	case IPC_TYPE_EVENT:	return "EVENT";
+	default:		return "UNDEFINED";
+	}
+}
+
+static const char *state_name(int s)
+{
+	switch (s) {
+	case STATE_OFFLINE:	return "OFFLINE";
+	case STATE_CRASH_RESET:	return "CRASH_RESET";
+	case STATE_CRASH_EXIT:	return "CRASH_EXIT";
+	case STATE_BOOTING:	return "BOOTING";
+	case STATE_ONLINE:	return "ONLINE";
+	case STATE_NV_REBUILDING:return "NV_REBUILDING";
+	case STATE_LOADER_DONE:	return "LOADER_DONE";
+	case STATE_SIM_ATTACH:	return "SIM_ATTACH";
+	case STATE_SIM_DETACH:	return "SIM_DETACH";
+	case STATE_CRASH_WATCHDOG:return "CRASH_WATCHDOG";
+	default:		return "?";
+	}
+}
+
+static long now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static void hexdump(const char *prefix, const uint8_t *p, size_t n)
+{
+	size_t i;
+
+	fputs(prefix, stdout);
+	for (i = 0; i < n; i++)
+		printf("%02x", p[i]);
+	fputc('\n', stdout);
+}
+
+/* ------------------------------------------------------------------ */
+/* transport                                                          */
+/* ------------------------------------------------------------------ */
+struct ril {
+	int ipc_fd;
+	int rfs_fd;
+	uint8_t rx[IPC_MAX_MSG];	/* reassembly buffer */
+	size_t rxlen;
+	uint8_t seq;			/* IpcProtocol::GenerateMsgSequence */
+	char smsc[32];			/* last SMS_GET_SMSC reply */
+	bool smsc_valid;
+	uint8_t ack_tpid;		/* pending MTSMS ack (incoming [11]) */
+	bool ack_pending;
+};
+
+/* One write() must be exactly one message: the kernel turns each write into
+ * one SIPC5 frame (misc_write(), modem_io_device.c:845).  IoChannel::Write
+ * (libsec-ril 0xd9ee4) loops on partial writes and retries EINTR/EAGAIN. */
+static int write_all(int fd, const uint8_t *buf, size_t len)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		ssize_t n = write(fd, buf + done, len - done);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == ENOSPC) {
+				struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+
+				if (poll(&pfd, 1, 100) < 0 && errno != EINTR)
+					return -1;
+				continue;
+			}
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		done += (size_t)n;
+	}
+	return 0;
+}
+
+static int ipc_send(struct ril *r, uint8_t *msg, size_t len)
+{
+	if (len < IPC_HDR_LEN || len > IPC_MAX_MSG) {
+		errmsg("refusing to send %zu-byte message", len);
+		return -1;
+	}
+	/* IpcProtocol::SetMsgSequence (0x1a42d2) stores an incrementing
+	 * 8-bit counter in byte 2 immediately before the message is sent. */
+	msg[2] = r->seq++;
+	if (opt_verbose) {
+		char pfx[96];
+
+		snprintf(pfx, sizeof(pfx), "tx %s/%02x/%02x %s len=%zu: ",
+			 main_name(msg[4]), msg[4], msg[5], type_name(msg[6]), len);
+		hexdump(pfx, msg, len);
+	}
+	if (write_all(r->ipc_fd, msg, len) < 0) {
+		errmsg("write(%d): %s", r->ipc_fd, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/* Build a message from a descriptor. */
+static size_t build_req(uint8_t *out, size_t outsz, const struct ipc_req *req,
+			const uint8_t *payload, size_t plen)
+{
+	size_t len = IPC_HDR_LEN + plen;
+
+	if (len > outsz)
+		return 0;
+	memset(out, 0, len);
+	out[0] = (uint8_t)(len & 0xff);
+	out[1] = (uint8_t)(len >> 8);
+	out[2] = 0;			/* msg_seq: always 0               */
+	out[3] = 0;			/* ack_seq: always 0               */
+	out[4] = req->main;
+	out[5] = req->sub;
+	out[6] = req->type;
+	if (plen)
+		memcpy(out + IPC_HDR_LEN, payload, plen);
+	return len;
+}
+
+/* ------------------------------------------------------------------ */
+/* inbound message handling                                           */
+/* ------------------------------------------------------------------ */
+struct ipc_msg {
+	const uint8_t *data;
+	size_t len;
+};
+
+/* IpcProtocol41::IpcRxMiscSerialNumber, 0x1c4d6c, forwards to
+ * Ipc41RilDataBuilder::BuildRilDataMiscMobileEquipmentSerialNumber
+ * @0x1d3d04; the layout is the same one IpcProtocol40 uses at 0x1ac220:
+ *   [6] == 3 (EVENT)          -> no identity in this message
+ *   [7] = wire kind (DeviceInfoType mapped by the request builder:
+ *         1/2->1, 4->2, 8->3, 16->4, 32->5, 64->6, 128->7)
+ *   kind 3                    -> 7 bytes at [10..16], "%02X" each (ESN)
+ *   kind 2 or 7               -> 4 bytes at [9..12],  "%02X" each (MEID)
+ *   kind 1 (IMEI) and others  -> [8] length, bytes at [9..] (ASCII)
+ * The wire kind -> DeviceIdentityType table at 0x2383a8 is
+ * {1,4,8,0,0,0,0x80}. */
+static void decode_serial_number(const struct ipc_msg *m)
+{
+	static const uint8_t kind_map[] = { 1, 4, 8, 0, 0, 0, 0x80 };
+	char out[64];
+	size_t i, n;
+	uint8_t kind;
+
+	if (m->len < 8)
+		return;
+	if (m->data[6] == IPC_TYPE_EVENT) {
+		printf("  serial: none (event)\n");
+		return;
+	}
+	kind = m->data[7];
+	if (kind == 3 && m->len >= 0x11) {
+		n = 0;
+		for (i = 0; i < 7; i++)
+			n += (size_t)snprintf(out + n, sizeof(out) - n, "%02X",
+					      m->data[10 + i]);
+		printf("  esn: %s\n", out);
+	} else if ((kind == 2 || kind == 7) && m->len >= 13) {
+		n = 0;
+		for (i = 0; i < 4; i++)
+			n += (size_t)snprintf(out + n, sizeof(out) - n, "%02X",
+					      m->data[9 + i]);
+		printf("  meid: %s\n", out);
+	} else if (m->len >= 9) {
+		size_t l = m->data[8];
+
+		if (l > sizeof(out) - 1 || 9 + l > m->len)
+			return;
+		memcpy(out, m->data + 9, l);
+		out[l] = '\0';
+		printf("  %s: %s\n", kind == 1 ? "imei" : "serial", out);
+	} else {
+		return;
+	}
+	printf("  kind: %u (DeviceIdentityType %u)\n", kind,
+	       kind >= 1 && kind <= 7 ? kind_map[kind - 1] : 0);
+}
+
+/* IpcProtocol41::IpcRxNetRegState, 0x1c8bb4.  The handler reads these fixed
+ * offsets before handing them to NetRegState::NetRegState(); the semantic
+ * names below the offsets are the constructor argument positions, which the
+ * decompiler only shows positionally, so they are printed as raw fields. */
+static void decode_net_reg_state(const struct ipc_msg *m)
+{
+	size_t l = m->len;
+
+	if (l >= 10)
+		printf("  stat=0x%02x f8=0x%02x rat=0x%02x f10=0x%02x",
+		       m->data[7], m->data[8], m->data[9], m->data[10]);
+	if (l >= 0x0d)
+		printf(" f0b=0x%04x",
+		       (unsigned)(m->data[0x0b] | (m->data[0x0c] << 8)));
+	if (l >= 0x11)
+		printf(" f0d=0x%08x",
+		       (unsigned)(m->data[0x0d] | (m->data[0x0e] << 8) |
+				  (m->data[0x0f] << 16) |
+				  ((unsigned)m->data[0x10] << 24)));
+	if (l >= 0x12)
+		printf(" f11=0x%02x", m->data[0x11]);
+	if (l >= 0x14)
+		printf(" f12=0x%04x",
+		       (unsigned)(m->data[0x12] | (m->data[0x13] << 8)));
+	if (l >= 0x17)
+		printf(" f14=%u f15=%u f16=%u",
+		       m->data[0x14], m->data[0x15], m->data[0x16]);
+	if (l >= 0x19)
+		printf(" f17=0x%04x",
+		       (unsigned)(m->data[0x17] | (m->data[0x18] << 8)));
+	if (l < 0x19)
+		printf(" (short message, %zu bytes)", l);
+	putchar('\n');
+}
+
+/* IpcProtocol41::IpcRxSecPinStatus, 0x1cc4e0.
+ *   [7] = raw lock type, mapped through the 139-entry table at 0x23bcc0
+ *         (index raw-1): 1..11 identity, 0x80..0x84 -> 12..16,
+ *         0x88..0x8b -> 17..20, all other entries 0.  The result is the
+ *         LockType passed to IpcSimCache::UpdateLockInfo().
+ *   [8] = lock key used directly (1..6, identity table at 0x23bd58)
+ *   [6] == EVENT additionally sets "pin state changed" in IpcSimCache+0x21.
+ */
+static unsigned map_lock_type(uint8_t raw)
+{
+	if (raw >= 1 && raw <= 11)
+		return raw;
+	if (raw >= 0x80 && raw <= 0x84)
+		return 12 + (raw - 0x80);
+	if (raw >= 0x88 && raw <= 0x8b)
+		return 17 + (raw - 0x88);
+	return 0;
+}
+
+static void decode_sec_pin_status(const struct ipc_msg *m)
+{
+	unsigned raw_type, raw_key, mapped = 0, key = 0;
+
+	if (m->len < 9) {
+		printf("  (short pin-status message, %zu bytes)\n", m->len);
+		return;
+	}
+	raw_type = m->data[7];
+	raw_key = m->data[8];
+	mapped = map_lock_type((uint8_t)raw_type);
+	if (raw_key >= 1 && raw_key <= 6)
+		key = raw_key;
+	printf("  lock_type=0x%02x (LockType %u) lock_key=0x%02x (%u)%s\n",
+	       raw_type, mapped, raw_key, key,
+	       m->data[6] == IPC_TYPE_EVENT ? " changed" : "");
+}
+
+/* IpcProtocol41::IpcRxSmsc @0x1cda20: allocate 0x20 bytes, then copy
+ * (frame length - 7) bytes starting at frame+7.  The body is the SMSC
+ * address string; it is not re-encoded or validated there. */
+static void decode_smsc(struct ril *r, const struct ipc_msg *m)
+{
+	size_t n = m->len - IPC_HDR_LEN, i;
+
+	printf("  smsc: \"");
+	for (i = 0; i < n; i++) {
+		unsigned char c = m->data[IPC_HDR_LEN + i];
+
+		putchar(c >= 0x20 && c < 0x7f ? c : '.');
+	}
+	printf("\"\n");
+	r->smsc_valid = false;
+	if (n >= sizeof(r->smsc))
+		return;
+	for (i = 0; i < n; i++) {
+		unsigned char c = m->data[IPC_HDR_LEN + i];
+
+		if (c < 0x20 || c >= 0x7f)
+			return;		/* not a usable address string */
+		r->smsc[i] = (char)c;
+	}
+	r->smsc[n] = '\0';
+	r->smsc_valid = true;
+}
+
+/* IpcRxCallStatus @0x1b6aed: the only fields the parser reads are the raw
+ * u16 state word and four bytes; the stock object fields they feed were not
+ * named, so they are printed raw (spec/calls.md §3.2). */
+static void decode_call_status(const struct ipc_msg *m)
+{
+	if (m->len < 13) {
+		printf("  (short call-status message, %zu bytes)\n", m->len);
+		return;
+	}
+	printf("  state_word=0x%04x call_id=0x%02x f10=0x%02x f11=0x%02x "
+	       "f12=0x%02x\n",
+	       (unsigned)(m->data[7] | (m->data[8] << 8)),
+	       m->data[9], m->data[10], m->data[11], m->data[12]);
+}
+
+/* IpcProtocol41::IpcRxCallSignalInfo @0x1a6557: three signal bytes at
+ * frame offsets 9, 10, 11. */
+static void decode_call_signal(const struct ipc_msg *m)
+{
+	if (m->len < 12)
+		return;
+	printf("  signal=%u,%u,%u\n", m->data[9], m->data[10], m->data[11]);
+}
+
+/* Send result, 04/01 RESP: u16 status at [8..9], third field at [10],
+ * PDU length at [11], raw PDU from [12]. */
+static void decode_sms_send_result(const struct ipc_msg *m)
+{
+	if (m->len < 12)
+		return;
+	printf("  sms result status=0x%04x f10=0x%02x pdu_len=%u\n",
+	       (unsigned)(m->data[8] | (m->data[9] << 8)), m->data[10],
+	       m->data[11]);
+	if (m->data[11] && 12u + m->data[11] <= m->len)
+		hexdump("  pdu: ", m->data + 12, m->data[11]);
+}
+
+/* Incoming SMS, 04/02 INDI: [7]=type (2 GSM), [11]=tpid echoed in the ack,
+ * [12]=SCA+TPDU total, [13]=SCA length octet; SCA total is [13]+1 and the
+ * raw TPDU starts after it, with length [12]-SCA total. */
+static void decode_sms_incoming(const struct ipc_msg *m)
+{
+	unsigned sca_total, pdu_len;
+
+	if (m->len < 14)
+		return;
+	sca_total = (unsigned)m->data[13] + 1;
+	printf("  incoming sms type=0x%02x tpid=0x%02x total=%u "
+	       "sca_total=%u\n", m->data[7], m->data[11], m->data[12],
+	       sca_total);
+	if (sca_total > m->data[12])
+		return;
+	pdu_len = m->data[12] - sca_total;
+	if (pdu_len && 13 + sca_total + pdu_len <= m->len)
+		hexdump("  tpdu: ", m->data + 13 + sca_total, pdu_len);
+}
+
+/* IpcRxPdpContext @0x1a8700, used for cmd_type != EVENT:
+ * [7] = context count, then {cid, active} pairs from [8]. */
+static void decode_pdp_list(const struct ipc_msg *m)
+{
+	unsigned count, i;
+
+	if (m->len < 9) {
+		printf("  (short PDP list, %zu bytes)\n", m->len);
+		return;
+	}
+	count = m->data[7];
+	printf("  pdp contexts=%u", count);
+	for (i = 0; i < count && 8 + 2 * i + 1 < m->len; i++)
+		printf(" [cid=%u active=%u]", m->data[8 + 2 * i],
+		       m->data[9 + 2 * i]);
+	printf("\n");
+}
+
+/* IpcRxGprsCallStatus @0x1ba5d0: [7]=cid, [8]==1 connected, [9]=cause. */
+static void decode_gprs_state(const struct ipc_msg *m)
+{
+	if (m->len < 10)
+		return;
+	printf("  cid=%u %s cause=0x%02x\n", m->data[7],
+	       m->data[8] == 1 ? "connected" : "not-connected", m->data[9]);
+}
+
+/* IpcRxIpConfiguration @0x1ba4ba: only the cid and the raw u16 flag word
+ * are printed; the address fields at 0x0a..0x2a depend on that word. */
+static void decode_ip_config(const struct ipc_msg *m)
+{
+	if (m->len < 10)
+		return;
+	printf("  cid=%u flags=0x%04x\n", m->data[7],
+	       (unsigned)(m->data[8] | (m->data[9] << 8)));
+}
+
+/* IpcRxGprsPsState @0x1ba88c: [7]=attached, [8], [9]=cause. */
+static void decode_ps_state(const struct ipc_msg *m)
+{
+	if (m->len < 10)
+		return;
+	printf("  ps attached=%u f8=0x%02x cause=0x%02x\n", m->data[7],
+	       m->data[8], m->data[9]);
+}
+
+static void handle_message(struct ril *r, const struct ipc_msg *m)
+{
+	(void)r;
+	if (m->len < IPC_HDR_LEN) {
+		errmsg("short message (%zu bytes), dropping", m->len);
+		return;
+	}
+	if (opt_json) {
+		size_t i;
+
+		printf("{\"main\":%u,\"sub\":%u,\"type\":%u,\"len\":%zu,"
+		       "\"name\":\"%s/%s\",\"payload\":\"",
+		       m->data[4], m->data[5], m->data[6], m->len,
+		       main_name(m->data[4]), type_name(m->data[6]));
+		for (i = IPC_HDR_LEN; i < m->len; i++)
+			printf("%02x", m->data[i]);
+		printf("\"}\n");
+	} else {
+		printf("%s/%02x/%02x %s len=%zu\n", main_name(m->data[4]),
+		       m->data[4], m->data[5], type_name(m->data[6]), m->len);
+	}
+
+	if (opt_json)
+		return;
+	if (m->data[4] == IPC_MAIN_MISC && m->data[5] == 0x03) {
+		decode_serial_number(m);
+	} else if (m->data[4] == IPC_MAIN_NET && m->data[5] == 0x05) {
+		decode_net_reg_state(m);
+	} else if (m->data[4] == 0x05 && m->data[5] == 0x01) {
+		decode_sec_pin_status(m);
+	} else if (m->data[4] == IPC_MAIN_SMS && m->data[5] == 0x01) {
+		decode_sms_send_result(m);
+	} else if (m->data[4] == IPC_MAIN_SMS && m->data[5] == 0x02) {
+		decode_sms_incoming(m);
+		if (m->len >= 12 && m->data[7] == 2) {
+			r->ack_tpid = m->data[11];
+			r->ack_pending = true;
+		}
+	} else if (m->data[4] == IPC_MAIN_SMS && m->data[5] == 0x06) {
+		hexdump("  sms ack/delivery: ", m->data + IPC_HDR_LEN,
+			m->len - IPC_HDR_LEN);
+	} else if (m->data[4] == IPC_MAIN_SMS && m->data[5] == 0x0a) {
+		decode_smsc(r, m);
+	} else if (m->data[4] == IPC_MAIN_GPRS && m->data[5] == 0x04) {
+		if (m->data[6] != IPC_TYPE_EVENT)
+			decode_pdp_list(m);
+		else
+			hexdump("  pdp: ", m->data + IPC_HDR_LEN,
+				m->len - IPC_HDR_LEN);
+	} else if (m->data[4] == IPC_MAIN_GPRS && m->data[5] == 0x09) {
+		decode_ip_config(m);
+	} else if (m->data[4] == IPC_MAIN_GPRS && m->data[5] == 0x10) {
+		decode_gprs_state(m);
+	} else if (m->data[4] == IPC_MAIN_GPRS && m->data[5] == 0x03) {
+		decode_ps_state(m);
+	} else if (m->data[4] == IPC_MAIN_CALL && m->data[5] == 0x02) {
+		/* IpcRxCallIncoming @0x1a64b1 parses no fields; the number
+		 * and state arrive in CALL_STATUS / CALL_LIST. */
+		printf("  incoming call indication\n");
+	} else if (m->data[4] == IPC_MAIN_CALL && m->data[5] == 0x05) {
+		decode_call_status(m);
+	} else if (m->data[4] == IPC_MAIN_CALL && m->data[5] == 0x0b) {
+		decode_call_signal(m);
+	} else if (m->data[4] == IPC_MAIN_CALL && m->data[5] == 0x06) {
+		/* IpcRxCallList @0x1a61e8: record layout not decoded. */
+		hexdump("  calls: ", m->data + IPC_HDR_LEN,
+			m->len - IPC_HDR_LEN);
+	} else if (opt_verbose) {
+		hexdump("  ", m->data, m->len);
+	}
+}
+
+/* Reassemble messages from the byte stream returned by read(2).  Each read
+ * returns at most one SIPC5 frame payload, which may be a fragment of an
+ * IpcProtocol message (GetIpcMessage, 0x1a2ef4, does exactly this). */
+static int rx_feed(struct ril *r, const uint8_t *buf, size_t n)
+{
+	while (n) {
+		size_t space = sizeof(r->rx) - r->rxlen;
+		size_t take = n < space ? n : space;
+
+		memcpy(r->rx + r->rxlen, buf, take);
+		r->rxlen += take;
+		buf += take;
+		n -= take;
+
+		for (;;) {
+			size_t need;
+			struct ipc_msg m;
+
+			if (r->rxlen < 2)
+				break;
+			need = (size_t)r->rx[0] | ((size_t)r->rx[1] << 8);
+			if (need < IPC_HDR_LEN || need > IPC_MAX_MSG) {
+				errmsg("bad message length %zu, resyncing",
+				       need);
+				r->rxlen = 0;
+				break;
+			}
+			if (r->rxlen < need)
+				break;
+			m.data = r->rx;
+			m.len = need;
+			handle_message(r, &m);
+			memmove(r->rx, r->rx + need, r->rxlen - need);
+			r->rxlen -= need;
+		}
+		if (r->rxlen == sizeof(r->rx)) {
+			errmsg("reassembly buffer overflow, dropping");
+			r->rxlen = 0;
+		}
+	}
+	return 0;
+}
+
+/* Read one chunk into a scratch buffer and feed the reassembler. */
+static int ipc_read_once(struct ril *r)
+{
+	uint8_t scratch[4096];
+	ssize_t n = read(r->ipc_fd, scratch, sizeof(scratch));
+
+	if (n < 0) {
+		if (errno == EINTR || errno == EAGAIN)
+			return 0;
+		return -1;
+	}
+	if (n == 0)
+		return 0;
+	return rx_feed(r, scratch, (size_t)n);
+}
+
+static int ipc_wait_msg(struct ril *r, unsigned timeout_ms)
+{
+	struct pollfd pfd = { .fd = r->ipc_fd, .events = POLLIN };
+	long deadline = now_ms() + (long)timeout_ms;
+
+	for (;;) {
+		long left = deadline - now_ms();
+		int rc;
+
+		if (left < 0)
+			left = 0;
+		rc = poll(&pfd, 1, (int)left);
+		if (rc < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (rc == 0)
+			return 1;
+		if (pfd.revents & (POLLHUP | POLLERR)) {
+			errmsg("ipc channel hangup (CP crash?), revents=0x%x",
+			       pfd.revents);
+			return -1;
+		}
+		if (pfd.revents & POLLIN) {
+			if (ipc_read_once(r) < 0)
+				return -1;
+			return 0;
+		}
+	}
+}
+
+/* Read and dispatch messages until the channel has been quiet for quiet_ms.
+ * The kernel has no framing indication beyond POLLIN, so a short quiet
+ * window is how "the answer is complete" is detected. */
+static int drain(struct ril *r, unsigned quiet_ms)
+{
+	for (;;) {
+		int rc = ipc_wait_msg(r, quiet_ms);
+
+		if (rc != 0)
+			return rc < 0 ? -1 : 0;
+	}
+}
+
+/* Return the phone state from IOCTL_MODEM_STATUS, or a negative errno. */
+static int modem_state(int fd)
+{
+	int rc = ioctl(fd, IOCTL_MODEM_STATUS);
+
+	if (rc < 0)
+		return -errno;
+	return rc;
+}
+
+/* The kernel only publishes STATE_ONLINE to io devices that were already
+ * open when ss310ap_boot_off() ran (modem_ctrl_ss310ap.c:341-347 iterates
+ * mc->modem_state_notify_list and skips iodevs with opened == 0).  A RIL that
+ * starts *after* j7elte-cbd therefore finds the CP ONLINE on the wire but
+ * OFFLINE in the kernel, and misc_write() then rejects every message with
+ * -EPERM ("!cp_online", modem_io_device.c:873).  Re-issuing
+ * IOCTL_MODEM_BOOT_OFF is the documented way out: mc->init_cmpl is already
+ * complete, so it returns immediately and re-notifies every open iodev. */
+static int ensure_online(struct ril *r, unsigned timeout_ms)
+{
+	int st = modem_state(r->ipc_fd);
+
+	if (st < 0) {
+		errmsg("IOCTL_MODEM_STATUS: %s", strerror(-st));
+		return -1;
+	}
+	if (st == STATE_ONLINE)
+		return 0;
+	if (st == STATE_OFFLINE || st == STATE_BOOTING) {
+		logmsg("state %s (%d); re-issuing IOCTL_MODEM_BOOT_OFF",
+		       state_name(st), st);
+		if (ioctl(r->ipc_fd, IOCTL_MODEM_BOOT_OFF) < 0)
+			errmsg("IOCTL_MODEM_BOOT_OFF: %s", strerror(errno));
+		st = modem_state(r->ipc_fd);
+		if (st == STATE_ONLINE)
+			return 0;
+	}
+	{
+		long deadline = now_ms() + (long)timeout_ms;
+
+		while (st != STATE_ONLINE && now_ms() < deadline) {
+			logmsg("state %s (%d), waiting", state_name(st), st);
+			if (ipc_wait_msg(r, 200) < 0)
+				return -1;
+			st = modem_state(r->ipc_fd);
+			if (st < 0)
+				return -1;
+		}
+	}
+	if (st != STATE_ONLINE) {
+		errmsg("CP did not reach ONLINE (last state %s (%d))",
+		       state_name(st), st);
+		errmsg("boot the baseband first: j7elte-cbd -d");
+		return -1;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* command implementations                                            */
+/* ------------------------------------------------------------------ */
+static int send_req(struct ril *r, const struct ipc_req *req,
+		    const uint8_t *payload, size_t plen)
+{
+	uint8_t buf[IPC_HDR_LEN + 16];
+	size_t len = build_req(buf, sizeof(buf), req, payload, plen);
+
+	if (!len) {
+		errmsg("message too large");
+		return -1;
+	}
+	return ipc_send(r, buf, len);
+}
+
+static int query_imei(struct ril *r)
+{
+	uint8_t kind = IPC_DEVINFO_IMEI;
+
+	return send_req(r, &(struct ipc_req){
+		IPC_MAIN_MISC, 0x03, IPC_TYPE_GET, "MISC_GET_SERIAL_NUMBER",
+		{0}, 0 }, &kind, 1);
+}
+
+static int query_radio_power(struct ril *r, int state)
+{
+	uint8_t payload[2];
+
+	if (state == IPC_RADIO_ON) {
+		payload[0] = 0x01;	/* 0x1cb386: strb r4 (=1) at +7 */
+		payload[1] = 0x00;	/* +8 stays 0 for state 1       */
+	} else if (state == IPC_RADIO_OFF) {
+		payload[0] = 0x02;	/* 0x1cb386: r4 == 2           */
+		payload[1] = 0x02;
+	} else {
+		return -1;
+	}
+	return send_req(r, &(struct ipc_req){
+		IPC_MAIN_PWR, 0x07, IPC_TYPE_EXEC, "PWR_RADIO_POWER",
+		{0}, 0 }, payload, sizeof(payload));
+}
+
+static int send_sim_power(struct ril *r, int on)
+{
+	uint8_t p = on ? 1 : 0;
+
+	return send_req(r, &(struct ipc_req){
+		0x05, 0x0d, IPC_TYPE_SET, "SEC_SET_SIM_POWER", {0}, 0 }, &p, 1);
+}
+
+/* Largest body any builder below emits: GPRS_DEFINE_PDP_CONTEXT is 127. */
+#define IPC_MAX_BODY		256
+
+static int send_built(struct ril *r, const struct ipc_req *req,
+		      const uint8_t *body, size_t blen)
+{
+	uint8_t buf[IPC_HDR_LEN + IPC_MAX_BODY];
+	size_t len;
+
+	if (blen > IPC_MAX_BODY) {
+		errmsg("%s body is %zu bytes, limit %u", req->name, blen,
+		       IPC_MAX_BODY);
+		return -1;
+	}
+	len = build_req(buf, sizeof(buf), req, body, blen);
+	if (!len) {
+		errmsg("cannot build %s", req->name);
+		return -1;
+	}
+	return ipc_send(r, buf, len);
+}
+
+/* Fire-and-forget request: drain whatever the CP sends for a moment. */
+static int send_only(struct ril *r, const struct ipc_req *req,
+		     const uint8_t *body, size_t blen)
+{
+	if (send_built(r, req, body, blen) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* Send a request that must be answered (all of these are GETs). */
+static int send_wait(struct ril *r, const struct ipc_req *req,
+		     const uint8_t *body, size_t blen)
+{
+	int rc;
+
+	if (send_built(r, req, body, blen) < 0)
+		return 1;
+	rc = ipc_wait_msg(r, opt_timeout_ms);
+	if (rc == 1) {
+		errmsg("no response to %s", req->name);
+		return 1;
+	}
+	if (rc < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* IpcProtocol41::IpcTxSetSmscAddress @0x1afa10.
+ *   memset(frame, 0, 0x13); frame[0..1] = 0x13;
+ *   frame[4] = 4, frame[5] = 0x0a, frame[6] = 3 (SET);
+ *   memcpy(frame + 7, address, len);
+ * The header length is the constant 0x13, not 7+len, and the destination is
+ * a 19-byte stack buffer, i.e. the address field is 12 bytes.  A longer
+ * string would overflow in the stock binary, so it is rejected here. */
+static size_t build_smsc_set(uint8_t *out, size_t outsz, const char *addr)
+{
+	uint8_t body[12];
+	size_t n = strlen(addr);
+
+	memset(body, 0, sizeof(body));
+	memcpy(body, addr, n);
+	return build_req(out, outsz, &req_sms_set_smsc, body, sizeof(body));
+}
+
+static int cmd_sms_smsc_set(struct ril *r, const char *addr)
+{
+	uint8_t buf[IPC_HDR_LEN + 12];
+	size_t len;
+
+	if (strlen(addr) > 12) {
+		errmsg("SMSC address is %zu bytes; the traced frame has a "
+		       "12-byte address field", strlen(addr));
+		return 2;
+	}
+	len = build_smsc_set(buf, sizeof(buf), addr);
+	if (!len)
+		return 1;
+	if (ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* SmsCenter::BuildScaPdu @0x181340.  The stock code accepts any digit
+ * string, strips one leading '+', and uses SmsCenter::GetToA() @0x1812c5
+ * for the type-of-address when there is no '+'.  GetToA()'s return value was
+ * not resolved, so this implementation requires the international format
+ * (leading '+'), where the traced builder uses TOA 0x91.  k=(digits+1)/2
+ * must be <= 11, i.e. at most 21 digits. */
+static int build_sca(uint8_t *out, size_t outsz, const char *sca, size_t *len)
+{
+	const char *d = sca;
+	size_t n, k, i;
+
+	if (*d != '+')
+		return -1;
+	d++;
+	n = strlen(d);
+	if (!n || n > 21)
+		return -1;
+	k = (n + 1) / 2;
+	if (k > 11 || k + 2 > outsz)
+		return -1;
+	for (i = 0; i < n; i++)
+		if (d[i] < '0' || d[i] > '9')
+			return -1;
+	out[0] = (uint8_t)(k + 1);
+	out[1] = 0x91;
+	for (i = 0; i < k; i++) {
+		unsigned lo = (unsigned)(d[2 * i] - '0');
+		unsigned hi = (2 * i + 1 < n) ?
+			(unsigned)(d[2 * i + 1] - '0') : 0xf;
+
+		out[2 + i] = (uint8_t)(lo | (hi << 4));
+	}
+	*len = k + 2;
+	return 0;
+}
+
+/* IpcProtocol41::IpcTxSendSms @0x1cd280.  Write size is exactly 11 + N
+ * (the 267-byte memset is only the p40 twin's behaviour).  Body:
+ *   [7]=2 message type, [8]=1 GSM path, [9]=ConvertDomainToIPCE(domain)
+ *   (0->2, 1->3, 3->1, else 0), [10]=N, [11..]=SCA blob + raw TPDU.
+ * The TPDU itself is produced by the Android framework in the stock stack,
+ * so it is an input here rather than being encoded. */
+static uint8_t domain_to_ipce(unsigned domain)
+{
+	switch (domain) {
+	case 0: return 2;
+	case 1: return 3;
+	case 3: return 1;
+	default: return 0;
+	}
+}
+
+static size_t build_sms_send(uint8_t *out, size_t outsz,
+			     const uint8_t *tpdu, size_t tlen,
+			     const char *sca, unsigned domain)
+{
+	uint8_t body[4 + 256];
+	size_t scalen = 0;
+
+	if (!tlen || tlen > 256)
+		return 0;
+	if (build_sca(body + 4, sizeof(body) - 4, sca, &scalen) < 0)
+		return 0;
+	if (scalen + tlen > 256)
+		return 0;
+	body[0] = 2;
+	body[1] = 1;
+	body[2] = domain_to_ipce(domain);
+	body[3] = (uint8_t)(scalen + tlen);
+	memcpy(body + 4 + scalen, tpdu, tlen);
+	return build_req(out, outsz, &req_sms_send, body, 4 + scalen + tlen);
+}
+
+static int cmd_sms_send(struct ril *r, const uint8_t *tpdu, size_t tlen,
+			const char *sca, unsigned domain)
+{
+	uint8_t buf[11 + 256];
+	size_t len = build_sms_send(buf, sizeof(buf), tpdu, tlen, sca,
+				    domain);
+
+	if (!len) {
+		errmsg("cannot build SMS frame: TPDU %zu bytes, SMSC '%s' "
+		       "(needs '+' and at most 21 digits)", tlen, sca);
+		return 2;
+	}
+	if (ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* Read/delete stored SMS, both 10-byte frames:
+ *   [7]=index, [8..9]=u16(storage-1). */
+static size_t build_sms_store(uint8_t *out, size_t outsz,
+			      const struct ipc_req *req, unsigned index,
+			      unsigned storage)
+{
+	uint8_t body[3];
+	unsigned s = storage ? storage - 1 : 0xffff;
+
+	body[0] = (uint8_t)index;
+	body[1] = (uint8_t)(s & 0xff);
+	body[2] = (uint8_t)(s >> 8);
+	return build_req(out, outsz, req, body, sizeof(body));
+}
+
+/* IpcProtocol41::IpcTxDeliveryReport @0x1cd340, 12 bytes:
+ *   [7]=a (2 for GSM), [8..9]=status u16, [10]=tpid (u8), [11]=0.
+ * status: success -> 0; failure -> cause 0x80 -> 0x8080, 0x81 -> 0x8081,
+ * 22 -> 0x8016, anything else -> 0x806f. */
+static size_t build_sms_ack(uint8_t *out, size_t outsz, unsigned tpid,
+			    int success, unsigned cause)
+{
+	uint8_t body[5];
+	unsigned status;
+
+	if (success)
+		status = 0;
+	else if (cause == 0x80)
+		status = 0x8080;
+	else if (cause == 0x81)
+		status = 0x8081;
+	else if (cause == 22)
+		status = 0x8016;
+	else
+		status = 0x806f;
+	body[0] = 2;
+	body[1] = (uint8_t)(status & 0xff);
+	body[2] = (uint8_t)(status >> 8);
+	body[3] = (uint8_t)tpid;
+	body[4] = 0;
+	return build_req(out, outsz, &req_sms_ack, body, sizeof(body));
+}
+
+/* ---- GSM 03.40 SMS-SUBMIT encoder (new code, not a traced builder) ----
+ * The stock RIL receives a ready TPDU from the Android framework; this
+ * encoder exists so sms-send can take a number and text directly.  It is
+ * validated against the worked example in spec/sms.md §5.1 ("hi" with
+ * SCA and DA +15551234567 produces 01000B915155214365F7000002E834).
+ * Only the GSM 7-bit default alphabet is supported; a character with no
+ * mapping is rejected instead of being transliterated. */
+
+static int gsm7_encode_char(unsigned char c, uint8_t *out)
+{
+	if (c >= 'A' && c <= 'Z') { out[0] = c; return 1; }
+	if (c >= 'a' && c <= 'z') { out[0] = c; return 1; }
+	if (c >= '0' && c <= '9') { out[0] = c; return 1; }
+	switch (c) {
+	case '@': out[0] = 0x00; return 1;
+	case '$': out[0] = 0x02; return 1;
+	case ' ': case '!': case '"': case '#': case '%':
+	case '&': case '\'': case '(': case ')': case '*':
+	case '+': case ',': case '-': case '.': case '/':
+	case ':': case ';': case '<': case '=': case '>':
+	case '?':
+		out[0] = c;
+		return 1;
+	case '_': out[0] = 0x11; return 1;
+	case '^': out[0] = 0x1b; out[1] = 0x14; return 2;
+	case '{': out[0] = 0x1b; out[1] = 0x28; return 2;
+	case '}': out[0] = 0x1b; out[1] = 0x29; return 2;
+	case '\\': out[0] = 0x1b; out[1] = 0x2f; return 2;
+	case '[': out[0] = 0x1b; out[1] = 0x3c; return 2;
+	case '~': out[0] = 0x1b; out[1] = 0x3d; return 2;
+	case ']': out[0] = 0x1b; out[1] = 0x3e; return 2;
+	case '|': out[0] = 0x1b; out[1] = 0x40; return 2;
+	default: return 0;
+	}
+}
+
+static int gsm7_to_septets(const char *text, uint8_t *sep, size_t max)
+{
+	size_t n = 0;
+
+	for (; *text; text++) {
+		uint8_t t[2];
+		int k = gsm7_encode_char((unsigned char)*text, t);
+
+		if (!k || n + (size_t)k > max)
+			return -1;
+		sep[n++] = t[0];
+		if (k == 2)
+			sep[n++] = t[1];
+	}
+	return (int)n;
+}
+
+static size_t gsm7_pack(const uint8_t *sep, size_t n, uint8_t *out)
+{
+	uint32_t acc = 0;
+	unsigned bits = 0;
+	size_t i, o = 0;
+
+	for (i = 0; i < n; i++) {
+		acc |= (uint32_t)sep[i] << bits;
+		bits += 7;
+		while (bits >= 8) {
+			out[o++] = (uint8_t)(acc & 0xff);
+			acc >>= 8;
+			bits -= 8;
+		}
+	}
+	if (bits)
+		out[o++] = (uint8_t)(acc & 0xff);
+	return o;
+}
+
+/* SMS-SUBMIT with no VP field (the form in the spec example):
+ * [0]=0x01, [1]=MR 0, [2]=DA digits, [3]=TOA, [4..]=DA BCD,
+ * [..]=PID 0, DCS 0, UDL, packed septets. */
+static size_t build_submit_tpdu(uint8_t *out, size_t outsz,
+				const char *number, const char *text)
+{
+	const char *d = number;
+	int plus = 0;
+	size_t dn, k, i, o = 0, packed_len;
+	uint8_t sep[160], packed[160];
+	int septets;
+
+	if (*d == '+') {
+		plus = 1;
+		d++;
+	}
+	dn = strlen(d);
+	if (!dn || dn > 20)
+		return 0;
+	for (i = 0; i < dn; i++)
+		if (d[i] < '0' || d[i] > '9')
+			return 0;
+	k = (dn + 1) / 2;
+	septets = gsm7_to_septets(text, sep, sizeof(sep));
+	if (septets <= 0)
+		return 0;
+	packed_len = gsm7_pack(sep, (size_t)septets, packed);
+	if (2 + 2 + k + 3 + packed_len > outsz)
+		return 0;
+	out[o++] = 0x01;		/* SMS-SUBMIT, no VP */
+	out[o++] = 0x00;		/* TP-MR */
+	out[o++] = (uint8_t)dn;
+	out[o++] = plus ? 0x91 : 0x81;
+	for (i = 0; i < k; i++) {
+		unsigned lo = (unsigned)(d[2 * i] - '0');
+		unsigned hi = (2 * i + 1 < dn) ?
+			(unsigned)(d[2 * i + 1] - '0') : 0xf;
+
+		out[o++] = (uint8_t)(lo | (hi << 4));
+	}
+	out[o++] = 0x00;		/* TP-PID */
+	out[o++] = 0x00;		/* TP-DCS: 7-bit default */
+	out[o++] = (uint8_t)septets;	/* TP-UDL */
+	memcpy(out + o, packed, packed_len);
+	o += packed_len;
+	return o;
+}
+
+/* IpcProtocol41::IpcTxWriteSmsToSim @0x1cd110: len = 12+N, but the stock
+ * writes the whole 268-byte buffer.  [7]=2, [8..9]=u16(index==255?0xffff:
+ * index-1), [10]=(status+1)&0xff, [11]=N, [12..]=SCA+TPDU. */
+static size_t build_sms_write(uint8_t *out, size_t outsz, unsigned index,
+			      unsigned status, const uint8_t *tpdu,
+			      size_t tlen, const char *sca)
+{
+	uint8_t body[268 - IPC_HDR_LEN];
+	size_t scalen = 0, n;
+	unsigned rec = index == 255 ? 0xffff : index - 1;
+
+	if (outsz < 268 || !tlen || tlen > 256)
+		return 0;
+	memset(body, 0, sizeof(body));
+	if (build_sca(body + 5, sizeof(body) - 5, sca, &scalen) < 0)
+		return 0;
+	n = scalen + tlen;
+	if (n > 256)
+		return 0;
+	body[0] = 2;
+	body[1] = (uint8_t)(rec & 0xff);
+	body[2] = (uint8_t)(rec >> 8);
+	body[3] = (uint8_t)((status + 1) & 0xff);
+	body[4] = (uint8_t)n;
+	memcpy(body + 5 + scalen, tpdu, tlen);
+	memset(out, 0, 268);
+	out[0] = (uint8_t)((12 + n) & 0xff);
+	out[1] = (uint8_t)((12 + n) >> 8);
+	out[4] = IPC_MAIN_SMS;
+	out[5] = 0x04;
+	out[6] = IPC_TYPE_EXEC;
+	memcpy(out + IPC_HDR_LEN, body, sizeof(body));
+	return 268;		/* write size, not the len field */
+}
+
+/* Ask the CP for the stored SMSC and wait for the 04/0a reply. */
+static int query_smsc(struct ril *r)
+{
+	long deadline = now_ms() + (long)opt_timeout_ms;
+
+	r->smsc_valid = false;
+	if (send_built(r, &req_sms_get_smsc, NULL, 0) < 0)
+		return -1;
+	while (!r->smsc_valid && now_ms() < deadline) {
+		long left = deadline - now_ms();
+
+		if (left <= 0)
+			break;
+		if (ipc_wait_msg(r, (unsigned)left) != 0)
+			break;
+	}
+	drain(r, 100);
+	return r->smsc_valid ? 0 : -1;
+}
+
+/* Text-mode send: encode the TPDU and use the SMSC reply when no address
+ * was supplied. */
+static int cmd_sms_send_text(struct ril *r, const char *number,
+			     const char *text, const char *sca,
+			     unsigned domain)
+{
+	uint8_t tpdu[256], buf[11 + 256];
+	size_t tlen, len;
+	char sca_buf[32];
+
+	if (!sca || !*sca) {
+		if (query_smsc(r) < 0) {
+			errmsg("no SMSC address: pass it explicitly or make "
+			       "the SMS_GET_SMSC query succeed");
+			return 1;
+		}
+		snprintf(sca_buf, sizeof(sca_buf), "%s", r->smsc);
+		sca = sca_buf;
+	}
+	tlen = build_submit_tpdu(tpdu, sizeof(tpdu), number, text);
+	if (!tlen) {
+		errmsg("cannot encode SMS: number must be 1..20 digits, text "
+		       "must be non-empty GSM 7-bit (max 160 septets)");
+		return 2;
+	}
+	len = build_sms_send(buf, sizeof(buf), tpdu, tlen, sca, domain);
+	if (!len) {
+		errmsg("cannot build SMS frame (SMSC '%s' needs '+' and at "
+		       "most 21 digits)", sca);
+		return 2;
+	}
+	if (ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* IpcProtocol41::IpcTxDefinePdpContext @0x1b95bc, 0x86 = 134 bytes:
+ *   [0..1] len = 0x86, [4] = 0x0d GPRS, [5] = 1, [6] = 3 SET
+ *   body[0] = 1, body[1] = cid
+ *   body[2] = { DataProtocol 2->5, 3->6, 4->4, anything else->2 }
+ *             (signed-byte table at 0x239ae0: 05 06 04)
+ *   body[3..102]  = strncpy(apn, 100)
+ *   body[104..119] = 16 bytes from the optional auth pointer (none here)
+ *   body[120..123] = u32 from the optional pointer (none here)
+ *   body[126] = 0 when the builder's bool argument is false
+ * The two pointer arguments and the bool are left at "absent/false", which
+ * is the exact path taken when they are NULL/0. */
+static size_t build_pdp_define(uint8_t *out, size_t outsz, unsigned cid,
+			       const char *apn, unsigned proto)
+{
+	uint8_t body[0x86 - IPC_HDR_LEN];
+
+	memset(body, 0, sizeof(body));
+	body[0] = 1;
+	body[1] = (uint8_t)cid;
+	switch (proto) {
+	case 2:  body[2] = 5; break;
+	case 3:  body[2] = 6; break;
+	case 4:  body[2] = 4; break;
+	default: body[2] = 2; break;
+	}
+	memcpy(body + 3, apn, strlen(apn));
+	return build_req(out, outsz, &req_pdp_define, body, sizeof(body));
+}
+
+static int cmd_pdp_define(struct ril *r, unsigned cid, const char *apn,
+			  unsigned proto)
+{
+	uint8_t buf[0x86];
+	size_t len;
+
+	if (cid > 0xff) {
+		errmsg("cid %u does not fit the one-byte field", cid);
+		return 2;
+	}
+	if (strlen(apn) > 100) {
+		errmsg("APN is %zu bytes; the traced field is 100 bytes",
+		       strlen(apn));
+		return 2;
+	}
+	len = build_pdp_define(buf, sizeof(buf), cid, apn, proto);
+	if (!len)
+		return 1;
+	if (ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* IpcProtocol41::IpcTxSetPdpContext @0x1b96ac, 0x70 = 112 bytes.
+ * Absolute frame offsets (body[i] == frame[7+i]):
+ *   [7]      action: 0 deactivate, 1 activate   (builder switch on arg2)
+ *   [8]      cid
+ *   [9..12]  u32 LE flags: 1 = APN present, 2 = second string present,
+ *            0x10 = auth present
+ *   [13..44] APN, 32 bytes (strncpy)
+ *   [45..76] second string, 32 bytes (absent here)
+ *   [109]    auth byte: table 0x239b10 = {1,2,1} indexed by arg5-1 (1..3)
+ *   [111]    detach reason when action==0 (builder maps -9,-10,-15,-18 to
+ *            1,2,3,4; the wire value is 1..4)
+ * The builder's switch also has actions 2/3/5 whose control flow does not
+ * copy the string block; only actions 0 and 1 are reproduced here. */
+static unsigned pdp_auth_byte(unsigned auth)
+{
+	switch (auth) {
+	case 1: return 1;
+	case 2: return 2;
+	case 3: return 1;	/* table at 0x239b10: 01 02 01 */
+	default: return 0;
+	}
+}
+
+static size_t build_pdp_set(uint8_t *out, size_t outsz, unsigned cid,
+			    int activate, const char *apn, unsigned auth,
+			    unsigned reason)
+{
+	uint8_t body[0x70 - IPC_HDR_LEN];
+	uint32_t flags = 0;
+
+	memset(body, 0, sizeof(body));
+	body[0] = activate ? 1 : 0;
+	body[1] = (uint8_t)cid;
+	if (activate) {
+		flags |= 1;
+		memcpy(body + 6, apn, strlen(apn));
+		if (auth) {
+			flags |= 0x10;
+			body[102] = (uint8_t)pdp_auth_byte(auth);
+		}
+	} else {
+		body[104] = (uint8_t)reason;
+	}
+	body[2] = (uint8_t)(flags & 0xff);
+	body[3] = (uint8_t)((flags >> 8) & 0xff);
+	body[4] = (uint8_t)((flags >> 16) & 0xff);
+	body[5] = (uint8_t)((flags >> 24) & 0xff);
+	return build_req(out, outsz, &req_pdp_set, body, sizeof(body));
+}
+
+static int cmd_pdp_activate(struct ril *r, unsigned cid, const char *apn,
+			    unsigned auth)
+{
+	uint8_t buf[0x70];
+	size_t len;
+
+	if (cid > 0xff) {
+		errmsg("cid %u does not fit the one-byte field", cid);
+		return 2;
+	}
+	if (strlen(apn) > 32) {
+		errmsg("APN is %zu bytes; the SET-PDP field is 32",
+		       strlen(apn));
+		return 2;
+	}
+	if (auth > 3) {
+		errmsg("AUTH must be 0..3 (0 = none)");
+		return 2;
+	}
+	len = build_pdp_set(buf, sizeof(buf), cid, 1, apn, auth, 0);
+	if (!len)
+		return 1;
+	if (ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+static int cmd_pdp_deactivate(struct ril *r, unsigned cid, unsigned reason)
+{
+	uint8_t buf[0x70];
+	size_t len;
+
+	if (cid > 0xff) {
+		errmsg("cid %u does not fit the one-byte field", cid);
+		return 2;
+	}
+	if (!reason || reason > 4) {
+		errmsg("detach reason must be 1..4");
+		return 2;
+	}
+	len = build_pdp_set(buf, sizeof(buf), cid, 0, "", 0, reason);
+	if (!len)
+		return 1;
+	if (ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* IpcProtocol41::IpcTxSetPdpContext switch cases 2..5.  The jump table at
+ * 0x1b970c maps the builder's int argument directly to the wire action for
+ * 0..5; only case 1 copies the APN block and only case 0 stores a reason,
+ * so actions 2..5 are a 112-byte frame with [7]=action, [8]=cid and the
+ * remaining body bytes zero (the stock memset). */
+static size_t build_pdp_action(uint8_t *out, size_t outsz, unsigned cid,
+			       unsigned action)
+{
+	uint8_t body[0x70 - IPC_HDR_LEN];
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)action;
+	body[1] = (uint8_t)cid;
+	return build_req(out, outsz, &req_pdp_set, body, sizeof(body));
+}
+
+/* GPRS IPv6 configuration, 13/09/SET, 0x18 = 24 bytes: [7]=cid,
+ * [8..23]=16-byte address. */
+static size_t build_ipv6_config(uint8_t *out, size_t outsz, unsigned cid,
+				const uint8_t *addr)
+{
+	uint8_t body[0x18 - IPC_HDR_LEN];
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)cid;
+	memcpy(body + 1, addr, 16);
+	return build_req(out, outsz, &req_ipv6_config, body, sizeof(body));
+}
+
+/* GPRS mobile-data, 13/1d/SET, 9 bytes: [7], [8] are booleans. */
+static size_t build_mobile_data(uint8_t *out, size_t outsz, unsigned b0,
+				unsigned b1)
+{
+	uint8_t body[2] = { b0 ? 1 : 0, b1 ? 1 : 0 };
+
+	return build_req(out, outsz, &req_mobile_data, body, sizeof(body));
+}
+
+/* IpcProtocol41::IpcTxPsAttach @0x1b9828, 10 bytes:
+ *   [4]=0x0d, [5]=3, [6]=3 SET
+ *   body[0] = 1 iff the builder's bool argument is true
+ *   body[1] = 1 iff its third (bool) argument is true (always false here)
+ *   body[2] = DataDetachReason mapped through 0x239a20 = {1,2,3,4} when
+ *             body[0] is 0, else 0
+ * The builder's first argument (unsigned char) is not stored. */
+static size_t build_ps_attach(uint8_t *out, size_t outsz, int on,
+			      unsigned reason)
+{
+	uint8_t body[3] = { on ? 1 : 0, 0, 0 };
+
+	if (!on && reason >= 1 && reason <= 4)
+		body[2] = (uint8_t)reason;
+	return build_req(out, outsz, &req_ps_attach, body, sizeof(body));
+}
+
+static int cmd_ps_attach(struct ril *r, int on, unsigned reason)
+{
+	uint8_t buf[IPC_HDR_LEN + 3];
+	size_t len;
+
+	if (!on && (!reason || reason > 4)) {
+		errmsg("detach reason must be 1..4");
+		return 2;
+	}
+	len = build_ps_attach(buf, sizeof(buf), on, reason);
+	if (!len)
+		return 1;
+	if (ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* IpcProtocol41::ConvertCallTypeToIpc @0x1b5319: 21-entry int16 table at
+ * 0x2392f6, indexed by CallType-1.  Out-of-range values yield 0x0100.
+ * (spec/calls.md §2.1 prints a shifted table that omits 0x0307 at index 12;
+ * the bytes read from 0x2392f6 are authoritative.) */
+static uint16_t call_type_to_ipc(unsigned t)
+{
+	static const uint16_t tbl[21] = {
+		0x0000, 0x0100, 0x0300, 0x0105, 0x0106, 0x0301, 0x0306,
+		0x0302, 0x0303, 0x0304, 0x0305, 0x0307, 0x0700, 0x0702,
+		0x0100, 0x0801, 0x0308, 0x0309, 0x030a, 0x030b, 0x030c,
+	};
+
+	return (t >= 1 && t <= 21) ? tbl[t - 1] : 0x0100;
+}
+
+/* IpcProtocol41::IpcTxCallOriginate variant A @0x1b5335, 0x63 = 99 bytes.
+ * Stack argument order: (number, ClirType, CallType, int call_id,
+ * const char*, const char*); the last two are only logged.
+ *   [4]=2 [5]=1 [6]=1, body[0..1] = u16 LE ConvertCallTypeToIpc,
+ *   body[2] = ClirType raw, body[3] = min(strlen,82),
+ *   body[4] = 0x11 if number[0]=='+' else 0x21, body[5..] = digits,
+ *   body[91] = call_id & 0xff.  A NULL number makes the stock builder
+ *   return -1 without sending, so an empty number is rejected here. */
+static size_t build_call_originate(uint8_t *out, size_t outsz,
+				   const char *number, unsigned clir,
+				   unsigned calltype, unsigned call_id)
+{
+	uint8_t body[0x63 - IPC_HDR_LEN];
+	uint16_t w = call_type_to_ipc(calltype);
+	size_t n = strlen(number);
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)(w & 0xff);
+	body[1] = (uint8_t)(w >> 8);
+	body[2] = (uint8_t)clir;
+	body[3] = (uint8_t)n;
+	body[4] = number[0] == '+' ? 0x11 : 0x21;
+	memcpy(body + 5, number, n);
+	body[91] = (uint8_t)call_id;
+	return build_req(out, outsz, &req_call_originate, body, sizeof(body));
+}
+
+/* IpcProtocol41 continuous DTMF @0x1b5db5 (start) / 0x1b5e31 (stop):
+ * 9 bytes, body {1, tone} or {2, 0}. */
+static size_t build_cont_dtmf(uint8_t *out, size_t outsz, int start,
+			      unsigned char tone)
+{
+	uint8_t body[2];
+
+	body[0] = start ? 1 : 2;
+	body[1] = start ? tone : 0;
+	return build_req(out, outsz, &req_call_cont_dtmf, body, sizeof(body));
+}
+
+/* IpcProtocol41 burst DTMF @0x1b5cc1: 0x5b = 91 bytes,
+ * body[0] = 1 (2 when CallToneType==2), body[1] = min(len,82),
+ * body[2..] = digits. */
+static size_t build_burst_dtmf(uint8_t *out, size_t outsz,
+			       const char *digits)
+{
+	uint8_t body[0x5b - IPC_HDR_LEN];
+	size_t n = strlen(digits);
+
+	memset(body, 0, sizeof(body));
+	body[0] = 1;
+	body[1] = (uint8_t)n;
+	memcpy(body + 2, digits, n);
+	return build_req(out, outsz, &req_call_burst_dtmf, body, sizeof(body));
+}
+
+/* IpcProtocol41 flash/USSD string @0x1b5f91: 0x5a = 90 bytes,
+ * body[0] = min(len,48), body[1..] = string. */
+static size_t build_flash(uint8_t *out, size_t outsz, const char *s)
+{
+	uint8_t body[0x5a - IPC_HDR_LEN];
+	size_t n = strlen(s);
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)n;
+	memcpy(body + 1, s, n);
+	return build_req(out, outsz, &req_call_flash, body, sizeof(body));
+}
+
+/* IpcProtocol41 voice privacy: set is 9 bytes {1, type!=1}, get is 8 bytes
+ * {1} (0x1b5ea5 / 0x1b5f29). */
+static size_t build_voice_privacy_set(uint8_t *out, size_t outsz,
+				      unsigned type)
+{
+	uint8_t body[2] = { 1, type != 1 ? 1 : 0 };
+
+	return build_req(out, outsz, &req_call_voice_privacy_set, body,
+			 sizeof(body));
+}
+
+static int send_frame_now(struct ril *r, uint8_t *buf, size_t len)
+{
+	if (!len || ipc_send(r, buf, len) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* Send a complete frame and require at least one reply (used by GETs whose
+ * builders are not descriptor-payload shaped). */
+static int send_frame_wait(struct ril *r, uint8_t *buf, size_t len)
+{
+	int rc;
+
+	if (!len || ipc_send(r, buf, len) < 0)
+		return 1;
+	rc = ipc_wait_msg(r, opt_timeout_ms);
+	if (rc == 1) {
+		errmsg("no response");
+		return 1;
+	}
+	if (rc < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* ---- remaining CALL/CALL-adjacent builders from spec/calls.md ---- */
+
+/* Dial variant B @0x1b543d, 0x65 = 101 bytes.  Unlike A, it takes
+ * (number, ClirType, CallType, int1, bool, int2) and:
+ *   [7..8] u16 ConvertCallTypeToIpc, [9] ClirType raw, [10] len,
+ *   [11] 0x11 if (int1 != 0 && int2 == 1) else 0x21 (number[0] is not
+ *   examined), [12..] digits, [98] int1 & 0xff, [99] 1, [100] len-1. */
+static size_t build_dial_b(uint8_t *out, size_t outsz, const char *number,
+			   unsigned clir, unsigned calltype,
+			   unsigned int1, unsigned int2)
+{
+	uint8_t body[0x65 - IPC_HDR_LEN];
+	uint16_t w = call_type_to_ipc(calltype);
+	size_t n = strlen(number);
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)(w & 0xff);
+	body[1] = (uint8_t)(w >> 8);
+	body[2] = (uint8_t)clir;
+	body[3] = (uint8_t)n;
+	body[4] = (int1 && int2 == 1) ? 0x11 : 0x21;
+	memcpy(body + 5, number, n);
+	body[91] = (uint8_t)int1;
+	body[92] = 1;
+	body[93] = (uint8_t)(n - 1);
+	return build_req(out, outsz, &req_call_dial_b, body, sizeof(body));
+}
+
+struct cl_entry {
+	unsigned type, cid, f25, wire4, f24;
+	const char *number;
+};
+
+/* Call-list upload @0x1b55d5, 818-byte buffer.  Entry bytes:
+ * u16 (ConvertCallTypeToIpc(type) & 0xff00), CallDetails[+16], (f25?2:1),
+ * wire4, f24, number length, 0x81, number.  `wire4` is the stock
+ * table[CallDetails[+8]] result, which was not resolved (spec §2.6), so it
+ * is supplied as a wire byte. */
+static size_t build_call_list_set(uint8_t *out, size_t outsz, unsigned count,
+				  const struct cl_entry *e)
+{
+	uint8_t body[818 - IPC_HDR_LEN];
+	size_t c = 1;
+	unsigned i;
+
+	if (count > 0xff)
+		return 0;
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)count;
+	for (i = 0; i < count; i++) {
+		uint16_t w = call_type_to_ipc(e[i].type) & 0xff00;
+		size_t n = strlen(e[i].number);
+
+		if (n > 82 || c + 8 + n > sizeof(body))
+			return 0;
+		body[c] = (uint8_t)(w & 0xff);
+		body[c + 1] = (uint8_t)(w >> 8);
+		body[c + 2] = (uint8_t)e[i].cid;
+		body[c + 3] = (uint8_t)(e[i].f25 ? 2 : 1);
+		body[c + 4] = (uint8_t)e[i].wire4;
+		body[c + 5] = (uint8_t)e[i].f24;
+		body[c + 6] = (uint8_t)n;
+		body[c + 7] = 0x81;
+		memcpy(body + c + 8, e[i].number, n);
+		c += 8 + n;
+	}
+	return build_req(out, outsz, &req_call_list_set, body, c);
+}
+
+/* Modify @0x1b5949 / ModifyConfirm @0x1b5a45: [7] call id, [8..9] u16
+ * converted call type, [10] string count, then {u16 len, chars} per string.
+ * The length field accumulates. */
+static size_t build_call_modify(uint8_t *out, size_t outsz,
+				const struct ipc_req *req, unsigned id,
+				unsigned calltype, char *const *strs,
+				unsigned nstr)
+{
+	uint8_t body[780];
+	uint16_t w = call_type_to_ipc(calltype);
+	size_t c = 4;
+	unsigned i;
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)id;
+	body[1] = (uint8_t)(w & 0xff);
+	body[2] = (uint8_t)(w >> 8);
+	body[3] = (uint8_t)nstr;
+	for (i = 0; i < nstr; i++) {
+		size_t n = strlen(strs[i]);
+
+		if (n > 0xffff || c + 2 + n > sizeof(body))
+			return 0;
+		body[c] = (uint8_t)(n & 0xff);
+		body[c + 1] = (uint8_t)(n >> 8);
+		memcpy(body + c + 2, strs[i], n);
+		c += 2 + n;
+	}
+	return build_req(out, outsz, req, body, c);
+}
+
+/* Call time set @0x1b60ed, 37 bytes; the u32 is at frame offset 21
+ * (body[14]).  Total-time set @0x1b61fd: body[0]=7, then seven u32s from
+ * body[2]. */
+static size_t build_call_time_set(uint8_t *out, size_t outsz, uint32_t secs)
+{
+	uint8_t body[37 - IPC_HDR_LEN];
+
+	memset(body, 0, sizeof(body));
+	body[14] = (uint8_t)(secs & 0xff);
+	body[15] = (uint8_t)((secs >> 8) & 0xff);
+	body[16] = (uint8_t)((secs >> 16) & 0xff);
+	body[17] = (uint8_t)((secs >> 24) & 0xff);
+	return build_req(out, outsz, &req_call_time_set, body, sizeof(body));
+}
+
+static size_t build_total_time_set(uint8_t *out, size_t outsz,
+				   const uint32_t *v)
+{
+	uint8_t body[37 - IPC_HDR_LEN];
+	unsigned i;
+
+	memset(body, 0, sizeof(body));
+	body[0] = 7;
+	for (i = 0; i < 7; i++) {
+		body[2 + 4 * i] = (uint8_t)(v[i] & 0xff);
+		body[3 + 4 * i] = (uint8_t)((v[i] >> 8) & 0xff);
+		body[4 + 4 * i] = (uint8_t)((v[i] >> 16) & 0xff);
+		body[5 + 4 * i] = (uint8_t)((v[i] >> 24) & 0xff);
+	}
+	return build_req(out, outsz, &req_call_time_set, body, sizeof(body));
+}
+
+/* Manage call @0x1b5ba5, 92 bytes, main 0x0c: [7] mapped type (s8 table at
+ * 0x239352), [8] index, [9] number length, [10..] number.
+ * NeedCallIdPlusMinus()'s index += 1 is a product check that was not
+ * resolved; the index is passed through unchanged. */
+static int8_t manage_type_map(unsigned t)
+{
+	switch (t) {
+	case 1: return 3;
+	case 2: return 4;
+	case 3: return 5;
+	case 4: return 6;
+	case 5: return 7;
+	case 6: return 8;
+	case 7: return 9;
+	case 8: return 10;
+	case 9: case 10: case 11: case 12: case 13:
+	case 14: case 15: case 16: case 17: return -1;
+	case 18: return 4;
+	case 19: case 20: case 21: return 0;
+	default: return -1;
+	}
+}
+
+static size_t build_call_manage(uint8_t *out, size_t outsz, unsigned type,
+				unsigned index, const char *number)
+{
+	uint8_t body[92 - IPC_HDR_LEN];
+	size_t n = strlen(number);
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)manage_type_map(type);
+	body[1] = (uint8_t)index;
+	body[2] = (uint8_t)n;
+	memcpy(body + 3, number, n);
+	return build_req(out, outsz, &req_call_manage, body, sizeof(body));
+}
+
+/* Transfer @0x1b6679, 358 bytes: [7] int, then four length-prefixed strings
+ * at frame offsets 8/9, 91/92, 192/193, 275/276 (caps 82, 100, 82, 82). */
+static size_t build_call_transfer(uint8_t *out, size_t outsz, unsigned arg,
+				  const char *const *s)
+{
+	static const size_t lo[4] = { 1, 84, 185, 268 };
+	static const size_t cap[4] = { 82, 100, 82, 82 };
+	uint8_t body[358 - IPC_HDR_LEN];
+	unsigned i;
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)arg;
+	for (i = 0; i < 4; i++) {
+		size_t n = s[i] ? strlen(s[i]) : 0;
+
+		if (n > cap[i])
+			return 0;
+		body[lo[i]] = (uint8_t)n;
+		if (n)
+			memcpy(body + lo[i] + 1, s[i], n);
+	}
+	return build_req(out, outsz, &req_call_transfer, body, sizeof(body));
+}
+
+static int send_one(struct ril *r, const struct ipc_req *req, uint8_t b)
+{
+	uint8_t buf[IPC_HDR_LEN + 1];
+	size_t len = build_req(buf, sizeof(buf), req, &b, 1);
+
+	return send_frame_now(r, buf, len);
+}
+
+static int send_two(struct ril *r, const struct ipc_req *req, uint8_t a,
+		    uint8_t b)
+{
+	uint8_t body[2] = { a, b };
+	uint8_t buf[IPC_HDR_LEN + 2];
+	size_t len = build_req(buf, sizeof(buf), req, body, sizeof(body));
+
+	return send_frame_now(r, buf, len);
+}
+
+static int cmd_query(struct ril *r, const struct ipc_req *req)
+{
+	int rc;
+
+	if (send_req(r, req, req->payload, req->plen) < 0)
+		return 1;
+	rc = ipc_wait_msg(r, opt_timeout_ms);
+	if (rc == 1) {
+		errmsg("no response to %s", req->name);
+		return 1;
+	}
+	if (rc < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* The stock RIL's post-boot query set.  Ordering here is ours, not traced:
+ * each message is an independent GET/EXEC and the CP answers in any order. */
+static int cmd_info(struct ril *r)
+{
+	static const struct ipc_req *const set[] = {
+		&req_device_ready,
+		&req_baseband_ver,
+		&req_eri_ver,
+		&req_time_info,
+		&req_device_capa,
+		&req_pin_status,
+		&req_operator,
+		&req_voice_reg,
+		&req_data_reg,
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(set) / sizeof(set[0]); i++) {
+		int rc;
+
+		if (send_req(r, set[i], set[i]->payload, set[i]->plen) < 0)
+			return 1;
+		rc = ipc_wait_msg(r, opt_timeout_ms);
+		if (rc < 0)
+			return 1;
+		if (rc == 1)
+			errmsg("no response to %s", set[i]->name);
+		else
+			drain(r, 100);
+	}
+	if (query_imei(r) < 0)
+		return 1;
+	if (ipc_wait_msg(r, opt_timeout_ms) < 0)
+		return 1;
+	drain(r, 300);
+	return 0;
+}
+
+/* Auto-ack an incoming SMS.  The CP expects 04/06 within 60 s; the ack is
+ * therefore sent on the next loop iteration (well inside that window)
+ * rather than waiting for the timer to expire.  --no-auto-ack disables it. */
+static int auto_ack_pending(struct ril *r)
+{
+	uint8_t buf[16];
+	size_t len;
+
+	if (!opt_auto_ack || !r->ack_pending)
+		return 0;
+	len = build_sms_ack(buf, sizeof(buf), r->ack_tpid, 1, 0);
+	r->ack_pending = false;
+	if (!len || ipc_send(r, buf, len) < 0)
+		return 1;
+	logmsg("auto-ack 04/06 tpid=%u status=0x0000", r->ack_tpid);
+	return 0;
+}
+
+static int cmd_listen(struct ril *r)
+{
+	for (;;) {
+		int rc = ipc_wait_msg(r, 1000);
+
+		if (rc < 0)
+			return 1;
+		if (sigint_seen)
+			return 0;
+		if (auto_ack_pending(r) < 0)
+			return 1;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* self test: exact frame bytes + mock CP over a socketpair           */
+/* ------------------------------------------------------------------ */
+static const struct {
+	const char *name;
+	const struct ipc_req *req;
+	const uint8_t payload[2];
+	size_t plen;
+	const char *expect;
+} selftest_vectors[] = {
+	{ "device-ready", &req_device_ready, {0}, 0, "07000000040703" },
+	{ "baseband",    &req_baseband_ver, {0xff}, 1, "080000000a0102ff" },
+	{ "eri",         &req_eri_ver, {0x40}, 1, "080000000a010240" },
+	{ "time",        &req_time_info, {0}, 0, "070000000a0502" },
+	{ "capa",        &req_device_capa, {0}, 0, "070000000a2d02" },
+	{ "pin",         &req_pin_status, {0}, 0, "07000000050102" },
+	{ "operator",    &req_operator, {0}, 0, "07000000080302" },
+	{ "voice-reg",   &req_voice_reg, {0xff, 0x02}, 2, "09000000080502ff02" },
+	{ "data-reg",    &req_data_reg, {0xff, 0x03}, 2, "09000000080502ff03" },
+	{ "modem-off",   &req_modem_off, {0}, 0, "07000000010201" },
+	/* IpcTxGetSerialNumber(kind 1) -> 8-byte message, type byte 1 */
+	{ "imei",        &(struct ipc_req){ IPC_MAIN_MISC, 0x03, IPC_TYPE_GET,
+					    "MISC_GET_SERIAL_NUMBER", {0}, 0 },
+	  {0x01}, 1, "080000000a0302" "01" },
+	/* PWR_RADIO_POWER(1) -> 9 bytes, 01 00 */
+	{ "radio-on",    &(struct ipc_req){ IPC_MAIN_PWR, 0x07, IPC_TYPE_EXEC,
+					    "PWR_RADIO_POWER", {0}, 0 },
+	  {0x01, 0x00}, 2, "090000000107010100" },
+	{ "radio-off",   &(struct ipc_req){ IPC_MAIN_PWR, 0x07, IPC_TYPE_EXEC,
+					    "PWR_RADIO_POWER", {0}, 0 },
+	  {0x02, 0x02}, 2, "090000000107010202" },
+	{ "sim-power",   &(struct ipc_req){ 0x05, 0x0d, IPC_TYPE_SET,
+					    "SEC_SET_SIM_POWER", {0}, 0 },
+	  {0x01}, 1, "08000000050d0301" },
+	/* Call/SMS/GPRS fixed frames.  Header stores: IpcTxCallRelease
+	 * 0x1b5b38 (2/3/1), IpcTxCallAnswer 0x1b58dc (2/4/1),
+	 * IpcTxCallGetCallList 0x1b5568 (2/6/2), IpcTxGetSmscAddress
+	 * 0x1cd594 (4/0a/2), IpcTxGetPdpContext 0x1a7a4c (0d/4/2). */
+	{ "call-release", &req_call_release, {0}, 0, "07000000020301" },
+	{ "call-answer",  &req_call_answer, {0}, 0, "07000000020401" },
+	{ "call-list",    &req_call_get_list, {0}, 0, "07000000020602" },
+	{ "sms-smsc",     &req_sms_get_smsc, {0}, 0, "07000000040a02" },
+	{ "pdp-get",      &req_pdp_get, {0}, 0, "070000000d0402" },
+	/* CALL_HOLD 0x1b6421 and voice-privacy get 0x1b5f29. */
+	{ "call-hold",    &req_call_hold, {0}, 0, "07000000021301" },
+	{ "voice-priv-get", &req_call_voice_privacy_get, {0x01}, 1,
+	  "08000000020c0201" },
+};
+
+/* Builder-level vectors: the parameterised messages cannot be expressed by
+ * selftest_vectors (payload <= 2 bytes), so they are compared here.  The
+ * expected strings are the traced stores rendered independently. */
+static int selftest_builders(void)
+{
+	static const struct {
+		const char *name;
+		const char *expect;
+	} cases[] = {
+		/* IpcTxSetSmscAddress: fixed len 0x13, body = address. */
+		{ "smsc-set", "13000000040a032b3135353531323334353637" },
+		/* IpcTxDefinePdpContext(cid 1, "internet", proto 3):
+		 * body[2]=6, apn at body[3..], tail zero, len 0x86. */
+		{ "pdp-define",
+		  "860000000d0103010106696e7465726e65740000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "000000000000" },
+		/* IpcTxPsAttach(detach, reason 2) / (attach). */
+		{ "ps-detach", "0a0000000d0303000002" },
+		{ "ps-attach", "0a0000000d0303010000" },
+		/* IpcTxCallOriginate variant A, number "+15551234567",
+		 * ClirType 0, CallType 1, call_id 7. */
+		{ "call-orig",
+		  "630000000201010001000c112b31353535313233343536370000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "000007" },
+		/* Burst DTMF "123", continuous DTMF start '5' / stop,
+		 * voice privacy set type 2, flash "123". */
+		{ "burst-dtmf",
+		  "5b00000002070101033132330000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "000000000000000000000000000000000000000000000000000000" },
+		{ "dtmf-start", "090000000208030135" },
+		{ "dtmf-stop", "090000000208030200" },
+		{ "voice-priv-set", "09000000020c030101" },
+		/* IpcTxSetPdpContext: activate cid 1/"internet"/no auth,
+		 * activate cid 2/auth 2, deactivate cid 1/reason 2. */
+		{ "pdp-act",
+		  "700000000d0403010101000000696e7465726e65740000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "00000000000000000000000000000000" },
+		{ "pdp-act-auth",
+		  "700000000d0403010211000000696e7465726e65740000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "00000000000000000000000000020000" },
+		/* SMS: the spec's worked example (SCA +15551234567 and the
+		 * 15-byte GSM7 TPDU for "hi"), plus read/delete/ack. */
+		{ "sms-send",
+		  "220000000401010201021707915155214365f7"
+		  "01000b915155214365f7000002e834" },
+		{ "sms-read", "0a000000040302010000" },
+		{ "sms-delete", "0a000000040501010000" },
+		{ "sms-ack-ok", "0c0000000406010200000500" },
+		{ "sms-ack-fail", "0c0000000406010280800500" },
+		/* Text-mode encoder must reproduce the spec's worked example
+		 * byte for byte, and the SIM write frame (268-byte write,
+		 * len field 12+N = 0x23). */
+		{ "sms-text",
+		  "220000000401010201021707915155214365f701000b915155214365f7000002"
+		  "e834" },
+		{ "sms-write",
+		  "23000000040401020000011707915155214365f701000b915155214365f70000"
+		  "02e8340000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "000000000000000000000000" },
+		{ "pdp-action",
+		  "700000000d040303010000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "00000000000000000000000000000000" },
+		{ "ipv6",
+		  "180000000d09030120010db8000000000000000000000001" },
+		{ "mobile-data", "090000000d1d030100" },
+		{ "pdp-deact",
+		  "700000000d040300010000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "00000000000000000000000000000002" },
+		{ "flash",
+		  "5a00000002110303313233000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000000000000000"
+		  "0000000000000000000000000000000000000000000000000000" },
+	};
+	uint8_t buf[818];	/* sms-write is 268, PDP frames 112 */
+	size_t i;
+	int fails = 0;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		char got[2 * sizeof(buf) + 1];
+		size_t n, len;
+
+		if (!strcmp(cases[i].name, "smsc-set"))
+			len = build_smsc_set(buf, sizeof(buf), "+15551234567");
+		else if (!strcmp(cases[i].name, "pdp-define"))
+			len = build_pdp_define(buf, sizeof(buf), 1, "internet", 3);
+		else if (!strcmp(cases[i].name, "ps-detach"))
+			len = build_ps_attach(buf, sizeof(buf), 0, 2);
+		else if (!strcmp(cases[i].name, "ps-attach"))
+			len = build_ps_attach(buf, sizeof(buf), 1, 0);
+		else if (!strcmp(cases[i].name, "call-orig"))
+			len = build_call_originate(buf, sizeof(buf),
+						   "+15551234567", 0, 2, 7);
+		else if (!strcmp(cases[i].name, "burst-dtmf"))
+			len = build_burst_dtmf(buf, sizeof(buf), "123");
+		else if (!strcmp(cases[i].name, "flash"))
+			len = build_flash(buf, sizeof(buf), "123");
+		else if (!strcmp(cases[i].name, "dtmf-start"))
+			len = build_cont_dtmf(buf, sizeof(buf), 1, '5');
+		else if (!strcmp(cases[i].name, "dtmf-stop"))
+			len = build_cont_dtmf(buf, sizeof(buf), 0, 0);
+		else if (!strcmp(cases[i].name, "sms-send")) {
+			static const uint8_t tpdu[15] = {
+				0x01, 0x00, 0x0b, 0x91, 0x51, 0x55, 0x21,
+				0x43, 0x65, 0xf7, 0x00, 0x00, 0x02, 0xe8,
+				0x34
+			};
+
+			len = build_sms_send(buf, sizeof(buf), tpdu,
+					     sizeof(tpdu), "+15551234567",
+					     0);
+		} else if (!strcmp(cases[i].name, "sms-read"))
+			len = build_sms_store(buf, sizeof(buf), &req_sms_read,
+					      1, 1);
+		else if (!strcmp(cases[i].name, "sms-delete"))
+			len = build_sms_store(buf, sizeof(buf),
+					      &req_sms_delete, 1, 1);
+		else if (!strcmp(cases[i].name, "sms-ack-ok"))
+			len = build_sms_ack(buf, sizeof(buf), 5, 1, 0);
+		else if (!strcmp(cases[i].name, "sms-ack-fail"))
+			len = build_sms_ack(buf, sizeof(buf), 5, 0, 0x80);
+		else if (!strcmp(cases[i].name, "sms-text")) {
+			uint8_t t[256];
+			size_t tl = build_submit_tpdu(t, sizeof(t),
+						      "+15551234567", "hi");
+
+			len = build_sms_send(buf, sizeof(buf), t, tl,
+					     "+15551234567", 0);
+		} else if (!strcmp(cases[i].name, "sms-write")) {
+			static const uint8_t tpdu[15] = {
+				0x01, 0x00, 0x0b, 0x91, 0x51, 0x55, 0x21,
+				0x43, 0x65, 0xf7, 0x00, 0x00, 0x02, 0xe8,
+				0x34
+			};
+
+			len = build_sms_write(buf, sizeof(buf), 1, 0, tpdu,
+					      sizeof(tpdu), "+15551234567");
+		} else if (!strcmp(cases[i].name, "pdp-action"))
+			len = build_pdp_action(buf, sizeof(buf), 1, 3);
+		else if (!strcmp(cases[i].name, "ipv6")) {
+			static const uint8_t a[16] = {
+				0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0x01
+			};
+
+			len = build_ipv6_config(buf, sizeof(buf), 1, a);
+		} else if (!strcmp(cases[i].name, "mobile-data"))
+			len = build_mobile_data(buf, sizeof(buf), 1, 0);
+		else if (!strcmp(cases[i].name, "pdp-act"))
+			len = build_pdp_set(buf, sizeof(buf), 1, 1,
+					    "internet", 0, 0);
+		else if (!strcmp(cases[i].name, "pdp-act-auth"))
+			len = build_pdp_set(buf, sizeof(buf), 2, 1,
+					    "internet", 2, 0);
+		else if (!strcmp(cases[i].name, "pdp-deact"))
+			len = build_pdp_set(buf, sizeof(buf), 1, 0, "", 0, 2);
+		else
+			len = build_voice_privacy_set(buf, sizeof(buf), 2);
+		for (n = 0; n < len; n++)
+			snprintf(got + n * 2, 3, "%02x", buf[n]);
+		got[len * 2] = '\0';
+		if (strcmp(got, cases[i].expect) != 0) {
+			errmsg("selftest %s: got %s, want %s",
+			       cases[i].name, got, cases[i].expect);
+			fails++;
+		} else {
+			logmsg("selftest %s ok (%zu bytes)", cases[i].name, len);
+		}
+	}
+	return fails;
+}
+
+static int selftest_frames(void)
+{
+	uint8_t buf[32];
+	size_t i;
+	int fails = 0;
+
+	for (i = 0; i < sizeof(selftest_vectors) / sizeof(selftest_vectors[0]); i++) {
+		char got[64];
+		size_t n, len;
+		const void *pl = selftest_vectors[i].plen ?
+			selftest_vectors[i].payload : NULL;
+
+		len = build_req(buf, sizeof(buf), selftest_vectors[i].req, pl,
+				selftest_vectors[i].plen);
+		for (n = 0; n < len; n++)
+			snprintf(got + n * 2, 3, "%02x", buf[n]);
+		got[len * 2] = '\0';
+		if (strcmp(got, selftest_vectors[i].expect) != 0) {
+			errmsg("selftest %s: got %s, want %s",
+			       selftest_vectors[i].name, got,
+			       selftest_vectors[i].expect);
+			fails++;
+		} else {
+			logmsg("selftest %s ok (%s)", selftest_vectors[i].name, got);
+		}
+	}
+	return fails;
+}
+
+/* Mock CP: replies to MISC_GET_SERIAL_NUMBER with the kind-1 ASCII IMEI
+ * frame, to NET_GET_*_REG_STATE with a 0x19-byte NetRegState, and to
+ * SEC_GET_PIN_STATUS with a 9-byte lock status. */
+static void mock_cp(int fd)
+{
+	uint8_t buf[IPC_MAX_MSG];
+	size_t len = 0;
+
+	for (;;) {
+		ssize_t n = read(fd, buf + len, sizeof(buf) - len);
+
+		if (n <= 0)
+			_exit(0);
+		len += (size_t)n;
+		while (len >= 2) {
+			size_t need = (size_t)buf[0] | ((size_t)buf[1] << 8);
+			uint8_t out[32];
+
+			if (need < IPC_HDR_LEN || need > sizeof(buf))
+				_exit(0);
+			if (len < need)
+				break;
+			memset(out, 0, sizeof(out));
+			if (buf[4] == IPC_MAIN_MISC && buf[5] == 0x03) {
+				/* Reply to MISC_GET_SERIAL_NUMBER(kind 1):
+				 * [7]=kind 1, [8]=15, [9..23]=ASCII IMEI. */
+				static const char imei[] = "353438353132370";
+				size_t l = sizeof(imei) - 1;
+
+				out[0] = (uint8_t)(IPC_HDR_LEN + 2 + l);
+				out[1] = 0x00;
+				out[4] = IPC_MAIN_MISC;
+				out[5] = 0x03;
+				out[6] = IPC_TYPE_CFRM;
+				out[7] = 1;
+				out[8] = (uint8_t)l;
+				memcpy(out + 9, imei, l);
+				write(fd, out, IPC_HDR_LEN + 2 + l);
+			} else if (buf[4] == 0x05 && buf[5] == 0x01) {
+				out[0] = 0x09;
+				out[1] = 0x00;
+				out[4] = 0x05;
+				out[5] = 0x01;
+				out[6] = IPC_TYPE_CFRM;
+				out[7] = 0x01;	/* pin state: SIM_PIN    */
+				out[8] = 0x01;	/* pin type: SIM PIN1    */
+				write(fd, out, 9);
+			} else if (buf[4] == IPC_MAIN_NET && buf[5] == 0x05) {
+				out[0] = 0x19;
+				out[1] = 0x00;
+				out[4] = IPC_MAIN_NET;
+				out[5] = 0x05;
+				out[6] = IPC_TYPE_CFRM;
+				out[7] = 0x01;	/* stat */
+				out[8] = 0x01;
+				out[9] = 0x03;
+				out[10] = 0x00;
+				out[0x0b] = 0x34; out[0x0c] = 0x12;
+				out[0x0d] = 0x78; out[0x0e] = 0x56;
+				out[0x0f] = 0x34; out[0x10] = 0x12;
+				out[0x14] = 0x01; out[0x15] = 0x01;
+				write(fd, out, 0x19);
+			} else if (buf[4] == IPC_MAIN_CALL && buf[5] == 0x06) {
+				/* CALL_GET_CALL_LIST: empty record list. */
+				out[0] = IPC_HDR_LEN;
+				out[4] = IPC_MAIN_CALL;
+				out[5] = 0x06;
+				out[6] = IPC_TYPE_CFRM;
+				write(fd, out, IPC_HDR_LEN);
+			} else if (buf[4] == IPC_MAIN_SMS && buf[5] == 0x0a) {
+				/* SMS_GET_SMSC: body is the address string. */
+				static const char smsc[] = "+15551234567";
+				size_t l = sizeof(smsc) - 1;
+
+				out[0] = (uint8_t)(IPC_HDR_LEN + l);
+				out[1] = 0x00;
+				out[4] = IPC_MAIN_SMS;
+				out[5] = 0x0a;
+				out[6] = IPC_TYPE_CFRM;
+				memcpy(out + IPC_HDR_LEN, smsc, l);
+				write(fd, out, IPC_HDR_LEN + l);
+			} else if (buf[4] == IPC_MAIN_GPRS && buf[5] == 0x04) {
+				/* GPRS_GET_PDP_CONTEXT: dummy record. */
+				out[0] = IPC_HDR_LEN + 6;
+				out[1] = 0x00;
+				out[4] = IPC_MAIN_GPRS;
+				out[5] = 0x04;
+				out[6] = IPC_TYPE_CFRM;
+				out[7] = 0x01; out[8] = 0x00;
+				out[9] = 0x00; out[10] = 0x00;
+				out[11] = 0x01; out[12] = 0x00;
+				write(fd, out, IPC_HDR_LEN + 6);
+			}
+			memmove(buf, buf + need, len - need);
+			len -= need;
+		}
+	}
+}
+
+static int cmd_selftest(struct ril *r)
+{
+	int sv[2];
+	pid_t pid;
+	int fails = selftest_frames() + selftest_builders();
+
+	if (fails)
+		return 1;
+	if (r->ipc_fd < 0) {
+		printf("mock: set up loopback transport\n");
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+			errmsg("socketpair: %s", strerror(errno));
+			return 1;
+		}
+		pid = fork();
+		if (pid < 0) {
+			errmsg("fork: %s", strerror(errno));
+			return 1;
+		}
+		if (pid == 0) {
+			close(sv[0]);
+			mock_cp(sv[1]);
+			_exit(0);
+		}
+		close(sv[1]);
+		r->ipc_fd = sv[0];
+	}
+	printf("mock CP replies:\n");
+	if (query_imei(r) < 0)
+		return 1;
+	drain(r, 500);
+	if (send_req(r, &req_voice_reg, req_voice_reg.payload,
+		     req_voice_reg.plen) < 0)
+		return 1;
+	drain(r, 500);
+	if (send_req(r, &req_pin_status, NULL, 0) < 0)
+		return 1;
+	drain(r, 500);
+	if (send_wait(r, &req_call_get_list, NULL, 0) ||
+	    send_wait(r, &req_sms_get_smsc, NULL, 0) ||
+	    send_wait(r, &req_pdp_get, NULL, 0))
+		return 1;
+	if (send_only(r, &req_call_answer, NULL, 0) ||
+	    send_only(r, &req_call_release, NULL, 0) ||
+	    send_only(r, &req_call_hold, NULL, 0) ||
+	    cmd_pdp_define(r, 1, "internet", 3) ||
+	    cmd_ps_attach(r, 1, 0))
+		return 1;
+	{
+		uint8_t cb[0x63];
+		uint8_t fb[0x5b];
+
+		if (send_frame_now(r, cb,
+				   build_call_originate(cb, sizeof(cb),
+							"+15551234567", 0, 2,
+							7)) ||
+		    send_frame_now(r, cb,
+				   build_cont_dtmf(cb, sizeof(cb), 1, '5')) ||
+		    send_frame_now(r, cb,
+				   build_cont_dtmf(cb, sizeof(cb), 0, 0)) ||
+		    send_frame_now(r, fb,
+				   build_burst_dtmf(fb, sizeof(fb), "123")) ||
+		    send_frame_now(r, fb,
+				   build_flash(fb, sizeof(fb), "123")) ||
+		    send_frame_now(r, fb,
+				   build_voice_privacy_set(cb, sizeof(cb), 2)))
+			return 1;
+	}
+	r->ack_tpid = 42;
+	r->ack_pending = true;
+	if (auto_ack_pending(r) || r->ack_pending)
+		return 1;
+	if (auto_ack_pending(r))	/* second call must be a no-op */
+		return 1;
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* main                                                               */
+/* ------------------------------------------------------------------ */
+static void usage(FILE *f)
+{
+	fprintf(f,
+"usage: j7elte-ril [options] [command]\n"
+"\n"
+"commands:\n"
+"  info                 send the post-boot query set (device ready, versions,\n"
+"                       time, capacity, PIN state, operator, reg states, IMEI)\n"
+"  imei                 MISC_GET_SERIAL_NUMBER(kind 1)\n"
+"  version              baseband + ERI version\n"
+"  time                 MISC_GET_TIME_INFO\n"
+"  operator             NET_GET_OPERATOR\n"
+"  reg                  voice + data registration state\n"
+"  pin                  SEC_GET_PIN_STATUS\n"
+"  radio on|off         PWR_RADIO_POWER\n"
+"  sim-power on|off     SEC_SET_SIM_POWER\n"
+"  modem-off            PWR_MODEM_POWER_OFF\n"
+"  call-list            CALL_GET_CALL_LIST  (0x1b5568, 02/06/GET)\n"
+"  call-answer          CALL_ANSWER        (0x1b58dc, 02/04/EXEC)\n"
+"  call-release         CALL_RELEASE       (0x1b5b38, 02/03/EXEC)\n"
+"  sms-smsc             SMS_GET_SMSC_ADDRESS  (0x1cd594, 04/0a/GET)\n"
+"  sms-smsc-set ADDR    SMS_SET_SMSC_ADDRESS  (0x1afa10, 04/0a/SET)\n"
+"  pdp-get              GPRS_GET_PDP_CONTEXT  (0x1a7a4c, 0d/04/GET)\n"
+"  pdp-define CID APN [PROTO]\n"
+"                       GPRS_DEFINE_PDP_CONTEXT (0x1b95bc, 0d/01/SET)\n"
+"  pdp-activate CID APN [AUTH] ; pdp-deactivate CID [REASON]\n"
+"                       GPRS_SET_PDP_CONTEXT (0x1b96ac, 0d/04/SET, 112 B)\n"
+"  ps-attach on|off [REASON]\n"
+"                       GPRS_PS_ATTACH (0x1b9828, 0d/03/SET)\n"
+"  pdp-action CID ACTION\n"
+"                       GPRS_SET_PDP_CONTEXT actions 2..5 (0/1 use\n"
+"                       pdp-deactivate/pdp-activate)\n"
+"  ipv6-config CID ADDR_HEX\n"
+"                       GPRS_IPV6_CONFIG, 24-byte SET (0x1b9c68)\n"
+"  mobile-data B0 B1    GPRS_MOBILE_DATA, 9-byte SET (0x1a7b68)\n"
+"  call-originate NUM [CLIR] [TYPE] [ID]\n"
+"                       CALL_OUTGOING, 99-byte EXEC (0x1b5335)\n"
+"  call-hold            CALL_HOLD, 7-byte EXEC (0x1b6421)\n"
+"  call-dtmf TONE|stop  continuous DTMF start/stop (0x1b5db5/0x1b5e31)\n"
+"  call-burst-dtmf DIGITS\n"
+"                       CALL_BURST_DTMF, 91-byte EXEC (0x1b5cc1)\n"
+"  call-flash STRING    CALL_FLASH, 90-byte SET (0x1b5f91)\n"
+"  call-voice-privacy get|set [TYPE]\n"
+"                       CALL_VOICE_PRIVACY (0x1b5ea5/0x1b5f29)\n"
+"  call-dial-b NUM [CLIR] [TYPE] [FLAG] [COND]\n"
+"                       CALL_OUTGOING variant B, 101-byte EXEC (0x1b543d)\n"
+"  call-list-set TYPE,CID,F25,W4,F24,NUM ...\n"
+"                       CALL_LIST upload, 818-byte SET (0x1b55d5); W4 is\n"
+"                       the unresolved table[CallDetails[+8]] wire byte\n"
+"  call-modify ID TYPE STR... / call-modify-confirm ID TYPE STR...\n"
+"                       CALL_MODIFY 2/48, CALL_MODIFY_CONFIRM 2/50\n"
+"  call-time get|set SECS ; call-total-time get|set V1..V7\n"
+"                       CALL_TIME 2/13 GET 9 B / SET 37 B\n"
+"  e911-cb MODE ; e911-status STATUS RAT ; call-srvcc STATE\n"
+"                       CALL_E911_CB 2/16, E911 status 2/23, SRVCC 2/20\n"
+"  call-block STATUS     CALL_BLOCK_STATUS 2/24 SET\n"
+"  call-transfer ARG NUM1 [NUM2] [NUM3] [NUM4]\n"
+"                       transfer, 358-byte SET, main 0x0c sub 0x81\n"
+"  call-cancel-transfer ARG / call-manage TYPE INDEX NUMBER\n"
+"                       cancel 0c/82 SET 8 B; manage 0c/07 SET 92 B\n"
+"  audio-path PATH MODE  SND_AUDIO_PATH 09/03 SET 9 B (proto 41)\n"
+"  sms-send NUMBER TEXT [SMSC] [DOMAIN]\n"
+"                       04/01 EXEC, 11+N; encodes a GSM 03.40 SMS-SUBMIT\n"
+"                       (7-bit alphabet); without SMSC the stored address\n"
+"                       is queried first\n"
+"  sms-send-tpdu TPDU_HEX SMSC [DOMAIN]\n"
+"                       same frame with a caller-supplied TPDU\n"
+"  sms-write INDEX STATUS TPDU_HEX SMSC\n"
+"                       04/04 EXEC, 268-byte write, len field 12+N\n"
+"  sms-read INDEX STORAGE ; sms-delete INDEX STORAGE\n"
+"                       04/03 GET 10 B ; 04/05 EXEC 10 B\n"
+"  sms-ack TPID ok|fail [CAUSE]\n"
+"                       04/06 EXEC 12 B (tpid is the incoming [11])\n"
+"  raw HEXBYTES         send a raw message payload (hex, no spaces)\n"
+"  listen               decode inbound messages until SIGINT/POLLHUP\n"
+"  state                print the kernel's modem state (IOCTL_MODEM_STATUS)\n"
+"  selftest             verify frame encoding + run a mock CP (no hardware)\n"
+"  print-table          print the recovered main/sub command table\n"
+"\n"
+"flag aliases:\n"
+"  --imei               same as the imei command\n"
+"  --sim                same as the pin command\n"
+"  --net                same as the reg command\n"
+"  --send-sms           unsupported (SMS submit was not traced); exits 2\n"
+"\n"
+"call-answer/call-release, sms-smsc-set, pdp-define and ps-attach change CP\n"
+"or SIM state.  They encode exactly the traced builder output, but the tool\n"
+"keeps no call/PDP state model: do not run them against a live call or an\n"
+"already activated PDP context.\n"
+"\n"
+"options:\n"
+"  -i, --ipc PATH       FMT channel (default /dev/umts_ipc0)\n"
+"  -r, --rfs PATH       RFS channel (default /dev/umts_rfs0); opened so the\n"
+"                       kernel answers PHONE_START with INIT_END\n"
+"      --no-rfs         do not open the RFS channel\n"
+"  -t, --timeout SEC    response timeout (default 5)\n"
+"  -d, --daemon         listen after running the command; exit on POLLHUP\n"
+"  -n, --dry-run        print what would be sent and exit\n"
+"  -v, --verbose        hex dumps and kernel-state logging\n"
+"  -j, --json           one JSON object per message (machine readable)\n"
+"      --no-auto-ack    listen: do not send the 04/06 ack for incoming\n"
+"                       SMS (default: ack immediately, inside the 60 s\n"
+"                       window the CP allows)\n"
+"  -h, --help\n");
+}
+
+static const struct { const char *name; struct ipc_req req; const char *doc; }
+known_ops[] = {
+	{ "SMS_DEVICE_READY", { IPC_MAIN_SMS, 0x07, IPC_TYPE_SET, "", {0}, 0 },
+	  "sent once the AP is ready; IpcTxSetDeviceReady 0x1afa78" },
+	{ "MISC_GET_BASEBAND_VERSION", { IPC_MAIN_MISC, 0x01, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c22b4 / builder 0x1d3e60" },
+	{ "MISC_GET_ERI_VERSION", { IPC_MAIN_MISC, 0x01, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c2340, payload 0x40" },
+	{ "MISC_GET_SERIAL_NUMBER", { IPC_MAIN_MISC, 0x03, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c21f4 / builder 0x1d3bec, payload = kind" },
+	{ "MISC_GET_TIME_INFO", { IPC_MAIN_MISC, 0x05, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c2830" },
+	{ "MISC_GET_DEVICE_CAPA", { IPC_MAIN_MISC, 0x2d, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c5708" },
+	{ "SEC_GET_PIN_STATUS", { 0x05, 0x01, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1cb844" },
+	{ "SEC_SET_SIM_POWER", { 0x05, 0x0d, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1ccb10, payload = 0/1" },
+	{ "NET_GET_OPERATOR", { IPC_MAIN_NET, 0x03, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c75b0" },
+	{ "NET_GET_VOICE_REG_STATE", { IPC_MAIN_NET, 0x05, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c74bc, payload ff 02" },
+	{ "NET_GET_DATA_REG_STATE", { IPC_MAIN_NET, 0x05, IPC_TYPE_GET, "", {0}, 0 },
+	  "0x1c7534, payload ff 03" },
+	{ "PWR_RADIO_POWER", { IPC_MAIN_PWR, 0x07, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "0x1cb350, payload 01 00 / 02 02" },
+	{ "PWR_MODEM_POWER_OFF", { IPC_MAIN_PWR, 0x02, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "0x1ae6a8" },
+	{ "CALL_RELEASE", { IPC_MAIN_CALL, 0x03, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxCallRelease 0x1b5b38 (p40 0x1a5614), 7 bytes" },
+	{ "CALL_ANSWER", { IPC_MAIN_CALL, 0x04, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxCallAnswer 0x1b58dc (p40 0x1a5478), 7 bytes" },
+	{ "CALL_GET_CALL_LIST", { IPC_MAIN_CALL, 0x06, IPC_TYPE_GET, "", {0}, 0 },
+	  "IpcTxCallGetCallList 0x1b5568 (p40 0x1a53cc), 7 bytes" },
+	{ "SMS_GET_SMSC_ADDRESS", { IPC_MAIN_SMS, 0x0a, IPC_TYPE_GET, "", {0}, 0 },
+	  "IpcTxGetSmscAddress 0x1cd594 (p40 0x1af8c8), 7 bytes" },
+	{ "SMS_SET_SMSC_ADDRESS", { IPC_MAIN_SMS, 0x0a, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcTxSetSmscAddress 0x1afa10, fixed 19 bytes, body=address" },
+	{ "GPRS_GET_PDP_CONTEXT", { IPC_MAIN_GPRS, 0x04, IPC_TYPE_GET, "", {0}, 0 },
+	  "IpcTxGetPdpContext 0x1a7a4c, 7 bytes" },
+	{ "GPRS_DEFINE_PDP_CONTEXT", { IPC_MAIN_GPRS, 0x01, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcTxDefinePdpContext 0x1b95bc (p40 0x1a7830), 134 bytes" },
+	{ "GPRS_PS_ATTACH", { IPC_MAIN_GPRS, 0x03, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcTxPsAttach 0x1b9828 (p40 0x1a7a82), 10 bytes" },
+	{ "CALL_OUTGOING", { IPC_MAIN_CALL, 0x01, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxCallOriginate 0x1b5335, variant A, 99 bytes" },
+	{ "CALL_HOLD", { IPC_MAIN_CALL, 0x13, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxHoldCall 0x1b6421, 7 bytes" },
+	{ "CALL_CONT_DTMF", { IPC_MAIN_CALL, 0x08, IPC_TYPE_SET, "", {0}, 0 },
+	  "start 0x1b5db5 {1,tone} / stop 0x1b5e31 {2,0}, 9 bytes" },
+	{ "CALL_BURST_DTMF", { IPC_MAIN_CALL, 0x07, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxCallBurstDtmf 0x1b5cc1, 91 bytes" },
+	{ "CALL_FLASH", { IPC_MAIN_CALL, 0x11, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcTxCallFlash 0x1b5f91, 90 bytes" },
+	{ "CALL_VOICE_PRIVACY", { IPC_MAIN_CALL, 0x0c, IPC_TYPE_GET, "", {0}, 0 },
+	  "get 0x1b5f29 (8 B) / set 0x1b5ea5 (9 B)" },
+	{ "SMS_SEND_MSG", { IPC_MAIN_SMS, 0x01, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxSendSms 0x1cd280, 11+N; SCA 0x181340; tool encodes TPDU" },
+	{ "SMS_WRITE_TO_SIM", { IPC_MAIN_SMS, 0x04, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxWriteSmsToSim 0x1cd110, 268-byte write" },
+	{ "SMS_READ_MSG", { IPC_MAIN_SMS, 0x03, IPC_TYPE_GET, "", {0}, 0 },
+	  "IpcTxGetReadMsg 0x1af9c6, 10 bytes" },
+	{ "SMS_DELETE_MSG", { IPC_MAIN_SMS, 0x05, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxDeleteMsg 0x1af934, 10 bytes" },
+	{ "SMS_DELIVERY_ACK", { IPC_MAIN_SMS, 0x06, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxDeliveryReport 0x1cd340, 12 bytes" },
+	{ "CALL_OUTGOING_B", { IPC_MAIN_CALL, 0x01, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxCallOriginate variant B 0x1b543d, 101 bytes" },
+	{ "CALL_LIST_SET", { IPC_MAIN_CALL, 0x06, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcTxCallSetCallList 0x1b55d5, 818-byte buffer" },
+	{ "CALL_MODIFY", { IPC_MAIN_CALL, 0x30, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxCallModify 0x1b5949" },
+	{ "CALL_MODIFY_CONFIRM", { IPC_MAIN_CALL, 0x32, IPC_TYPE_EXEC, "", {0}, 0 },
+	  "IpcTxCallModifyConfirm 0x1b5a45" },
+	{ "CALL_TIME", { IPC_MAIN_CALL, 0x0d, IPC_TYPE_SET, "", {0}, 0 },
+	  "set 0x1b60ed 37 B / get 0x1b6171 9 B; total-time get 9 B" },
+	{ "CALL_E911_CB_MODE", { IPC_MAIN_CALL, 0x10, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcTxCallSetEmergencyCbMode 0x1b6075, 8 bytes" },
+	{ "CALL_E911_STATUS", { IPC_MAIN_CALL, 0x17, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1b6319, 9 bytes; RAT converter slot 0x8e4 unresolved" },
+	{ "CALL_SRVCC", { IPC_MAIN_CALL, 0x14, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1b63a5, 8 bytes" },
+	{ "CALL_BLOCK_STATUS", { IPC_MAIN_CALL, 0x18, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1b6609, 8 bytes" },
+	{ "CALL_TRANSFER", { IPC_MAIN_SS, 0x81, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1b6679, 358 bytes" },
+	{ "CALL_CANCEL_TRANSFER", { IPC_MAIN_SS, 0x82, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1b6865, 8 bytes" },
+	{ "CALL_MANAGE", { IPC_MAIN_SS, 0x07, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1b5ba5, 92 bytes" },
+	{ "SND_AUDIO_PATH", { IPC_MAIN_SND, 0x03, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcProtocol41::IpcTxSndSetAudioPath 0x1ce085, 9 bytes" },
+	{ "GPRS_SET_PDP_CONTEXT", { IPC_MAIN_GPRS, 0x04, IPC_TYPE_SET, "", {0}, 0 },
+	  "IpcTxSetPdpContext 0x1b96ac, 112 bytes (actions 0..5)" },
+	{ "GPRS_IPV6_CONFIG", { IPC_MAIN_GPRS, 0x09, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1b9c68, 24 bytes" },
+	{ "GPRS_MOBILE_DATA", { IPC_MAIN_GPRS, 0x1d, IPC_TYPE_SET, "", {0}, 0 },
+	  "0x1a7b68, 9 bytes" },
+};
+
+static int print_table(void)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(known_ops) / sizeof(known_ops[0]); i++)
+		printf("%02x %02x %d  %-26s %s\n", known_ops[i].req.main,
+		       known_ops[i].req.sub, known_ops[i].req.type,
+		       known_ops[i].name, known_ops[i].doc);
+	return 0;
+}
+
+static int parse_uint(const char *s, unsigned *out)
+{
+	char *end;
+	unsigned long v;
+
+	if (!s || !*s)
+		return -1;
+	errno = 0;
+	v = strtoul(s, &end, 0);
+	if (errno || *end || end == s || v > 0xffffffffUL)
+		return -1;
+	*out = (unsigned)v;
+	return 0;
+}
+
+static int parse_hex(const char *s, uint8_t *out, size_t max, size_t *len)
+{
+	size_t n = 0;
+
+	while (*s) {
+		char tmp[3];
+		unsigned v;
+
+		if (*s == ' ' || *s == ':')
+			s++;
+		if (!s[0] || !s[1])
+			return -1;
+		tmp[0] = s[0];
+		tmp[1] = s[1];
+		tmp[2] = '\0';
+		if (sscanf(tmp, "%2x", &v) != 1)
+			return -1;
+		if (n >= max)
+			return -1;
+		out[n++] = (uint8_t)v;
+		s += 2;
+	}
+	*len = n;
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	static struct ril ril;
+	const char *ipc = "/dev/umts_ipc0";
+	const char *rfs = "/dev/umts_rfs0";
+	bool use_rfs = true, daemon_mode = false, dry_run = false;
+	int opt, rc = 0;
+	const char *cmd;
+	const char *flag_cmd = NULL;
+
+	static const struct option lopts[] = {
+		{ "ipc",	required_argument,	NULL, 'i' },
+		{ "rfs",	required_argument,	NULL, 'r' },
+		{ "no-rfs",	no_argument,		NULL, 'R' },
+		{ "timeout",	required_argument,	NULL, 't' },
+		{ "daemon",	no_argument,		NULL, 'd' },
+		{ "dry-run",	no_argument,		NULL, 'n' },
+		{ "verbose",	no_argument,		NULL, 'v' },
+		{ "json",	no_argument,		NULL, 'j' },
+		{ "no-auto-ack", no_argument,		NULL, 1004 },
+		{ "imei",	no_argument,		NULL, 1000 },
+		{ "sim",	no_argument,		NULL, 1001 },
+		{ "net",	no_argument,		NULL, 1002 },
+		{ "send-sms",	no_argument,		NULL, 1003 },
+		{ "help",	no_argument,		NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
+
+	ril.ipc_fd = -1;
+	ril.rfs_fd = -1;
+
+	while ((opt = getopt_long(argc, argv, "i:r:t:dnvjh", lopts, NULL)) != -1) {
+		switch (opt) {
+		case 'i': ipc = optarg; break;
+		case 'r': rfs = optarg; break;
+		case 'R': use_rfs = false; break;
+		case 't': opt_timeout_ms = (unsigned)atoi(optarg) * 1000; break;
+		case 'd': daemon_mode = true; break;
+		case 'n': dry_run = true; break;
+		case 'v': opt_verbose = true; break;
+		case 'j': opt_json = true; break;
+		case 1004: opt_auto_ack = false; break;
+		case 1000: flag_cmd = "imei"; break;
+		case 1001: flag_cmd = "pin"; break;
+		case 1002: flag_cmd = "reg"; break;
+		case 1003:
+			errmsg("--send-sms is not a flag form: use "
+			       "'j7elte-ril sms-send TPDU_HEX SMSC [DOMAIN]'. "
+			       "The TPDU must be a GSM 03.40 submit PDU built "
+			       "by the caller (the stock RIL receives it from "
+			       "the framework); this tool does not encode "
+			       "text into a TPDU");
+			return 2;
+		case 'h': usage(stdout); return 0;
+		default: usage(stderr); return 2;
+		}
+	}
+	if (flag_cmd) {
+		if (optind < argc) {
+			errmsg("%s takes no positional command", flag_cmd);
+			return 2;
+		}
+		cmd = flag_cmd;
+	} else {
+		cmd = optind < argc ? argv[optind] : "info";
+	}
+
+	signal(SIGINT, on_sigint);
+	signal(SIGTERM, on_sigint);
+
+	if (!strcmp(cmd, "print-table"))
+		return print_table();
+	if (!strcmp(cmd, "selftest"))
+		return cmd_selftest(&ril);
+
+	if (dry_run) {
+		uint8_t buf[818];	/* call-list upload is the largest */
+		static const uint8_t tpdu[15] = {
+			0x01, 0x00, 0x0b, 0x91, 0x51, 0x55, 0x21,
+			0x43, 0x65, 0xf7, 0x00, 0x00, 0x02, 0xe8, 0x34
+		};
+		size_t i;
+
+		for (i = 0; i < sizeof(selftest_vectors) / sizeof(selftest_vectors[0]); i++) {
+			const void *pl = selftest_vectors[i].plen ?
+				selftest_vectors[i].payload : NULL;
+			size_t len = build_req(buf, sizeof(buf),
+					       selftest_vectors[i].req, pl,
+					       selftest_vectors[i].plen);
+
+			printf("%-14s ", selftest_vectors[i].name);
+			hexdump("", buf, len);
+		}
+		printf("%-14s ", "smsc-set");
+		hexdump("", buf, build_smsc_set(buf, sizeof(buf),
+						"+15551234567"));
+		printf("%-14s ", "pdp-define");
+		hexdump("", buf, build_pdp_define(buf, sizeof(buf), 1,
+						  "internet", 3));
+		printf("%-14s ", "ps-detach");
+		hexdump("", buf, build_ps_attach(buf, sizeof(buf), 0, 2));
+		printf("%-14s ", "ps-attach");
+		hexdump("", buf, build_ps_attach(buf, sizeof(buf), 1, 0));
+		printf("%-14s ", "call-orig");
+		hexdump("", buf, build_call_originate(buf, sizeof(buf),
+						     "+15551234567", 0, 2, 7));
+		printf("%-14s ", "dtmf-start");
+		hexdump("", buf, build_cont_dtmf(buf, sizeof(buf), 1, '5'));
+		printf("%-14s ", "burst-dtmf");
+		hexdump("", buf, build_burst_dtmf(buf, sizeof(buf), "123"));
+		printf("%-14s ", "flash");
+		hexdump("", buf, build_flash(buf, sizeof(buf), "123"));
+		printf("%-14s ", "pdp-act");
+		hexdump("", buf, build_pdp_set(buf, sizeof(buf), 1, 1,
+					      "internet", 2, 0));
+		printf("%-14s ", "pdp-deact");
+		hexdump("", buf, build_pdp_set(buf, sizeof(buf), 1, 0, "", 0,
+					      2));
+		printf("%-14s ", "dial-b");
+		hexdump("", buf, build_dial_b(buf, sizeof(buf),
+					     "+15551234567", 0, 2, 0, 1));
+		printf("%-14s ", "call-time-set");
+		hexdump("", buf, build_call_time_set(buf, sizeof(buf), 90));
+		printf("%-14s ", "sms-send");
+		hexdump("", buf, build_sms_send(buf, sizeof(buf), tpdu,
+					       sizeof(tpdu),
+					       "+15551234567", 0));
+		printf("%-14s ", "sms-read");
+		hexdump("", buf, build_sms_store(buf, sizeof(buf),
+						&req_sms_read, 1, 1));
+		printf("%-14s ", "sms-ack");
+		hexdump("", buf, build_sms_ack(buf, sizeof(buf), 5, 1, 0));
+		printf("%-14s ", "sms-text");
+		{
+			uint8_t t[256];
+			size_t tl = build_submit_tpdu(t, sizeof(t),
+						      "+15551234567", "hi");
+
+			hexdump("", buf,
+				build_sms_send(buf, sizeof(buf), t, tl,
+					       "+15551234567", 0));
+		}
+		printf("%-14s ", "sms-write");
+		hexdump("", buf, build_sms_write(buf, sizeof(buf), 1, 0, tpdu,
+						 sizeof(tpdu),
+						 "+15551234567"));
+		printf("%-14s ", "pdp-action");
+		hexdump("", buf, build_pdp_action(buf, sizeof(buf), 1, 3));
+		printf("%-14s ", "ipv6-config");
+		{
+			static const uint8_t a[16] = {
+				0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0x01
+			};
+
+			hexdump("", buf,
+				build_ipv6_config(buf, sizeof(buf), 1, a));
+		}
+		printf("%-14s ", "mobile-data");
+		hexdump("", buf, build_mobile_data(buf, sizeof(buf), 1, 0));
+		printf("(dry run: %s + %s would be opened, then %s)\n",
+		       ipc, use_rfs ? rfs : "(no rfs)", cmd);
+		return 0;
+	}
+
+	ril.ipc_fd = open(ipc, O_RDWR | O_CLOEXEC);
+	if (ril.ipc_fd < 0) {
+		errmsg("open %s: %s", ipc, strerror(errno));
+		return 1;
+	}
+	/* Opening both FMT and RFS devices is what makes rild_ready() true, so
+	 * that cmd_phone_start_handler() answers the CP's CMD_PHONE_START with
+	 * CMD_INIT_END (link_device_shmem.c:261,366).  Without the RFS fd the
+	 * CP retries PHONE_START forever. */
+	if (use_rfs) {
+		ril.rfs_fd = open(rfs, O_RDWR | O_CLOEXEC);
+		if (ril.rfs_fd < 0)
+			errmsg("open %s: %s (kernel will not send INIT_END)",
+			       rfs, strerror(errno));
+	}
+
+	if (!strcmp(cmd, "state")) {
+		int st = modem_state(ril.ipc_fd);
+
+		if (st < 0) {
+			errmsg("IOCTL_MODEM_STATUS: %s", strerror(-st));
+			rc = 1;
+		} else {
+			printf("%s (%d)\n", state_name(st), st);
+		}
+		goto out;
+	}
+
+	if (ensure_online(&ril, opt_timeout_ms * 4) < 0) {
+		rc = 1;
+		goto out;
+	}
+
+	if (!strcmp(cmd, "info")) {
+		rc = cmd_info(&ril);
+	} else if (!strcmp(cmd, "imei")) {
+		rc = query_imei(&ril) < 0 ? 1 : 0;
+		if (!rc && ipc_wait_msg(&ril, opt_timeout_ms) != 0) {
+			errmsg("no response to MISC_GET_SERIAL_NUMBER");
+			rc = 1;
+		}
+	} else if (!strcmp(cmd, "version")) {
+		rc = cmd_query(&ril, &req_baseband_ver);
+	} else if (!strcmp(cmd, "time")) {
+		rc = cmd_query(&ril, &req_time_info);
+	} else if (!strcmp(cmd, "operator")) {
+		rc = cmd_query(&ril, &req_operator);
+	} else if (!strcmp(cmd, "reg")) {
+		rc = cmd_query(&ril, &req_voice_reg);
+		if (!rc)
+			rc = cmd_query(&ril, &req_data_reg);
+	} else if (!strcmp(cmd, "pin")) {
+		rc = cmd_query(&ril, &req_pin_status);
+	} else if (!strcmp(cmd, "radio") || !strcmp(cmd, "sim-power")) {
+		const char *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
+		int on = arg && (!strcmp(arg, "on") || !strcmp(arg, "1"));
+
+		if (!arg) {
+			errmsg("%s needs 'on' or 'off'", cmd);
+			rc = 2;
+			goto out;
+		}
+		if (!strcmp(cmd, "radio"))
+			rc = query_radio_power(&ril, on ? IPC_RADIO_ON : IPC_RADIO_OFF) < 0;
+		else
+			rc = send_sim_power(&ril, on) < 0;
+	} else if (!strcmp(cmd, "modem-off")) {
+		rc = send_req(&ril, &req_modem_off, NULL, 0) < 0;
+	} else if (!strcmp(cmd, "call-list")) {
+		rc = cmd_query(&ril, &req_call_get_list);
+	} else if (!strcmp(cmd, "call-answer")) {
+		rc = send_only(&ril, &req_call_answer, NULL, 0);
+	} else if (!strcmp(cmd, "call-release")) {
+		rc = send_only(&ril, &req_call_release, NULL, 0);
+	} else if (!strcmp(cmd, "call-originate")) {
+		uint8_t buf[0x63];
+		const char *num;
+		unsigned clir = 0, type = 2, id = 0;	/* 2 -> 0x0100 */
+		size_t len;
+
+		if (optind + 1 >= argc) {
+			errmsg("call-originate needs NUMBER [CLIR] [TYPE] [ID]");
+			rc = 2;
+			goto out;
+		}
+		num = argv[optind + 1];
+		if (!*num) {
+			errmsg("empty number: the stock builder refuses it");
+			rc = 2;
+			goto out;
+		}
+		if (strlen(num) > 82) {
+			errmsg("number is %zu digits; the traced frame caps it "
+			       "at 82", strlen(num));
+			rc = 2;
+			goto out;
+		}
+		if ((optind + 2 < argc &&
+		     parse_uint(argv[optind + 2], &clir) < 0) ||
+		    (optind + 3 < argc &&
+		     parse_uint(argv[optind + 3], &type) < 0) ||
+		    (optind + 4 < argc &&
+		     parse_uint(argv[optind + 4], &id) < 0)) {
+			errmsg("invalid CLIR/TYPE/ID argument");
+			rc = 2;
+			goto out;
+		}
+		len = build_call_originate(buf, sizeof(buf), num, clir, type,
+					   id);
+		rc = send_frame_now(&ril, buf, len);
+	} else if (!strcmp(cmd, "call-hold")) {
+		rc = send_only(&ril, &req_call_hold, NULL, 0);
+	} else if (!strcmp(cmd, "call-dtmf")) {
+		const char *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
+		uint8_t buf[IPC_HDR_LEN + 2];
+		size_t len;
+
+		if (!arg) {
+			errmsg("call-dtmf needs a tone character or 'stop'");
+			rc = 2;
+			goto out;
+		}
+		if (!strcmp(arg, "stop"))
+			len = build_cont_dtmf(buf, sizeof(buf), 0, 0);
+		else if (strlen(arg) == 1)
+			len = build_cont_dtmf(buf, sizeof(buf), 1,
+					      (unsigned char)arg[0]);
+		else {
+			errmsg("call-dtmf takes one character or 'stop'");
+			rc = 2;
+			goto out;
+		}
+		rc = send_frame_now(&ril, buf, len);
+	} else if (!strcmp(cmd, "call-burst-dtmf")) {
+		const char *digits = optind + 1 < argc ? argv[optind + 1] : NULL;
+		uint8_t buf[0x5b];
+		size_t len;
+
+		if (!digits || !*digits || strlen(digits) > 82) {
+			errmsg("call-burst-dtmf needs 1..82 digit characters");
+			rc = 2;
+			goto out;
+		}
+		len = build_burst_dtmf(buf, sizeof(buf), digits);
+		rc = send_frame_now(&ril, buf, len);
+	} else if (!strcmp(cmd, "call-flash")) {
+		const char *s = optind + 1 < argc ? argv[optind + 1] : NULL;
+		uint8_t buf[0x5a];
+		size_t len;
+
+		if (!s || !*s || strlen(s) > 48) {
+			errmsg("call-flash needs a 1..48 character string");
+			rc = 2;
+			goto out;
+		}
+		len = build_flash(buf, sizeof(buf), s);
+		rc = send_frame_now(&ril, buf, len);
+	} else if (!strcmp(cmd, "call-voice-privacy")) {
+		const char *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
+
+		if (arg && !strcmp(arg, "get")) {
+			rc = cmd_query(&ril, &req_call_voice_privacy_get);
+		} else if (arg && !strcmp(arg, "set")) {
+			unsigned type = 0;
+			uint8_t buf[IPC_HDR_LEN + 2];
+			size_t len;
+
+			if (optind + 2 < argc &&
+			    parse_uint(argv[optind + 2], &type) < 0) {
+				errmsg("invalid TYPE '%s'",
+				       argv[optind + 2]);
+				rc = 2;
+				goto out;
+			}
+			len = build_voice_privacy_set(buf, sizeof(buf), type);
+			rc = send_frame_now(&ril, buf, len);
+		} else {
+			errmsg("call-voice-privacy needs 'get' or 'set [TYPE]'");
+			rc = 2;
+			goto out;
+		}
+	} else if (!strcmp(cmd, "call-dial-b")) {
+		uint8_t buf[0x65];
+		const char *num = optind + 1 < argc ? argv[optind + 1] : NULL;
+		unsigned clir = 0, type = 2, flag = 0, cond = 1;
+
+		if (!num || !*num || strlen(num) > 82) {
+			errmsg("call-dial-b needs a 1..82 character number "
+			       "[CLIR] [TYPE] [FLAG] [COND]");
+			rc = 2;
+			goto out;
+		}
+		if ((optind + 2 < argc &&
+		     parse_uint(argv[optind + 2], &clir) < 0) ||
+		    (optind + 3 < argc &&
+		     parse_uint(argv[optind + 3], &type) < 0) ||
+		    (optind + 4 < argc &&
+		     parse_uint(argv[optind + 4], &flag) < 0) ||
+		    (optind + 5 < argc &&
+		     parse_uint(argv[optind + 5], &cond) < 0)) {
+			errmsg("invalid CLIR/TYPE/FLAG/COND argument");
+			rc = 2;
+			goto out;
+		}
+		if (clir > 0xff || flag > 0xff) {
+			errmsg("CLIR and FLAG must fit one byte");
+			rc = 2;
+			goto out;
+		}
+		rc = send_frame_now(&ril, buf,
+				    build_dial_b(buf, sizeof(buf), num, clir,
+						 type, flag, cond));
+	} else if (!strcmp(cmd, "call-list-set")) {
+		struct cl_entry e[64];
+		uint8_t buf[818];
+		unsigned n = 0, i;
+
+		for (i = (unsigned)optind + 1; i < (unsigned)argc; i++) {
+			char number[128];
+			unsigned t, cid, f25, w4, f24;
+
+			if (n >= 64 ||
+			    sscanf(argv[i], "%u,%u,%u,%u,%u,%127s",
+				   &t, &cid, &f25, &w4, &f24, number) != 6 ||
+			    cid > 0xff || w4 > 0xff || f24 > 0xff ||
+			    f25 > 1 || strlen(number) > 82) {
+				errmsg("bad entry '%s'; expected "
+				       "TYPE,CID,F25,WIRE4,F24,NUMBER",
+				       argv[i]);
+				rc = 2;
+				goto out;
+			}
+			e[n].type = t; e[n].cid = cid; e[n].f25 = f25;
+			e[n].wire4 = w4; e[n].f24 = f24;
+			e[n].number = strdup(number);
+			if (!e[n].number) {
+				errmsg("out of memory");
+				rc = 1;
+				goto out;
+			}
+			n++;
+		}
+		rc = send_frame_now(&ril, buf,
+				    build_call_list_set(buf, sizeof(buf), n, e));
+		for (i = 0; i < n; i++)
+			free((void *)e[i].number);
+	} else if (!strcmp(cmd, "call-modify") ||
+		   !strcmp(cmd, "call-modify-confirm")) {
+		uint8_t buf[780];
+		unsigned id, type;
+		const struct ipc_req *req = !strcmp(cmd, "call-modify") ?
+			&req_call_modify : &req_call_modify_conf;
+
+		if (optind + 3 >= argc ||
+		    parse_uint(argv[optind + 1], &id) < 0 || id > 0xff ||
+		    parse_uint(argv[optind + 2], &type) < 0) {
+			errmsg("%s needs ID(0..255) TYPE STR [STR...]", cmd);
+			rc = 2;
+			goto out;
+		}
+		rc = send_frame_now(&ril, buf,
+				    build_call_modify(buf, sizeof(buf), req,
+						      id, type,
+						      &argv[optind + 3],
+						      (unsigned)(argc - optind - 3)));
+	} else if (!strcmp(cmd, "call-time")) {
+		const char *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
+
+		if (arg && !strcmp(arg, "get")) {
+			uint8_t zero = 0;
+
+			rc = send_wait(&ril, &req_call_time_get, &zero, 1);
+		} else if (arg && !strcmp(arg, "set") && optind + 2 < argc) {
+			unsigned secs;
+			uint8_t buf[37];
+
+			if (parse_uint(argv[optind + 2], &secs) < 0) {
+				errmsg("invalid seconds '%s'",
+				       argv[optind + 2]);
+				rc = 2;
+				goto out;
+			}
+			rc = send_frame_now(&ril, buf,
+					    build_call_time_set(buf,
+								sizeof(buf),
+								secs));
+		} else {
+			errmsg("call-time needs 'get' or 'set SECONDS'");
+			rc = 2;
+			goto out;
+		}
+	} else if (!strcmp(cmd, "call-total-time")) {
+		const char *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
+
+		if (arg && !strcmp(arg, "get")) {
+			uint8_t body[2] = { 7, 0 };
+
+			rc = send_wait(&ril, &req_call_total_time_get, body,
+				       sizeof(body));
+		} else if (arg && !strcmp(arg, "set") && optind + 8 <= argc) {
+			uint32_t v[7];
+			uint8_t buf[37];
+			unsigned i;
+
+			for (i = 0; i < 7; i++) {
+				unsigned tmp;
+
+				if (parse_uint(argv[optind + 2 + i],
+					       &tmp) < 0) {
+					errmsg("invalid value '%s'",
+					       argv[optind + 2 + i]);
+					rc = 2;
+					goto out;
+				}
+				v[i] = tmp;
+			}
+			rc = send_frame_now(&ril, buf,
+					    build_total_time_set(buf,
+								 sizeof(buf), v));
+		} else {
+			errmsg("call-total-time needs 'get' or 'set V1..V7'");
+			rc = 2;
+			goto out;
+		}
+	} else if (!strcmp(cmd, "e911-cb")) {
+		unsigned mode;
+
+		if (optind + 1 >= argc ||
+		    parse_uint(argv[optind + 1], &mode) < 0) {
+			errmsg("e911-cb needs MODE");
+			rc = 2;
+			goto out;
+		}
+		rc = send_one(&ril, &req_call_e911_cb,
+			      mode != 1 ? 1 : 0);
+	} else if (!strcmp(cmd, "e911-status")) {
+		unsigned status, rat;
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &status) < 0 ||
+		    parse_uint(argv[optind + 2], &rat) < 0 ||
+		    status > 0xff || rat > 0xff) {
+			errmsg("e911-status needs STATUS RAT_WIRE (the RAT "
+			       "converter slot 0x8e4 was not resolved)");
+			rc = 2;
+			goto out;
+		}
+		rc = send_two(&ril, &req_call_e911_status,
+			      (uint8_t)status, (uint8_t)rat);
+	} else if (!strcmp(cmd, "call-srvcc")) {
+		unsigned state;
+		uint8_t v;
+
+		if (optind + 1 >= argc ||
+		    parse_uint(argv[optind + 1], &state) < 0) {
+			errmsg("call-srvcc needs STATE (0, 1 or 2)");
+			rc = 2;
+			goto out;
+		}
+		v = state == 1 ? 1 : state == 2 ? 2 : 0;
+		rc = send_one(&ril, &req_call_srvcc, v);
+	} else if (!strcmp(cmd, "call-block")) {
+		unsigned status;
+
+		if (optind + 1 >= argc ||
+		    parse_uint(argv[optind + 1], &status) < 0 ||
+		    status > 0xff) {
+			errmsg("call-block needs STATUS (0..255)");
+			rc = 2;
+			goto out;
+		}
+		rc = send_one(&ril, &req_call_block, (uint8_t)status);
+	} else if (!strcmp(cmd, "call-transfer")) {
+		const char *s[4] = { NULL, NULL, NULL, NULL };
+		uint8_t buf[358];
+		unsigned arg;
+		int i;
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &arg) < 0 || arg > 0xff) {
+			errmsg("call-transfer needs ARG(0..255) NUM1 [NUM2] "
+			       "[NUM3] [NUM4]");
+			rc = 2;
+			goto out;
+		}
+		for (i = 0; i < 4 && optind + 2 + i < argc; i++)
+			s[i] = argv[optind + 2 + i];
+		rc = send_frame_now(&ril, buf,
+				    build_call_transfer(buf, sizeof(buf), arg,
+							s));
+	} else if (!strcmp(cmd, "call-cancel-transfer")) {
+		unsigned arg;
+
+		if (optind + 1 >= argc ||
+		    parse_uint(argv[optind + 1], &arg) < 0 || arg > 0xff) {
+			errmsg("call-cancel-transfer needs ARG (0..255)");
+			rc = 2;
+			goto out;
+		}
+		rc = send_one(&ril, &req_call_cancel_transfer,
+			      (uint8_t)arg);
+	} else if (!strcmp(cmd, "call-manage")) {
+		unsigned type, index;
+		uint8_t buf[92];
+
+		if (optind + 3 >= argc ||
+		    parse_uint(argv[optind + 1], &type) < 0 ||
+		    parse_uint(argv[optind + 2], &index) < 0 ||
+		    index > 0xff) {
+			errmsg("call-manage needs TYPE INDEX(0..255) NUMBER");
+			rc = 2;
+			goto out;
+		}
+		rc = send_frame_now(&ril, buf,
+				    build_call_manage(buf, sizeof(buf), type,
+						      index,
+						      argv[optind + 3]));
+	} else if (!strcmp(cmd, "audio-path")) {
+		unsigned path, mode;
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &path) < 0 ||
+		    parse_uint(argv[optind + 2], &mode) < 0 ||
+		    path > 0xff || mode > 0xff) {
+			errmsg("audio-path needs PATH(0..255) MODE(0..255)");
+			rc = 2;
+			goto out;
+		}
+		rc = send_two(&ril, &req_snd_audio_path,
+			      (uint8_t)path, (uint8_t)mode);
+	} else if (!strcmp(cmd, "sms-smsc")) {
+		rc = cmd_query(&ril, &req_sms_get_smsc);
+	} else if (!strcmp(cmd, "sms-smsc-set")) {
+		if (optind + 1 >= argc) {
+			errmsg("sms-smsc-set needs an address string");
+			rc = 2;
+			goto out;
+		}
+		rc = cmd_sms_smsc_set(&ril, argv[optind + 1]);
+	} else if (!strcmp(cmd, "sms-send")) {
+		const char *number, *text, *sca = NULL;
+		unsigned domain = 0;
+
+		if (optind + 2 >= argc) {
+			errmsg("sms-send needs NUMBER TEXT [SMSC] [DOMAIN]; "
+			       "without SMSC the stored SMSC is queried from "
+			       "the CP");
+			rc = 2;
+			goto out;
+		}
+		number = argv[optind + 1];
+		text = argv[optind + 2];
+		if (optind + 3 < argc)
+			sca = argv[optind + 3];
+		if (optind + 4 < argc &&
+		    parse_uint(argv[optind + 4], &domain) < 0) {
+			errmsg("invalid DOMAIN '%s'", argv[optind + 4]);
+			rc = 2;
+			goto out;
+		}
+		rc = cmd_sms_send_text(&ril, number, text, sca, domain);
+	} else if (!strcmp(cmd, "sms-send-tpdu")) {
+		uint8_t tpdu[256];
+		size_t tlen = 0;
+		unsigned domain = 0;
+
+		if (optind + 2 >= argc ||
+		    parse_hex(argv[optind + 1], tpdu, sizeof(tpdu),
+			      &tlen) < 0 || !tlen) {
+			errmsg("sms-send-tpdu needs TPDU_HEX SMSC [DOMAIN]; "
+			       "TPDU is the framework-built GSM 03.40 PDU");
+			rc = 2;
+			goto out;
+		}
+		if (optind + 3 < argc &&
+		    parse_uint(argv[optind + 3], &domain) < 0) {
+			errmsg("invalid DOMAIN '%s'", argv[optind + 3]);
+			rc = 2;
+			goto out;
+		}
+		rc = cmd_sms_send(&ril, tpdu, tlen, argv[optind + 2],
+				  domain);
+	} else if (!strcmp(cmd, "sms-write")) {
+		uint8_t tpdu[256], buf[268];
+		size_t tlen = 0, len;
+		unsigned index, status;
+
+		if (optind + 4 >= argc ||
+		    parse_uint(argv[optind + 1], &index) < 0 ||
+		    parse_uint(argv[optind + 2], &status) < 0 ||
+		    index > 0xff || status > 0xff ||
+		    parse_hex(argv[optind + 3], tpdu, sizeof(tpdu),
+			      &tlen) < 0 || !tlen) {
+			errmsg("sms-write needs INDEX STATUS TPDU_HEX SMSC");
+			rc = 2;
+			goto out;
+		}
+		len = build_sms_write(buf, sizeof(buf), index, status, tpdu,
+				      tlen, argv[optind + 4]);
+		rc = send_frame_now(&ril, buf, len);
+	} else if (!strcmp(cmd, "sms-read") ||
+		   !strcmp(cmd, "sms-delete")) {
+		unsigned index, storage;
+		uint8_t buf[16];
+		const struct ipc_req *req = !strcmp(cmd, "sms-read") ?
+			&req_sms_read : &req_sms_delete;
+		size_t len;
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &index) < 0 ||
+		    parse_uint(argv[optind + 2], &storage) < 0 ||
+		    index > 0xff || storage > 0xffff) {
+			errmsg("%s needs INDEX STORAGE", cmd);
+			rc = 2;
+			goto out;
+		}
+		len = build_sms_store(buf, sizeof(buf), req, index, storage);
+		if (!strcmp(cmd, "sms-read"))
+			rc = send_frame_wait(&ril, buf, len);
+		else
+			rc = send_frame_now(&ril, buf, len);
+	} else if (!strcmp(cmd, "sms-ack")) {
+		const char *arg = optind + 2 < argc ? argv[optind + 2] : NULL;
+		unsigned tpid, cause = 0x80;
+		uint8_t buf[16];
+		size_t len;
+		int ok;
+
+		if (optind + 1 >= argc ||
+		    parse_uint(argv[optind + 1], &tpid) < 0 ||
+		    tpid > 0xff || !arg ||
+		    (strcmp(arg, "ok") && strcmp(arg, "fail"))) {
+			errmsg("sms-ack needs TPID ok|fail [CAUSE] "
+			       "(TPID must be <= 255)");
+			rc = 2;
+			goto out;
+		}
+		ok = !strcmp(arg, "ok");
+		if (!ok && optind + 3 < argc &&
+		    parse_uint(argv[optind + 3], &cause) < 0) {
+			errmsg("invalid CAUSE '%s'", argv[optind + 3]);
+			rc = 2;
+			goto out;
+		}
+		len = build_sms_ack(buf, sizeof(buf), tpid, ok, cause);
+		rc = send_frame_now(&ril, buf, len);
+	} else if (!strcmp(cmd, "pdp-get")) {
+		rc = cmd_query(&ril, &req_pdp_get);
+	} else if (!strcmp(cmd, "pdp-define")) {
+		unsigned cid, proto = 0;
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &cid) < 0) {
+			errmsg("pdp-define needs CID APN [PROTO] "
+			       "(e.g. pdp-define 1 internet 3)");
+			rc = 2;
+			goto out;
+		}
+		if (optind + 3 < argc &&
+		    parse_uint(argv[optind + 3], &proto) < 0) {
+			errmsg("invalid PROTO '%s'", argv[optind + 3]);
+			rc = 2;
+			goto out;
+		}
+		rc = cmd_pdp_define(&ril, cid, argv[optind + 2], proto);
+	} else if (!strcmp(cmd, "pdp-activate")) {
+		unsigned cid, auth = 0;
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &cid) < 0) {
+			errmsg("pdp-activate needs CID APN [AUTH]");
+			rc = 2;
+			goto out;
+		}
+		if (optind + 3 < argc &&
+		    parse_uint(argv[optind + 3], &auth) < 0) {
+			errmsg("invalid AUTH '%s'", argv[optind + 3]);
+			rc = 2;
+			goto out;
+		}
+		rc = cmd_pdp_activate(&ril, cid, argv[optind + 2], auth);
+	} else if (!strcmp(cmd, "pdp-deactivate")) {
+		unsigned cid, reason = 1;
+
+		if (optind + 1 >= argc ||
+		    parse_uint(argv[optind + 1], &cid) < 0) {
+			errmsg("pdp-deactivate needs CID [REASON 1..4]");
+			rc = 2;
+			goto out;
+		}
+		if (optind + 2 < argc &&
+		    parse_uint(argv[optind + 2], &reason) < 0) {
+			errmsg("invalid REASON '%s'", argv[optind + 2]);
+			rc = 2;
+			goto out;
+		}
+		rc = cmd_pdp_deactivate(&ril, cid, reason);
+	} else if (!strcmp(cmd, "pdp-action")) {
+		unsigned cid, action;
+		uint8_t buf[0x70];
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &cid) < 0 ||
+		    parse_uint(argv[optind + 2], &action) < 0 ||
+		    cid > 0xff || action < 2 || action > 5) {
+			errmsg("pdp-action needs CID ACTION(2..5); actions 0 "
+			       "and 1 use pdp-deactivate/pdp-activate");
+			rc = 2;
+			goto out;
+		}
+		rc = send_frame_now(&ril, buf,
+				    build_pdp_action(buf, sizeof(buf), cid,
+						     action));
+	} else if (!strcmp(cmd, "ipv6-config")) {
+		uint8_t addr[16];
+		size_t alen = 0;
+		unsigned cid;
+		uint8_t buf[0x18];
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &cid) < 0 || cid > 0xff ||
+		    parse_hex(argv[optind + 2], addr, sizeof(addr), &alen) < 0 ||
+		    alen != sizeof(addr)) {
+			errmsg("ipv6-config needs CID ADDR_HEX (exactly 16 "
+			       "bytes)");
+			rc = 2;
+			goto out;
+		}
+		rc = send_frame_now(&ril, buf,
+				    build_ipv6_config(buf, sizeof(buf), cid,
+						      addr));
+	} else if (!strcmp(cmd, "mobile-data")) {
+		unsigned b0, b1;
+		uint8_t buf[IPC_HDR_LEN + 2];
+
+		if (optind + 2 >= argc ||
+		    parse_uint(argv[optind + 1], &b0) < 0 ||
+		    parse_uint(argv[optind + 2], &b1) < 0 ||
+		    b0 > 1 || b1 > 1) {
+			errmsg("mobile-data needs B0 B1 (0 or 1)");
+			rc = 2;
+			goto out;
+		}
+		rc = send_frame_now(&ril, buf,
+				    build_mobile_data(buf, sizeof(buf), b0,
+						      b1));
+	} else if (!strcmp(cmd, "ps-attach")) {
+		const char *arg = optind + 1 < argc ? argv[optind + 1] : NULL;
+		unsigned reason = 0;
+		int on;
+
+		if (!arg || (strcmp(arg, "on") && strcmp(arg, "off") &&
+			     strcmp(arg, "1") && strcmp(arg, "0"))) {
+			errmsg("ps-attach needs 'on' or 'off' [reason 1..4]");
+			rc = 2;
+			goto out;
+		}
+		on = !strcmp(arg, "on") || !strcmp(arg, "1");
+		if (optind + 2 < argc &&
+		    parse_uint(argv[optind + 2], &reason) < 0) {
+			errmsg("invalid reason '%s'", argv[optind + 2]);
+			rc = 2;
+			goto out;
+		}
+		rc = cmd_ps_attach(&ril, on, reason);
+	} else if (!strcmp(cmd, "raw")) {
+		uint8_t buf[IPC_MAX_MSG];
+		size_t len = 0;
+
+		if (optind + 1 >= argc || parse_hex(argv[optind + 1], buf,
+						   sizeof(buf), &len) < 0 || !len) {
+			errmsg("raw needs hex bytes (e.g. 070000000a0302 01)");
+			rc = 2;
+			goto out;
+		}
+		rc = ipc_send(&ril, buf, len) < 0;
+	} else if (!strcmp(cmd, "listen")) {
+		rc = cmd_listen(&ril);
+	} else {
+		errmsg("unknown command '%s'", cmd);
+		usage(stderr);
+		rc = 2;
+		goto out;
+	}
+
+	/* Drain anything still queued (responses to the last request). */
+	if (rc == 0 && strcmp(cmd, "listen") != 0)
+		drain(&ril, 300);
+
+	if (daemon_mode) {
+		errmsg("supervising the CP; exit on POLLHUP");
+		rc = cmd_listen(&ril);
+	}
+
+out:
+	if (ril.rfs_fd >= 0)
+		close(ril.rfs_fd);
+	if (ril.ipc_fd >= 0)
+		close(ril.ipc_fd);
+	return rc;
+}

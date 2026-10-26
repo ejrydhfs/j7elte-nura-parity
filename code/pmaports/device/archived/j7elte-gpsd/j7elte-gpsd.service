@@ -1,0 +1,16 @@
+[Unit]
+Description=BCM4752 GPS NMEA bridge (Samsung Galaxy J7 / j7elte)
+After=dev-ttySAC0.device
+Wants=dev-ttySAC0.device
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/j7elte-gpsd.conf
+ExecStart=/usr/sbin/j7elte-gpsd $J7ELTE_GPSD_OPTS
+RuntimeDirectory=j7elte-gpsd
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

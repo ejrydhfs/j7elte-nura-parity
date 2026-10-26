@@ -1,0 +1,559 @@
+
+parity/userspace/gpu/blob/libGLES_mali.so:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+004699a8 <eglInitialize@@Base>:
+  4699a8:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  4699ac:	mov	r4, r0
+  4699b0:	strd	r8, [sp, #16]
+  4699b4:	mov	r9, r1
+  4699b8:	mov	r8, r2
+  4699bc:	str	lr, [sp, #32]
+  4699c0:	strd	r6, [sp, #8]
+  4699c4:	strd	sl, [sp, #24]
+  4699c8:	sub	sp, sp, #20
+  4699cc:	bl	471c58 <egl_connect_native_window_to_egl@@Base+0x2f4>
+  4699d0:	mov	r5, r0
+  4699d4:	mov	r0, #8
+  4699d8:	bl	215818 <osup_mutex_static_get@plt>
+  4699dc:	mov	r3, #0
+  4699e0:	cmp	r5, #0
+  4699e4:	str	r3, [sp, #12]
+  4699e8:	beq	469a64 <eglInitialize@@Base+0xbc>
+  4699ec:	ldr	r7, [pc, #2072]	; 46a20c <eglInitialize@@Base+0x864>
+  4699f0:	mov	r1, #12288	; 0x3000
+  4699f4:	mov	fp, r0
+  4699f8:	mov	r0, #7
+  4699fc:	str	r1, [r5, #12]
+  469a00:	bl	215818 <osup_mutex_static_get@plt>
+  469a04:	add	r7, pc, r7
+  469a08:	mov	r6, r0
+  469a0c:	bl	215728 <pthread_mutex_lock@plt>
+  469a10:	ldr	sl, [r7]
+  469a14:	cmp	sl, #0
+  469a18:	bne	469a44 <eglInitialize@@Base+0x9c>
+  469a1c:	bl	26a800 <egl_color_buffer_is_secure@@Base+0x1374>
+  469a20:	subs	r2, r0, #0
+  469a24:	beq	469ce8 <eglInitialize@@Base+0x340>
+  469a28:	bl	26a2b4 <egl_color_buffer_is_secure@@Base+0xe28>
+  469a2c:	ldr	ip, [pc, #2012]	; 46a210 <eglInitialize@@Base+0x868>
+  469a30:	mov	r1, sl
+  469a34:	add	r0, pc, ip
+  469a38:	bl	215824 <osup_register_unload_callback@plt>
+  469a3c:	mov	r3, #1
+  469a40:	str	r3, [r7]
+  469a44:	mov	r0, r6
+  469a48:	bl	215734 <pthread_mutex_unlock@plt>
+  469a4c:	mov	r0, r4
+  469a50:	bl	4691ac <eglQueryContext@@Base+0x288>
+  469a54:	cmp	r0, #0
+  469a58:	bne	469a84 <eglInitialize@@Base+0xdc>
+  469a5c:	movw	r6, #12296	; 0x3008
+  469a60:	str	r6, [r5, #12]
+  469a64:	mov	r0, #0
+  469a68:	add	sp, sp, #20
+  469a6c:	ldrd	r4, [sp]
+  469a70:	ldrd	r6, [sp, #8]
+  469a74:	ldrd	r8, [sp, #16]
+  469a78:	ldrd	sl, [sp, #24]
+  469a7c:	add	sp, sp, #32
+  469a80:	pop	{pc}		; (ldr pc, [sp], #4)
+  469a84:	mov	r0, fp
+  469a88:	bl	215728 <pthread_mutex_lock@plt>
+  469a8c:	ldr	r1, [pc, #1920]	; 46a214 <eglInitialize@@Base+0x86c>
+  469a90:	add	r7, pc, r1
+  469a94:	ldr	r6, [r7, #4]
+  469a98:	cmp	r4, r6
+  469a9c:	beq	469d54 <eglInitialize@@Base+0x3ac>
+  469aa0:	bl	26a7f8 <egl_color_buffer_is_secure@@Base+0x136c>
+  469aa4:	mov	r6, r0
+  469aa8:	mov	r0, fp
+  469aac:	bl	215734 <pthread_mutex_unlock@plt>
+  469ab0:	cmp	r6, #0
+  469ab4:	beq	469bd0 <eglInitialize@@Base+0x228>
+  469ab8:	add	sl, r4, #12
+  469abc:	mov	r0, sl
+  469ac0:	bl	215728 <pthread_mutex_lock@plt>
+  469ac4:	ldrb	r2, [r4, #128]	; 0x80
+  469ac8:	cmp	r2, #1
+  469acc:	beq	469da0 <eglInitialize@@Base+0x3f8>
+  469ad0:	ldr	lr, [r4, #8]
+  469ad4:	cmp	lr, #1
+  469ad8:	beq	469db4 <eglInitialize@@Base+0x40c>
+  469adc:	mov	r7, #0
+  469ae0:	cmp	lr, #2
+  469ae4:	str	r7, [r4, #116]	; 0x74
+  469ae8:	str	r7, [r4, #120]	; 0x78
+  469aec:	beq	469d60 <eglInitialize@@Base+0x3b8>
+  469af0:	ldr	ip, [pc, #1824]	; 46a218 <eglInitialize@@Base+0x870>
+  469af4:	mov	r1, #1
+  469af8:	mov	r0, r6
+  469afc:	mov	r2, r1
+  469b00:	str	r6, [r4, #60]	; 0x3c
+  469b04:	ldr	r3, [pc, ip]
+  469b08:	bl	28fc74 <LLVMGetBufferStart@@Base+0x1bb8>
+  469b0c:	ldr	r3, [r4, #24]
+  469b10:	mov	r1, r4
+  469b14:	ldr	r0, [r4, #72]	; 0x48
+  469b18:	ldr	r2, [r4, #124]	; 0x7c
+  469b1c:	ldr	r6, [r3, #4]
+  469b20:	blx	r6
+  469b24:	cmp	r0, #0
+  469b28:	str	r0, [r4, #20]
+  469b2c:	beq	469d14 <eglInitialize@@Base+0x36c>
+  469b30:	ldr	fp, [pc, #1764]	; 46a21c <eglInitialize@@Base+0x874>
+  469b34:	mov	r6, #1
+  469b38:	add	r0, r4, #92	; 0x5c
+  469b3c:	mov	r1, r7
+  469b40:	str	r6, [r4, #84]	; 0x54
+  469b44:	str	r0, [sp]
+  469b48:	add	r2, pc, fp
+  469b4c:	str	r2, [r4, #80]	; 0x50
+  469b50:	bl	215770 <pthread_mutex_init@plt>
+  469b54:	subs	fp, r0, #0
+  469b58:	bne	469d38 <eglInitialize@@Base+0x390>
+  469b5c:	add	r0, r4, #96	; 0x60
+  469b60:	mov	r1, fp
+  469b64:	bl	215770 <pthread_mutex_init@plt>
+  469b68:	subs	r7, r0, #0
+  469b6c:	bne	469dc0 <eglInitialize@@Base+0x418>
+  469b70:	add	r0, r4, #100	; 0x64
+  469b74:	mov	r1, r7
+  469b78:	bl	215770 <pthread_mutex_init@plt>
+  469b7c:	subs	fp, r0, #0
+  469b80:	bne	469de0 <eglInitialize@@Base+0x438>
+  469b84:	mov	r1, fp
+  469b88:	add	r0, r4, #104	; 0x68
+  469b8c:	bl	215770 <pthread_mutex_init@plt>
+  469b90:	subs	r1, r0, #0
+  469b94:	bne	469dfc <eglInitialize@@Base+0x454>
+  469b98:	add	r0, r4, #88	; 0x58
+  469b9c:	mov	r2, r1
+  469ba0:	bl	2155c0 <sem_init@plt>
+  469ba4:	cmp	r0, #0
+  469ba8:	beq	469e1c <eglInitialize@@Base+0x474>
+  469bac:	mov	r6, #1
+  469bb0:	movw	lr, #12289	; 0x3001
+  469bb4:	mov	r7, r6
+  469bb8:	mov	sl, r6
+  469bbc:	str	lr, [r5, #12]
+  469bc0:	mov	r9, r6
+  469bc4:	mov	r8, #0
+  469bc8:	str	r6, [sp]
+  469bcc:	b	469bec <eglInitialize@@Base+0x244>
+  469bd0:	movw	lr, #12289	; 0x3001
+  469bd4:	mov	r7, r6
+  469bd8:	str	r6, [sp]
+  469bdc:	mov	sl, r6
+  469be0:	mov	r9, r6
+  469be4:	mov	r8, r6
+  469be8:	str	lr, [r5, #12]
+  469bec:	ldr	r5, [r4, #64]	; 0x40
+  469bf0:	cmp	r5, #0
+  469bf4:	movne	fp, #0
+  469bf8:	beq	469c2c <eglInitialize@@Base+0x284>
+  469bfc:	ldr	r0, [r5, #128]	; 0x80
+  469c00:	mov	r5, #0
+  469c04:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  469c08:	ldr	r0, [r4, #64]	; 0x40
+  469c0c:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  469c10:	cmp	fp, #0
+  469c14:	str	r5, [r4, #64]	; 0x40
+  469c18:	beq	469c2c <eglInitialize@@Base+0x284>
+  469c1c:	ldr	r0, [fp]
+  469c20:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  469c24:	mov	r0, fp
+  469c28:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  469c2c:	ldr	r3, [sp]
+  469c30:	cmp	r3, #0
+  469c34:	bne	469cd8 <eglInitialize@@Base+0x330>
+  469c38:	cmp	r9, #0
+  469c3c:	bne	469ccc <eglInitialize@@Base+0x324>
+  469c40:	cmp	sl, #0
+  469c44:	bne	469cc0 <eglInitialize@@Base+0x318>
+  469c48:	cmp	r7, #0
+  469c4c:	bne	469cb4 <eglInitialize@@Base+0x30c>
+  469c50:	cmp	r8, #0
+  469c54:	bne	469ca8 <eglInitialize@@Base+0x300>
+  469c58:	ldr	r0, [r4, #60]	; 0x3c
+  469c5c:	cmp	r0, #0
+  469c60:	beq	469c70 <eglInitialize@@Base+0x2c8>
+  469c64:	mov	r7, #0
+  469c68:	bl	26a2b4 <egl_color_buffer_is_secure@@Base+0xe28>
+  469c6c:	str	r7, [r4, #60]	; 0x3c
+  469c70:	ldr	r0, [r4, #20]
+  469c74:	cmp	r0, #0
+  469c78:	beq	469c90 <eglInitialize@@Base+0x2e8>
+  469c7c:	ldr	sl, [r4, #24]
+  469c80:	ldr	r9, [sl, #12]
+  469c84:	blx	r9
+  469c88:	mov	r2, #0
+  469c8c:	str	r2, [r4, #20]
+  469c90:	cmp	r6, #1
+  469c94:	bne	469a64 <eglInitialize@@Base+0xbc>
+  469c98:	add	sl, r4, #12
+  469c9c:	mov	r0, sl
+  469ca0:	bl	215734 <pthread_mutex_unlock@plt>
+  469ca4:	b	469a64 <eglInitialize@@Base+0xbc>
+  469ca8:	add	r0, r4, #88	; 0x58
+  469cac:	bl	215590 <sem_destroy@plt>
+  469cb0:	b	469c58 <eglInitialize@@Base+0x2b0>
+  469cb4:	add	r0, r4, #104	; 0x68
+  469cb8:	bl	21577c <pthread_mutex_destroy@plt>
+  469cbc:	b	469c50 <eglInitialize@@Base+0x2a8>
+  469cc0:	add	r0, r4, #100	; 0x64
+  469cc4:	bl	21577c <pthread_mutex_destroy@plt>
+  469cc8:	b	469c48 <eglInitialize@@Base+0x2a0>
+  469ccc:	add	r0, r4, #96	; 0x60
+  469cd0:	bl	21577c <pthread_mutex_destroy@plt>
+  469cd4:	b	469c40 <eglInitialize@@Base+0x298>
+  469cd8:	add	r0, r4, #92	; 0x5c
+  469cdc:	str	r0, [sp]
+  469ce0:	bl	21577c <pthread_mutex_destroy@plt>
+  469ce4:	b	469c38 <eglInitialize@@Base+0x290>
+  469ce8:	mov	r0, r6
+  469cec:	mov	r6, r2
+  469cf0:	bl	215734 <pthread_mutex_unlock@plt>
+  469cf4:	movw	r0, #12289	; 0x3001
+  469cf8:	mov	r7, r6
+  469cfc:	str	r6, [sp]
+  469d00:	mov	sl, r6
+  469d04:	mov	r9, r6
+  469d08:	mov	r8, r6
+  469d0c:	str	r0, [r5, #12]
+  469d10:	b	469bec <eglInitialize@@Base+0x244>
+  469d14:	movw	ip, #12289	; 0x3001
+  469d18:	mov	r7, r0
+  469d1c:	str	r0, [sp]
+  469d20:	mov	sl, r0
+  469d24:	mov	r9, r0
+  469d28:	mov	r8, r0
+  469d2c:	str	ip, [r5, #12]
+  469d30:	mov	r6, #1
+  469d34:	b	469bec <eglInitialize@@Base+0x244>
+  469d38:	movw	r1, #12289	; 0x3001
+  469d3c:	mov	sl, r7
+  469d40:	str	r7, [sp]
+  469d44:	mov	r9, r7
+  469d48:	mov	r8, r7
+  469d4c:	str	r1, [r5, #12]
+  469d50:	b	469bec <eglInitialize@@Base+0x244>
+  469d54:	bl	26a800 <egl_color_buffer_is_secure@@Base+0x1374>
+  469d58:	mov	r6, r0
+  469d5c:	b	469aa8 <eglInitialize@@Base+0x100>
+  469d60:	mov	r0, r6
+  469d64:	bl	26a2b4 <egl_color_buffer_is_secure@@Base+0xe28>
+  469d68:	mov	r0, #1
+  469d6c:	str	r0, [r4, #8]
+  469d70:	cmp	r9, #0
+  469d74:	mov	fp, #12288	; 0x3000
+  469d78:	movne	r0, #1
+  469d7c:	strne	r0, [r9]
+  469d80:	cmp	r8, #0
+  469d84:	movne	r0, #4
+  469d88:	strne	r0, [r8]
+  469d8c:	mov	r0, sl
+  469d90:	str	fp, [r5, #12]
+  469d94:	bl	215734 <pthread_mutex_unlock@plt>
+  469d98:	mov	r0, #1
+  469d9c:	b	469a68 <eglInitialize@@Base+0xc0>
+  469da0:	movw	r8, #12289	; 0x3001
+  469da4:	mov	r0, r6
+  469da8:	bl	26a2b4 <egl_color_buffer_is_secure@@Base+0xe28>
+  469dac:	str	r8, [r5, #12]
+  469db0:	b	469c9c <eglInitialize@@Base+0x2f4>
+  469db4:	mov	r0, r6
+  469db8:	bl	26a2b4 <egl_color_buffer_is_secure@@Base+0xe28>
+  469dbc:	b	469d70 <eglInitialize@@Base+0x3c8>
+  469dc0:	movw	r2, #12289	; 0x3001
+  469dc4:	mov	r7, fp
+  469dc8:	str	r6, [sp]
+  469dcc:	mov	sl, fp
+  469dd0:	mov	r9, fp
+  469dd4:	str	r2, [r5, #12]
+  469dd8:	mov	r8, fp
+  469ddc:	b	469bec <eglInitialize@@Base+0x244>
+  469de0:	movw	r0, #12289	; 0x3001
+  469de4:	mov	r9, r6
+  469de8:	str	r6, [sp]
+  469dec:	mov	sl, r7
+  469df0:	mov	r8, r7
+  469df4:	str	r0, [r5, #12]
+  469df8:	b	469bec <eglInitialize@@Base+0x244>
+  469dfc:	movw	r3, #12289	; 0x3001
+  469e00:	mov	r7, fp
+  469e04:	str	r6, [sp]
+  469e08:	mov	sl, r6
+  469e0c:	mov	r9, r6
+  469e10:	str	r3, [r5, #12]
+  469e14:	mov	r8, fp
+  469e18:	b	469bec <eglInitialize@@Base+0x244>
+  469e1c:	mov	r7, #0
+  469e20:	add	fp, sp, #12
+  469e24:	ldr	r6, [r4, #60]	; 0x3c
+  469e28:	mov	r0, r7
+  469e2c:	mov	r1, fp
+  469e30:	str	r7, [r4, #112]	; 0x70
+  469e34:	mov	r2, r4
+  469e38:	str	r7, [r4, #108]	; 0x6c
+  469e3c:	bl	4624c0 <_ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base+0x5e0c>
+  469e40:	cmp	r0, #12288	; 0x3000
+  469e44:	beq	469e6c <eglInitialize@@Base+0x4c4>
+  469e48:	mov	r6, #1
+  469e4c:	movw	r9, #12289	; 0x3001
+  469e50:	mov	r7, r6
+  469e54:	mov	sl, r6
+  469e58:	str	r9, [r5, #12]
+  469e5c:	mov	r8, r6
+  469e60:	mov	r9, r6
+  469e64:	str	r6, [sp]
+  469e68:	b	469bec <eglInitialize@@Base+0x244>
+  469e6c:	add	lr, r6, #9088	; 0x2380
+  469e70:	ldr	r1, [sp, #12]
+  469e74:	mov	r2, #3
+  469e78:	add	r6, lr, #32
+  469e7c:	mov	r0, r6
+  469e80:	bl	2932b0 <LLVMGetBufferStart@@Base+0x51f4>
+  469e84:	subs	r1, r0, #0
+  469e88:	str	r1, [sp, #4]
+  469e8c:	beq	469e48 <eglInitialize@@Base+0x4a0>
+  469e90:	ldr	ip, [sp, #4]
+  469e94:	mov	r1, fp
+  469e98:	mov	r2, r4
+  469e9c:	str	ip, [r4, #16]
+  469ea0:	bl	4624c0 <_ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base+0x5e0c>
+  469ea4:	cmp	r0, #12288	; 0x3000
+  469ea8:	beq	469ef8 <eglInitialize@@Base+0x550>
+  469eac:	movw	sl, #12289	; 0x3001
+  469eb0:	mov	fp, r7
+  469eb4:	str	sl, [r5, #12]
+  469eb8:	ldr	r0, [sp, #4]
+  469ebc:	mov	r8, #1
+  469ec0:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  469ec4:	ldr	r5, [r4, #64]	; 0x40
+  469ec8:	mov	ip, #0
+  469ecc:	mov	r7, r8
+  469ed0:	mov	r6, r8
+  469ed4:	mov	sl, r8
+  469ed8:	str	ip, [r4, #16]
+  469edc:	cmp	r5, ip
+  469ee0:	moveq	r9, r8
+  469ee4:	ldreq	r0, [sp]
+  469ee8:	beq	469ce0 <eglInitialize@@Base+0x338>
+  469eec:	str	r8, [sp]
+  469ef0:	mov	r9, r8
+  469ef4:	b	469bfc <eglInitialize@@Base+0x254>
+  469ef8:	ldr	r3, [r4, #24]
+  469efc:	ldr	r7, [r3, #8]
+  469f00:	cmp	r7, #0
+  469f04:	beq	469f18 <eglInitialize@@Base+0x570>
+  469f08:	ldr	r0, [r4, #20]
+  469f0c:	add	r1, r4, #112	; 0x70
+  469f10:	add	r2, r4, #108	; 0x6c
+  469f14:	blx	r7
+  469f18:	mov	r0, r6
+  469f1c:	mov	r1, #2448	; 0x990
+  469f20:	mov	r2, #3
+  469f24:	bl	2932b0 <LLVMGetBufferStart@@Base+0x51f4>
+  469f28:	cmp	r0, #0
+  469f2c:	mov	r3, r0
+  469f30:	str	r0, [r4, #64]	; 0x40
+  469f34:	beq	469fc4 <eglInitialize@@Base+0x61c>
+  469f38:	ldr	r2, [pc, #736]	; 46a220 <eglInitialize@@Base+0x878>
+  469f3c:	add	r1, pc, r2
+  469f40:	mov	r2, #2448	; 0x990
+  469f44:	bl	215788 <memcpy@plt>
+  469f48:	ldr	fp, [r4, #108]	; 0x6c
+  469f4c:	mov	r0, #17
+  469f50:	str	r0, [r4, #68]	; 0x44
+  469f54:	cmp	fp, #0
+  469f58:	beq	46a040 <eglInitialize@@Base+0x698>
+  469f5c:	lsl	lr, fp, #1
+  469f60:	mov	r1, #68	; 0x44
+  469f64:	ldr	fp, [r4, #64]	; 0x40
+  469f68:	mov	r0, r6
+  469f6c:	add	r7, lr, #1
+  469f70:	mov	r2, #3
+  469f74:	mul	r1, r1, r7
+  469f78:	bl	2932b0 <LLVMGetBufferStart@@Base+0x51f4>
+  469f7c:	str	r0, [fp, #128]	; 0x80
+  469f80:	ldr	ip, [r4, #64]	; 0x40
+  469f84:	ldr	r3, [ip, #128]	; 0x80
+  469f88:	cmp	r3, #0
+  469f8c:	beq	469fc4 <eglInitialize@@Base+0x61c>
+  469f90:	lsl	lr, r7, #2
+  469f94:	mov	r2, #1
+  469f98:	mov	ip, #144	; 0x90
+  469f9c:	ldr	r0, [r4, #68]	; 0x44
+  469fa0:	cmp	r2, r0
+  469fa4:	bcs	469fd4 <eglInitialize@@Base+0x62c>
+  469fa8:	ldr	r3, [r4, #64]	; 0x40
+  469fac:	mla	r0, ip, r2, r3
+  469fb0:	add	r2, r2, #1
+  469fb4:	ldr	fp, [r0, #-16]
+  469fb8:	add	r1, fp, lr
+  469fbc:	str	r1, [r0, #128]	; 0x80
+  469fc0:	b	469f9c <eglInitialize@@Base+0x5f4>
+  469fc4:	movw	r8, #12289	; 0x3001
+  469fc8:	mov	fp, r3
+  469fcc:	str	r8, [r5, #12]
+  469fd0:	b	469eb8 <eglInitialize@@Base+0x510>
+  469fd4:	mov	ip, #0
+  469fd8:	mov	lr, #144	; 0x90
+  469fdc:	movw	r3, #12344	; 0x3038
+  469fe0:	cmp	ip, r0
+  469fe4:	bcs	46a044 <eglInitialize@@Base+0x69c>
+  469fe8:	ldr	fp, [r4, #64]	; 0x40
+  469fec:	mov	r1, #0
+  469ff0:	mla	r0, lr, ip, fp
+  469ff4:	ldr	r2, [r0, #128]	; 0x80
+  469ff8:	b	46a01c <eglInitialize@@Base+0x674>
+  469ffc:	ldr	fp, [r4, #112]	; 0x70
+  46a000:	ldr	r0, [fp, r1, lsl #4]
+  46a004:	str	r0, [r2, #-8]
+  46a008:	ldr	fp, [r4, #112]	; 0x70
+  46a00c:	add	r0, fp, r1, lsl #4
+  46a010:	add	r1, r1, #1
+  46a014:	ldr	fp, [r0, #4]
+  46a018:	str	fp, [r2, #-4]
+  46a01c:	ldr	fp, [r4, #108]	; 0x6c
+  46a020:	mov	r0, r2
+  46a024:	add	r2, r2, #8
+  46a028:	cmp	r1, fp
+  46a02c:	blt	469ffc <eglInitialize@@Base+0x654>
+  46a030:	str	r3, [r0]
+  46a034:	add	ip, ip, #1
+  46a038:	ldr	r0, [r4, #68]	; 0x44
+  46a03c:	b	469fe0 <eglInitialize@@Base+0x638>
+  46a040:	mov	r7, #1
+  46a044:	mov	r2, #3
+  46a048:	lsl	r1, r0, #2
+  46a04c:	mov	r0, r6
+  46a050:	bl	2932b0 <LLVMGetBufferStart@@Base+0x51f4>
+  46a054:	subs	fp, r0, #0
+  46a058:	movweq	r2, #12289	; 0x3001
+  46a05c:	streq	r2, [r5, #12]
+  46a060:	beq	469eb8 <eglInitialize@@Base+0x510>
+  46a064:	ldr	lr, [r4, #68]	; 0x44
+  46a068:	mov	r0, r6
+  46a06c:	add	r7, r7, #36	; 0x24
+  46a070:	mov	r2, #3
+  46a074:	lsl	r6, lr, #2
+  46a078:	mul	r1, r7, r6
+  46a07c:	bl	2932b0 <LLVMGetBufferStart@@Base+0x51f4>
+  46a080:	cmp	r0, #0
+  46a084:	mov	r6, r0
+  46a088:	str	r0, [fp]
+  46a08c:	beq	46a1ac <eglInitialize@@Base+0x804>
+  46a090:	lsl	r7, r7, #2
+  46a094:	mov	r6, fp
+  46a098:	mov	ip, #1
+  46a09c:	ldr	lr, [r4, #68]	; 0x44
+  46a0a0:	cmp	ip, lr
+  46a0a4:	add	ip, ip, #1
+  46a0a8:	bcs	46a0bc <eglInitialize@@Base+0x714>
+  46a0ac:	ldr	r1, [r6]
+  46a0b0:	add	r3, r1, r7
+  46a0b4:	str	r3, [r6, #4]!
+  46a0b8:	b	46a09c <eglInitialize@@Base+0x6f4>
+  46a0bc:	ldr	r1, [pc, #352]	; 46a224 <eglInitialize@@Base+0x87c>
+  46a0c0:	sub	r6, fp, #4
+  46a0c4:	mov	r7, #0
+  46a0c8:	add	r3, pc, r1
+  46a0cc:	stm	sp, {r3, r5}
+  46a0d0:	mov	r5, r4
+  46a0d4:	mov	r2, #144	; 0x90
+  46a0d8:	cmp	r7, lr
+  46a0dc:	ldr	r1, [sp]
+  46a0e0:	mul	r4, r2, r7
+  46a0e4:	add	r7, r7, #1
+  46a0e8:	bcs	46a144 <eglInitialize@@Base+0x79c>
+  46a0ec:	ldr	r0, [r6, #4]!
+  46a0f0:	bl	215788 <memcpy@plt>
+  46a0f4:	movw	r2, #12344	; 0x3038
+  46a0f8:	ldr	r0, [r6]
+  46a0fc:	str	r2, [r0, #144]	; 0x90
+  46a100:	ldr	ip, [r5, #64]	; 0x40
+  46a104:	ldr	r1, [r6]
+  46a108:	add	r0, ip, r4
+  46a10c:	bl	4675f4 <egl_color_buffer_set_non_secure_world@@Base+0x92c>
+  46a110:	ldr	r3, [r5, #64]	; 0x40
+  46a114:	add	r4, r3, r4
+  46a118:	ldr	r1, [r4, #128]	; 0x80
+  46a11c:	cmp	r1, #0
+  46a120:	beq	46a13c <eglInitialize@@Base+0x794>
+  46a124:	ldr	lr, [r5, #108]	; 0x6c
+  46a128:	ldr	r0, [r6]
+  46a12c:	lsl	r2, lr, #3
+  46a130:	add	r0, r0, #144	; 0x90
+  46a134:	add	r2, r2, #4
+  46a138:	bl	215788 <memcpy@plt>
+  46a13c:	ldr	lr, [r5, #68]	; 0x44
+  46a140:	b	46a0d4 <eglInitialize@@Base+0x72c>
+  46a144:	mov	r4, r5
+  46a148:	mov	r1, fp
+  46a14c:	ldr	r5, [sp, #4]
+  46a150:	ldr	r3, [r4, #24]
+  46a154:	mov	r2, lr
+  46a158:	mov	r7, #0
+  46a15c:	ldr	r0, [r4, #20]
+  46a160:	mov	r6, r7
+  46a164:	ldr	ip, [r3, #16]
+  46a168:	blx	ip
+  46a16c:	ldr	r1, [r4, #68]	; 0x44
+  46a170:	cmp	r6, r1
+  46a174:	bcs	46a1e8 <eglInitialize@@Base+0x840>
+  46a178:	ldr	r2, [fp, r6, lsl #2]
+  46a17c:	add	r6, r6, #1
+  46a180:	ldr	lr, [r2, #68]	; 0x44
+  46a184:	tst	lr, #7
+  46a188:	beq	46a170 <eglInitialize@@Base+0x7c8>
+  46a18c:	ldr	ip, [r4, #64]	; 0x40
+  46a190:	mov	r3, #144	; 0x90
+  46a194:	add	r1, r2, #48	; 0x30
+  46a198:	mla	r0, r3, r7, ip
+  46a19c:	add	r7, r7, #1
+  46a1a0:	bl	215b60 <eglp_config_set_attributes@plt>
+  46a1a4:	ldr	r1, [r4, #68]	; 0x44
+  46a1a8:	b	46a170 <eglInitialize@@Base+0x7c8>
+  46a1ac:	movw	sl, #12289	; 0x3001
+  46a1b0:	ldr	r0, [sp, #4]
+  46a1b4:	mov	r8, #1
+  46a1b8:	mov	r7, r8
+  46a1bc:	mov	r9, r8
+  46a1c0:	str	sl, [r5, #12]
+  46a1c4:	mov	sl, r8
+  46a1c8:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  46a1cc:	ldr	r5, [r4, #64]	; 0x40
+  46a1d0:	str	r6, [r4, #16]
+  46a1d4:	mov	r6, r8
+  46a1d8:	str	r8, [sp]
+  46a1dc:	cmp	r5, #0
+  46a1e0:	bne	469bfc <eglInitialize@@Base+0x254>
+  46a1e4:	b	469c1c <eglInitialize@@Base+0x274>
+  46a1e8:	str	r7, [r4, #68]	; 0x44
+  46a1ec:	ldr	r0, [fp]
+  46a1f0:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  46a1f4:	mov	r0, fp
+  46a1f8:	bl	293390 <LLVMGetBufferStart@@Base+0x52d4>
+  46a1fc:	bl	46bd38 <eglp_check_attribute_present@@Base+0x864>
+  46a200:	mov	r0, #1
+  46a204:	str	r0, [r4, #8]
+  46a208:	b	469d70 <eglInitialize@@Base+0x3c8>
+  46a20c:	strdeq	pc, [r7, -r8]!
+  46a210:			; <UNDEFINED> instruction: 0x000008b8
+  46a214:	msreq	(UNDEF: 39), r4
+  46a218:			; <UNDEFINED> instruction: 0x0126deb8
+  46a21c:			; <UNDEFINED> instruction: 0xfffff654
+  46a220:	rsceq	r2, ip, ip, lsl #5
+  46a224:	rsceq	r2, ip, r0, ror r0
+
+0046a228 <eglTerminate@@Base>:
+  46a228:	strd	r4, [sp, #-16]!
+  46a22c:	mov	r4, r0
+  46a230:	str	r6, [sp, #8]
+  46a234:	str	lr, [sp, #12]
+  46a238:	bl	471c58 <egl_connect_native_window_to_egl@@Base+0x2f4>
+  46a23c:	subs	r6, r0, #0

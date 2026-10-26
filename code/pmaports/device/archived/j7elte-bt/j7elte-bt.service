@@ -1,0 +1,24 @@
+[Unit]
+Description=Broadcom BCM43438 Bluetooth HCI attach (j7elte)
+Documentation=file:///etc/conf.d/j7elte-bt
+ConditionPathExists=/dev/ttySAC3
+ConditionPathExists=/usr/bin/hciattach
+ConditionPathExists=!/etc/j7elte-bt.disabled
+# The HCI transport must exist before bluetoothd enumerates controllers, so
+# this unit is ordered *before* bluetooth.service (same intent as the OpenRC
+# "before bluetooth" dependency), not after it.  bluetooth.service is pulled
+# in so a systemd image does not need a separate enable.
+After=dev-ttySAC3.device
+Wants=bluetooth.service
+Before=bluetooth.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/conf.d/j7elte-bt
+ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+ExecStart=/usr/bin/hciattach -n -t ${J7ELTE_BT_TIMEOUT} -s ${J7ELTE_BT_INIT_SPEED} ${J7ELTE_BT_UART} ${J7ELTE_BT_TYPE} ${J7ELTE_BT_SPEED} ${J7ELTE_BT_FLOW}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

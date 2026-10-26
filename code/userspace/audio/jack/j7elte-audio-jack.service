@@ -1,0 +1,24 @@
+[Unit]
+Description=Samsung Galaxy J7 (j7elte) automatic headset jack routing
+After=sound.target
+ConditionPathExists=/sys/class/switch
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/j7elte-audio-jack --config /etc/j7elte-audio-jack.conf
+Restart=on-failure
+RestartSec=2
+
+# The daemon only reads sysfs and runs alsaucm/amixer; it needs the
+# netlink uevent socket and /dev/snd access.
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+PrivateDevices=false
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_NETLINK
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

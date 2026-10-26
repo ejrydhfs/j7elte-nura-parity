@@ -1,0 +1,1150 @@
+diff --git a/device/archived/j7elte-power/APKBUILD b/device/archived/j7elte-power/APKBUILD
+new file mode 100644
+index 0000000..fc09dc3
+--- /dev/null
++++ b/device/archived/j7elte-power/APKBUILD
+@@ -0,0 +1,68 @@
++# Battery charge limit and capacity_max restore for the Samsung Galaxy J7
++# (SM-J700F/M, "j7elte", Exynos 7580 / SM5703).
++#
++# The vendor 3.10 kernel already exposes the standard power_supply class
++# ("battery", "ac", "usb", "wireless"), so UPower gets level and charging state
++# without any helper.  What userspace was missing:
++#  * the stock ROM's /efs/Battery/batt_capacity_max calibration restore
++#    (/system/bin/lpm does this on Android),
++#  * any way to set a charge limit; the kernel has no
++#    charge_control_end_threshold, only the sec_battery batt_slate_mode knob.
++pkgname=j7elte-power
++pkgver=1.0
++pkgrel=0
++pkgdesc="Battery charge limit and capacity_max restore for Samsung Galaxy J7 (j7elte)"
++url="https://postmarketos.org"
++arch="aarch64"
++license="MIT"
++depends=""
++install="$pkgname.post-install"
++source="
++	j7elte-power.c
++	j7elte-power.conf
++	j7elte-power.service
++	j7elte-efs-restore.service
++	j7elte-power.initd
++	j7elte-efs-restore.initd
++	j7elte-power.post-install
++	restore-capacity-max.sh
++"
++builddir="$srcdir"
++
++build() {
++	${CC:-cc} $CFLAGS -std=c11 -D_GNU_SOURCE -Wall -Wextra \
++		-o j7elte-power j7elte-power.c $LDFLAGS
++}
++
++package() {
++	install -Dm755 j7elte-power \
++		"$pkgdir"/usr/bin/j7elte-power
++	install -Dm755 restore-capacity-max.sh \
++		"$pkgdir"/usr/libexec/j7elte-power/restore-capacity-max
++	install -Dm644 j7elte-power.conf \
++		"$pkgdir"/etc/j7elte-power.conf
++	install -Dm644 j7elte-power.service \
++		"$pkgdir"/usr/lib/systemd/system/j7elte-power.service
++	install -Dm644 j7elte-efs-restore.service \
++		"$pkgdir"/usr/lib/systemd/system/j7elte-efs-restore.service
++
++	# OpenRC is the default service manager on this pmOS port; the systemd
++	# units are installed alongside for systemd images.  The .post-install
++	# script enables the restore service in whichever manager exists and
++	# leaves the opt-in charge-limit daemon disabled.
++	install -Dm755 j7elte-efs-restore.initd \
++		"$pkgdir"/etc/init.d/j7elte-efs-restore
++	install -Dm755 j7elte-power.initd \
++		"$pkgdir"/etc/init.d/j7elte-power
++}
++
++sha512sums="
++39c794087231ebd1f4b74fb0b26bc21e12270d81ffe655f78b6397722e701f3f1a78886fbae467ed31248bcd6a2c7cacd0f993fee251798af2a493f1f605f60e  j7elte-power.c
++dce24255f1ec266120784886c026ebdd78c354f287ae39300da67230dd0b465e2caaf19aafa55102a8a9200831c35daf2147a2e355231beeb3b9ea1e0a58f29a  j7elte-power.conf
++404b353564d5bbdd1d5f26c269a0347fd640615090453d98a7f668259362ac33954b1ebf039525f5dea3d10492e077460e7b637af3a1a561ff4bac7a7e93c82c  j7elte-power.service
++9cd74e5e84ed6da39d5e7ad1b1385c1a2af5cf18ea344abdd2cb86b414d6b9ddf563d21158deb15f1804703edbb05ba611ce5b13a8f56a01d7a835a5c61e55dc  j7elte-efs-restore.service
++502b6d856797078b27dd1469d6dab6e99baae8b90ea24291fb711d96175e6e0beb851841ef5fa00a6f276604dabc8862dbe07b8a015cc783a74d87df4803f37b  j7elte-power.initd
++d28874a4f58129641ce7e03ed64dc9caab1c27f0e403dd3c014990718ee6d1a9c43d77a031909f9116ef942de9098352cd1f19af678e33d4aba9204afc36c338  j7elte-efs-restore.initd
++397d791eafa3e7ae8453df0285c9d0e140062140fc87d85a254803867be771e00484958dcf48ddb94f6c4cfcb0ef97de500ad81d7534e19723b8fc0456e7c2e8  j7elte-power.post-install
++5d46f303e231323dc199588c322e75a9992698974730a4f9685e8c6d6a955d48b652d057439a814d14b975f0062dc6565ad46f048a33bac1195a492255f84bf9  restore-capacity-max.sh
++"
+diff --git a/device/archived/j7elte-power/j7elte-efs-restore.initd b/device/archived/j7elte-power/j7elte-efs-restore.initd
+new file mode 100755
+index 0000000..fe7f2fb
+--- /dev/null
++++ b/device/archived/j7elte-power/j7elte-efs-restore.initd
+@@ -0,0 +1,23 @@
++#!/sbin/openrc-run
++# Restore the SM5703 fuelgauge capacity_max calibration that the stock ROM
++# keeps in /efs/Battery/batt_capacity_max (stock Android does this in
++# /system/bin/lpm).  The helper mounts the EFS partition read-only, writes the
++# value to /sys/class/power_supply/battery/batt_capacity_max, unmounts again,
++# and exits 0 for every expected failure (no EFS partition, no fuelgauge), so
++# this service can never fail the boot.
++#
++# OpenRC equivalent of j7elte-efs-restore.service.
++
++description="Restore battery capacity_max from EFS (j7elte)"
++command="/usr/libexec/j7elte-power/restore-capacity-max"
++command_args=""
++pidfile="/run/${RC_SVCNAME}.pid"
++
++depend() {
++	need localmount
++	after udev-settle
++}
++
++start_pre() {
++	checkpath -d -m 0755 /run
++}
+diff --git a/device/archived/j7elte-power/j7elte-efs-restore.service b/device/archived/j7elte-power/j7elte-efs-restore.service
+new file mode 100644
+index 0000000..058004c
+--- /dev/null
++++ b/device/archived/j7elte-power/j7elte-efs-restore.service
+@@ -0,0 +1,13 @@
++[Unit]
++Description=Restore battery capacity_max from EFS (Samsung Galaxy J7 / j7elte)
++After=local-fs.target systemd-udev-settle.service
++Wants=systemd-udev-settle.service
++ConditionPathExists=/sys/class/power_supply/battery/batt_capacity_max
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++ExecStart=/usr/libexec/j7elte-power/restore-capacity-max
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/device/archived/j7elte-power/j7elte-power.c b/device/archived/j7elte-power/j7elte-power.c
+new file mode 100644
+index 0000000..9656925
+--- /dev/null
++++ b/device/archived/j7elte-power/j7elte-power.c
+@@ -0,0 +1,777 @@
++/*
++ * j7elte-power - battery charge-limit daemon for the Samsung Galaxy J7
++ *                (SM-J700F/M, "j7elte", Exynos 7580 + SM5703).
++ *
++ * The 3.10 vendor kernel exposes the standard power_supply class for the
++ * "battery" device, so UPower already gets capacity/status/present without
++ * any help.  Two things the kernel does not do by itself are handled here:
++ *
++ *   1. The stock ROM's /system/bin/lpm ("LPMBattery") restores the fuelgauge
++ *      capacity_max calibration from /efs/Battery/batt_capacity_max at boot
++ *      and persists the value the gauge learns at runtime.  The boot half is
++ *      done by restore-capacity-max (shipped with this package).  Persistence
++ *      of the learned value is an opt-in feature of this daemon because it
++ *      writes to the EFS partition.
++ *
++ *   2. Charge limiting (e.g. stop at 80%).  The SM5703/sec-battery driver has
++ *      no charge_control_end_threshold; the only supported way to stop
++ *      charging from userspace is the battery driver's "batt_slate_mode"
++ *      attribute.  While it is 1 the driver disables charger current,
++ *      disables the charger if the battery data says always_enable, and
++ *      reports cable_type = BATTERY, i.e. status "Discharging" and
++ *      ac/usb "online" = 0.  That is exactly what a charge limit looks like
++ *      to UPower, and it is reverted as soon as the limit is released.
++ *
++ * Written against the interfaces that actually exist in
++ * android_kernel_samsung_universal7580 (3.10.108), not against mainline
++ * charge_control_* attributes.
++ *
++ * License: MIT
++ */
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <linux/netlink.h>
++
++#define DEFAULT_CONF		"/etc/j7elte-power.conf"
++#define DEFAULT_BATTERY_DIR	"/sys/class/power_supply/battery"
++#define DEFAULT_EFS_FILE	"/efs/Battery/batt_capacity_max"
++
++/* Same sanity window the kernel store handler uses for batt_capacity_max:
++ * sec_battery.c only forwards values > 800 and < 1200 to the fuelgauge, and
++ * sm5703_fuelgauge.c then clamps them to [capacity_max - margin, capacity_max
++ * + margin], i.e. [910, 1060] with the j7elte device tree (990/70): values
++ * below 910 become 920, values above 1060 become 1060.  Keep the same gate
++ * for persistence. */
++#define CAP_MAX_MIN		801
++#define CAP_MAX_MAX		1199
++
++/* batt_slate_mode is the only writable charge control of this kernel. */
++#define SLATE_ATTR		"batt_slate_mode"
++#define CAP_MAX_ATTR		"batt_capacity_max"
++#define CAPACITY_ATTR		"capacity"
++#define STATUS_ATTR		"status"
++
++struct config {
++	char	battery_dir[PATH_MAX];
++	char	efs_file[PATH_MAX];
++	int	charge_limit;		/* percent, 0 = disabled */
++	int	resume_margin;		/* percent */
++	int	poll_interval;		/* seconds, safety poll */
++	int	persist_capacity_max;	/* 0/1 */
++};
++
++static volatile sig_atomic_t g_stop;
++
++/* Charge limiting state: 1 only when this process wrote slate_mode=1 and has
++ * not released it yet.  We never clear a slate_mode we did not set. */
++static int g_limited;
++static long long g_last_slate_write;
++static int g_warned_battery_io;
++
++static void logmsg(const char *fmt, ...)
++{
++	va_list ap;
++
++	fputs("j7elte-power: ", stderr);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
++	fflush(stderr);
++}
++
++static void on_signal(int sig)
++{
++	(void)sig;
++	g_stop = 1;
++}
++
++/* Monotonic seconds; wall-clock jumps must not disturb the safety poll. */
++static long long now_sec(void)
++{
++	struct timespec ts;
++
++	if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
++		return (long long)time(NULL);
++	return (long long)ts.tv_sec;
++}
++
++/* snprintf wrapper: returns 0, or -1 with errno = ENAMETOOLONG. */
++static int build_path(char *out, size_t n, const char *fmt, ...)
++{
++	va_list ap;
++	int r;
++
++	va_start(ap, fmt);
++	r = vsnprintf(out, n, fmt, ap);
++	va_end(ap);
++	if (r < 0 || (size_t)r >= n) {
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return 0;
++}
++
++/* Read a sysfs attribute into buf, strip trailing whitespace.
++ * Returns 0 on success, -1 on error (errno preserved). */
++static int read_small(const char *path, char *buf, size_t len)
++{
++	ssize_t n;
++	size_t i;
++	int fd, saved;
++
++	fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++
++	n = read(fd, buf, len - 1);
++	saved = errno;
++	close(fd);
++	if (n < 0) {
++		errno = saved;
++		return -1;
++	}
++	buf[n] = '\0';
++	for (i = (size_t)n; i > 0; i--) {
++		char c = buf[i - 1];
++
++		if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
++			break;
++		buf[i - 1] = '\0';
++	}
++	return 0;
++}
++
++static int read_int(const char *path, int *out)
++{
++	char buf[64];
++	char *end;
++	long v;
++
++	if (read_small(path, buf, sizeof(buf)) < 0)
++		return -1;
++	errno = 0;
++	v = strtol(buf, &end, 10);
++	if (errno != 0 || end == buf) {
++		errno = EINVAL;
++		return -1;
++	}
++	*out = (int)v;
++	return 0;
++}
++
++static int write_int(const char *path, int value)
++{
++	char buf[32];
++	ssize_t n, w;
++	int fd, saved;
++
++	n = snprintf(buf, sizeof(buf), "%d\n", value);
++	if (n <= 0 || (size_t)n >= sizeof(buf)) {
++		errno = EINVAL;
++		return -1;
++	}
++
++	fd = open(path, O_WRONLY | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	w = write(fd, buf, (size_t)n);
++	saved = errno;
++	close(fd);
++	if (w != n) {
++		errno = (w < 0) ? saved : EIO;
++		return -1;
++	}
++	return 0;
++}
++
++/* Write "<value>\n" to an EFS file atomically (tmp + fsync + rename + dir fsync).
++ * Only valid for a read-write EFS mount; the caller decides whether to try. */
++static int write_file_atomic(const char *path, int value)
++{
++	char tmp[PATH_MAX], *slash;
++	char buf[32];
++	ssize_t n, w;
++	int fd, dfd, saved;
++
++	if (build_path(tmp, sizeof(tmp), "%s.tmp", path) < 0)
++		return -1;
++
++	n = snprintf(buf, sizeof(buf), "%d\n", value);
++	if (n <= 0 || (size_t)n >= sizeof(buf)) {
++		errno = EINVAL;
++		return -1;
++	}
++
++	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++	if (fd < 0)
++		return -1;
++	w = write(fd, buf, (size_t)n);
++	if (w != n) {
++		saved = errno;
++		close(fd);
++		unlink(tmp);
++		errno = (w < 0) ? saved : EIO;
++		return -1;
++	}
++	if (fsync(fd) < 0) {
++		saved = errno;
++		close(fd);
++		unlink(tmp);
++		errno = saved;
++		return -1;
++	}
++	close(fd);
++
++	if (rename(tmp, path) < 0) {
++		saved = errno;
++		unlink(tmp);
++		errno = saved;
++		return -1;
++	}
++
++	/* Make the rename durable as well (best effort: the value is already
++	 * in place). */
++	if (build_path(tmp, sizeof(tmp), "%s", path) == 0) {
++		slash = strrchr(tmp, '/');
++		if (slash != NULL) {
++			*slash = '\0';
++			dfd = open(tmp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++			if (dfd >= 0) {
++				(void)fsync(dfd);
++				close(dfd);
++			}
++		}
++	}
++	return 0;
++}
++
++/* ------------------------------ config ---------------------------------- */
++
++static void config_defaults(struct config *c)
++{
++	memset(c, 0, sizeof(*c));
++	snprintf(c->battery_dir, sizeof(c->battery_dir), "%s", DEFAULT_BATTERY_DIR);
++	snprintf(c->efs_file, sizeof(c->efs_file), "%s", DEFAULT_EFS_FILE);
++	c->charge_limit = 0;
++	c->resume_margin = 5;
++	c->poll_interval = 60;
++	c->persist_capacity_max = 0;
++}
++
++static char *trim(char *s)
++{
++	char *end;
++
++	while (*s == ' ' || *s == '\t')
++		s++;
++	end = s + strlen(s);
++	while (end > s && (end[-1] == ' ' || end[-1] == '\t' ||
++			   end[-1] == '\n' || end[-1] == '\r'))
++		*--end = '\0';
++	return s;
++}
++
++/* Strip one pair of matching single or double quotes. */
++static void strip_quotes(char *s)
++{
++	size_t n = strlen(s);
++
++	if (n < 2)
++		return;
++	if ((s[0] == '"' && s[n - 1] == '"') ||
++	    (s[0] == '\'' && s[n - 1] == '\'')) {
++		memmove(s, s + 1, n - 2);
++		s[n - 2] = '\0';
++	}
++}
++
++static int parse_nonneg(const char *s, int *out)
++{
++	char *end;
++	long v;
++
++	errno = 0;
++	v = strtol(s, &end, 10);
++	if (errno != 0 || end == s || *end != '\0' || v < 0 || v > INT_MAX)
++		return -1;
++	*out = (int)v;
++	return 0;
++}
++
++/* Missing config file is not an error: built-in defaults apply. */
++static int config_load(struct config *c, const char *path)
++{
++	FILE *f;
++	char line[512];
++	int lineno = 0;
++
++	f = fopen(path, "re");
++	if (f == NULL) {
++		if (errno == ENOENT)
++			return 0;
++		logmsg("cannot open %s: %s", path, strerror(errno));
++		return -1;
++	}
++
++	while (fgets(line, sizeof(line), f) != NULL) {
++		char *key, *value, *eq;
++
++		lineno++;
++		key = trim(line);
++		if (*key == '\0' || *key == '#')
++			continue;
++		eq = strchr(key, '=');
++		if (eq == NULL) {
++			logmsg("%s:%d: expected key=value, ignoring", path, lineno);
++			continue;
++		}
++		*eq = '\0';
++		value = trim(eq + 1);
++		key = trim(key);
++		strip_quotes(value);
++
++		if (strcmp(key, "battery_dir") == 0) {
++			snprintf(c->battery_dir, sizeof(c->battery_dir), "%s", value);
++		} else if (strcmp(key, "efs_capacity_max_file") == 0) {
++			snprintf(c->efs_file, sizeof(c->efs_file), "%s", value);
++		} else if (strcmp(key, "charge_limit") == 0) {
++			if (parse_nonneg(value, &c->charge_limit) < 0)
++				logmsg("%s:%d: bad charge_limit '%s'", path, lineno, value);
++		} else if (strcmp(key, "resume_margin") == 0) {
++			if (parse_nonneg(value, &c->resume_margin) < 0)
++				logmsg("%s:%d: bad resume_margin '%s'", path, lineno, value);
++		} else if (strcmp(key, "poll_interval") == 0) {
++			if (parse_nonneg(value, &c->poll_interval) < 0)
++				logmsg("%s:%d: bad poll_interval '%s'", path, lineno, value);
++		} else if (strcmp(key, "persist_capacity_max") == 0) {
++			if (parse_nonneg(value, &c->persist_capacity_max) < 0)
++				logmsg("%s:%d: bad persist_capacity_max '%s'", path, lineno, value);
++		} else {
++			logmsg("%s:%d: unknown key '%s', ignoring", path, lineno, key);
++		}
++	}
++	fclose(f);
++
++	if (c->charge_limit != 0 &&
++	    (c->charge_limit < 50 || c->charge_limit > 100)) {
++		logmsg("charge_limit=%d out of range 50..100, disabling",
++		       c->charge_limit);
++		c->charge_limit = 0;
++	}
++	if (c->resume_margin < 1 || c->resume_margin > 20) {
++		logmsg("resume_margin=%d out of range 1..20, using 5",
++		       c->resume_margin);
++		c->resume_margin = 5;
++	}
++	if (c->poll_interval < 5 || c->poll_interval > 3600) {
++		logmsg("poll_interval=%d out of range 5..3600, using 60",
++		       c->poll_interval);
++		c->poll_interval = 60;
++	}
++	return 0;
++}
++
++/* ---------------------------- uevent socket ------------------------------ */
++
++static int open_uevent(void)
++{
++	struct sockaddr_nl sa;
++	int fd, flags;
++
++	fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
++	if (fd < 0)
++		return -1;
++
++	memset(&sa, 0, sizeof(sa));
++	sa.nl_family = AF_NETLINK;
++	sa.nl_groups = 1;	/* kernel broadcast group */
++	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
++		close(fd);
++		return -1;
++	}
++
++	flags = fcntl(fd, F_GETFL);
++	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
++		close(fd);
++		return -1;
++	}
++	return fd;
++}
++
++/* A netlink uevent payload is a sequence of NUL-terminated "key=value"
++ * fields ("add@/devices/...\0ACTION=add\0DEVPATH=...\0SUBSYSTEM=...\0").
++ * strstr() stops at the first NUL, so match field by field over the whole
++ * received length instead. */
++static bool uevent_is_power_supply(const char *buf, size_t len)
++{
++	static const char tag[] = "SUBSYSTEM=power_supply";
++	size_t off = 0;
++
++	while (off < len) {
++		size_t n = strnlen(buf + off, len - off);
++
++		if (n == sizeof(tag) - 1 &&
++		    memcmp(buf + off, tag, sizeof(tag) - 1) == 0)
++			return true;
++		off += n + 1;
++	}
++	return false;
++}
++
++/* Drain all pending uevents; return true if any was a power_supply change. */
++static bool uevent_drain_power(int fd)
++{
++	char buf[2048];
++	bool seen = false;
++	int guard = 0;
++
++	while (guard++ < 256) {
++		ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
++
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			break;	/* EAGAIN: queue empty */
++		}
++		if (n == 0)
++			break;
++		buf[n] = '\0';
++		if (uevent_is_power_supply(buf, (size_t)n))
++			seen = true;
++	}
++	return seen;
++}
++
++/* ---------------------------- charge control ----------------------------- */
++
++static int set_slate_mode(const struct config *c, int on)
++{
++	char path[PATH_MAX];
++
++	if (build_path(path, sizeof(path), "%s/%s", c->battery_dir, SLATE_ATTR) < 0)
++		return -1;
++	if (write_int(path, on) < 0) {
++		logmsg("cannot write %s: %s", path, strerror(errno));
++		return -1;
++	}
++	g_last_slate_write = now_sec();
++	return 0;
++}
++
++/* Current batt_slate_mode: 1/0, or -1 if the attribute cannot be read. */
++static int read_slate_mode(const struct config *c)
++{
++	char path[PATH_MAX];
++	int v;
++
++	if (build_path(path, sizeof(path), "%s/%s", c->battery_dir, SLATE_ATTR) < 0)
++		return -1;
++	if (read_int(path, &v) < 0)
++		return -1;
++	return v != 0;
++}
++
++static int read_online(const char *base, const char *psy)
++{
++	char path[PATH_MAX];
++	int v;
++
++	if (build_path(path, sizeof(path), "%s/%s/online", base, psy) < 0)
++		return 0;
++	if (read_int(path, &v) < 0)
++		return 0;	/* absent supply / read error -> not online */
++	return v != 0;
++}
++
++static bool charger_plugged(const struct config *c)
++{
++	char base[PATH_MAX], *slash;
++
++	snprintf(base, sizeof(base), "%s", c->battery_dir);
++	slash = strrchr(base, '/');
++	if (slash == NULL)
++		return false;
++	*slash = '\0';		/* /sys/class/power_supply */
++
++	return read_online(base, "ac") ||
++	       read_online(base, "usb") ||
++	       read_online(base, "wireless");
++}
++
++static void log_battery_error_once(const char *what, const char *path)
++{
++	if (g_warned_battery_io)
++		return;
++	logmsg("cannot read %s (%s): %s", what, path, strerror(errno));
++	g_warned_battery_io = 1;
++}
++
++/* Read capacity/status and drive the limit latch. */
++static void evaluate(const struct config *c)
++{
++	char path[PATH_MAX], status[64];
++	int capacity;
++	bool plugged;
++
++	if (build_path(path, sizeof(path), "%s/%s", c->battery_dir, CAPACITY_ATTR) < 0)
++		return;
++	if (read_int(path, &capacity) < 0) {
++		log_battery_error_once("capacity", path);
++		return;
++	}
++	g_warned_battery_io = 0;
++
++	plugged = charger_plugged(c);
++
++	/* g_limited can only be set while charge_limit > 0; a fresh process with
++	 * limiting disabled never touches batt_slate_mode. */
++	if (c->charge_limit <= 0)
++		return;
++
++	if (!g_limited) {
++		if (plugged && capacity >= c->charge_limit) {
++			if (set_slate_mode(c, 1) == 0) {
++				g_limited = 1;
++				logmsg("capacity %d%% >= limit %d%%, charging stopped",
++				       capacity, c->charge_limit);
++			}
++		}
++		return;
++	}
++
++	/* Latched: release when the pack has dropped by the resume margin. */
++	if (capacity <= c->charge_limit - c->resume_margin) {
++		if (set_slate_mode(c, 0) == 0) {
++			g_limited = 0;
++			logmsg("capacity %d%% <= %d%%, charging resumed",
++			       capacity, c->charge_limit - c->resume_margin);
++		}
++		return;
++	}
++
++	/* The battery driver re-enables charging on some temperature/health
++	 * recoveries.  If we see it charging again above the limit, re-apply
++	 * the latch (rate limited to avoid a write/uevent storm). */
++	if (!plugged)
++		return;
++	if (build_path(path, sizeof(path), "%s/%s", c->battery_dir, STATUS_ATTR) < 0)
++		return;
++	if (read_small(path, status, sizeof(status)) < 0)
++		return;
++	if (strcmp(status, "Charging") == 0 &&
++	    now_sec() - g_last_slate_write >= 30) {
++		logmsg("charging restarted above limit (%d%%), re-applying",
++		       capacity);
++		set_slate_mode(c, 1);	/* latch stays 1 */
++	}
++}
++
++/* --------------------- capacity_max persistence (opt-in) ----------------- */
++
++static int g_persisted = -1;
++
++static void persist_capacity_max(const struct config *c)
++{
++	char path[PATH_MAX];
++	int value, saved;
++
++	if (!c->persist_capacity_max)
++		return;
++	if (build_path(path, sizeof(path), "%s/%s", c->battery_dir, CAP_MAX_ATTR) < 0)
++		return;
++	if (read_int(path, &value) < 0)
++		return;
++	if (value < CAP_MAX_MIN || value > CAP_MAX_MAX)
++		return;
++	if (value == g_persisted)
++		return;
++
++	if (write_file_atomic(c->efs_file, value) < 0) {
++		saved = errno;
++		/* ENOENT/EROFS means /efs is not mounted read-write; retry on
++		 * the next poll without flooding the log. */
++		if (saved != ENOENT && saved != EROFS && saved != EACCES)
++			logmsg("cannot persist capacity_max to %s: %s",
++			       c->efs_file, strerror(saved));
++		return;
++	}
++	logmsg("persisted learned capacity_max=%d to %s", value, c->efs_file);
++	g_persisted = value;
++}
++
++/* --------------------------------- main ---------------------------------- */
++
++static void usage(const char *argv0)
++{
++	printf("usage: %s [--config PATH] [--once]\n", argv0);
++	printf("\n");
++	printf("  --config PATH  configuration file (default %s)\n", DEFAULT_CONF);
++	printf("  --once         evaluate and persist once, then exit\n");
++}
++
++int main(int argc, char **argv)
++{
++	struct config cfg;
++	const char *conf_path = DEFAULT_CONF;
++	int once = 0;
++	int uevent_fd, i;
++	long long last_poll;
++	struct sigaction sa;
++
++	for (i = 1; i < argc; i++) {
++		if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
++			conf_path = argv[++i];
++		} else if (strcmp(argv[i], "--once") == 0) {
++			once = 1;
++		} else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
++			usage(argv[0]);
++			return 0;
++		} else {
++			logmsg("unknown argument '%s'", argv[i]);
++			usage(argv[0]);
++			return 2;
++		}
++	}
++
++	config_defaults(&cfg);
++	if (config_load(&cfg, conf_path) < 0)
++		return 1;
++
++	if (access(cfg.battery_dir, F_OK) < 0) {
++		logmsg("%s not present: sec_battery driver not probed?",
++		       cfg.battery_dir);
++		return 1;
++	}
++
++	if (cfg.charge_limit == 0 && !cfg.persist_capacity_max && !once) {
++		logmsg("no work configured (charge_limit=0, persist_capacity_max=0); "
++		       "capacity_max restore is handled by "
++		       "j7elte-efs-restore.service");
++		return 0;
++	}
++
++	memset(&sa, 0, sizeof(sa));
++	sa.sa_handler = on_signal;
++	sigemptyset(&sa.sa_mask);
++	sigaction(SIGTERM, &sa, NULL);
++	sigaction(SIGINT, &sa, NULL);
++	sigaction(SIGHUP, &sa, NULL);
++
++	/* Seed the persisted value so the first check does not rewrite an
++	 * unchanged file. */
++	if (cfg.persist_capacity_max) {
++		int v;
++
++		if (read_int(cfg.efs_file, &v) == 0)
++			g_persisted = v;
++	}
++
++	uevent_fd = open_uevent();
++	if (uevent_fd < 0)
++		logmsg("uevent socket unavailable (%s), falling back to polling",
++		       strerror(errno));
++
++	logmsg("started: battery=%s limit=%d%% margin=%d%% poll=%ds persist=%d",
++	       cfg.battery_dir, cfg.charge_limit, cfg.resume_margin,
++	       cfg.poll_interval, cfg.persist_capacity_max);
++
++	/* A previous instance (or a crash/SIGKILL) may have left the latch
++	 * engaged.  Adopt it so the normal resume path can release it;
++	 * otherwise charging would stay disabled after a service restart.
++	 * With limiting disabled the attribute is never touched. */
++	if (cfg.charge_limit > 0 && read_slate_mode(&cfg) == 1) {
++		g_limited = 1;
++		g_last_slate_write = now_sec();
++		logmsg("adopting pre-existing batt_slate_mode=1");
++	}
++
++	/* Apply the limit immediately: booting at 90% with limit=80 must stop
++	 * charging without waiting for the next uevent. */
++	evaluate(&cfg);
++	persist_capacity_max(&cfg);
++
++	if (once) {
++		if (uevent_fd >= 0)
++			close(uevent_fd);
++		return 0;
++	}
++
++	last_poll = now_sec();
++
++	while (!g_stop) {
++		struct pollfd pfd;
++		long long elapsed;
++		int timeout_ms;
++		int r;
++		elapsed = now_sec() - last_poll;
++		if (elapsed < 0)
++			elapsed = 0;
++		if (elapsed >= cfg.poll_interval)
++			timeout_ms = 0;
++		else
++			timeout_ms = (int)((cfg.poll_interval - elapsed) * 1000);
++
++		pfd.fd = uevent_fd;
++		pfd.events = POLLIN;
++		pfd.revents = 0;
++
++		r = poll(uevent_fd >= 0 ? &pfd : NULL,
++			 uevent_fd >= 0 ? 1 : 0,
++			 timeout_ms);
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			logmsg("poll: %s", strerror(errno));
++			break;
++		}
++
++		if (r > 0 && (pfd.revents & POLLIN) &&
++		    uevent_drain_power(uevent_fd)) {
++			evaluate(&cfg);
++			persist_capacity_max(&cfg);
++			last_poll = now_sec();
++			continue;
++		}
++
++		/* Safety poll: elapsed time, not poll()'s return value, so a
++		 * stream of unrelated uevents cannot starve it. */
++		if (now_sec() - last_poll >= cfg.poll_interval) {
++			evaluate(&cfg);
++			persist_capacity_max(&cfg);
++			last_poll = now_sec();
++		}
++	}
++
++	if (uevent_fd >= 0)
++		close(uevent_fd);
++
++	/* Never leave the charger disabled because the service stopped. */
++	if (g_limited) {
++		if (set_slate_mode(&cfg, 0) == 0)
++			logmsg("exiting: charge limit released");
++		else
++			logmsg("exiting: FAILED to release charge limit; write 0 to "
++			       "%s/%s manually", cfg.battery_dir, SLATE_ATTR);
++	}
++	logmsg("stopped");
++	return 0;
++}
+diff --git a/device/archived/j7elte-power/j7elte-power.conf b/device/archived/j7elte-power/j7elte-power.conf
+new file mode 100644
+index 0000000..d7ca390
+--- /dev/null
++++ b/device/archived/j7elte-power/j7elte-power.conf
+@@ -0,0 +1,36 @@
++# j7elte-power configuration (Samsung Galaxy J7, j7elte)
++#
++# This file is read by /usr/bin/j7elte-power and is sourced as shell by
++# /usr/libexec/j7elte-power/restore-capacity-max, so keep it to simple
++# key=value lines without spaces around '='.
++
++# Battery power_supply directory (the sec_battery "battery" device).
++battery_dir=/sys/class/power_supply/battery
++
++# Where the stock ROM (/system/bin/lpm) stores the fuelgauge capacity_max
++# calibration.  Read at boot by restore-capacity-max; written back only when
++# persist_capacity_max=1 and /efs is mounted read-write.
++efs_capacity_max_file=/efs/Battery/batt_capacity_max
++
++# Stop charging when the reported capacity reaches this percentage and resume
++# at charge_limit - resume_margin.  0 disables charge limiting.
++#
++# The kernel has no charge_control_end_threshold.  The limit is implemented
++# with the sec_battery driver's batt_slate_mode control, which stops charger
++# current and reports the pack as "Discharging" (status) with ac/usb online=0
++# while the cable is still attached.  Nothing is written unless this is > 0.
++charge_limit=0
++
++# Resume hysteresis in percent (1..20).
++resume_margin=5
++
++# Safety poll interval in seconds.  Capacity/status changes are normally seen
++# through power_supply uevents; this is the fallback when no uevent arrives.
++poll_interval=60
++
++# Persist the capacity_max value the fuelgauge learns at runtime back to
++# efs_capacity_max_file, like the stock lpm daemon does.  Requires /efs to be
++# mounted read-write (it is not mounted by default in postmarketOS).  The value
++# is only written when it changed and lies in the same 801..1199 window the
++# kernel accepts.  0 = off.
++persist_capacity_max=0
+diff --git a/device/archived/j7elte-power/j7elte-power.initd b/device/archived/j7elte-power/j7elte-power.initd
+new file mode 100755
+index 0000000..4946f0c
+--- /dev/null
++++ b/device/archived/j7elte-power/j7elte-power.initd
+@@ -0,0 +1,25 @@
++#!/sbin/openrc-run
++# Battery charge limit for the Samsung Galaxy J7 (j7elte).
++#
++# Opt-in: set charge_limit in /etc/j7elte-power.conf and run
++#   rc-update add j7elte-power default && rc-service j7elte-power start
++# The daemon exits 0 immediately when both charge_limit and
++# persist_capacity_max are disabled, so adding it to a runlevel without
++# configuration is harmless.
++#
++# OpenRC equivalent of j7elte-power.service.
++
++description="Battery charge limit (Samsung Galaxy J7 / j7elte)"
++command="/usr/bin/j7elte-power"
++command_args="--config /etc/j7elte-power.conf"
++command_background="true"
++pidfile="/run/${RC_SVCNAME}.pid"
++
++depend() {
++	need localmount
++	after j7elte-efs-restore
++}
++
++start_pre() {
++	checkpath -d -m 0755 /run
++}
+diff --git a/device/archived/j7elte-power/j7elte-power.post-install b/device/archived/j7elte-power/j7elte-power.post-install
+new file mode 100755
+index 0000000..eb76647
+--- /dev/null
++++ b/device/archived/j7elte-power/j7elte-power.post-install
+@@ -0,0 +1,22 @@
++#!/bin/sh
++
++# The capacity_max restore must always run at boot; the charge-limit daemon is
++# opt-in (charge_limit=0 by default) and is not enabled here.
++
++post_install() {
++	if [ -d /etc/runlevels ] && command -v rc-update >/dev/null 2>&1; then
++		rc-update add j7elte-efs-restore default >/dev/null 2>&1 || true
++	elif command -v systemctl >/dev/null 2>&1; then
++		systemctl enable j7elte-efs-restore.service >/dev/null 2>&1 || true
++	fi
++}
++
++pre_deinstall() {
++	if [ -d /etc/runlevels ] && command -v rc-update >/dev/null 2>&1; then
++		rc-update del j7elte-efs-restore default >/dev/null 2>&1 || true
++		rc-update del j7elte-power default >/dev/null 2>&1 || true
++	elif command -v systemctl >/dev/null 2>&1; then
++		systemctl disable j7elte-efs-restore.service >/dev/null 2>&1 || true
++		systemctl disable j7elte-power.service >/dev/null 2>&1 || true
++	fi
++}
+diff --git a/device/archived/j7elte-power/j7elte-power.service b/device/archived/j7elte-power/j7elte-power.service
+new file mode 100644
+index 0000000..75d28d2
+--- /dev/null
++++ b/device/archived/j7elte-power/j7elte-power.service
+@@ -0,0 +1,13 @@
++[Unit]
++Description=Battery charge limit (Samsung Galaxy J7 / j7elte)
++After=local-fs.target j7elte-efs-restore.service
++Wants=j7elte-efs-restore.service
++
++[Service]
++Type=simple
++ExecStart=/usr/bin/j7elte-power --config /etc/j7elte-power.conf
++Restart=on-failure
++RestartSec=10
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/device/archived/j7elte-power/restore-capacity-max.sh b/device/archived/j7elte-power/restore-capacity-max.sh
+new file mode 100755
+index 0000000..851d16e
+--- /dev/null
++++ b/device/archived/j7elte-power/restore-capacity-max.sh
+@@ -0,0 +1,119 @@
++#!/bin/sh
++# Restore the SM5703 fuelgauge capacity_max calibration that the stock ROM
++# keeps in /efs/Battery/batt_capacity_max.
++#
++# Stock behaviour: /system/bin/lpm ("LPMBattery", the binary the ROM runs as
++# its battery daemon) reads that file on boot and writes the value to
++# /sys/class/power_supply/battery/batt_capacity_max, then stores the value the
++# gauge learns back into the file.  This script does the boot half.  The
++# write-back half is opt-in in j7elte-power.conf (persist_capacity_max=1).
++#
++# postmarketOS does not mount /efs, so the script mounts the EFS partition
++# read-only for the duration of the restore and unmounts it again.  It never
++# fails the unit: a missing or unreadable EFS partition is reported and
++# ignored, leaving the device-tree default (990) in place.
++#
++# Overridable from the environment:
++#   J7ELTE_POWER_CONF  config file (default /etc/j7elte-power.conf)
++#   J7ELTE_EFS_MOUNT   mount point (default /efs)
++#   J7ELTE_EFS_DEVICE  block device to mount (default: resolve by label)
++#   J7ELTE_FORCE_RW    1 = mount read-write (only useful with persist enabled)
++
++set -u
++
++CONF=${J7ELTE_POWER_CONF:-/etc/j7elte-power.conf}
++efs_mount=${J7ELTE_EFS_MOUNT:-/efs}
++efs_device=${J7ELTE_EFS_DEVICE:-}
++force_rw=${J7ELTE_FORCE_RW:-0}
++
++# Defaults matching a pristine j7elte-power.conf; the file may override the
++# two keys this script needs.
++battery_dir=/sys/class/power_supply/battery
++efs_capacity_max_file=/efs/Battery/batt_capacity_max
++
++if [ -r "$CONF" ]; then
++	# shellcheck disable=SC1090
++	. "$CONF"
++fi
++
++log() {
++	echo "j7elte-power-restore: $*" >&2
++}
++
++bat_attr="$battery_dir/batt_capacity_max"
++
++if [ ! -e "$bat_attr" ]; then
++	log "$bat_attr not present (fuelgauge not probed?); nothing to restore"
++	exit 0
++fi
++
++mounted_by_us=0
++if ! grep -qs "[[:space:]]$efs_mount[[:space:]]" /proc/mounts; then
++	if [ -z "$efs_device" ]; then
++		# The Exynos eMMC partition table is a GPT whose names match the
++		# Samsung PIT (EFS is a real partition there); udev creates the
++		# by-partlabel symlink.  The Android-style by-name path is kept as
++		# a fallback in case the device is booted with an Android-style
++		# init that creates it.
++		for cand in \
++			/dev/disk/by-partlabel/EFS \
++			/dev/block/platform/13540000.dwmmc0/by-name/EFS
++		do
++			if [ -e "$cand" ]; then
++				efs_device=$cand
++				break
++			fi
++		done
++	fi
++
++	if [ -z "$efs_device" ]; then
++		log "EFS partition not found; skipping capacity_max restore"
++		exit 0
++	fi
++
++	if [ ! -d "$efs_mount" ]; then
++		mkdir -p "$efs_mount" || {
++			log "cannot create $efs_mount"
++			exit 0
++		}
++	fi
++
++	mount_opts="ro,nosuid,nodev,noatime"
++	[ "$force_rw" = "1" ] && mount_opts="rw,nosuid,nodev,noatime"
++
++	if ! mount -t ext4 -o "$mount_opts" "$efs_device" "$efs_mount"; then
++		log "cannot mount $efs_device on $efs_mount; skipping restore"
++		exit 0
++	fi
++	mounted_by_us=1
++fi
++
++value=""
++if [ -r "$efs_capacity_max_file" ]; then
++	# The ROM writes a plain decimal, optionally with a newline.
++	value=$(tr -cd '0-9' < "$efs_capacity_max_file" 2>/dev/null)
++elif [ -e "$efs_capacity_max_file" ]; then
++	log "cannot read $efs_capacity_max_file; leaving device-tree default in place"
++fi
++
++if [ -z "$value" ]; then
++	log "no value in $efs_capacity_max_file; leaving device-tree default in place"
++else
++	# Same window the sec_battery store handler accepts (>800 and <1200).
++	if [ "$value" -le 800 ] || [ "$value" -ge 1200 ]; then
++		log "refusing out-of-range capacity_max=$value (kernel accepts 801..1199)"
++	else
++		if printf '%s\n' "$value" > "$bat_attr" 2>/dev/null; then
++			effective=$(cat "$bat_attr" 2>/dev/null)
++			log "restored capacity_max=$value (effective $effective)"
++		else
++			log "failed to write $bat_attr"
++		fi
++	fi
++fi
++
++if [ "$mounted_by_us" = "1" ]; then
++	umount "$efs_mount" || log "failed to unmount $efs_mount"
++fi
++
++exit 0

@@ -1,0 +1,12 @@
+
+parity/userspace/gpu/blob/libGLES_mali.so:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+0047452c <eglSwapBuffers@@Base>:
+  47452c:	mov	r2, #0
+  474530:	mov	r3, r2
+  474534:	b	215e90 <eglp_swap_buffers@plt>
+  474538:	b	215e90 <eglp_swap_buffers@plt>
+  47453c:	b	215e90 <eglp_swap_buffers@plt>

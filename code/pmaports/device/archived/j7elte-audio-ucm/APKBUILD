@@ -1,0 +1,49 @@
+# Audio routing configuration for the Samsung Galaxy J7 (j7elte).
+#
+# Installs an ALSA UCM2 profile for the ASoC sound card
+# "Universal7580-I2S" (COD3022X codec + S2801X aux codec), derived from
+# the stock ROM mixer graph.  Also installs the ROM's Android HAL jack
+# configuration for reference.
+#
+# Control names were cross-checked against the Nura kernel sources; see
+# parity/reports/audio-userspace.md.
+
+pkgname=j7elte-audio-ucm
+pkgver=0.1
+pkgrel=0
+pkgdesc="ALSA UCM2 profile and jack mixer data for Samsung Galaxy J7 (j7elte)"
+url="https://postmarketos.org"
+arch="aarch64"
+# UCM routes are derived from the stock Samsung ROM mixer_paths.xml.
+license="proprietary"
+options="!check !archcheck"
+depends="alsa-ucm-conf"
+
+source="
+	Universal7580-I2S.conf
+	HiFi.conf
+	VoiceCall.conf
+	jack_alsa_mixer.json
+"
+
+build() {
+	:
+}
+
+package() {
+	install -Dm644 "$srcdir"/Universal7580-I2S.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/conf.d/Universal7580-I2S/Universal7580-I2S.conf
+	install -Dm644 "$srcdir"/HiFi.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/j7elte/HiFi.conf
+	install -Dm644 "$srcdir"/VoiceCall.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/j7elte/VoiceCall.conf
+	install -Dm644 "$srcdir"/jack_alsa_mixer.json \
+		"$pkgdir"/usr/share/j7elte-audio/jack_alsa_mixer.json
+}
+
+sha512sums="
+8789d5411a0daf1dbbbcd41b25c828f4564dff1afb532bde029f196c033207adea06229d8f9281b9fd15f0bb126f5a048b6df68de1b47e0b87355759d41571b3  HiFi.conf
+986bbf48daa3159b236528de1b56a5bc4e2ea064bbc30adca4d564e5de9aa50bbebf8c783ac235dca414a05547997a7b709dc573e1fa75910e1acf64bd1fbb4e  Universal7580-I2S.conf
+bf9f399ad254ee04e629435c16361aa6def0ce85b68cceb802726f4a88dc484ed5fcbbc6e2192b797684d96b656c42bef948d9db5d2400d11b49b8463f91d31a  VoiceCall.conf
+1fae831c79ad1f592003b43222a15a019db964c7513e5dde72ca2d921d4cea2f497198c841e7d9af84f8341ed5891492c75ed42d2be21c62d88041686eeb3ee7  jack_alsa_mixer.json
+"

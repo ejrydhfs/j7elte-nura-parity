@@ -1,0 +1,21 @@
+#!/bin/sh
+
+post_install() {
+	if [ -e /etc/j7elte-bt.disabled ]; then
+		return 0
+	fi
+
+	if [ -d /etc/runlevels ] && command -v rc-update >/dev/null 2>&1; then
+		rc-update add j7elte-bt default >/dev/null 2>&1 || true
+	elif command -v systemctl >/dev/null 2>&1; then
+		systemctl enable j7elte-bt.service >/dev/null 2>&1 || true
+	fi
+}
+
+pre_deinstall() {
+	if [ -d /etc/runlevels ] && command -v rc-update >/dev/null 2>&1; then
+		rc-update del j7elte-bt default >/dev/null 2>&1 || true
+	elif command -v systemctl >/dev/null 2>&1; then
+		systemctl disable j7elte-bt.service >/dev/null 2>&1 || true
+	fi
+}

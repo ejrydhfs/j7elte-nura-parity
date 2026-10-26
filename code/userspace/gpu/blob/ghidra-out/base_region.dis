@@ -1,0 +1,2059 @@
+
+parity/userspace/gpu/blob/libGLES_mali.so:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+00264c00 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x20a0>:
+  264c00:	beq	264c70 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x2110>
+  264c04:	ldr	r2, [r6, #48]	; 0x30
+  264c08:	tst	r2, #16384	; 0x4000
+  264c0c:	bne	264c88 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x2128>
+  264c10:	mov	r0, #16
+  264c14:	bl	2155a8 <malloc@plt>
+  264c18:	subs	sl, r0, #0
+  264c1c:	beq	264c64 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x2104>
+  264c20:	mov	r3, #0
+  264c24:	mov	r1, #4
+  264c28:	str	r6, [sl, #4]
+  264c2c:	mov	r0, r4
+  264c30:	mov	r2, sl
+  264c34:	str	r3, [sl]
+  264c38:	str	r3, [sl, #12]
+  264c3c:	bl	2156b0 <egl_color_buffer_user_property_set@plt>
+  264c40:	subs	r1, r0, #0
+  264c44:	bne	264c90 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x2130>
+  264c48:	mov	r0, r4
+  264c4c:	mov	r4, r1
+  264c50:	bl	215584 <egl_color_buffer_release@plt>
+  264c54:	mov	r0, sl
+  264c58:	bl	215554 <free@plt>
+  264c5c:	movw	r0, #12291	; 0x3003
+  264c60:	b	264af8 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x1f98>
+  264c64:	mov	r0, r4
+  264c68:	mov	r4, sl
+  264c6c:	bl	215584 <egl_color_buffer_release@plt>
+  264c70:	movw	r0, #12291	; 0x3003
+  264c74:	b	264af8 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x1f98>
+  264c78:	ldr	r0, [r8, #4]
+  264c7c:	bl	2156bc <egl_current_context_get_secure@plt>
+  264c80:	ldr	r3, [r6, #48]	; 0x30
+  264c84:	b	264b98 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x2038>
+  264c88:	bl	2156c8 <egl_color_buffer_set_secure_flag@plt>
+  264c8c:	b	264c10 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x20b0>
+  264c90:	mov	r0, r6
+  264c94:	ldr	r7, [r6, #24]
+  264c98:	blx	r7
+  264c9c:	mov	r0, #12288	; 0x3000
+  264ca0:	b	264af8 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x1f98>
+  264ca4:	mov	r4, r0
+  264ca8:	movw	r0, #12300	; 0x300c
+  264cac:	b	264af8 <stdlibp_neon_fast_aligned_memcpy_64@@Base+0x1f98>
+  264cb0:			; <UNDEFINED> instruction: 0xffffe960
+
+00264cb4 <egl_winsys_get_implementation@@Base>:
+  264cb4:	ldr	r0, [pc, #4]	; 264cc0 <egl_winsys_get_implementation@@Base+0xc>
+  264cb8:	add	r0, pc, r0
+  264cbc:	bx	lr
+  264cc0:	smlaltteq	lr, r7, ip, r3
+  264cc4:	ldr	r0, [pc, #40]	; 264cf4 <egl_winsys_get_implementation@@Base+0x40>
+  264cc8:	push	{lr}		; (str lr, [sp, #-4]!)
+  264ccc:	sub	sp, sp, #20
+  264cd0:	add	ip, sp, #12
+  264cd4:	mov	r1, #3
+  264cd8:	mov	r2, #16
+  264cdc:	mov	r3, #1
+  264ce0:	str	ip, [sp]
+  264ce4:	add	r0, pc, r0
+  264ce8:	bl	462598 <_ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base+0x5ee4>
+  264cec:	add	sp, sp, #20
+  264cf0:	pop	{pc}		; (ldr pc, [sp], #4)
+  264cf4:			; <UNDEFINED> instruction: 0xffffef1c
+  264cf8:	strd	r4, [sp, #-16]!
+  264cfc:	mov	r5, r0
+  264d00:	mov	r0, #12
+  264d04:	str	r6, [sp, #8]
+  264d08:	str	lr, [sp, #12]
+  264d0c:	bl	2155a8 <malloc@plt>
+  264d10:	subs	r4, r0, #0
+  264d14:	beq	264d38 <egl_winsys_get_implementation@@Base+0x84>
+  264d18:	lsl	r0, r5, #3
+  264d1c:	bl	2155a8 <malloc@plt>
+  264d20:	cmp	r0, #0
+  264d24:	mov	r3, r0
+  264d28:	str	r0, [r4]
+  264d2c:	beq	264d4c <egl_winsys_get_implementation@@Base+0x98>
+  264d30:	mov	r3, #0
+  264d34:	stmib	r4, {r3, r5}
+  264d38:	mov	r0, r4
+  264d3c:	ldr	r6, [sp, #8]
+  264d40:	ldrd	r4, [sp]
+  264d44:	add	sp, sp, #12
+  264d48:	pop	{pc}		; (ldr pc, [sp], #4)
+  264d4c:	mov	r0, r4
+  264d50:	mov	r4, r3
+  264d54:	bl	215554 <free@plt>
+  264d58:	b	264d38 <egl_winsys_get_implementation@@Base+0x84>
+  264d5c:	strd	r4, [sp, #-16]!
+  264d60:	mov	r4, r0
+  264d64:	str	r6, [sp, #8]
+  264d68:	str	lr, [sp, #12]
+  264d6c:	ldr	lr, [r0, #4]
+  264d70:	cmp	lr, #0
+  264d74:	ble	264db4 <egl_winsys_get_implementation@@Base+0x100>
+  264d78:	ldr	r5, [r0]
+  264d7c:	ldr	r3, [r5, #4]
+  264d80:	cmp	r3, r1
+  264d84:	addne	r2, r5, #8
+  264d88:	movne	r3, #0
+  264d8c:	bne	264da0 <egl_winsys_get_implementation@@Base+0xec>
+  264d90:	b	264dcc <egl_winsys_get_implementation@@Base+0x118>
+  264d94:	ldr	r0, [r2, #-4]
+  264d98:	cmp	r0, r1
+  264d9c:	beq	264dd4 <egl_winsys_get_implementation@@Base+0x120>
+  264da0:	add	r3, r3, #1
+  264da4:	mov	ip, r2
+  264da8:	cmp	r3, lr
+  264dac:	add	r2, r2, #8
+  264db0:	bne	264d94 <egl_winsys_get_implementation@@Base+0xe0>
+  264db4:	mov	r6, #0
+  264db8:	mov	r0, r6
+  264dbc:	ldrd	r4, [sp]
+  264dc0:	ldr	r6, [sp, #8]
+  264dc4:	add	sp, sp, #12
+  264dc8:	pop	{pc}		; (ldr pc, [sp], #4)
+  264dcc:	mov	ip, r5
+  264dd0:	mov	r3, #0
+  264dd4:	ldr	r6, [ip]
+  264dd8:	cmp	r6, #0
+  264ddc:	beq	264db8 <egl_winsys_get_implementation@@Base+0x104>
+  264de0:	sub	r2, lr, #1
+  264de4:	cmp	r2, r3
+  264de8:	ble	264e2c <egl_winsys_get_implementation@@Base+0x178>
+  264dec:	lsl	ip, r3, #3
+  264df0:	add	lr, ip, #8
+  264df4:	ldr	r0, [r5, lr]
+  264df8:	add	r3, r3, #1
+  264dfc:	str	r0, [r5, ip]
+  264e00:	ldr	r5, [r4]
+  264e04:	add	r0, r5, lr
+  264e08:	add	r2, r5, ip
+  264e0c:	ldr	r5, [r0, #4]
+  264e10:	mov	ip, lr
+  264e14:	str	r5, [r2, #4]
+  264e18:	ldr	lr, [r4, #4]
+  264e1c:	ldr	r5, [r4]
+  264e20:	sub	r0, lr, #1
+  264e24:	cmp	r0, r3
+  264e28:	bgt	264df0 <egl_winsys_get_implementation@@Base+0x13c>
+  264e2c:	sub	lr, lr, #-536870911	; 0xe0000001
+  264e30:	mov	r0, r6
+  264e34:	str	r6, [r5, lr, lsl #3]
+  264e38:	ldr	r2, [r4, #4]
+  264e3c:	ldr	r4, [r4]
+  264e40:	add	r3, r4, r2, lsl #3
+  264e44:	str	r1, [r3, #-4]
+  264e48:	bl	215644 <egl_color_buffer_retain@plt>
+  264e4c:	b	264db8 <egl_winsys_get_implementation@@Base+0x104>
+  264e50:	strd	r4, [sp, #-16]!
+  264e54:	mov	r4, r0
+  264e58:	mov	r0, r1
+  264e5c:	str	r6, [sp, #8]
+  264e60:	mov	r5, r2
+  264e64:	mov	r6, r1
+  264e68:	str	lr, [sp, #12]
+  264e6c:	bl	215644 <egl_color_buffer_retain@plt>
+  264e70:	ldr	r3, [r4, #4]
+  264e74:	ldr	r2, [r4, #8]
+  264e78:	cmp	r3, r2
+  264e7c:	bge	264eb4 <egl_winsys_get_implementation@@Base+0x200>
+  264e80:	ldr	lr, [r4]
+  264e84:	str	r6, [lr, r3, lsl #3]
+  264e88:	ldr	r0, [r4, #4]
+  264e8c:	ldr	r2, [r4]
+  264e90:	add	r1, r2, r0, lsl #3
+  264e94:	str	r5, [r1, #4]
+  264e98:	ldr	r5, [r4, #4]
+  264e9c:	add	ip, r5, #1
+  264ea0:	str	ip, [r4, #4]
+  264ea4:	ldrd	r4, [sp]
+  264ea8:	ldr	r6, [sp, #8]
+  264eac:	add	sp, sp, #12
+  264eb0:	pop	{pc}		; (ldr pc, [sp], #4)
+  264eb4:	ldr	r0, [r4]
+  264eb8:	ldr	r0, [r0]
+  264ebc:	bl	215584 <egl_color_buffer_release@plt>
+  264ec0:	ldr	r0, [r4, #8]
+  264ec4:	cmp	r0, #1
+  264ec8:	ble	264f0c <egl_winsys_get_implementation@@Base+0x258>
+  264ecc:	mov	lr, #8
+  264ed0:	mov	r3, #0
+  264ed4:	ldr	ip, [r4]
+  264ed8:	ldr	r1, [ip, lr]
+  264edc:	str	r1, [ip, r3, lsl #3]
+  264ee0:	ldr	r0, [r4]
+  264ee4:	add	r2, r0, lr
+  264ee8:	add	ip, r0, r3, lsl #3
+  264eec:	ldr	r1, [r2, #4]
+  264ef0:	add	r3, r3, #1
+  264ef4:	add	lr, lr, #8
+  264ef8:	str	r1, [ip, #4]
+  264efc:	ldr	r0, [r4, #8]
+  264f00:	sub	r2, r0, #1
+  264f04:	cmp	r2, r3
+  264f08:	bgt	264ed4 <egl_winsys_get_implementation@@Base+0x220>
+  264f0c:	ldr	r1, [r4]
+  264f10:	sub	ip, r0, #-536870911	; 0xe0000001
+  264f14:	str	r6, [r1, ip, lsl #3]
+  264f18:	ldr	r6, [r4, #8]
+  264f1c:	ldr	r4, [r4]
+  264f20:	add	r3, r4, r6, lsl #3
+  264f24:	str	r5, [r3, #-4]
+  264f28:	b	264ea4 <egl_winsys_get_implementation@@Base+0x1f0>
+  264f2c:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  264f30:	mov	r5, r2
+  264f34:	strd	r8, [sp, #16]
+  264f38:	mov	r8, r1
+  264f3c:	strd	sl, [sp, #24]
+  264f40:	mov	sl, r0
+  264f44:	mov	r0, r2
+  264f48:	str	lr, [sp, #32]
+  264f4c:	strd	r6, [sp, #8]
+  264f50:	sub	sp, sp, #20
+  264f54:	bl	215524 <egl_color_buffer_get_width@plt>
+  264f58:	mov	r9, r0
+  264f5c:	mov	r0, r5
+  264f60:	bl	215530 <egl_color_buffer_get_height@plt>
+  264f64:	ldr	r3, [r8]
+  264f68:	str	r0, [sp]
+  264f6c:	cmp	r3, #0
+  264f70:	blt	265034 <egl_winsys_get_implementation@@Base+0x380>
+  264f74:	ldr	r1, [r8, #4]
+  264f78:	cmp	r1, #0
+  264f7c:	blt	265034 <egl_winsys_get_implementation@@Base+0x380>
+  264f80:	ldr	r2, [r8, #8]
+  264f84:	cmp	r9, r2
+  264f88:	blt	265034 <egl_winsys_get_implementation@@Base+0x380>
+  264f8c:	ldr	r4, [r8, #12]
+  264f90:	cmp	r0, r4
+  264f94:	blt	265034 <egl_winsys_get_implementation@@Base+0x380>
+  264f98:	ldr	r6, [sl, #4]
+  264f9c:	cmp	r6, #0
+  264fa0:	addgt	r6, sp, #12
+  264fa4:	movgt	fp, #0
+  264fa8:	strgt	r6, [sp, #4]
+  264fac:	bgt	264fc4 <egl_winsys_get_implementation@@Base+0x310>
+  264fb0:	b	26502c <egl_winsys_get_implementation@@Base+0x378>
+  264fb4:	ldr	r1, [sl, #4]
+  264fb8:	add	fp, fp, #1
+  264fbc:	cmp	r1, fp
+  264fc0:	ble	26502c <egl_winsys_get_implementation@@Base+0x378>
+  264fc4:	ldr	r7, [sl]
+  264fc8:	ldr	r4, [r7, fp, lsl #3]
+  264fcc:	mov	r0, r4
+  264fd0:	bl	215524 <egl_color_buffer_get_width@plt>
+  264fd4:	mov	r6, r0
+  264fd8:	mov	r0, r4
+  264fdc:	bl	215530 <egl_color_buffer_get_height@plt>
+  264fe0:	mov	r7, r0
+  264fe4:	mov	r1, #4
+  264fe8:	ldr	r2, [sp, #4]
+  264fec:	mov	r0, r4
+  264ff0:	bl	2154f4 <egl_color_buffer_user_property_get@plt>
+  264ff4:	cmp	r4, r5
+  264ff8:	beq	265054 <egl_winsys_get_implementation@@Base+0x3a0>
+  264ffc:	ldr	lr, [sp]
+  265000:	cmp	r7, lr
+  265004:	cmpeq	r6, r9
+  265008:	bne	264fb4 <egl_winsys_get_implementation@@Base+0x300>
+  26500c:	ldr	r3, [sp, #12]
+  265010:	mov	r1, r8
+  265014:	add	fp, fp, #1
+  265018:	ldr	r0, [r3, #12]
+  26501c:	bl	2156d4 <_ZN7android6Region6orSelfERKNS_4RectE@plt>
+  265020:	ldr	r1, [sl, #4]
+  265024:	cmp	r1, fp
+  265028:	bgt	264fc4 <egl_winsys_get_implementation@@Base+0x310>
+  26502c:	mov	r0, #12288	; 0x3000
+  265030:	b	265038 <egl_winsys_get_implementation@@Base+0x384>
+  265034:	movw	r0, #12300	; 0x300c
+  265038:	add	sp, sp, #20
+  26503c:	ldrd	r4, [sp]
+  265040:	ldrd	r6, [sp, #8]
+  265044:	ldrd	r8, [sp, #16]
+  265048:	ldrd	sl, [sp, #24]
+  26504c:	add	sp, sp, #32
+  265050:	pop	{pc}		; (ldr pc, [sp], #4)
+  265054:	ldr	ip, [sp, #12]
+  265058:	mov	r1, r8
+  26505c:	ldr	r0, [ip, #12]
+  265060:	bl	2156e0 <_ZN7android6Region12subtractSelfERKNS_4RectE@plt>
+  265064:	b	264fb4 <egl_winsys_get_implementation@@Base+0x300>
+  265068:	ldr	r3, [r0, #4]
+  26506c:	cmp	r3, #0
+  265070:	bxle	lr
+  265074:	strd	r4, [sp, #-24]!	; 0xffffffe8
+  265078:	mov	r4, #0
+  26507c:	strd	r6, [sp, #8]
+  265080:	mov	r7, r1
+  265084:	mov	r6, r0
+  265088:	str	r8, [sp, #16]
+  26508c:	str	lr, [sp, #20]
+  265090:	b	2650a0 <egl_winsys_get_implementation@@Base+0x3ec>
+  265094:	ldr	r1, [r6, #4]
+  265098:	cmp	r1, r4
+  26509c:	ble	2650d4 <egl_winsys_get_implementation@@Base+0x420>
+  2650a0:	ldr	r0, [r6]
+  2650a4:	ldr	r5, [r0, r4, lsl #3]
+  2650a8:	add	r4, r4, #1
+  2650ac:	mov	r0, r5
+  2650b0:	bl	2156ec <egl_color_buffer_get_age@plt>
+  2650b4:	cmp	r5, r7
+  2650b8:	cmpne	r0, #0
+  2650bc:	ble	265094 <egl_winsys_get_implementation@@Base+0x3e0>
+  2650c0:	mov	r0, r5
+  2650c4:	bl	2156f8 <egl_color_buffer_increment_age@plt>
+  2650c8:	ldr	r1, [r6, #4]
+  2650cc:	cmp	r1, r4
+  2650d0:	bgt	2650a0 <egl_winsys_get_implementation@@Base+0x3ec>
+  2650d4:	ldrd	r4, [sp]
+  2650d8:	ldrd	r6, [sp, #8]
+  2650dc:	ldr	r8, [sp, #16]
+  2650e0:	add	sp, sp, #20
+  2650e4:	pop	{pc}		; (ldr pc, [sp], #4)
+  2650e8:	strd	r4, [sp, #-16]!
+  2650ec:	mov	r5, r0
+  2650f0:	str	r6, [sp, #8]
+  2650f4:	str	lr, [sp, #12]
+  2650f8:	ldr	r3, [r0, #4]
+  2650fc:	cmp	r3, #0
+  265100:	movgt	r4, #0
+  265104:	ble	265124 <egl_winsys_get_implementation@@Base+0x470>
+  265108:	ldr	r0, [r5]
+  26510c:	ldr	r0, [r0, r4, lsl #3]
+  265110:	add	r4, r4, #1
+  265114:	bl	215584 <egl_color_buffer_release@plt>
+  265118:	ldr	r1, [r5, #4]
+  26511c:	cmp	r1, r4
+  265120:	bgt	265108 <egl_winsys_get_implementation@@Base+0x454>
+  265124:	ldr	r0, [r5]
+  265128:	bl	215554 <free@plt>
+  26512c:	mov	r0, r5
+  265130:	ldr	r6, [sp, #8]
+  265134:	ldrd	r4, [sp]
+  265138:	ldr	lr, [sp, #12]
+  26513c:	add	sp, sp, #16
+  265140:	b	215554 <free@plt>
+  265144:	str	r4, [sp, #-8]!
+  265148:	mov	r4, r0
+  26514c:	str	lr, [sp, #4]
+  265150:	bl	50f140 <osup_get_number_of_cpu_cores@@Base+0xa8>
+  265154:	mov	r0, r4
+  265158:	ldr	r4, [sp]
+  26515c:	add	sp, sp, #4
+  265160:	pop	{pc}		; (ldr pc, [sp], #4)
+  265164:	cmp	r0, #31
+  265168:	bhi	2651a4 <egl_winsys_get_implementation@@Base+0x4f0>
+  26516c:	ldr	r3, [pc, #56]	; 2651ac <egl_winsys_get_implementation@@Base+0x4f8>
+  265170:	add	r2, pc, r3
+  265174:	ldr	ip, [r2, r0, lsl #2]
+  265178:	cmp	ip, r1
+  26517c:	bls	2651a4 <egl_winsys_get_implementation@@Base+0x4f0>
+  265180:	ldr	r3, [pc, #40]	; 2651b0 <egl_winsys_get_implementation@@Base+0x4fc>
+  265184:	add	r2, pc, r3
+  265188:	ldr	r0, [r2, r0, lsl #2]
+  26518c:	ldr	r1, [r0, r1, lsl #2]
+  265190:	ldr	ip, [r1, #4]
+  265194:	cmp	ip, #0
+  265198:	bne	2651a4 <egl_winsys_get_implementation@@Base+0x4f0>
+  26519c:	ldr	r0, [r1]
+  2651a0:	bx	lr
+  2651a4:	mov	r0, #0
+  2651a8:	bx	lr
+  2651ac:	smlatteq	fp, r8, r6, r1
+  2651b0:	ldrsheq	r7, [sp, -r4]!
+  2651b4:	cmp	r0, #31
+  2651b8:	bhi	265200 <egl_winsys_get_implementation@@Base+0x54c>
+  2651bc:	ldr	r3, [pc, #68]	; 265208 <egl_winsys_get_implementation@@Base+0x554>
+  2651c0:	add	ip, pc, r3
+  2651c4:	ldr	r3, [ip, r0, lsl #2]
+  2651c8:	cmp	r3, r1
+  2651cc:	bls	265200 <egl_winsys_get_implementation@@Base+0x54c>
+  2651d0:	ldr	ip, [pc, #52]	; 26520c <egl_winsys_get_implementation@@Base+0x558>
+  2651d4:	add	r3, pc, ip
+  2651d8:	ldr	r0, [r3, r0, lsl #2]
+  2651dc:	ldr	ip, [r0, r1, lsl #2]
+  2651e0:	ldr	r1, [ip, #4]
+  2651e4:	cmp	r1, r2
+  2651e8:	bls	265200 <egl_winsys_get_implementation@@Base+0x54c>
+  2651ec:	ldr	r3, [ip]
+  2651f0:	lsl	r0, r2, #4
+  2651f4:	add	r2, r0, r2, lsl #2
+  2651f8:	add	r0, r3, r2
+  2651fc:	bx	lr
+  265200:	mov	r0, #0
+  265204:	bx	lr
+  265208:			; <UNDEFINED> instruction: 0x010b1698
+  26520c:	teqeq	sp, r4, lsr #1
+  265210:	movw	r3, #24307	; 0x5ef3
+  265214:	str	r3, [r0]
+  265218:	ldr	r0, [pc, #4]	; 265224 <egl_winsys_get_implementation@@Base+0x570>
+  26521c:	add	r0, pc, r0
+  265220:	bx	lr
+  265224:	tsteq	r9, r4, lsl #6
+  265228:	ldr	r3, [pc, #108]	; 26529c <egl_winsys_get_implementation@@Base+0x5e8>
+  26522c:	str	r4, [sp, #-8]!
+  265230:	str	lr, [sp, #4]
+  265234:	add	r0, pc, r3
+  265238:	ldr	r4, [r0, #8]
+  26523c:	cmp	r4, #0
+  265240:	beq	26527c <egl_winsys_get_implementation@@Base+0x5c8>
+  265244:	ldr	r0, [r4, #8]
+  265248:	bl	215710 <close@plt>
+  26524c:	ldr	r4, [r4]
+  265250:	cmp	r4, #0
+  265254:	bne	265244 <egl_winsys_get_implementation@@Base+0x590>
+  265258:	ldr	r1, [pc, #64]	; 2652a0 <egl_winsys_get_implementation@@Base+0x5ec>
+  26525c:	add	r2, pc, r1
+  265260:	ldr	r0, [r2, #8]
+  265264:	cmp	r0, #0
+  265268:	beq	26527c <egl_winsys_get_implementation@@Base+0x5c8>
+  26526c:	ldr	r4, [r0]
+  265270:	bl	215554 <free@plt>
+  265274:	subs	r0, r4, #0
+  265278:	bne	26526c <egl_winsys_get_implementation@@Base+0x5b8>
+  26527c:	ldr	ip, [pc, #32]	; 2652a4 <egl_winsys_get_implementation@@Base+0x5f0>
+  265280:	mov	r0, #0
+  265284:	add	r3, pc, ip
+  265288:	str	r0, [r3, #8]
+  26528c:	str	r0, [r3, #12]
+  265290:	ldr	r4, [sp]
+  265294:	add	sp, sp, #4
+  265298:	pop	{pc}		; (ldr pc, [sp], #4)
+  26529c:	ldrdeq	r2, [r8, #-144]	; 0xffffff70
+  2652a0:	smlaltbeq	r2, r8, r8, r9
+  2652a4:	smlalbbeq	r2, r8, r0, r9
+  2652a8:	ldr	r0, [pc, #48]	; 2652e0 <egl_winsys_get_implementation@@Base+0x62c>
+  2652ac:	push	{lr}		; (str lr, [sp, #-4]!)
+  2652b0:	mov	r2, #0
+  2652b4:	sub	sp, sp, #12
+  2652b8:	mov	ip, #15
+  2652bc:	mov	r3, r2
+  2652c0:	mov	r1, #1824	; 0x720
+  2652c4:	str	r2, [sp]
+  2652c8:	mov	r2, #1
+  2652cc:	add	r0, pc, r0
+  2652d0:	str	ip, [sp, #4]
+  2652d4:	bl	26e7f8 <egl_color_buffer_is_secure@@Base+0x536c>
+  2652d8:	add	sp, sp, #12
+  2652dc:	pop	{pc}		; (ldr pc, [sp], #4)
+  2652e0:	smlabbeq	r7, r0, r5, r3
+  2652e4:	strd	r4, [sp, #-16]!
+  2652e8:	ldr	r4, [pc, #208]	; 2653c0 <egl_winsys_get_implementation@@Base+0x70c>
+  2652ec:	mov	r5, r0
+  2652f0:	str	r6, [sp, #8]
+  2652f4:	str	lr, [sp, #12]
+  2652f8:	ldr	r3, [r0]
+  2652fc:	sub	sp, sp, #32
+  265300:	ldr	r4, [pc, r4]
+  265304:	cmp	r3, #1824	; 0x720
+  265308:	ldr	r6, [r4]
+  26530c:	str	r6, [sp, #28]
+  265310:	beq	265394 <egl_winsys_get_implementation@@Base+0x6e0>
+  265314:	cmp	r1, #0
+  265318:	moveq	r0, r1
+  26531c:	beq	265370 <egl_winsys_get_implementation@@Base+0x6bc>
+  265320:	ldr	lr, [pc, #156]	; 2653c4 <egl_winsys_get_implementation@@Base+0x710>
+  265324:	str	r2, [sp]
+  265328:	add	r6, sp, #12
+  26532c:	ldr	r2, [pc, #148]	; 2653c8 <egl_winsys_get_implementation@@Base+0x714>
+  265330:	mov	r1, #16
+  265334:	mov	r0, r6
+  265338:	add	r3, pc, lr
+  26533c:	add	r2, pc, r2
+  265340:	bl	45eb40 <_ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base+0x248c>
+  265344:	ldr	r2, [r5]
+  265348:	mov	r1, r6
+  26534c:	ldrh	r3, [r5, #8]
+  265350:	ldrh	r6, [r5, #6]
+  265354:	ldr	r0, [pc, #112]	; 2653cc <egl_winsys_get_implementation@@Base+0x718>
+  265358:	ldrh	r5, [r5, #4]
+  26535c:	str	r6, [sp]
+  265360:	add	r0, pc, r0
+  265364:	str	r5, [sp, #4]
+  265368:	bl	26e7f8 <egl_color_buffer_is_secure@@Base+0x536c>
+  26536c:	mov	r0, #0
+  265370:	ldr	r1, [sp, #28]
+  265374:	ldr	r4, [r4]
+  265378:	cmp	r1, r4
+  26537c:	bne	2653bc <egl_winsys_get_implementation@@Base+0x708>
+  265380:	add	sp, sp, #32
+  265384:	ldrd	r4, [sp]
+  265388:	ldr	r6, [sp, #8]
+  26538c:	add	sp, sp, #12
+  265390:	pop	{pc}		; (ldr pc, [sp], #4)
+  265394:	ldrh	r0, [r0, #8]
+  265398:	cmp	r0, #1
+  26539c:	bne	265314 <egl_winsys_get_implementation@@Base+0x660>
+  2653a0:	ldrh	ip, [r5, #6]
+  2653a4:	cmp	ip, #0
+  2653a8:	bne	265314 <egl_winsys_get_implementation@@Base+0x660>
+  2653ac:	ldrh	r3, [r5, #4]
+  2653b0:	cmp	r3, #15
+  2653b4:	bls	265370 <egl_winsys_get_implementation@@Base+0x6bc>
+  2653b8:	b	265314 <egl_winsys_get_implementation@@Base+0x660>
+  2653bc:	bl	21571c <__stack_chk_fail@plt>
+  2653c0:	cmpeq	r7, ip, asr #10
+  2653c4:	smlabteq	r7, r0, r5, r3
+  2653c8:			; <UNDEFINED> instruction: 0x010735b4
+  2653cc:	smlatbeq	r7, r4, r5, r3
+
+002653d0 <LLVMAddSimplifyLibCallsPass@@Base>:
+  2653d0:	bx	lr
+  2653d4:	strd	r4, [sp, #-16]!
+  2653d8:	ldr	r4, [pc, #148]	; 265474 <LLVMAddSimplifyLibCallsPass@@Base+0xa4>
+  2653dc:	str	r6, [sp, #8]
+  2653e0:	str	lr, [sp, #12]
+  2653e4:	ldr	r5, [r0]
+  2653e8:	add	r6, pc, r4
+  2653ec:	mov	r0, r6
+  2653f0:	bl	215728 <pthread_mutex_lock@plt>
+  2653f4:	cmp	r0, #0
+  2653f8:	bne	265464 <LLVMAddSimplifyLibCallsPass@@Base+0x94>
+  2653fc:	ldr	r4, [r6, #8]
+  265400:	cmp	r4, #0
+  265404:	bne	265418 <LLVMAddSimplifyLibCallsPass@@Base+0x48>
+  265408:	b	265448 <LLVMAddSimplifyLibCallsPass@@Base+0x78>
+  26540c:	ldr	r4, [r4]
+  265410:	cmp	r4, #0
+  265414:	beq	265448 <LLVMAddSimplifyLibCallsPass@@Base+0x78>
+  265418:	ldr	r3, [r4, #8]
+  26541c:	cmp	r5, r3
+  265420:	bne	26540c <LLVMAddSimplifyLibCallsPass@@Base+0x3c>
+  265424:	ldr	r0, [pc, #76]	; 265478 <LLVMAddSimplifyLibCallsPass@@Base+0xa8>
+  265428:	mov	r1, r4
+  26542c:	add	r2, pc, r0
+  265430:	add	r0, r2, #8
+  265434:	bl	460a9c <_ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base+0x43e8>
+  265438:	mov	r0, r4
+  26543c:	bl	215554 <free@plt>
+  265440:	mov	r0, r5
+  265444:	bl	215710 <close@plt>
+  265448:	ldr	r1, [pc, #44]	; 26547c <LLVMAddSimplifyLibCallsPass@@Base+0xac>
+  26544c:	ldrd	r4, [sp]
+  265450:	ldr	r6, [sp, #8]
+  265454:	ldr	lr, [sp, #12]
+  265458:	add	sp, sp, #16
+  26545c:	add	r0, pc, r1
+  265460:	b	215734 <pthread_mutex_unlock@plt>
+  265464:	ldrd	r4, [sp]
+  265468:	ldr	r6, [sp, #8]
+  26546c:	add	sp, sp, #12
+  265470:	pop	{pc}		; (ldr pc, [sp], #4)
+  265474:	cmpeq	r8, ip, lsl r8
+  265478:	ldrdeq	r2, [r8, #-120]	; 0xffffff88
+  26547c:	smlaltbeq	r2, r8, r8, r7
+  265480:	str	r4, [sp, #-8]!
+  265484:	mov	ip, r1
+  265488:	str	lr, [sp, #4]
+  26548c:	ldr	r3, [r1]
+  265490:	ldr	r0, [r0]
+  265494:	orr	r1, r3, #-1073741824	; 0xc0000000
+  265498:	orr	r4, r1, #32768	; 0x8000
+  26549c:	orr	r1, r4, r2, lsl #16
+  2654a0:	mov	r2, ip
+  2654a4:	bl	215740 <ioctl@plt>
+  2654a8:	cmp	r0, #0
+  2654ac:	ldr	r4, [sp]
+  2654b0:	add	sp, sp, #4
+  2654b4:	movne	r0, #3
+  2654b8:	moveq	r0, #0
+  2654bc:	pop	{pc}		; (ldr pc, [sp], #4)
+  2654c0:	strd	r4, [sp, #-24]!	; 0xffffffe8
+  2654c4:	ldr	r4, [pc, #536]	; 2656e4 <LLVMAddSimplifyLibCallsPass@@Base+0x314>
+  2654c8:	cmp	r0, #0
+  2654cc:	strd	r6, [sp, #8]
+  2654d0:	movne	r0, #2
+  2654d4:	str	r8, [sp, #16]
+  2654d8:	str	lr, [sp, #20]
+  2654dc:	sub	sp, sp, #152	; 0x98
+  2654e0:	ldr	r4, [pc, r4]
+  2654e4:	ldr	ip, [r4]
+  2654e8:	str	ip, [sp, #148]	; 0x94
+  2654ec:	beq	265518 <LLVMAddSimplifyLibCallsPass@@Base+0x148>
+  2654f0:	ldr	r5, [sp, #148]	; 0x94
+  2654f4:	ldr	r4, [r4]
+  2654f8:	cmp	r5, r4
+  2654fc:	bne	265640 <LLVMAddSimplifyLibCallsPass@@Base+0x270>
+  265500:	add	sp, sp, #152	; 0x98
+  265504:	ldrd	r4, [sp]
+  265508:	ldrd	r6, [sp, #8]
+  26550c:	ldr	r8, [sp, #16]
+  265510:	add	sp, sp, #20
+  265514:	pop	{pc}		; (ldr pc, [sp], #4)
+  265518:	mov	r5, r2
+  26551c:	mov	r6, r3
+  265520:	ldr	r2, [pc, #448]	; 2656e8 <LLVMAddSimplifyLibCallsPass@@Base+0x318>
+  265524:	ldr	r3, [pc, #448]	; 2656ec <LLVMAddSimplifyLibCallsPass@@Base+0x31c>
+  265528:	add	r7, sp, #132	; 0x84
+  26552c:	str	r1, [sp]
+  265530:	mov	r0, r7
+  265534:	mov	r1, #16
+  265538:	add	r2, pc, r2
+  26553c:	add	r3, pc, r3
+  265540:	bl	45eb40 <_ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base+0x248c>
+  265544:	mov	r1, #2
+  265548:	mov	r0, r7
+  26554c:	movt	r1, #8
+  265550:	bl	21574c <open@plt>
+  265554:	cmn	r0, #1
+  265558:	mov	r8, r0
+  26555c:	bne	265570 <LLVMAddSimplifyLibCallsPass@@Base+0x1a0>
+  265560:	bl	215758 <__errno@plt>
+  265564:	ldr	r3, [r0]
+  265568:	mov	r0, #2
+  26556c:	b	2654f0 <LLVMAddSimplifyLibCallsPass@@Base+0x120>
+  265570:	add	r1, sp, #24
+  265574:	bl	215764 <fstat@plt>
+  265578:	subs	ip, r0, #0
+  26557c:	bne	265630 <LLVMAddSimplifyLibCallsPass@@Base+0x260>
+  265580:	ldr	r0, [sp, #40]	; 0x28
+  265584:	and	r1, r0, #61440	; 0xf000
+  265588:	cmp	r1, #8192	; 0x2000
+  26558c:	bne	265630 <LLVMAddSimplifyLibCallsPass@@Base+0x260>
+  265590:	ldrh	lr, [r5]
+  265594:	mov	r0, r6
+  265598:	add	r1, sp, #8
+  26559c:	ldrh	r3, [r5, #2]
+  2655a0:	mov	r2, #16
+  2655a4:	str	r8, [r6]
+  2655a8:	str	ip, [sp, #8]
+  2655ac:	strh	lr, [sp, #16]
+  2655b0:	strh	r3, [sp, #18]
+  2655b4:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  2655b8:	cmp	r0, #0
+  2655bc:	bne	265630 <LLVMAddSimplifyLibCallsPass@@Base+0x260>
+  2655c0:	ldr	r2, [sp, #8]
+  2655c4:	cmp	r2, #0
+  2655c8:	bne	265630 <LLVMAddSimplifyLibCallsPass@@Base+0x260>
+  2655cc:	ldrh	r2, [r5]
+  2655d0:	ldrh	r0, [sp, #16]
+  2655d4:	cmp	r2, r0
+  2655d8:	beq	265644 <LLVMAddSimplifyLibCallsPass@@Base+0x274>
+  2655dc:	ldrh	r3, [r5, #2]
+  2655e0:	ldrh	ip, [sp, #18]
+  2655e4:	str	ip, [sp, #4]
+  2655e8:	ldr	ip, [pc, #256]	; 2656f0 <LLVMAddSimplifyLibCallsPass@@Base+0x320>
+  2655ec:	mov	r1, r7
+  2655f0:	str	r0, [sp]
+  2655f4:	add	r0, pc, ip
+  2655f8:	bl	26e7f8 <egl_color_buffer_is_secure@@Base+0x536c>
+  2655fc:	ldrh	r1, [sp, #16]
+  265600:	mov	r0, r8
+  265604:	mvn	r3, #0
+  265608:	ldrh	r8, [sp, #18]
+  26560c:	strh	r1, [r5]
+  265610:	strh	r8, [r5, #2]
+  265614:	str	r3, [r6]
+  265618:	bl	215710 <close@plt>
+  26561c:	mov	r0, #1
+  265620:	b	2654f0 <LLVMAddSimplifyLibCallsPass@@Base+0x120>
+  265624:	ldr	r0, [pc, #200]	; 2656f4 <LLVMAddSimplifyLibCallsPass@@Base+0x324>
+  265628:	add	r0, pc, r0
+  26562c:	bl	215734 <pthread_mutex_unlock@plt>
+  265630:	mov	r0, r8
+  265634:	bl	215710 <close@plt>
+  265638:	mov	r0, #2
+  26563c:	b	2654f0 <LLVMAddSimplifyLibCallsPass@@Base+0x120>
+  265640:	bl	21571c <__stack_chk_fail@plt>
+  265644:	ldrh	ip, [sp, #18]
+  265648:	ldrh	r3, [r5, #2]
+  26564c:	cmp	r3, ip
+  265650:	bhi	2655e4 <LLVMAddSimplifyLibCallsPass@@Base+0x214>
+  265654:	ldr	r6, [pc, #156]	; 2656f8 <LLVMAddSimplifyLibCallsPass@@Base+0x328>
+  265658:	strh	ip, [r5, #2]
+  26565c:	add	r7, pc, r6
+  265660:	mov	r0, r7
+  265664:	bl	215728 <pthread_mutex_lock@plt>
+  265668:	cmp	r0, #0
+  26566c:	bne	265630 <LLVMAddSimplifyLibCallsPass@@Base+0x260>
+  265670:	ldr	lr, [r7, #4]
+  265674:	cmp	lr, #0
+  265678:	bne	2656b0 <LLVMAddSimplifyLibCallsPass@@Base+0x2e0>
+  26567c:	ldr	r5, [pc, #120]	; 2656fc <LLVMAddSimplifyLibCallsPass@@Base+0x32c>
+  265680:	mov	r0, lr
+  265684:	mov	r1, lr
+  265688:	ldr	r3, [pc, #112]	; 265700 <LLVMAddSimplifyLibCallsPass@@Base+0x330>
+  26568c:	add	r6, pc, r5
+  265690:	add	r2, pc, r3
+  265694:	str	lr, [r6, #8]
+  265698:	str	lr, [r6, #12]
+  26569c:	bl	25e888 <__aeabi_cfrcmple@plt+0x29888>
+  2656a0:	cmp	r0, #0
+  2656a4:	bne	265624 <LLVMAddSimplifyLibCallsPass@@Base+0x254>
+  2656a8:	mov	r1, #1
+  2656ac:	str	r1, [r6, #4]
+  2656b0:	mov	r0, #12
+  2656b4:	bl	2155a8 <malloc@plt>
+  2656b8:	subs	r1, r0, #0
+  2656bc:	beq	265624 <LLVMAddSimplifyLibCallsPass@@Base+0x254>
+  2656c0:	ldr	r2, [pc, #60]	; 265704 <LLVMAddSimplifyLibCallsPass@@Base+0x334>
+  2656c4:	str	r8, [r1, #8]
+  2656c8:	add	r7, pc, r2
+  2656cc:	add	r0, r7, #8
+  2656d0:	bl	460d04 <_ZN5clang9ModuleMap9setTargetERKNS_10TargetInfoE@@Base+0x4650>
+  2656d4:	mov	r0, r7
+  2656d8:	bl	215734 <pthread_mutex_unlock@plt>
+  2656dc:	mov	r0, #0
+  2656e0:	b	2654f0 <LLVMAddSimplifyLibCallsPass@@Base+0x120>
+  2656e4:	cmpeq	r7, ip, ror #6
+  2656e8:			; <UNDEFINED> instruction: 0x010733b8
+  2656ec:			; <UNDEFINED> instruction: 0x010733bc
+  2656f0:	tsteq	r7, r8, lsr r3
+  2656f4:	ldrdeq	r2, [r8, #-92]	; 0xffffffa4
+  2656f8:	smlaltbeq	r2, r8, r8, r5
+  2656fc:	hvceq	33368	; 0x8258
+  265700:			; <UNDEFINED> instruction: 0xfffffb90
+  265704:	cmpeq	r8, ip, lsr r5
+  265708:	vldr	d16, [pc, #456]	; 2658d8 <LLVMAddSimplifyLibCallsPass@@Base+0x508>
+  26570c:	vldr	d17, [pc, #460]	; 2658e0 <LLVMAddSimplifyLibCallsPass@@Base+0x510>
+  265710:	mov	ip, #0
+  265714:	strd	r4, [sp, #-28]!	; 0xffffffe4
+  265718:	mov	r5, ip
+  26571c:	strd	r6, [sp, #8]
+  265720:	mov	r6, r0
+  265724:	mov	r7, r1
+  265728:	strd	r8, [sp, #16]
+  26572c:	mov	r8, r2
+  265730:	mov	r9, r3
+  265734:	str	lr, [sp, #24]
+  265738:	vpush	{d8-d13}
+  26573c:	vmov.i32	q4, #0	; 0x00000000
+  265740:	vmov.i32	q5, #1	; 0x00000001
+  265744:	sub	sp, sp, #20
+  265748:	str	ip, [r0, #48]	; 0x30
+  26574c:	str	r1, [r6, #60]	; 0x3c
+  265750:	str	ip, [r0, #52]	; 0x34
+  265754:	vceq.i32	q0, q4, q8
+  265758:	str	ip, [r0, #56]	; 0x38
+  26575c:	vbsl	q0, q5, q4
+  265760:	vmvn	q6, q0
+  265764:	sub	r4, r5, #1
+  265768:	cmp	r4, #4
+  26576c:	addls	pc, pc, r4, lsl #2
+  265770:	b	26588c <LLVMAddSimplifyLibCallsPass@@Base+0x4bc>
+  265774:	b	26585c <LLVMAddSimplifyLibCallsPass@@Base+0x48c>
+  265778:	b	26581c <LLVMAddSimplifyLibCallsPass@@Base+0x44c>
+  26577c:	b	2657d0 <LLVMAddSimplifyLibCallsPass@@Base+0x400>
+  265780:	b	265788 <LLVMAddSimplifyLibCallsPass@@Base+0x3b8>
+  265784:	b	2658a0 <LLVMAddSimplifyLibCallsPass@@Base+0x4d0>
+  265788:	vldr	d2, [pc, #344]	; 2658e8 <LLVMAddSimplifyLibCallsPass@@Base+0x518>
+  26578c:	vldr	d3, [pc, #348]	; 2658f0 <LLVMAddSimplifyLibCallsPass@@Base+0x520>
+  265790:	mov	r3, #0
+  265794:	vstr	d12, [r6, #8]
+  265798:	vstr	d13, [r6, #16]
+  26579c:	mov	r1, r3
+  2657a0:	add	r0, r6, #40	; 0x28
+  2657a4:	str	r3, [r6, #4]
+  2657a8:	vceq.i32	q2, q4, q1
+  2657ac:	vbsl	q2, q5, q4
+  2657b0:	vmvn	q3, q2
+  2657b4:	vstr	d6, [r6, #24]
+  2657b8:	vstr	d7, [r6, #32]
+  2657bc:	bl	215770 <pthread_mutex_init@plt>
+  2657c0:	cmp	r0, #0
+  2657c4:	beq	26582c <LLVMAddSimplifyLibCallsPass@@Base+0x45c>
+  2657c8:	mov	r7, #2
+  2657cc:	b	2657ec <LLVMAddSimplifyLibCallsPass@@Base+0x41c>
+  2657d0:	add	r0, r6, #64	; 0x40
+  2657d4:	mov	r1, r9
+  2657d8:	mov	r2, r8
+  2657dc:	bl	2652e4 <egl_winsys_get_implementation@@Base+0x630>
+  2657e0:	cmp	r0, #0
+  2657e4:	bne	26582c <LLVMAddSimplifyLibCallsPass@@Base+0x45c>
+  2657e8:	mov	r7, #1
+  2657ec:	add	r5, r6, #40	; 0x28
+  2657f0:	b	2657fc <LLVMAddSimplifyLibCallsPass@@Base+0x42c>
+  2657f4:	bl	21577c <pthread_mutex_destroy@plt>
+  2657f8:	sub	r4, r4, #1
+  2657fc:	cmp	r4, #0
+  265800:	beq	2658bc <LLVMAddSimplifyLibCallsPass@@Base+0x4ec>
+  265804:	cmp	r4, #4
+  265808:	mov	r0, r5
+  26580c:	beq	2657f4 <LLVMAddSimplifyLibCallsPass@@Base+0x424>
+  265810:	cmp	r4, #0
+  265814:	bne	2657f8 <LLVMAddSimplifyLibCallsPass@@Base+0x428>
+  265818:	b	26583c <LLVMAddSimplifyLibCallsPass@@Base+0x46c>
+  26581c:	mov	r0, r6
+  265820:	bl	2659fc <LLVMAddSimplifyLibCallsPass@@Base+0x62c>
+  265824:	cmp	r0, #0
+  265828:	bne	2658c8 <LLVMAddSimplifyLibCallsPass@@Base+0x4f8>
+  26582c:	add	r5, r5, #1
+  265830:	cmp	r5, #6
+  265834:	bne	265764 <LLVMAddSimplifyLibCallsPass@@Base+0x394>
+  265838:	mov	r7, #0
+  26583c:	mov	r0, r7
+  265840:	add	sp, sp, #20
+  265844:	vpop	{d8-d13}
+  265848:	ldrd	r4, [sp]
+  26584c:	ldrd	r6, [sp, #8]
+  265850:	ldrd	r8, [sp, #16]
+  265854:	add	sp, sp, #24
+  265858:	pop	{pc}		; (ldr pc, [sp], #4)
+  26585c:	movw	lr, #530	; 0x212
+  265860:	and	ip, r7, #6
+  265864:	add	r0, r6, #44	; 0x2c
+  265868:	mov	r1, sp
+  26586c:	mov	r2, #16
+  265870:	str	lr, [sp]
+  265874:	str	ip, [sp, #8]
+  265878:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  26587c:	cmp	r0, #0
+  265880:	bne	2658c8 <LLVMAddSimplifyLibCallsPass@@Base+0x4f8>
+  265884:	ldr	r0, [sp]
+  265888:	b	265824 <LLVMAddSimplifyLibCallsPass@@Base+0x454>
+  26588c:	mov	r0, r6
+  265890:	mov	r1, r7
+  265894:	mov	r2, r8
+  265898:	bl	265db4 <LLVMAddSimplifyLibCallsPass@@Base+0x9e4>
+  26589c:	b	265824 <LLVMAddSimplifyLibCallsPass@@Base+0x454>
+  2658a0:	mov	r0, #0
+  2658a4:	str	r0, [r6, #592]	; 0x250
+  2658a8:	str	r0, [r6, #596]	; 0x254
+  2658ac:	str	r0, [r6, #600]	; 0x258
+  2658b0:	str	r0, [r6, #604]	; 0x25c
+  2658b4:	str	r0, [r6, #608]	; 0x260
+  2658b8:	b	26582c <LLVMAddSimplifyLibCallsPass@@Base+0x45c>
+  2658bc:	mov	r0, r6
+  2658c0:	bl	265e28 <LLVMAddSimplifyLibCallsPass@@Base+0xa58>
+  2658c4:	b	26583c <LLVMAddSimplifyLibCallsPass@@Base+0x46c>
+  2658c8:	cmp	r5, #0
+  2658cc:	bne	2657c8 <LLVMAddSimplifyLibCallsPass@@Base+0x3f8>
+  2658d0:	mov	r7, #2
+  2658d4:	b	26583c <LLVMAddSimplifyLibCallsPass@@Base+0x46c>
+  2658d8:	andeq	r0, r0, r0
+  2658dc:	andeq	r0, r0, r1
+  2658e0:	andeq	r0, r0, r2
+  2658e4:	andeq	r0, r0, r3
+  2658e8:	andeq	r0, r0, r4
+  2658ec:	andeq	r0, r0, r5
+  2658f0:	andeq	r0, r0, r6
+  2658f4:	andeq	r0, r0, r7
+  2658f8:	strd	r4, [sp, #-16]!
+  2658fc:	mov	ip, #0
+  265900:	mov	r5, r0
+  265904:	str	r6, [sp, #8]
+  265908:	mov	r6, r1
+  26590c:	str	lr, [sp, #12]
+  265910:	mov	r2, ip
+  265914:	mov	r0, r5
+  265918:	mov	r1, r6
+  26591c:	mov	r3, #0
+  265920:	add	r4, ip, #1
+  265924:	bl	265708 <LLVMAddSimplifyLibCallsPass@@Base+0x338>
+  265928:	cmp	r0, #1
+  26592c:	mov	ip, r4
+  265930:	beq	265910 <LLVMAddSimplifyLibCallsPass@@Base+0x540>
+  265934:	cmp	r0, #0
+  265938:	moveq	r0, #1
+  26593c:	bne	265950 <LLVMAddSimplifyLibCallsPass@@Base+0x580>
+  265940:	ldrd	r4, [sp]
+  265944:	ldr	r6, [sp, #8]
+  265948:	add	sp, sp, #12
+  26594c:	pop	{pc}		; (ldr pc, [sp], #4)
+  265950:	bl	2652a8 <egl_winsys_get_implementation@@Base+0x5f4>
+  265954:	mov	ip, #0
+  265958:	mov	r2, ip
+  26595c:	mov	r3, #1
+  265960:	mov	r0, r5
+  265964:	mov	r1, r6
+  265968:	add	r4, ip, r3
+  26596c:	bl	265708 <LLVMAddSimplifyLibCallsPass@@Base+0x338>
+  265970:	cmp	r0, #1
+  265974:	mov	ip, r4
+  265978:	beq	265958 <LLVMAddSimplifyLibCallsPass@@Base+0x588>
+  26597c:	mov	r0, #0
+  265980:	b	265940 <LLVMAddSimplifyLibCallsPass@@Base+0x570>
+  265984:	strd	r4, [sp, #-16]!
+  265988:	str	r6, [sp, #8]
+  26598c:	mov	r6, r0
+  265990:	str	lr, [sp, #12]
+  265994:	ldr	r3, [r0, #52]	; 0x34
+  265998:	cmp	r3, #0
+  26599c:	beq	2659a4 <LLVMAddSimplifyLibCallsPass@@Base+0x5d4>
+  2659a0:	bl	265e4c <LLVMAddSimplifyLibCallsPass@@Base+0xa7c>
+  2659a4:	mov	r4, #6
+  2659a8:	add	r5, r6, #40	; 0x28
+  2659ac:	subs	r4, r4, #1
+  2659b0:	beq	2659cc <LLVMAddSimplifyLibCallsPass@@Base+0x5fc>
+  2659b4:	cmp	r4, #4
+  2659b8:	mov	r0, r5
+  2659bc:	bne	2659e4 <LLVMAddSimplifyLibCallsPass@@Base+0x614>
+  2659c0:	bl	21577c <pthread_mutex_destroy@plt>
+  2659c4:	subs	r4, r4, #1
+  2659c8:	bne	2659b4 <LLVMAddSimplifyLibCallsPass@@Base+0x5e4>
+  2659cc:	mov	r0, r6
+  2659d0:	ldrd	r4, [sp]
+  2659d4:	ldr	r6, [sp, #8]
+  2659d8:	ldr	lr, [sp, #12]
+  2659dc:	add	sp, sp, #16
+  2659e0:	b	265e28 <LLVMAddSimplifyLibCallsPass@@Base+0xa58>
+  2659e4:	cmp	r4, #0
+  2659e8:	bne	2659ac <LLVMAddSimplifyLibCallsPass@@Base+0x5dc>
+  2659ec:	ldrd	r4, [sp]
+  2659f0:	ldr	r6, [sp, #8]
+  2659f4:	add	sp, sp, #12
+  2659f8:	pop	{pc}		; (ldr pc, [sp], #4)
+  2659fc:	strd	r4, [sp, #-12]!
+  265a00:	movw	r3, #526	; 0x20e
+  265a04:	mov	r5, r0
+  265a08:	str	lr, [sp, #8]
+  265a0c:	sub	sp, sp, #540	; 0x21c
+  265a10:	mov	r2, #536	; 0x218
+  265a14:	add	r1, sp, #536	; 0x218
+  265a18:	add	r0, r0, #44	; 0x2c
+  265a1c:	str	r3, [r1, #-536]!	; 0xfffffde8
+  265a20:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265a24:	subs	r4, r0, #0
+  265a28:	bne	265a38 <LLVMAddSimplifyLibCallsPass@@Base+0x668>
+  265a2c:	ldr	r4, [sp]
+  265a30:	cmp	r4, #0
+  265a34:	beq	265a4c <LLVMAddSimplifyLibCallsPass@@Base+0x67c>
+  265a38:	mov	r0, r4
+  265a3c:	add	sp, sp, #540	; 0x21c
+  265a40:	ldrd	r4, [sp]
+  265a44:	add	sp, sp, #8
+  265a48:	pop	{pc}		; (ldr pc, [sp], #4)
+  265a4c:	add	r0, r5, #64	; 0x40
+  265a50:	add	r1, sp, #8
+  265a54:	mov	r2, #528	; 0x210
+  265a58:	bl	215788 <memcpy@plt>
+  265a5c:	b	265a38 <LLVMAddSimplifyLibCallsPass@@Base+0x668>
+  265a60:	add	r0, r0, #64	; 0x40
+  265a64:	bx	lr
+  265a68:	push	{lr}		; (str lr, [sp, #-4]!)
+  265a6c:	sub	sp, sp, #540	; 0x21c
+  265a70:	movw	r3, #526	; 0x20e
+  265a74:	add	r1, sp, #536	; 0x218
+  265a78:	add	r0, r0, #44	; 0x2c
+  265a7c:	mov	r2, #536	; 0x218
+  265a80:	str	r3, [r1, #-536]!	; 0xfffffde8
+  265a84:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265a88:	cmp	r0, #0
+  265a8c:	movne	r0, #0
+  265a90:	bne	265ad8 <LLVMAddSimplifyLibCallsPass@@Base+0x708>
+  265a94:	ldr	r1, [sp]
+  265a98:	cmp	r1, #0
+  265a9c:	bne	265ad8 <LLVMAddSimplifyLibCallsPass@@Base+0x708>
+  265aa0:	ldr	r0, [sp, #8]
+  265aa4:	cmp	r0, #2080	; 0x820
+  265aa8:	beq	265b78 <LLVMAddSimplifyLibCallsPass@@Base+0x7a8>
+  265aac:	bls	265ae0 <LLVMAddSimplifyLibCallsPass@@Base+0x710>
+  265ab0:	cmp	r0, #2144	; 0x860
+  265ab4:	beq	265b68 <LLVMAddSimplifyLibCallsPass@@Base+0x798>
+  265ab8:	bls	265b28 <LLVMAddSimplifyLibCallsPass@@Base+0x758>
+  265abc:	cmp	r0, #2176	; 0x880
+  265ac0:	beq	265b18 <LLVMAddSimplifyLibCallsPass@@Base+0x748>
+  265ac4:	movw	r2, #26966	; 0x6956
+  265ac8:	cmp	r0, r2
+  265acc:	bne	265af8 <LLVMAddSimplifyLibCallsPass@@Base+0x728>
+  265ad0:	ldr	lr, [pc, #260]	; 265bdc <LLVMAddSimplifyLibCallsPass@@Base+0x80c>
+  265ad4:	add	r0, pc, lr
+  265ad8:	add	sp, sp, #540	; 0x21c
+  265adc:	pop	{pc}		; (ldr pc, [sp], #4)
+  265ae0:	cmp	r0, #1824	; 0x720
+  265ae4:	beq	265b40 <LLVMAddSimplifyLibCallsPass@@Base+0x770>
+  265ae8:	cmp	r0, #1872	; 0x750
+  265aec:	beq	265b08 <LLVMAddSimplifyLibCallsPass@@Base+0x738>
+  265af0:	cmp	r0, #1568	; 0x620
+  265af4:	beq	265b50 <LLVMAddSimplifyLibCallsPass@@Base+0x780>
+  265af8:	ldr	ip, [pc, #224]	; 265be0 <LLVMAddSimplifyLibCallsPass@@Base+0x810>
+  265afc:	add	r0, pc, ip
+  265b00:	add	sp, sp, #540	; 0x21c
+  265b04:	pop	{pc}		; (ldr pc, [sp], #4)
+  265b08:	ldr	r3, [pc, #212]	; 265be4 <LLVMAddSimplifyLibCallsPass@@Base+0x814>
+  265b0c:	add	r0, pc, r3
+  265b10:	add	sp, sp, #540	; 0x21c
+  265b14:	pop	{pc}		; (ldr pc, [sp], #4)
+  265b18:	ldr	r3, [pc, #200]	; 265be8 <LLVMAddSimplifyLibCallsPass@@Base+0x818>
+  265b1c:	add	r0, pc, r3
+  265b20:	add	sp, sp, #540	; 0x21c
+  265b24:	pop	{pc}		; (ldr pc, [sp], #4)
+  265b28:	cmp	r0, #2096	; 0x830
+  265b2c:	bne	265af8 <LLVMAddSimplifyLibCallsPass@@Base+0x728>
+  265b30:	ldr	r0, [pc, #180]	; 265bec <LLVMAddSimplifyLibCallsPass@@Base+0x81c>
+  265b34:	add	r0, pc, r0
+  265b38:	add	sp, sp, #540	; 0x21c
+  265b3c:	pop	{pc}		; (ldr pc, [sp], #4)
+  265b40:	ldr	r1, [pc, #168]	; 265bf0 <LLVMAddSimplifyLibCallsPass@@Base+0x820>
+  265b44:	add	r0, pc, r1
+  265b48:	add	sp, sp, #540	; 0x21c
+  265b4c:	pop	{pc}		; (ldr pc, [sp], #4)
+  265b50:	ldr	r2, [sp, #268]	; 0x10c
+  265b54:	cmp	r2, #1
+  265b58:	bls	265b88 <LLVMAddSimplifyLibCallsPass@@Base+0x7b8>
+  265b5c:	ldr	lr, [pc, #144]	; 265bf4 <LLVMAddSimplifyLibCallsPass@@Base+0x824>
+  265b60:	add	r0, pc, lr
+  265b64:	b	265ad8 <LLVMAddSimplifyLibCallsPass@@Base+0x708>
+  265b68:	ldr	r1, [pc, #136]	; 265bf8 <LLVMAddSimplifyLibCallsPass@@Base+0x828>
+  265b6c:	add	r0, pc, r1
+  265b70:	add	sp, sp, #540	; 0x21c
+  265b74:	pop	{pc}		; (ldr pc, [sp], #4)
+  265b78:	ldr	r0, [pc, #124]	; 265bfc <LLVMAddSimplifyLibCallsPass@@Base+0x82c>
+  265b7c:	add	r0, pc, r0
+  265b80:	add	sp, sp, #540	; 0x21c
+  265b84:	pop	{pc}		; (ldr pc, [sp], #4)
+  265b88:	ldr	ip, [sp, #264]	; 0x108
+  265b8c:	cmp	ip, #1
+  265b90:	bls	265ba0 <LLVMAddSimplifyLibCallsPass@@Base+0x7d0>
+  265b94:	ldr	ip, [pc, #100]	; 265c00 <LLVMAddSimplifyLibCallsPass@@Base+0x830>
+  265b98:	add	r0, pc, ip
+  265b9c:	b	265ad8 <LLVMAddSimplifyLibCallsPass@@Base+0x708>
+  265ba0:	add	lr, sp, #288	; 0x120
+  265ba4:	ldrh	r3, [lr]
+  265ba8:	cmp	r3, #4
+  265bac:	bhi	265bc4 <LLVMAddSimplifyLibCallsPass@@Base+0x7f4>
+  265bb0:	cmp	r3, #2
+  265bb4:	bls	265bd0 <LLVMAddSimplifyLibCallsPass@@Base+0x800>
+  265bb8:	ldr	r1, [pc, #68]	; 265c04 <LLVMAddSimplifyLibCallsPass@@Base+0x834>
+  265bbc:	add	r0, pc, r1
+  265bc0:	b	265ad8 <LLVMAddSimplifyLibCallsPass@@Base+0x708>
+  265bc4:	ldr	r2, [pc, #60]	; 265c08 <LLVMAddSimplifyLibCallsPass@@Base+0x838>
+  265bc8:	add	r0, pc, r2
+  265bcc:	b	265ad8 <LLVMAddSimplifyLibCallsPass@@Base+0x708>
+  265bd0:	ldr	r0, [pc, #52]	; 265c0c <LLVMAddSimplifyLibCallsPass@@Base+0x83c>
+  265bd4:	add	r0, pc, r0
+  265bd8:	b	265ad8 <LLVMAddSimplifyLibCallsPass@@Base+0x708>
+  265bdc:			; <UNDEFINED> instruction: 0x01072e9c
+  265be0:	smlatteq	r7, ip, lr, r2
+  265be4:			; <UNDEFINED> instruction: 0x01072e94
+  265be8:			; <UNDEFINED> instruction: 0x01072e9c
+  265bec:			; <UNDEFINED> instruction: 0x01072e9c
+  265bf0:	tsteq	r7, r8, ror #28
+  265bf4:	tsteq	r7, ip, lsl lr
+  265bf8:	tsteq	r7, r8, asr lr
+  265bfc:	tsteq	r7, r0, ror #28
+  265c00:	smlatteq	r7, r4, sp, r2
+  265c04:	ldrdeq	r2, [r7, -r8]
+  265c08:			; <UNDEFINED> instruction: 0x01072db4
+  265c0c:			; <UNDEFINED> instruction: 0x01072db4
+  265c10:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  265c14:	mov	r3, r1
+  265c18:	mov	r4, #61440	; 0xf000
+  265c1c:	str	lr, [sp, #32]
+  265c20:	movt	r4, #65535	; 0xffff
+  265c24:	mvn	r5, #0
+  265c28:	strd	r6, [sp, #8]
+  265c2c:	mov	lr, #520	; 0x208
+  265c30:	mov	r2, #40	; 0x28
+  265c34:	strd	r8, [sp, #16]
+  265c38:	add	r0, r0, #44	; 0x2c
+  265c3c:	strd	sl, [sp, #24]
+  265c40:	ldrd	r6, [r1]
+  265c44:	sub	sp, sp, #44	; 0x2c
+  265c48:	vldr	d16, [r1, #8]
+  265c4c:	mov	r1, sp
+  265c50:	ldrd	sl, [r3, #16]
+  265c54:	str	lr, [sp]
+  265c58:	ldrd	r8, [r3, #24]
+  265c5c:	and	r4, r4, r6
+  265c60:	and	r5, r5, r7
+  265c64:	strd	sl, [sp, #24]
+  265c68:	vstr	d16, [sp, #16]
+  265c6c:	strd	r4, [sp, #8]
+  265c70:	strd	r8, [sp, #32]
+  265c74:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265c78:	add	sp, sp, #44	; 0x2c
+  265c7c:	ldrd	r4, [sp]
+  265c80:	ldrd	r6, [sp, #8]
+  265c84:	ldrd	r8, [sp, #16]
+  265c88:	ldrd	sl, [sp, #24]
+  265c8c:	add	sp, sp, #32
+  265c90:	pop	{pc}		; (ldr pc, [sp], #4)
+  265c94:	str	r4, [sp, #-8]!
+  265c98:	mov	r3, r1
+  265c9c:	mov	r4, #540	; 0x21c
+  265ca0:	str	lr, [sp, #4]
+  265ca4:	ldr	ip, [r1, #48]	; 0x30
+  265ca8:	sub	sp, sp, #32
+  265cac:	mov	lr, #56	; 0x38
+  265cb0:	mov	r1, sp
+  265cb4:	str	r2, [sp, #16]
+  265cb8:	add	r0, r0, #44	; 0x2c
+  265cbc:	mov	r2, #32
+  265cc0:	str	r3, [sp, #8]
+  265cc4:	str	r4, [sp]
+  265cc8:	str	lr, [sp, #20]
+  265ccc:	str	ip, [sp, #24]
+  265cd0:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265cd4:	cmp	r0, #0
+  265cd8:	ldreq	r0, [sp]
+  265cdc:	add	sp, sp, #32
+  265ce0:	ldr	r4, [sp]
+  265ce4:	add	sp, sp, #4
+  265ce8:	pop	{pc}		; (ldr pc, [sp], #4)
+  265cec:	str	r4, [sp, #-8]!
+  265cf0:	str	lr, [sp, #4]
+  265cf4:	bl	265c94 <LLVMAddSimplifyLibCallsPass@@Base+0x8c4>
+  265cf8:	cmp	r0, #0
+  265cfc:	bne	265d0c <LLVMAddSimplifyLibCallsPass@@Base+0x93c>
+  265d00:	ldr	r4, [sp]
+  265d04:	add	sp, sp, #4
+  265d08:	pop	{pc}		; (ldr pc, [sp], #4)
+  265d0c:	ldr	r4, [sp]
+  265d10:	ldr	lr, [sp, #4]
+  265d14:	add	sp, sp, #8
+  265d18:	b	50fa60 <osup_deregister_unload_callback@@Base+0x760>
+  265d1c:	str	r4, [sp, #-8]!
+  265d20:	mov	r3, r0
+  265d24:	movw	ip, #521	; 0x209
+  265d28:	str	lr, [sp, #4]
+  265d2c:	sub	sp, sp, #16
+  265d30:	mov	r4, #1
+  265d34:	add	r1, sp, #16
+  265d38:	add	r0, r0, #44	; 0x2c
+  265d3c:	mov	r2, #8
+  265d40:	str	r4, [r3, #48]	; 0x30
+  265d44:	str	ip, [r1, #-8]!
+  265d48:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265d4c:	cmp	r0, #0
+  265d50:	beq	265d94 <LLVMAddSimplifyLibCallsPass@@Base+0x9c4>
+  265d54:	mov	r0, r4
+  265d58:	bl	26d8a4 <egl_color_buffer_is_secure@@Base+0x4418>
+  265d5c:	ldr	lr, [pc, #64]	; 265da4 <LLVMAddSimplifyLibCallsPass@@Base+0x9d4>
+  265d60:	mov	r2, r0
+  265d64:	mov	r0, #2
+  265d68:	ldr	r1, [pc, #56]	; 265da8 <LLVMAddSimplifyLibCallsPass@@Base+0x9d8>
+  265d6c:	ldr	r3, [pc, #56]	; 265dac <LLVMAddSimplifyLibCallsPass@@Base+0x9dc>
+  265d70:	add	r4, pc, lr
+  265d74:	ldr	lr, [pc, #52]	; 265db0 <LLVMAddSimplifyLibCallsPass@@Base+0x9e0>
+  265d78:	add	ip, pc, r1
+  265d7c:	str	r4, [sp]
+  265d80:	add	r1, pc, r3
+  265d84:	str	ip, [sp, #4]
+  265d88:	add	r3, pc, lr
+  265d8c:	bl	26e6dc <egl_color_buffer_is_secure@@Base+0x5250>
+  265d90:	bl	26e514 <egl_color_buffer_is_secure@@Base+0x5088>
+  265d94:	add	sp, sp, #16
+  265d98:	ldr	r4, [sp]
+  265d9c:	add	sp, sp, #4
+  265da0:	pop	{pc}		; (ldr pc, [sp], #4)
+  265da4:	tsteq	fp, r8, ror #10
+  265da8:	smlatteq	r7, r4, ip, r2
+  265dac:	tsteq	r7, r0, ror ip
+  265db0:	tsteq	r7, r0, ror ip
+  265db4:	strd	r4, [sp, #-12]!
+  265db8:	mov	r4, r0
+  265dbc:	mov	r0, #10
+  265dc0:	str	lr, [sp, #8]
+  265dc4:	sub	sp, sp, #12
+  265dc8:	mov	ip, #0
+  265dcc:	add	r5, r4, #44	; 0x2c
+  265dd0:	mov	r1, r2
+  265dd4:	strh	r0, [sp, #4]
+  265dd8:	mov	r3, r5
+  265ddc:	mov	r0, ip
+  265de0:	add	r2, sp, #4
+  265de4:	strh	ip, [sp, #6]
+  265de8:	bl	2654c0 <LLVMAddSimplifyLibCallsPass@@Base+0xf0>
+  265dec:	cmp	r0, #0
+  265df0:	movne	r0, #3
+  265df4:	beq	265e08 <LLVMAddSimplifyLibCallsPass@@Base+0xa38>
+  265df8:	add	sp, sp, #12
+  265dfc:	ldrd	r4, [sp]
+  265e00:	add	sp, sp, #8
+  265e04:	pop	{pc}		; (ldr pc, [sp], #4)
+  265e08:	mov	r0, r4
+  265e0c:	bl	266168 <LLVMAddSimplifyLibCallsPass@@Base+0xd98>
+  265e10:	cmp	r0, #0
+  265e14:	beq	265df8 <LLVMAddSimplifyLibCallsPass@@Base+0xa28>
+  265e18:	mov	r0, r5
+  265e1c:	bl	2653d4 <LLVMAddSimplifyLibCallsPass@@Base+0x4>
+  265e20:	mov	r0, #3
+  265e24:	b	265df8 <LLVMAddSimplifyLibCallsPass@@Base+0xa28>
+  265e28:	str	r4, [sp, #-8]!
+  265e2c:	mov	r4, r0
+  265e30:	str	lr, [sp, #4]
+  265e34:	bl	2661d0 <LLVMAddSimplifyLibCallsPass@@Base+0xe00>
+  265e38:	add	r0, r4, #44	; 0x2c
+  265e3c:	ldr	lr, [sp, #4]
+  265e40:	ldr	r4, [sp]
+  265e44:	add	sp, sp, #8
+  265e48:	b	2653d4 <LLVMAddSimplifyLibCallsPass@@Base+0x4>
+  265e4c:	vmov.i32	d16, #0	; 0x00000000
+  265e50:	str	r4, [sp, #-8]!
+  265e54:	movw	r3, #522	; 0x20a
+  265e58:	str	lr, [sp, #4]
+  265e5c:	sub	sp, sp, #40	; 0x28
+  265e60:	mov	r4, r0
+  265e64:	mov	r1, sp
+  265e68:	mov	r2, #40	; 0x28
+  265e6c:	add	r0, r0, #44	; 0x2c
+  265e70:	str	r3, [sp]
+  265e74:	vstr	d16, [sp, #8]
+  265e78:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265e7c:	mov	r0, #0
+  265e80:	str	r0, [r4, #52]	; 0x34
+  265e84:	add	sp, sp, #40	; 0x28
+  265e88:	ldr	r4, [sp]
+  265e8c:	add	sp, sp, #4
+  265e90:	pop	{pc}		; (ldr pc, [sp], #4)
+  265e94:	push	{lr}		; (str lr, [sp, #-4]!)
+  265e98:	sub	sp, sp, #20
+  265e9c:	mov	ip, #516	; 0x204
+  265ea0:	mov	r1, sp
+  265ea4:	strd	r2, [sp, #8]
+  265ea8:	mov	r2, #16
+  265eac:	str	ip, [sp]
+  265eb0:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265eb4:	add	sp, sp, #20
+  265eb8:	pop	{pc}		; (ldr pc, [sp], #4)
+  265ebc:	str	r4, [sp, #-8]!
+  265ec0:	movw	r2, #541	; 0x21d
+  265ec4:	mov	r4, r1
+  265ec8:	str	lr, [sp, #4]
+  265ecc:	sub	sp, sp, #16
+  265ed0:	add	r0, r0, #44	; 0x2c
+  265ed4:	add	r3, sp, #16
+  265ed8:	str	r2, [r3, #-16]!
+  265edc:	mov	r2, #16
+  265ee0:	mov	r1, r3
+  265ee4:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  265ee8:	cmp	r0, #0
+  265eec:	ldreq	r1, [sp, #8]
+  265ef0:	streq	r1, [r4]
+  265ef4:	add	sp, sp, #16
+  265ef8:	ldr	r4, [sp]
+  265efc:	add	sp, sp, #4
+  265f00:	pop	{pc}		; (ldr pc, [sp], #4)
+  265f04:	strd	r4, [sp, #-12]!
+  265f08:	mov	ip, #0
+  265f0c:	str	lr, [sp, #8]
+  265f10:	sub	sp, sp, #36	; 0x24
+  265f14:	mov	lr, #2
+  265f18:	ldr	r5, [sp, #48]	; 0x30
+  265f1c:	mov	r1, sp
+  265f20:	ldr	r4, [sp, #52]	; 0x34
+  265f24:	strd	r2, [sp]
+  265f28:	str	ip, [sp, #12]
+  265f2c:	str	ip, [sp, #20]
+  265f30:	str	r5, [sp, #8]
+  265f34:	str	r4, [sp, #16]
+  265f38:	strb	lr, [sp, #24]
+  265f3c:	bl	265c10 <LLVMAddSimplifyLibCallsPass@@Base+0x840>
+  265f40:	add	sp, sp, #36	; 0x24
+  265f44:	ldrd	r4, [sp]
+  265f48:	add	sp, sp, #8
+  265f4c:	pop	{pc}		; (ldr pc, [sp], #4)
+  265f50:	strd	r4, [sp, #-12]!
+  265f54:	mov	ip, #0
+  265f58:	str	lr, [sp, #8]
+  265f5c:	sub	sp, sp, #36	; 0x24
+  265f60:	mov	lr, #1
+  265f64:	ldr	r5, [sp, #48]	; 0x30
+  265f68:	mov	r1, sp
+  265f6c:	ldr	r4, [sp, #52]	; 0x34
+  265f70:	strd	r2, [sp]
+  265f74:	str	ip, [sp, #12]
+  265f78:	str	ip, [sp, #20]
+  265f7c:	str	r5, [sp, #8]
+  265f80:	str	r4, [sp, #16]
+  265f84:	strb	lr, [sp, #24]
+  265f88:	bl	265c10 <LLVMAddSimplifyLibCallsPass@@Base+0x840>
+  265f8c:	add	sp, sp, #36	; 0x24
+  265f90:	ldrd	r4, [sp]
+  265f94:	add	sp, sp, #8
+  265f98:	pop	{pc}		; (ldr pc, [sp], #4)
+  265f9c:	movw	r3, #49151	; 0xbfff
+  265fa0:	tst	r0, #16
+  265fa4:	movt	r3, #1
+  265fa8:	and	r3, r3, r0
+  265fac:	orrne	r3, r3, #4
+  265fb0:	mov	r0, r3
+  265fb4:	bx	lr
+  265fb8:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  265fbc:	add	r0, r0, #44	; 0x2c
+  265fc0:	strd	r8, [sp, #16]
+  265fc4:	strd	sl, [sp, #24]
+  265fc8:	mov	fp, #0
+  265fcc:	strd	r6, [sp, #8]
+  265fd0:	str	lr, [sp, #32]
+  265fd4:	vpush	{d8}
+  265fd8:	sub	sp, sp, #20
+  265fdc:	ldrh	r8, [sp, #72]	; 0x48
+  265fe0:	ldr	r4, [sp, #64]	; 0x40
+  265fe4:	ldrd	r6, [sp, #80]	; 0x50
+  265fe8:	vmov	d8, r2, r3
+  265fec:	cmp	r8, #0
+  265ff0:	lsl	r4, r4, #12
+  265ff4:	movne	r5, #3
+  265ff8:	and	sl, r6, #2
+  265ffc:	addne	r5, r4, r5, lsl r8
+  266000:	moveq	r5, r4
+  266004:	and	r6, r6, #1
+  266008:	orrs	r3, sl, fp
+  26600c:	mov	r9, r6
+  266010:	orrne	r9, r6, #2
+  266014:	bl	2653d0 <LLVMAddSimplifyLibCallsPass@@Base>
+  266018:	ldr	ip, [r0]
+  26601c:	mov	r2, r9
+  266020:	mov	r0, #0
+  266024:	vstr	d8, [sp, #8]
+  266028:	mov	r1, r5
+  26602c:	mov	r3, #1
+  266030:	str	ip, [sp]
+  266034:	bl	215794 <mmap64@plt>
+  266038:	cmn	r0, #1
+  26603c:	beq	2660e0 <LLVMAddSimplifyLibCallsPass@@Base+0xd10>
+  266040:	cmp	r8, #0
+  266044:	beq	2660a8 <LLVMAddSimplifyLibCallsPass@@Base+0xcd8>
+  266048:	mov	r3, #1
+  26604c:	add	r7, r0, r5
+  266050:	lsl	r2, r3, r8
+  266054:	sub	r5, r2, #1
+  266058:	add	r1, r0, r5
+  26605c:	bic	sl, r1, r5
+  266060:	add	fp, sl, r4
+  266064:	bic	lr, fp, #4080	; 0xff0
+  266068:	bic	r8, lr, #15
+  26606c:	cmp	r8, #0
+  266070:	bne	2660c8 <LLVMAddSimplifyLibCallsPass@@Base+0xcf8>
+  266074:	lsl	r9, r2, #1
+  266078:	add	sl, sl, r9
+  26607c:	add	fp, fp, r9
+  266080:	cmp	r0, sl
+  266084:	beq	266090 <LLVMAddSimplifyLibCallsPass@@Base+0xcc0>
+  266088:	rsb	r1, r0, sl
+  26608c:	bl	2157a0 <munmap@plt>
+  266090:	cmp	r7, fp
+  266094:	beq	2660a4 <LLVMAddSimplifyLibCallsPass@@Base+0xcd4>
+  266098:	rsb	r1, fp, r7
+  26609c:	mov	r0, fp
+  2660a0:	bl	2157a0 <munmap@plt>
+  2660a4:	mov	r0, sl
+  2660a8:	add	sp, sp, #20
+  2660ac:	vpop	{d8}
+  2660b0:	ldrd	r4, [sp]
+  2660b4:	ldrd	r6, [sp, #8]
+  2660b8:	ldrd	r8, [sp, #16]
+  2660bc:	ldrd	sl, [sp, #24]
+  2660c0:	add	sp, sp, #32
+  2660c4:	pop	{pc}		; (ldr pc, [sp], #4)
+  2660c8:	bic	r4, sl, #4080	; 0xff0
+  2660cc:	bic	r6, r4, #15
+  2660d0:	cmp	r6, #0
+  2660d4:	addeq	sl, sl, r2
+  2660d8:	addeq	fp, fp, r2
+  2660dc:	b	266080 <LLVMAddSimplifyLibCallsPass@@Base+0xcb0>
+  2660e0:	mov	r0, #0
+  2660e4:	b	2660a8 <LLVMAddSimplifyLibCallsPass@@Base+0xcd8>
+  2660e8:	strd	r4, [sp, #-20]!	; 0xffffffec
+  2660ec:	movw	ip, #515	; 0x203
+  2660f0:	add	r0, r0, #44	; 0x2c
+  2660f4:	strd	r6, [sp, #8]
+  2660f8:	mov	r6, #61440	; 0xf000
+  2660fc:	mvn	r7, #0
+  266100:	str	lr, [sp, #16]
+  266104:	sub	sp, sp, #36	; 0x24
+  266108:	movt	r6, #65535	; 0xffff
+  26610c:	ldr	r4, [sp, #56]	; 0x38
+  266110:	and	r6, r6, r2
+  266114:	and	r7, r7, r3
+  266118:	mov	r1, sp
+  26611c:	mov	r2, #32
+  266120:	str	ip, [sp]
+  266124:	strd	r6, [sp, #8]
+  266128:	asr	r5, r4, #31
+  26612c:	strd	r4, [sp, #16]
+  266130:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  266134:	cmp	r0, #0
+  266138:	bne	266154 <LLVMAddSimplifyLibCallsPass@@Base+0xd84>
+  26613c:	ldr	r0, [sp]
+  266140:	cmp	r0, #0
+  266144:	bne	266154 <LLVMAddSimplifyLibCallsPass@@Base+0xd84>
+  266148:	ldrd	r2, [sp, #24]
+  26614c:	ldr	r1, [sp, #60]	; 0x3c
+  266150:	strd	r2, [r1]
+  266154:	add	sp, sp, #36	; 0x24
+  266158:	ldrd	r4, [sp]
+  26615c:	ldrd	r6, [sp, #8]
+  266160:	add	sp, sp, #16
+  266164:	pop	{pc}		; (ldr pc, [sp], #4)
+  266168:	str	r4, [sp, #-16]!
+  26616c:	mov	r4, r0
+  266170:	add	r0, r0, #44	; 0x2c
+  266174:	strd	r6, [sp, #4]
+  266178:	mov	r6, #12288	; 0x3000
+  26617c:	mov	r7, #0
+  266180:	str	lr, [sp, #12]
+  266184:	sub	sp, sp, #16
+  266188:	bl	2653d0 <LLVMAddSimplifyLibCallsPass@@Base>
+  26618c:	ldr	ip, [r0]
+  266190:	mov	r0, #0
+  266194:	mov	r1, #4096	; 0x1000
+  266198:	mov	r2, r0
+  26619c:	strd	r6, [sp, #8]
+  2661a0:	mov	r3, #1
+  2661a4:	str	ip, [sp]
+  2661a8:	bl	215794 <mmap64@plt>
+  2661ac:	cmn	r0, #1
+  2661b0:	str	r0, [r4, #612]	; 0x264
+  2661b4:	moveq	r0, #3
+  2661b8:	movne	r0, #0
+  2661bc:	add	sp, sp, #16
+  2661c0:	ldr	r4, [sp]
+  2661c4:	ldrd	r6, [sp, #4]
+  2661c8:	add	sp, sp, #12
+  2661cc:	pop	{pc}		; (ldr pc, [sp], #4)
+  2661d0:	str	r4, [sp, #-8]!
+  2661d4:	mov	r1, #4096	; 0x1000
+  2661d8:	mov	r4, r0
+  2661dc:	str	lr, [sp, #4]
+  2661e0:	ldr	r0, [r0, #612]	; 0x264
+  2661e4:	bl	2157a0 <munmap@plt>
+  2661e8:	mov	r3, #0
+  2661ec:	str	r3, [r4, #612]	; 0x264
+  2661f0:	ldr	r4, [sp]
+  2661f4:	add	sp, sp, #4
+  2661f8:	pop	{pc}		; (ldr pc, [sp], #4)
+  2661fc:	strd	r4, [sp, #-8]!
+  266200:	and	r4, r2, #8
+  266204:	mov	r5, #0
+  266208:	orrs	ip, r4, r5
+  26620c:	ldr	r1, [sp, #8]
+  266210:	bne	266238 <LLVMAddSimplifyLibCallsPass@@Base+0xe68>
+  266214:	mov	r4, #61440	; 0xf000
+  266218:	mvn	r5, #0
+  26621c:	movt	r4, #65535	; 0xffff
+  266220:	and	r3, r3, r5
+  266224:	and	r2, r2, r4
+  266228:	add	r0, r0, #44	; 0x2c
+  26622c:	ldrd	r4, [sp]
+  266230:	add	sp, sp, #8
+  266234:	b	265e94 <LLVMAddSimplifyLibCallsPass@@Base+0xac4>
+  266238:	bic	r0, r2, #4080	; 0xff0
+  26623c:	ldrd	r4, [sp]
+  266240:	lsl	r1, r1, #12
+  266244:	bic	r0, r0, #15
+  266248:	add	sp, sp, #8
+  26624c:	b	2157a0 <munmap@plt>
+  266250:	strd	r4, [sp, #-20]!	; 0xffffffec
+  266254:	mov	r4, #61440	; 0xf000
+  266258:	mvn	r5, #0
+  26625c:	strd	r6, [sp, #8]
+  266260:	movt	r4, #65535	; 0xffff
+  266264:	movw	ip, #514	; 0x202
+  266268:	str	lr, [sp, #16]
+  26626c:	sub	sp, sp, #36	; 0x24
+  266270:	and	r4, r4, r2
+  266274:	ldrd	r6, [sp, #56]	; 0x38
+  266278:	and	r5, r5, r3
+  26627c:	add	r0, r0, #44	; 0x2c
+  266280:	mov	r1, sp
+  266284:	mov	r2, #32
+  266288:	str	ip, [sp]
+  26628c:	strd	r4, [sp, #8]
+  266290:	strd	r6, [sp, #16]
+  266294:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  266298:	cmp	r0, #0
+  26629c:	bne	2662c0 <LLVMAddSimplifyLibCallsPass@@Base+0xef0>
+  2662a0:	ldr	r0, [sp]
+  2662a4:	cmp	r0, #0
+  2662a8:	ldrne	r0, [sp, #24]
+  2662ac:	add	sp, sp, #36	; 0x24
+  2662b0:	ldrd	r4, [sp]
+  2662b4:	ldrd	r6, [sp, #8]
+  2662b8:	add	sp, sp, #16
+  2662bc:	pop	{pc}		; (ldr pc, [sp], #4)
+  2662c0:	mvn	r0, #3
+  2662c4:	b	2662ac <LLVMAddSimplifyLibCallsPass@@Base+0xedc>
+  2662c8:	push	{lr}		; (str lr, [sp, #-4]!)
+  2662cc:	sub	sp, sp, #12
+  2662d0:	mov	ip, #1
+  2662d4:	ldr	r1, [sp, #16]
+  2662d8:	str	ip, [sp]
+  2662dc:	str	r1, [sp, #4]
+  2662e0:	bl	2660e8 <LLVMAddSimplifyLibCallsPass@@Base+0xd18>
+  2662e4:	add	sp, sp, #12
+  2662e8:	pop	{pc}		; (ldr pc, [sp], #4)
+  2662ec:	strd	r4, [sp, #-28]!	; 0xffffffe4
+  2662f0:	strd	r6, [sp, #8]
+  2662f4:	strd	r8, [sp, #16]
+  2662f8:	str	lr, [sp, #24]
+  2662fc:	sub	sp, sp, #28
+  266300:	ldrd	r6, [sp, #64]	; 0x40
+  266304:	orrs	r1, r6, r7
+  266308:	beq	266394 <LLVMAddSimplifyLibCallsPass@@Base+0xfc4>
+  26630c:	and	r4, r2, #4
+  266310:	mov	r5, #0
+  266314:	orrs	r1, r4, r5
+  266318:	beq	266394 <LLVMAddSimplifyLibCallsPass@@Base+0xfc4>
+  26631c:	and	r8, r2, #32
+  266320:	mov	r9, #0
+  266324:	strd	r6, [sp]
+  266328:	orrs	r1, r8, r9
+  26632c:	lsr	r4, r2, #4
+  266330:	mov	r8, #61440	; 0xf000
+  266334:	movt	r8, #65535	; 0xffff
+  266338:	mvn	r9, #0
+  26633c:	orr	r5, r4, r3, lsl #28
+  266340:	and	r2, r2, r8
+  266344:	and	r3, r3, r9
+  266348:	ldrd	r8, [sp, #56]	; 0x38
+  26634c:	and	r4, r5, #1
+  266350:	mov	r1, #0
+  266354:	orrne	r4, r4, #2
+  266358:	mov	r5, #0
+  26635c:	str	r1, [sp, #8]
+  266360:	lsl	r7, r9, #12
+  266364:	lsl	lr, r8, #12
+  266368:	strd	r4, [sp, #16]
+  26636c:	orr	ip, r7, r8, lsr #20
+  266370:	adds	r2, r2, lr
+  266374:	adc	r3, r3, ip
+  266378:	bl	265fb8 <LLVMAddSimplifyLibCallsPass@@Base+0xbe8>
+  26637c:	add	sp, sp, #28
+  266380:	ldrd	r4, [sp]
+  266384:	ldrd	r6, [sp, #8]
+  266388:	ldrd	r8, [sp, #16]
+  26638c:	add	sp, sp, #24
+  266390:	pop	{pc}		; (ldr pc, [sp], #4)
+  266394:	mov	r0, #0
+  266398:	b	26637c <LLVMAddSimplifyLibCallsPass@@Base+0xfac>
+  26639c:	ldr	r1, [sp, #8]
+  2663a0:	ldr	r0, [sp]
+  2663a4:	lsl	r1, r1, #12
+  2663a8:	b	2157a0 <munmap@plt>
+  2663ac:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  2663b0:	mov	ip, #0
+  2663b4:	add	r5, r0, #44	; 0x2c
+  2663b8:	strd	r6, [sp, #8]
+  2663bc:	mov	r4, r0
+  2663c0:	mov	r0, r5
+  2663c4:	str	lr, [sp, #32]
+  2663c8:	movw	lr, #518	; 0x206
+  2663cc:	strd	sl, [sp, #24]
+  2663d0:	strd	r8, [sp, #16]
+  2663d4:	sub	sp, sp, #84	; 0x54
+  2663d8:	ldr	r7, [sp, #120]	; 0x78
+  2663dc:	ldr	r6, [sp, #124]	; 0x7c
+  2663e0:	str	r1, [sp, #32]
+  2663e4:	add	r1, sp, #24
+  2663e8:	strd	r2, [sp, #40]	; 0x28
+  2663ec:	mov	r2, #56	; 0x38
+  2663f0:	str	lr, [sp, #24]
+  2663f4:	str	r7, [sp, #48]	; 0x30
+  2663f8:	str	r6, [sp, #56]	; 0x38
+  2663fc:	str	ip, [sp, #36]	; 0x24
+  266400:	str	ip, [sp, #52]	; 0x34
+  266404:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  266408:	cmp	r0, #0
+  26640c:	bne	266448 <LLVMAddSimplifyLibCallsPass@@Base+0x1078>
+  266410:	ldr	r3, [sp, #24]
+  266414:	cmp	r3, #0
+  266418:	bne	266448 <LLVMAddSimplifyLibCallsPass@@Base+0x1078>
+  26641c:	ldrd	r6, [sp, #32]
+  266420:	mov	r1, #0
+  266424:	and	r0, r6, #16384	; 0x4000
+  266428:	orrs	r2, r0, r1
+  26642c:	bne	26646c <LLVMAddSimplifyLibCallsPass@@Base+0x109c>
+  266430:	ldrd	r0, [sp, #64]	; 0x40
+  266434:	orr	r0, r0, #2048	; 0x800
+  266438:	ldrd	r2, [sp, #72]	; 0x48
+  26643c:	ldr	r9, [sp, #128]	; 0x80
+  266440:	strd	r2, [r9]
+  266444:	b	266450 <LLVMAddSimplifyLibCallsPass@@Base+0x1080>
+  266448:	mov	r0, #0
+  26644c:	mov	r1, #0
+  266450:	add	sp, sp, #84	; 0x54
+  266454:	ldrd	r4, [sp]
+  266458:	ldrd	r6, [sp, #8]
+  26645c:	ldrd	r8, [sp, #16]
+  266460:	ldrd	sl, [sp, #24]
+  266464:	add	sp, sp, #32
+  266468:	pop	{pc}		; (ldr pc, [sp], #4)
+  26646c:	ldrd	sl, [sp, #64]	; 0x40
+  266470:	str	r3, [sp, #8]
+  266474:	mov	r0, r4
+  266478:	ldrd	r8, [sp, #72]	; 0x48
+  26647c:	strd	r6, [sp, #16]
+  266480:	mov	r2, sl
+  266484:	mov	r3, fp
+  266488:	strd	r8, [sp]
+  26648c:	bl	265fb8 <LLVMAddSimplifyLibCallsPass@@Base+0xbe8>
+  266490:	cmp	r0, #0
+  266494:	orrne	r0, r0, #2048	; 0x800
+  266498:	movne	r1, #0
+  26649c:	orrne	r0, r0, #8
+  2664a0:	bne	266438 <LLVMAddSimplifyLibCallsPass@@Base+0x1068>
+  2664a4:	mov	r0, r5
+  2664a8:	ldrd	r2, [sp, #64]	; 0x40
+  2664ac:	bl	265e94 <LLVMAddSimplifyLibCallsPass@@Base+0xac4>
+  2664b0:	mov	r0, #0
+  2664b4:	mov	r1, #0
+  2664b8:	b	266450 <LLVMAddSimplifyLibCallsPass@@Base+0x1080>
+  2664bc:	strd	r4, [sp, #-24]!	; 0xffffffe8
+  2664c0:	mov	ip, #0
+  2664c4:	mov	r5, r0
+  2664c8:	str	r6, [sp, #8]
+  2664cc:	add	r6, r0, #44	; 0x2c
+  2664d0:	str	lr, [sp, #20]
+  2664d4:	movw	lr, #513	; 0x201
+  2664d8:	mov	r0, r6
+  2664dc:	strd	r8, [sp, #12]
+  2664e0:	sub	sp, sp, #72	; 0x48
+  2664e4:	str	r2, [sp, #32]
+  2664e8:	mov	r2, #48	; 0x30
+  2664ec:	str	r1, [sp, #40]	; 0x28
+  2664f0:	add	r1, sp, #24
+  2664f4:	str	r3, [sp, #48]	; 0x30
+  2664f8:	str	lr, [sp, #24]
+  2664fc:	str	ip, [sp, #52]	; 0x34
+  266500:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  266504:	cmp	r0, #0
+  266508:	bne	266578 <LLVMAddSimplifyLibCallsPass@@Base+0x11a8>
+  26650c:	ldr	r3, [sp, #24]
+  266510:	cmp	r3, #0
+  266514:	bne	266578 <LLVMAddSimplifyLibCallsPass@@Base+0x11a8>
+  266518:	ldrd	r0, [sp, #48]	; 0x30
+  26651c:	mov	r9, #0
+  266520:	mov	r3, #0
+  266524:	and	r2, r0, #1
+  266528:	and	r8, r0, #2
+  26652c:	lsl	r4, r2, #4
+  266530:	orrs	ip, r8, r9
+  266534:	and	r2, r0, #24576	; 0x6000
+  266538:	orrne	r4, r4, #32
+  26653c:	orrs	r3, r2, r3
+  266540:	bne	266598 <LLVMAddSimplifyLibCallsPass@@Base+0x11c8>
+  266544:	ldrd	r0, [sp, #56]	; 0x38
+  266548:	orrs	r3, r0, r1
+  26654c:	beq	266580 <LLVMAddSimplifyLibCallsPass@@Base+0x11b0>
+  266550:	ldr	r5, [sp, #96]	; 0x60
+  266554:	cmp	r5, #0
+  266558:	beq	266564 <LLVMAddSimplifyLibCallsPass@@Base+0x1194>
+  26655c:	ldrd	r2, [sp, #64]	; 0x40
+  266560:	strd	r2, [r5]
+  266564:	orr	ip, r4, #2048	; 0x800
+  266568:	orr	r3, ip, #5
+  26656c:	orr	r0, r0, r3
+  266570:	orr	r1, r1, r3, asr #31
+  266574:	b	266580 <LLVMAddSimplifyLibCallsPass@@Base+0x11b0>
+  266578:	mov	r0, #0
+  26657c:	mov	r1, #0
+  266580:	add	sp, sp, #72	; 0x48
+  266584:	ldrd	r4, [sp]
+  266588:	ldr	r6, [sp, #8]
+  26658c:	ldrd	r8, [sp, #12]
+  266590:	add	sp, sp, #20
+  266594:	pop	{pc}		; (ldr pc, [sp], #4)
+  266598:	ldrd	r8, [sp, #64]	; 0x40
+  26659c:	mov	lr, #0
+  2665a0:	strd	r0, [sp, #16]
+  2665a4:	ldrd	r2, [sp, #56]	; 0x38
+  2665a8:	mov	r0, r5
+  2665ac:	str	lr, [sp, #8]
+  2665b0:	strd	r8, [sp]
+  2665b4:	bl	265fb8 <LLVMAddSimplifyLibCallsPass@@Base+0xbe8>
+  2665b8:	subs	r9, r0, #0
+  2665bc:	beq	2665ec <LLVMAddSimplifyLibCallsPass@@Base+0x121c>
+  2665c0:	ldrd	r0, [sp, #48]	; 0x30
+  2665c4:	mov	r1, #0
+  2665c8:	ldr	r5, [sp, #96]	; 0x60
+  2665cc:	and	r0, r0, #8192	; 0x2000
+  2665d0:	orrs	r2, r0, r1
+  2665d4:	mov	r1, #0
+  2665d8:	orrne	r0, r9, #10
+  2665dc:	orreq	r0, r9, #8
+  2665e0:	cmp	r5, #0
+  2665e4:	bne	26655c <LLVMAddSimplifyLibCallsPass@@Base+0x118c>
+  2665e8:	b	266564 <LLVMAddSimplifyLibCallsPass@@Base+0x1194>
+  2665ec:	mov	r0, r6
+  2665f0:	ldrd	r2, [sp, #56]	; 0x38
+  2665f4:	bl	265e94 <LLVMAddSimplifyLibCallsPass@@Base+0xac4>
+  2665f8:	mov	r0, #0
+  2665fc:	mov	r1, #0
+  266600:	b	266580 <LLVMAddSimplifyLibCallsPass@@Base+0x11b0>
+  266604:	strd	r4, [sp, #-36]!	; 0xffffffdc
+  266608:	mov	r5, r0
+  26660c:	mov	r4, r2
+  266610:	strd	r6, [sp, #8]
+  266614:	strd	r8, [sp, #16]
+  266618:	strd	sl, [sp, #24]
+  26661c:	str	lr, [sp, #32]
+  266620:	sub	sp, sp, #84	; 0x54
+  266624:	ldr	r7, [sp, #136]	; 0x88
+  266628:	ands	r8, r7, #65536	; 0x10000
+  26662c:	bne	266710 <LLVMAddSimplifyLibCallsPass@@Base+0x1340>
+  266630:	ldrd	sl, [sp, #120]	; 0x78
+  266634:	mov	r6, r3
+  266638:	mov	r3, #512	; 0x200
+  26663c:	mov	r0, r7
+  266640:	str	r2, [sp, #32]
+  266644:	add	r7, r5, #44	; 0x2c
+  266648:	str	r3, [sp, #24]
+  26664c:	str	r6, [sp, #36]	; 0x24
+  266650:	strd	sl, [sp, #40]	; 0x28
+  266654:	ldrd	sl, [sp, #128]	; 0x80
+  266658:	strd	sl, [sp, #48]	; 0x30
+  26665c:	bl	265f9c <LLVMAddSimplifyLibCallsPass@@Base+0xbcc>
+  266660:	str	r0, [sp, #56]	; 0x38
+  266664:	add	r1, sp, #24
+  266668:	mov	r0, r7
+  26666c:	mov	r2, #56	; 0x38
+  266670:	str	r8, [sp, #60]	; 0x3c
+  266674:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  266678:	cmp	r0, #0
+  26667c:	bne	2666e8 <LLVMAddSimplifyLibCallsPass@@Base+0x1318>
+  266680:	ldr	r0, [sp, #24]
+  266684:	cmp	r0, #0
+  266688:	bne	2666e8 <LLVMAddSimplifyLibCallsPass@@Base+0x1318>
+  26668c:	ldrd	r8, [sp, #56]	; 0x38
+  266690:	mov	r3, #0
+  266694:	and	fp, r8, #1
+  266698:	and	r2, r8, #2
+  26669c:	lsl	sl, fp, #4
+  2666a0:	orrs	r3, r2, r3
+  2666a4:	and	r2, r8, #33792	; 0x8400
+  2666a8:	mov	r3, #0
+  2666ac:	orrne	sl, sl, #32
+  2666b0:	orrs	r3, r2, r3
+  2666b4:	and	r2, r8, #8192	; 0x2000
+  2666b8:	mov	r3, #0
+  2666bc:	orrne	sl, sl, #64	; 0x40
+  2666c0:	orrs	r3, r2, r3
+  2666c4:	bne	26675c <LLVMAddSimplifyLibCallsPass@@Base+0x138c>
+  2666c8:	ldrd	r0, [sp, #64]	; 0x40
+  2666cc:	movw	r9, #2052	; 0x804
+  2666d0:	mov	ip, #0
+  2666d4:	orr	lr, r9, r0
+  2666d8:	orr	r5, ip, r1
+  2666dc:	orr	r2, lr, sl
+  2666e0:	orr	r1, r5, sl, asr #31
+  2666e4:	b	2666f0 <LLVMAddSimplifyLibCallsPass@@Base+0x1320>
+  2666e8:	mov	r2, #0
+  2666ec:	mov	r1, #0
+  2666f0:	mov	r0, r2
+  2666f4:	add	sp, sp, #84	; 0x54
+  2666f8:	ldrd	r4, [sp]
+  2666fc:	ldrd	r6, [sp, #8]
+  266700:	ldrd	r8, [sp, #16]
+  266704:	ldrd	sl, [sp, #24]
+  266708:	add	sp, sp, #32
+  26670c:	pop	{pc}		; (ldr pc, [sp], #4)
+  266710:	mov	r0, r2
+  266714:	bl	50e7d4 <_ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base+0x4881c>
+  266718:	cmp	r0, #0
+  26671c:	str	r0, [sp, #24]
+  266720:	blt	26679c <LLVMAddSimplifyLibCallsPass@@Base+0x13cc>
+  266724:	mov	r2, #0
+  266728:	mov	r3, r7
+  26672c:	mov	r0, r5
+  266730:	mov	r1, #2
+  266734:	str	r2, [sp]
+  266738:	add	r2, sp, #24
+  26673c:	bl	2664bc <LLVMAddSimplifyLibCallsPass@@Base+0x10ec>
+  266740:	mov	r7, r0
+  266744:	ldr	r0, [sp, #24]
+  266748:	mov	fp, r1
+  26674c:	bl	50e87c <_ZN4llvm21SymbolTableListTraitsINS_11GlobalAliasENS_6ModuleEE7getListEPS2_@@Base+0x488c4>
+  266750:	mov	r0, r7
+  266754:	mov	r1, fp
+  266758:	b	2666f4 <LLVMAddSimplifyLibCallsPass@@Base+0x1324>
+  26675c:	str	r4, [sp]
+  266760:	ldrh	r4, [sp, #72]	; 0x48
+  266764:	mov	r0, r5
+  266768:	ldrd	r2, [sp, #64]	; 0x40
+  26676c:	str	r6, [sp, #4]
+  266770:	strd	r8, [sp, #16]
+  266774:	str	r4, [sp, #8]
+  266778:	bl	265fb8 <LLVMAddSimplifyLibCallsPass@@Base+0xbe8>
+  26677c:	cmp	r0, #0
+  266780:	beq	2667a8 <LLVMAddSimplifyLibCallsPass@@Base+0x13d8>
+  266784:	orr	r8, sl, #2048	; 0x800
+  266788:	mov	r1, #0
+  26678c:	orr	r6, r8, #14
+  266790:	orr	r3, r0, r6
+  266794:	mov	r2, r3
+  266798:	b	2666f0 <LLVMAddSimplifyLibCallsPass@@Base+0x1320>
+  26679c:	mov	r7, #0
+  2667a0:	mov	fp, r7
+  2667a4:	b	266750 <LLVMAddSimplifyLibCallsPass@@Base+0x1380>
+  2667a8:	ldrd	r2, [sp, #64]	; 0x40
+  2667ac:	mov	r0, r7
+  2667b0:	bl	265e94 <LLVMAddSimplifyLibCallsPass@@Base+0xac4>
+  2667b4:	mov	r2, #0
+  2667b8:	mov	r1, #0
+  2667bc:	b	2666f0 <LLVMAddSimplifyLibCallsPass@@Base+0x1320>
+  2667c0:	strd	r4, [sp, #-16]!
+  2667c4:	mov	r4, #61440	; 0xf000
+  2667c8:	mvn	r5, #0
+  2667cc:	str	r6, [sp, #8]
+  2667d0:	movt	r4, #65535	; 0xffff
+  2667d4:	and	r5, r5, r3
+  2667d8:	str	lr, [sp, #12]
+  2667dc:	sub	sp, sp, #32
+  2667e0:	mov	r3, #0
+  2667e4:	ldr	lr, [sp, #48]	; 0x30
+  2667e8:	and	r4, r4, r2
+  2667ec:	movw	r6, #517	; 0x205
+  2667f0:	ldr	ip, [sp, #52]	; 0x34
+  2667f4:	mov	r1, sp
+  2667f8:	mov	r2, #32
+  2667fc:	add	r0, r0, #44	; 0x2c
+  266800:	str	r6, [sp]
+  266804:	strd	r4, [sp, #8]
+  266808:	str	lr, [sp, #16]
+  26680c:	str	ip, [sp, #24]
+  266810:	str	r3, [sp, #20]
+  266814:	str	r3, [sp, #28]
+  266818:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  26681c:	cmp	r0, #0
+  266820:	ldreq	r0, [sp]
+  266824:	add	sp, sp, #32
+  266828:	ldrd	r4, [sp]
+  26682c:	ldr	r6, [sp, #8]
+  266830:	add	sp, sp, #12
+  266834:	pop	{pc}		; (ldr pc, [sp], #4)
+  266838:	push	{lr}		; (str lr, [sp, #-4]!)
+  26683c:	sub	sp, sp, #20
+  266840:	mov	r1, #3
+  266844:	add	ip, sp, #8
+  266848:	str	r1, [sp]
+  26684c:	str	ip, [sp, #4]
+  266850:	bl	2660e8 <LLVMAddSimplifyLibCallsPass@@Base+0xd18>
+  266854:	cmp	r0, #0
+  266858:	bne	266868 <LLVMAddSimplifyLibCallsPass@@Base+0x1498>
+  26685c:	ldr	r3, [sp, #8]
+  266860:	ldr	r2, [sp, #24]
+  266864:	str	r3, [r2]
+  266868:	add	sp, sp, #20
+  26686c:	pop	{pc}		; (ldr pc, [sp], #4)
+  266870:	strd	r4, [sp, #-16]!
+  266874:	mov	r3, r0
+  266878:	mov	r4, #1
+  26687c:	str	r6, [sp, #8]
+  266880:	mov	r5, r2
+  266884:	add	r0, r0, #44	; 0x2c
+  266888:	str	lr, [sp, #12]
+  26688c:	mov	r6, r1
+  266890:	str	r4, [r3, #56]	; 0x38
+  266894:	bl	2653d0 <LLVMAddSimplifyLibCallsPass@@Base>
+  266898:	lsl	r2, r5, #5
+  26689c:	ldr	r0, [r0]
+  2668a0:	mov	r1, r6
+  2668a4:	sub	r2, r2, r5, lsl #3
+  2668a8:	bl	2157ac <read@plt>
+  2668ac:	cmp	r0, #0
+  2668b0:	blt	2668d4 <LLVMAddSimplifyLibCallsPass@@Base+0x1504>
+  2668b4:	movw	r1, #43691	; 0xaaab
+  2668b8:	movt	r1, #43690	; 0xaaaa
+  2668bc:	umull	r3, r0, r1, r0
+  2668c0:	lsr	r0, r0, #4
+  2668c4:	ldrd	r4, [sp]
+  2668c8:	ldr	r6, [sp, #8]
+  2668cc:	add	sp, sp, #12
+  2668d0:	pop	{pc}		; (ldr pc, [sp], #4)
+  2668d4:	mov	ip, #28672	; 0x7000
+  2668d8:	str	ip, [r6]
+  2668dc:	bl	215758 <__errno@plt>
+  2668e0:	ldr	r3, [r0]
+  2668e4:	cmp	r3, #9
+  2668e8:	beq	26690c <LLVMAddSimplifyLibCallsPass@@Base+0x153c>
+  2668ec:	ldr	lr, [r0]
+  2668f0:	cmp	lr, #32
+  2668f4:	beq	26690c <LLVMAddSimplifyLibCallsPass@@Base+0x153c>
+  2668f8:	ldr	r5, [pc, #20]	; 266914 <LLVMAddSimplifyLibCallsPass@@Base+0x1544>
+  2668fc:	add	r0, pc, r5
+  266900:	bl	2157b8 <perror@plt>
+  266904:	mov	r0, r4
+  266908:	b	2668c4 <LLVMAddSimplifyLibCallsPass@@Base+0x14f4>
+  26690c:	mov	r0, r4
+  266910:	b	2668c4 <LLVMAddSimplifyLibCallsPass@@Base+0x14f4>
+  266914:	smlatteq	r7, r4, r1, r2
+  266918:	strd	r4, [sp, #-24]!	; 0xffffffe8
+  26691c:	ldr	r4, [pc, #220]	; 266a00 <LLVMAddSimplifyLibCallsPass@@Base+0x1630>
+  266920:	mov	r3, #536	; 0x218
+  266924:	strd	r6, [sp, #8]
+  266928:	mov	r6, r2
+  26692c:	mov	r7, r1
+  266930:	str	r8, [sp, #16]
+  266934:	mov	r8, r0
+  266938:	str	lr, [sp, #20]
+  26693c:	sub	sp, sp, #64	; 0x40
+  266940:	ldr	r4, [pc, r4]
+  266944:	add	r5, sp, #64	; 0x40
+  266948:	str	r3, [r5, #-56]!	; 0xffffffc8
+  26694c:	ldr	r0, [r4]
+  266950:	str	r0, [sp, #60]	; 0x3c
+  266954:	bl	2157c4 <getpid@plt>
+  266958:	ldr	r2, [pc, #164]	; 266a04 <LLVMAddSimplifyLibCallsPass@@Base+0x1634>
+  26695c:	mov	r3, r0
+  266960:	str	r6, [sp]
+  266964:	add	r0, sp, #16
+  266968:	mov	r1, #32
+  26696c:	add	r2, pc, r2
+  266970:	bl	2157d0 <snprintf@plt>
+  266974:	cmp	r0, #0
+  266978:	movlt	r0, #3
+  26697c:	blt	26698c <LLVMAddSimplifyLibCallsPass@@Base+0x15bc>
+  266980:	cmp	r0, #31
+  266984:	movgt	r0, #2
+  266988:	ble	2669b4 <LLVMAddSimplifyLibCallsPass@@Base+0x15e4>
+  26698c:	ldr	r5, [sp, #60]	; 0x3c
+  266990:	ldr	r3, [r4]
+  266994:	cmp	r5, r3
+  266998:	bne	2669fc <LLVMAddSimplifyLibCallsPass@@Base+0x162c>
+  26699c:	add	sp, sp, #64	; 0x40
+  2669a0:	ldrd	r4, [sp]
+  2669a4:	ldrd	r6, [sp, #8]
+  2669a8:	ldr	r8, [sp, #16]
+  2669ac:	add	sp, sp, #20
+  2669b0:	pop	{pc}		; (ldr pc, [sp], #4)
+  2669b4:	mvn	ip, #8
+  2669b8:	add	r0, r8, #44	; 0x2c
+  2669bc:	mov	r1, r5
+  2669c0:	mov	r2, #48	; 0x30
+  2669c4:	str	ip, [sp, #48]	; 0x30
+  2669c8:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  2669cc:	cmp	r0, #0
+  2669d0:	beq	2669e4 <LLVMAddSimplifyLibCallsPass@@Base+0x1614>
+  2669d4:	mvn	lr, #8
+  2669d8:	mov	r0, #3
+  2669dc:	str	lr, [r7]
+  2669e0:	b	26698c <LLVMAddSimplifyLibCallsPass@@Base+0x15bc>
+  2669e4:	ldr	r0, [sp, #8]
+  2669e8:	cmp	r0, #0
+  2669ec:	bne	2669d4 <LLVMAddSimplifyLibCallsPass@@Base+0x1604>
+  2669f0:	ldr	r1, [sp, #48]	; 0x30
+  2669f4:	str	r1, [r7]
+  2669f8:	b	26698c <LLVMAddSimplifyLibCallsPass@@Base+0x15bc>
+  2669fc:	bl	21571c <__stack_chk_fail@plt>
+  266a00:	cmpeq	r7, ip, lsl #30
+  266a04:	tsteq	r7, ip, ror r1
+  266a08:	str	r4, [sp, #-8]!
+  266a0c:	mov	r4, r0
+  266a10:	str	lr, [sp, #4]
+  266a14:	ldr	r0, [r0]
+  266a18:	bl	215710 <close@plt>
+  266a1c:	mvn	r3, #8
+  266a20:	str	r3, [r4]
+  266a24:	ldr	r4, [sp]
+  266a28:	add	sp, sp, #4
+  266a2c:	pop	{pc}		; (ldr pc, [sp], #4)
+  266a30:	ldr	r3, [r0]
+  266a34:	mvn	r2, #0
+  266a38:	mov	r0, #0
+  266a3c:	strd	r2, [r1]
+  266a40:	bx	lr
+  266a44:	str	r4, [sp, #-8]!
+  266a48:	mov	r4, r0
+  266a4c:	str	lr, [sp, #4]
+  266a50:	ldr	r0, [r0]
+  266a54:	cmp	r0, #0
+  266a58:	blt	266a60 <LLVMAddSimplifyLibCallsPass@@Base+0x1690>
+  266a5c:	bl	215710 <close@plt>
+  266a60:	mvn	r3, #8
+  266a64:	str	r3, [r4]
+  266a68:	ldr	r4, [sp]
+  266a6c:	add	sp, sp, #4
+  266a70:	pop	{pc}		; (ldr pc, [sp], #4)
+  266a74:	ldr	r0, [r0]
+  266a78:	movw	r1, #1030	; 0x406
+  266a7c:	mov	r2, #0
+  266a80:	b	2157dc <fcntl@plt>
+  266a84:	strd	r4, [sp, #-12]!
+  266a88:	mov	r4, r1
+  266a8c:	mov	r5, r0
+  266a90:	str	lr, [sp, #8]
+  266a94:	mov	r0, r2
+  266a98:	sub	sp, sp, #20
+  266a9c:	movw	r1, #1030	; 0x406
+  266aa0:	mov	r2, #0
+  266aa4:	bl	2157dc <fcntl@plt>
+  266aa8:	cmn	r0, #1
+  266aac:	mov	r3, r0
+  266ab0:	str	r0, [r4]
+  266ab4:	bne	266ad4 <LLVMAddSimplifyLibCallsPass@@Base+0x1704>
+  266ab8:	mvn	r1, #8
+  266abc:	mov	r0, #3
+  266ac0:	str	r1, [r4]
+  266ac4:	add	sp, sp, #20
+  266ac8:	ldrd	r4, [sp]
+  266acc:	add	sp, sp, #8
+  266ad0:	pop	{pc}		; (ldr pc, [sp], #4)
+  266ad4:	movw	ip, #535	; 0x217
+  266ad8:	add	r0, r5, #44	; 0x2c
+  266adc:	str	r3, [sp, #8]
+  266ae0:	mov	r1, sp
+  266ae4:	mov	r2, #16
+  266ae8:	str	ip, [sp]
+  266aec:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  266af0:	cmp	r0, #0
+  266af4:	bne	266b04 <LLVMAddSimplifyLibCallsPass@@Base+0x1734>
+  266af8:	ldr	r0, [sp]
+  266afc:	cmp	r0, #0
+  266b00:	beq	266ac4 <LLVMAddSimplifyLibCallsPass@@Base+0x16f4>
+  266b04:	ldr	r0, [r4]
+  266b08:	bl	215710 <close@plt>
+  266b0c:	b	266ab8 <LLVMAddSimplifyLibCallsPass@@Base+0x16e8>
+  266b10:	push	{lr}		; (str lr, [sp, #-4]!)
+  266b14:	sub	sp, sp, #28
+  266b18:	movw	r3, #539	; 0x21b
+  266b1c:	add	r0, r0, #44	; 0x2c
+  266b20:	str	r2, [sp, #8]
+  266b24:	mov	r2, #24
+  266b28:	str	r1, [sp, #16]
+  266b2c:	mov	r1, sp
+  266b30:	str	r3, [sp]
+  266b34:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  266b38:	cmp	r0, #0
+  266b3c:	ldreq	r0, [sp]
+  266b40:	add	sp, sp, #28
+  266b44:	pop	{pc}		; (ldr pc, [sp], #4)
+  266b48:	strd	r4, [sp, #-24]!	; 0xffffffe8
+  266b4c:	ldr	r4, [pc, #308]	; 266c88 <LLVMAddSimplifyLibCallsPass@@Base+0x18b8>
+  266b50:	mov	r1, #35	; 0x23
+  266b54:	str	lr, [sp, #20]
+  266b58:	ldr	ip, [pc, #300]	; 266c8c <LLVMAddSimplifyLibCallsPass@@Base+0x18bc>
+  266b5c:	ldr	lr, [pc, #300]	; 266c90 <LLVMAddSimplifyLibCallsPass@@Base+0x18c0>
+  266b60:	strd	r6, [sp, #8]
+  266b64:	str	r8, [sp, #16]
+  266b68:	ldr	r2, [pc, #292]	; 266c94 <LLVMAddSimplifyLibCallsPass@@Base+0x18c4>
+  266b6c:	sub	sp, sp, #56	; 0x38
+  266b70:	add	r4, pc, r4
+  266b74:	ldr	r3, [pc, #284]	; 266c98 <LLVMAddSimplifyLibCallsPass@@Base+0x18c8>
+  266b78:	add	r6, sp, #16
+  266b7c:	ldr	r5, [r4, ip]
+  266b80:	mov	r0, r6
+  266b84:	add	r8, pc, lr
+  266b88:	ldr	ip, [r8]
+  266b8c:	add	r2, pc, r2
+  266b90:	add	r3, pc, r3
+  266b94:	ldr	r7, [r5]
+  266b98:	add	lr, ip, #1
+  266b9c:	str	lr, [sp]
+  266ba0:	str	lr, [r8]
+  266ba4:	str	r7, [sp, #52]	; 0x34
+  266ba8:	bl	2157d0 <snprintf@plt>
+  266bac:	ldr	r0, [pc, #232]	; 266c9c <LLVMAddSimplifyLibCallsPass@@Base+0x18cc>
+  266bb0:	ldr	r8, [r4, r0]
+  266bb4:	ldrb	r1, [r8]
+  266bb8:	dmb	sy
+  266bbc:	cmp	r1, #0
+  266bc0:	beq	266c38 <LLVMAddSimplifyLibCallsPass@@Base+0x1868>
+  266bc4:	ldr	r2, [pc, #212]	; 266ca0 <LLVMAddSimplifyLibCallsPass@@Base+0x18d0>
+  266bc8:	ldr	r7, [r4, r2]
+  266bcc:	ldrd	r2, [r7]
+  266bd0:	mov	r3, #0
+  266bd4:	and	r2, r2, #2
+  266bd8:	orrs	r3, r2, r3
+  266bdc:	bne	266c40 <LLVMAddSimplifyLibCallsPass@@Base+0x1870>
+  266be0:	ldrb	r6, [r8]
+  266be4:	dmb	sy
+  266be8:	cmp	r6, #0
+  266bec:	beq	266c58 <LLVMAddSimplifyLibCallsPass@@Base+0x1888>
+  266bf0:	ldrd	r2, [r7]
+  266bf4:	mov	r3, #0
+  266bf8:	and	r2, r2, #2
+  266bfc:	orrs	r3, r2, r3

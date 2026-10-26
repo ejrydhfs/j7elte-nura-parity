@@ -1,0 +1,13 @@
+[Unit]
+Description=Battery charge limit (Samsung Galaxy J7 / j7elte)
+After=local-fs.target j7elte-efs-restore.service
+Wants=j7elte-efs-restore.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/j7elte-power --config /etc/j7elte-power.conf
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

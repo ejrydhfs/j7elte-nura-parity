@@ -1,0 +1,68 @@
+# Maintainer: ROM/Nura parity integration (SM-J700M / j7elte)
+#
+# SIPC5 RIL client for the Shannon SS310AP modem on the Exynos 7580.
+#
+# Stock Android telephony is rild + libril.so + libsec-ril.so, all bionic and
+# not installable on a musl rootfs.  libsec-ril.so speaks a proprietary
+# "IpcProtocol" message layer over the kernel's SIPC5 FMT/RFS channels; this
+# package is a from-scratch implementation of the subset of that protocol that
+# was recovered by disassembling the stock library (see
+# parity/reports/ril-re.md for every address):
+#
+#   * opens /dev/umts_ipc0 and /dev/umts_rfs0 -- which is what makes the
+#     kernel answer the CP's PHONE_START with INIT_END (rild_ready(),
+#     link_device_shmem.c:261) and lets the baseband become usable,
+#   * re-issues IOCTL_MODEM_BOOT_OFF when the kernel still reports OFFLINE
+#     (a RIL started after j7elte-cbd), because misc_write() rejects messages
+#     with -EPERM until mc->phone_state == STATE_ONLINE,
+#   * encodes/decodes the 7-byte struct sipc_fmt_hdr message framing that the
+#     stock library uses (len/seq/ack/main/sub/type), including reassembly of
+#     messages split over several SIPC5 frames,
+#   * implements SMS_DEVICE_READY, the MISC version/time/capacity/serial
+#     number requests, SEC pin status and SIM power, NET operator and
+#     voice/data registration state, and PWR radio/modem power,
+#   * decodes the IMEI/MEID reply and the registration-state reply layout.
+#
+# Calls, SMS and data/PDP are NOT implemented; the gap and the exact missing
+# pieces are documented in the report.  Do not expect telephony to work yet.
+pkgname=j7elte-ril
+pkgver=0.1
+pkgrel=0
+pkgdesc="SIPC5 RIL client (stock libsec-ril subset) for the Samsung Galaxy J7 baseband"
+url="https://postmarketos.org"
+arch="aarch64"
+license="MIT"
+options="!check"
+source="j7elte-ril.c
+	j7elte-ril.initd
+	j7elte-ril.confd
+	j7elte-ril.service
+	"
+builddir="$srcdir"
+
+build() {
+	${CC:-cc} $CFLAGS -std=c11 -D_GNU_SOURCE -Wall -Wextra \
+		-Wno-unused-parameter -O2 \
+		-o j7elte-ril j7elte-ril.c $LDFLAGS
+}
+
+package() {
+	install -Dm755 j7elte-ril "$pkgdir"/usr/bin/j7elte-ril
+
+	# OpenRC (default pmOS service manager on this port).
+	install -Dm755 "$srcdir"/j7elte-ril.initd \
+		"$pkgdir"/etc/init.d/j7elte-ril
+	install -Dm644 "$srcdir"/j7elte-ril.confd \
+		"$pkgdir"/etc/conf.d/j7elte-ril
+
+	# Optional systemd equivalent; it reads the same /etc/conf.d file.
+	install -Dm644 "$srcdir"/j7elte-ril.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-ril.service
+}
+
+sha512sums="
+8ab9c319b58b461fe1007613df4ef2b0f777478a7e03f3a846db256e2c78903c8bf6da65ca3c908026baa63c9996ec11ace67c07261cb968fc4d21c9942737fa  j7elte-ril.c
+7c470ff2b060392f3001891336f158b183c2b662d6c128abe2e5650d32208490e3a80413955464de15f6c83e5d5fb6b6167538057a5896d0cef8a3762077dd3d  j7elte-ril.initd
+3aadbf431714c29305605dcffefd0042d558424cf1037238ca5aaa4a3e12de26f904ccc2b1378088385445f0cd35267ae3bc8c21cfc0625a649286a54b8fb63b  j7elte-ril.confd
+5dab81eac77027a2c1e9bcbaa470b0f8fd13549873aae53d30a003f9e27fa4ad65d0b40da5b748ec61970bd56b5e73d44208073c803816aa47a11909672186ef  j7elte-ril.service
+"

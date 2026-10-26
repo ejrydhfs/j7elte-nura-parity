@@ -1,0 +1,42 @@
+
+parity/userspace/gpu/blob/libGLES_mali.so:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+004731d4 <eglCreateWindowSurface@@Base>:
+  4731d4:	strd	r4, [sp, #-20]!	; 0xffffffec
+  4731d8:	mov	r4, r0
+  4731dc:	mov	r5, r3
+  4731e0:	strd	r6, [sp, #8]
+  4731e4:	mov	r7, r1
+  4731e8:	mov	r6, r2
+  4731ec:	str	lr, [sp, #16]
+  4731f0:	ldr	r0, [r0, #60]	; 0x3c
+  4731f4:	sub	sp, sp, #36	; 0x24
+  4731f8:	add	ip, sp, #32
+  4731fc:	mov	lr, #552	; 0x228
+  473200:	mov	r2, #24
+  473204:	str	lr, [ip, #-24]!	; 0xffffffe8
+  473208:	mov	r1, ip
+  47320c:	add	r0, r0, #44	; 0x2c
+  473210:	bl	265480 <LLVMAddSimplifyLibCallsPass@@Base+0xb0>
+  473214:	mov	ip, #4
+  473218:	mov	r0, r4
+  47321c:	mov	r1, r7
+  473220:	mov	r2, r6
+  473224:	mov	r3, r5
+  473228:	str	ip, [sp]
+  47322c:	bl	46db64 <eglCopyBuffers@@Base+0xc34>
+  473230:	add	sp, sp, #36	; 0x24
+  473234:	ldrd	r4, [sp]
+  473238:	ldrd	r6, [sp, #8]
+  47323c:	add	sp, sp, #16
+  473240:	pop	{pc}		; (ldr pc, [sp], #4)
+  473244:	strd	r4, [sp, #-16]!
+  473248:	mov	r4, r0
+  47324c:	mov	r5, r3
+  473250:	str	r6, [sp, #8]
+  473254:	mov	r6, r1
+  473258:	str	lr, [sp, #12]
+  47325c:	ldr	r1, [r0, #24]

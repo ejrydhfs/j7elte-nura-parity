@@ -1,0 +1,49 @@
+# Maintainer: j7elte parity work <parity@example.invalid>
+# net.hadess.SensorProxy bridge for the Samsung K2HH accelerometer and the
+# CM36672P/STK3013 proximity sensor, which are evdev/sysfs devices (not IIO)
+# in the Nura kernel.
+pkgname=j7elte-sensors
+pkgver=1.0.0
+pkgrel=0
+pkgdesc="net.hadess.SensorProxy bridge for Samsung Galaxy J7 (j7elte) evdev sensors"
+url="https://postmarketos.org"
+arch="aarch64"
+license="GPL-3.0-or-later"
+depends="dbus"
+makedepends=""
+options="!check"
+source="
+	j7elte-sensors.c
+	dbus-wire.c
+	dbus-wire.h
+	Makefile
+	j7elte-sensors.service
+	j7elte-sensors.initd
+	j7elte-sensors.conf
+"
+builddir="$srcdir"
+
+build() {
+	make CC="$CC" CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
+}
+
+package() {
+	install -Dm755 j7elte-sensors \
+		"$pkgdir"/usr/bin/j7elte-sensors
+	install -Dm644 j7elte-sensors.service \
+		"$pkgdir"/usr/lib/systemd/system/j7elte-sensors.service
+	install -Dm755 j7elte-sensors.initd \
+		"$pkgdir"/etc/init.d/j7elte-sensors
+	install -Dm644 j7elte-sensors.conf \
+		"$pkgdir"/usr/share/dbus-1/system.d/j7elte-sensors.conf
+}
+
+sha512sums="
+514b545790a70400480f72458ce4f24a659b5a56132b8b0abe46a5f9aa0c4cdcfdf8514da51ea46f92d52a7298765418ad50394712464f40625b9271dcef782b  j7elte-sensors.c
+9c49ea039d5cdfec2cae61f6ce0200aaa368163498be63e07be0793eee8744ce891ddd4d1472de2c685cac9e7acc526096ea712ce721cfa10dff072f96a73304  dbus-wire.c
+11ddaf7a1895cb09e76c00c3add3ff61cb659ca852bdb3f82b5d89304a11869a0bd54cb65a5054a70ac1a0e21401c120c0a3934270fd4c650b9a1f58a6e890d4  dbus-wire.h
+9c7944bff72372781cf3887a1389811406dd16a594916cabb7ef55dfb83b4d23f2d19fed9984ea3c0409b7f390369160143b7a026de40acbbd8a6c8643a38b20  Makefile
+43febf50866f5d7cb7db163066cfce8c3c217a99407444d7b28fcfdd27840b983427413cb292f7615cf3b921301351861a83fa8c196ddf02457b96eb5343b9f9  j7elte-sensors.service
+782d36620a67b4f95f17f19d17e6512e7578b2abdc880c51adfbef1d84555311026650569f3aaa2e73a007ec78085c1f1982b7d258524b3c2fb2f1ca81336a1a  j7elte-sensors.initd
+deec0aeaf5ca6dc5c481f53c3f9ed77456aaf9df410e88cfff3c64a07eebdb63789638a3d2492589b267c6d5a2bb8abbf18b4d6355fa1d32e1c7e6ed037500a7  j7elte-sensors.conf
+"

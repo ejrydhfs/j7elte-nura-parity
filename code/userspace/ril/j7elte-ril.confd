@@ -1,0 +1,26 @@
+# /etc/conf.d/j7elte-ril
+#
+# SIPC5 FMT/RFS client for the Samsung Galaxy J7 (j7elte, Exynos 7580 +
+# Shannon SS310AP).  Read by both the OpenRC service and the systemd unit.
+
+# Kernel IO devices created by drivers/misc/modem_v1.
+# Opening *both* is what makes the kernel answer the CP's PHONE_START with
+# INIT_END (rild_ready(), link_device_shmem.c:261); with only one of them open
+# the CP keeps retrying and telephony never comes up.
+J7ELTE_RIL_IPC_DEV=/dev/umts_ipc0
+J7ELTE_RIL_RFS_DEV=/dev/umts_rfs0
+
+# Response timeout per message, in seconds.
+J7ELTE_RIL_TIMEOUT=5
+
+# Extra arguments.  Useful ones:
+#   -v            verbose (hex dump of every frame, kernel state changes)
+#   -j            one JSON object per inbound message
+#   --no-rfs      do not open /dev/umts_rfs0 (breaks INIT_END; debug only)
+J7ELTE_RIL_EXTRA_ARGS="-v"
+
+# Command run once the CP is ONLINE before the daemon starts listening.
+#   info        full query set (versions, time, PIN state, operator,
+#               registration, IMEI)
+#   state       only print the kernel state
+J7ELTE_RIL_COMMAND=info

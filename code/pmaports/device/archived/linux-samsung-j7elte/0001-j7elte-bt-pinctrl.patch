@@ -1,0 +1,94 @@
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi
+index e29ca762..c203bf05 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_00.dtsi
+@@ -392,6 +392,14 @@
+ 
+ 	pinctrl-0= <&sleep7>;
+ 
++	bt_en_j7: bt-en {
++		samsung,pins = "gpc4-2";
++		samsung,pin-function = <1>;
++		samsung,pin-pud = <0>;
++		samsung,pin-con-pdn = <3>;
++		samsung,pin-pud-pdn = <0>;
++	};
++
+ 	sleep7: sleep-state {
+ 
+ 		PIN_SLP(gpc4-0, INPUT, NONE);	/* TSP_SDA_1P8 */
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi
+index 11dce44d..5fb39279 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_04.dtsi
+@@ -254,6 +254,13 @@
+ &pinctrl_7 {
+ 	pinctrl-names = "sleep";
+ 	pinctrl-0= <&sleep7>;
++	bt_en_j7: bt-en {
++		samsung,pins = "gpc4-2";
++		samsung,pin-function = <1>;
++		samsung,pin-pud = <0>;
++		samsung,pin-con-pdn = <3>;
++		samsung,pin-pud-pdn = <0>;
++	};
+ 	sleep7: sleep-state {
+ 		PIN_SLP(gpc4-0, INPUT, NONE);	/* TSP_SDA_1P8 */
+ 		PIN_SLP(gpc4-1, INPUT, NONE);	/* TSP_SCL_1P8 */
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi
+index 5fbfd6b6..7268a849 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_gpio_06.dtsi
+@@ -256,6 +256,13 @@
+ &pinctrl_7 {
+ 	pinctrl-names = "sleep";
+ 	pinctrl-0= <&sleep7>;
++	bt_en_j7: bt-en {
++		samsung,pins = "gpc4-2";
++		samsung,pin-function = <1>;
++		samsung,pin-pud = <0>;
++		samsung,pin-con-pdn = <3>;
++		samsung,pin-pud-pdn = <0>;
++	};
+ 	sleep7: sleep-state {
+ 		PIN_SLP(gpc4-0, INPUT, NONE);	/* TSP_SDA_1P8 */
+ 		PIN_SLP(gpc4-1, INPUT, NONE);	/* TSP_SCL_1P8 */
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
+index 153e52f2..e49b6edf 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev00.dts
+@@ -1226,7 +1226,7 @@
+ 				&gpa2 2 0x1	/*BT_WAKE*/
+ 				&gpa2 6 0xF	/*BT_HOST_WAKE*/ >;
+ 		pinctrl-names = "default";
+-		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en>;
++		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en_j7>;
+ 		status = "okay";
+ 	};
+ 	input_booster {
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
+index 6a327be3..bc629d06 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev04.dts
+@@ -1223,7 +1223,7 @@
+ 				&gpa2 2 0x1	/*BT_WAKE*/
+ 				&gpa2 6 0xF	/*BT_HOST_WAKE*/ >;
+ 		pinctrl-names = "default";
+-		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en>;
++		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en_j7>;
+ 		status = "okay";
+ 	};
+ 	input_booster {
+diff --git a/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts b/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
+index e2e312d7..3ea9b75a 100644
+--- a/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
++++ b/arch/arm64/boot/dts/exynos7580-j7elte_rev06.dts
+@@ -1223,7 +1223,7 @@
+ 				&gpa2 2 0x1	/*BT_WAKE*/
+ 				&gpa2 6 0xF	/*BT_HOST_WAKE*/ >;
+ 		pinctrl-names = "default";
+-		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en>;
++		pinctrl-0=<&bt_hostwake &bt_btwake &bt_en_j7>;
+ 		status = "okay";
+ 	};
+ 	input_booster {
