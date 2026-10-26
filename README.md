@@ -8,7 +8,7 @@ The short answer from the investigation: the stock ROM's drivers are the
 usual Samsung/CAF downstream stack; upstream 7.3 has no Exynos 7580 platform
 support. Nura's vendor 3.10.108 tree is the closest working base. Most driver
 families are at parity; the gaps were in config/DT/firmware and userspace
-bring-up, not missing vendor kernel code.
+bring-up, not missing vendor kernel code. The ROM was obtained from SamFW https://samfw.com/firmware/SM-J700M/PCW/J700MUBU2BRC2 
 
 No phone was connected. Runtime claims below are limited to builds,
 cross-compilation, static analysis and emulated selftests.
