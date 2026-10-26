@@ -73,7 +73,9 @@ contain them.
 
 ## Session archives
 
-Both archives are in [`session/`](session/) and attached to the GitHub release:
+Both archives are in [`session/`](session/) and attached to the
+[`session-archive-2026-10-25`](https://github.com/ejrydhfs/j7elte-nura-parity/releases/tag/session-archive-2026-10-25)
+release:
 
 - `omp-archive-full.zip` (40 MB): main transcript, 63 subagent sessions,
   311 artifact/tool logs, viewer, manifest.
