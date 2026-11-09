@@ -73,17 +73,15 @@ contain them.
 
 ## Session archives
 
-Both archives are in [`session/`](session/) and attached to the
-[`session-archive-2026-10-25`](https://github.com/ejrydhfs/j7elte-nura-parity/releases/tag/session-archive-2026-10-25)
-release:
+Both archives are in [`session/`](session/):
 
 - `omp-archive-full.zip` (40 MB): main transcript, 63 subagent sessions,
   311 artifact/tool logs, viewer, manifest.
 - `omp-archive-noartifacts.zip` (27 MB): transcript + viewer only.
 
-Unzip and open `viewer.html`. The archives are unredacted: they contain local
-paths, shell history, research context and personal filenames. They are
-published by the owner's request.
+Unzip and open `viewer.html`. Local usernames, home paths, host names, volume
+UUIDs and the author's email addresses were redacted before publication; the
+archives otherwise contain command output, shell history and research context.
 
 ## Provenance and licensing
 
