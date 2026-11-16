@@ -250,7 +250,13 @@ image (`fbdevHWEnterVT: symbol not found`), so the shim is what runs.
   pcmanfm-qt openbox xcb-util-cursor`.
 * A full `/` (2 GiB) breaks `apk`; drop `gcc musl-dev xfce4*` first, and
   build heavy things on `/data` (USERDATA mounted at `/data` via fstab).
-* The panel is unstyled without an icon theme: only the 4-desktop pager
-  draws until `~/.config/lxqt/panel.conf` is supplied.
+* The panel is unstyled without an icon theme and draws no background of
+  its own (black on black); only the 4-desktop pager is visible. The config
+  used on the device is `code/experience/panel.conf`
+  (`~/.config/lxqt/panel.conf`); `mainmenu`/`clock` warn about missing
+  sections until each plugin is added once through the GUI.
+* USB networking does not survive a reboot on its own: `code/experience/usbnet.start`
+  (installed as `/etc/local.d/usbnet.start`, `rc-update add local default`)
+  restores the default route via `172.16.42.2` and a resolver.
 * `xwd` (Alpine) is the only screenshot path; `/dev/fb0` reads are stubbed,
   `fbdump` mmaps instead.

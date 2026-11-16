@@ -1,0 +1,5 @@
+#!/bin/sh
+# Host shares its uplink through NetworkManager (ipv4.method shared,
+# 172.16.42.2/24); the device only needs the default route and a resolver.
+ip route replace default via 172.16.42.2 dev rndis0
+printf 'nameserver 172.16.42.2\n' > /etc/resolv.conf
