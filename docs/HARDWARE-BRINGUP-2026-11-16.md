@@ -372,3 +372,48 @@ sh: line 0: megapixels: not found
 
 `megapixels` (Camera tile) is not installed; replace the tile command or
 install the app. Tiles run through `sh -c`, so any command works.
+
+## 15. Camera (FIMC-IS): firmware fixed, driver blocks capture
+
+Hardware path: the vendor FIMC-IS stack is present (`/dev/video101`
+`exynos-fimc-is-ss0`, `ss1`, `30s/30c/30p`, `i0s`, `dis`, `scp`), the DT sensor
+node is `fimc-is_sensor_3l2@0` (`compatible = samsung,exynos5-fimc-is-sensor-3l2`,
+`status = okay`), and the sensor sits on an `hsi2c` controller.
+
+**Missing firmware.** `firmware-samsung-j7elte` is not in the repo index, so
+`/lib/firmware` contained only `regulatory.db`. Captures failed before the
+sensor was even touched. The blobs were extracted from the exact stock ROM
+`J700MUBU2BRC2` (archive.org `fwatlas-samsung-sm-j700m-j700mubu2brc2`), by
+streaming `system.img` out of the AP tar, `simg2img`, loop-mounting it and
+copying out of `/vendor/firmware`:
+
+```
+fimc_is_fw2_3l2.bin  2813502
+setfile_3l2.bin       161172
+setfile_5e3.bin       108876
+fimc_is_fd.bin        500640
+mfc_fw.bin            356088
+```
+
+**Boot-time open leak.** With firmware installed, every capture failed with
+`fimc_is_sensor_open:1181: already open` -> `-EMFILE`. `fimc-is-device-sensor.c`
+guards on `test_bit(FIMC_IS_SENSOR_OPEN)`; the boot log showed
+`fimc_is_ischain_close_wrap:3559: close is invalid on opening` at ~32 s, i.e.
+something opens both sensors during boot and the close never clears the bit.
+udev's `v4l_id` was the suspect: masking
+`60-persistent-v4l.rules` **and** renaming `/lib/udev/v4l_id` to
+`v4l_id.disabled` produces a boot with zero FIMC-IS messages, after which the
+sensor opens cleanly.
+
+**Current blocker (kernel-side).** With a clean boot the open succeeds, but a
+kworker then hangs in `exynos5_i2c_xfer` and the driver loops
+`[@][WRN]sensor is not yet power off`, leaving the caller in D-state in
+`msleep`. That is sensor I2C/power sequencing in the vendor driver, not
+userspace: `j7elte-cam` never reaches VIDIOC_STREAMON. Fixing it needs a kernel
+patch (bounded I2C transfer plus a correct power-off/close path) and a rebuild
+of `linux-samsung-j7elte`; reusing the parity tree
+(`patches/camera/0001...` is only the firmware-path fallback).
+
+Until then the Camera tile should not launch a capture tool. Field state:
+`/lib/udev/v4l_id.disabled`, masked v4l rule, firmware blobs installed
+(proprietary, not committed).
