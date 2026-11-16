@@ -260,3 +260,41 @@ image (`fbdevHWEnterVT: symbol not found`), so the shim is what runs.
   restores the default route via `172.16.42.2` and a resolver.
 * `xwd` (Alpine) is the only screenshot path; `/dev/fb0` reads are stubbed,
   `fbdump` mmaps instead.
+
+## 11. `/usr` on USERDATA (binding before switch_root)
+
+The 2 GiB SYSTEM partition cannot hold a desktop stack (LXQt already put `/`
+at 92%; Plasma is ~1 GB). Packages install into `/usr`, so `/usr` has to live
+on USERDATA (12.6 GiB). A bind mount *after* boot is too late: udev and
+openrc start out of `/usr` during `switch_root`.
+
+`patches/initramfs/0002-bind-usr-from-userdata.patch` adds, right after
+`mount_root_partition` in `init_2nd.sh`:
+
+```sh
+if [ -b /dev/mmcblk0p23 ]; then
+	mkdir -p /sysroot/data
+	if mount -t ext4 -o rw /dev/mmcblk0p23 /sysroot/data 2>/dev/null; then
+		if [ -d /sysroot/data/usr ] &&
+		    mount --bind /sysroot/data/usr /sysroot/usr 2>/dev/null; then
+			echo "$LOG_PREFIX /usr bind-mounted from USERDATA"
+		fi
+	fi
+fi
+```
+
+Procedure used on the device:
+
+```sh
+cp -a /usr /data/usr                       # 1.5 GiB, rootfs untouched
+# rebuild boot.img: kernel + patched initramfs + dtb, preserving the
+# original cmdline, then dd it to /dev/mmcblk0p10
+```
+
+Verified after reboot: `mount | grep ' /usr '` ->
+`/dev/mmcblk0p23 on /usr type ext4 (rw,relatime,data=ordered)`, `df -h /usr`
+shows 11.8 GiB with 9.4 GiB free, and the X session comes up unchanged.
+
+The old `/usr` on SYSTEM is deliberately left in place as a fallback: if the
+bind fails, the system still boots on the 2 GiB copy. USERDATA is also
+mounted at `/data` (fstab), so the bind source stays reachable.

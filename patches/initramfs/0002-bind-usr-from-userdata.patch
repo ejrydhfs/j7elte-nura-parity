@@ -1,0 +1,21 @@
+--- irorig/init_2nd.sh	1969-12-31 19:00:00.000000000 -0500
++++ ir/init_2nd.sh	2026-11-16 11:14:35.634303336 -0500
+@@ -53,6 +53,18 @@
+ mount_root_partition
+ resize_filesystem_after_mount /sysroot
+ 
++# Nura: the 2 GiB SYSTEM partition cannot hold a desktop, so /usr lives on
++# USERDATA. Mount and bind it here, before udev/openrc start using /usr.
++if [ -b /dev/mmcblk0p23 ]; then
++	mkdir -p /sysroot/data
++	if mount -t ext4 -o rw /dev/mmcblk0p23 /sysroot/data 2>/dev/null; then
++		if [ -d /sysroot/data/usr ] &&
++		    mount --bind /sysroot/data/usr /sysroot/usr 2>/dev/null; then
++			echo "$LOG_PREFIX /usr bind-mounted from USERDATA"
++		fi
++	fi
++fi
++
+ # Mount boot partition into sysroot if needed since some
+ # old installations don't have a proper /etc/fstab file. See #2800
+ if [ -z "$(cat /sysroot/etc/fstab | grep -v "#" | tr -d '[:space:]')" ]; then
