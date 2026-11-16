@@ -193,6 +193,64 @@ production and space is reclaimed by dropping development packages.
 * `code/experience/launcher.c` — Xlib/Cairo touch launcher.
 * `code/experience/start-ui.sh`, `code/experience/xsession.initd` — openrc
   session wiring.
+* `code/experience/lxqt-session.sh` — openbox + lxqt-panel + pcmanfm-qt.
+* `code/experience/shadowfix.c` — LD_PRELOAD shim for the fbdev shadow bug
+  (section 9).
+* `code/experience/Xorg-preload`, `code/experience/99-fbdev.conf` — server
+  wrapper and X configuration that load the shim.
+* `code/experience/fbdump.c` — mmap `/dev/fb0` to a file (vendor `fb_read`
+  is stubbed; `dd if=/dev/fb0` returns 0 bytes, mmap works).
 * `patches/initramfs/0001-prefer-userdata-by-uuid.patch` — experimental
   initramfs change to prefer a specific root UUID (kept for reference; the
   label relabel approach is simpler).
+* `patches/xorg-fbdev/0001-shadow-32to24-only-when-24bpp.patch` — driver
+  patch matching the shim (section 9).
+
+## 9. X fills the screen: the 24bpp shadow blit
+
+Symptom: Xorg renders 720x1280, `xwd -root` has no white area, but the panel
+shows a solid white band over the right 180 px (25%). `fbdump` proves it is
+in the framebuffer itself: every word in x=540..719 is `0xffffffff` for the
+full height; `nonzero` is 232770 of 921600 words, of which 230400 are that
+band.
+
+Cause: fbdev forces a shadow framebuffer for a 24bpp screen
+(`24bpp requires shadow framebuffer, forcing`), and
+`FBDevCreateScreenResources()` installs `fbdevUpdate32to24` as the shadow
+blit whenever `fPtr->shadow24` is set. `shadowUpdate32to24()` writes
+3 bytes per pixel, i.e. 2160 bytes per row, while the framebuffer stride is
+2880 bytes: bytes 2160..2879 of every row are never written. Config options
+cannot reconcile this (`DefaultFbBpp 32`, `FbBpp 32` in the Display section
+both leave the 3-byte blit; `fbset -depth 24` is silently coerced back to
+32bpp by the driver).
+
+Fix used: `LD_PRELOAD` shim (`code/experience/shadowfix.c`) that redefines
+`shadowUpdate32to24()` and forwards to the server's `shadowUpdatePacked()`
+(32bpp copy, found with `dlopen("libshadow.so")` because `libshadow` is
+loaded by `shadowAdd` *after* the shim). Preload only the server, not
+`xinit`/clients, which do not export the shadow symbols:
+
+```
+/usr/local/bin/Xorg-preload:  LD_PRELOAD=/usr/local/lib/shadowfix.so exec /usr/libexec/Xorg "$@"
+xinit ... -- /usr/local/bin/Xorg-preload :0 vt1 -config /etc/X11/xorg.conf.d/99-fbdev.conf ...
+```
+
+Result: `fbdump` nonzero falls 232770 -> 3087 (band gone, desktop black),
+`xwd` unchanged, panel fills 720x1280.
+
+Rebuilding the driver with the patch in `patches/xorg-fbdev/` is the
+upstream-shaped fix, but a locally built 0.5.0 does not load on this
+image (`fbdevHWEnterVT: symbol not found`), so the shim is what runs.
+
+## 10. Desktop stack
+
+* `openbox` + `lxqt-panel` + `pcmanfm-qt --desktop`, started by
+  `code/experience/lxqt-session.sh` from `xsession` (openrc).
+* Installing LXQt needs ~60 MiB: `apk add lxqt-session lxqt-panel
+  pcmanfm-qt openbox xcb-util-cursor`.
+* A full `/` (2 GiB) breaks `apk`; drop `gcc musl-dev xfce4*` first, and
+  build heavy things on `/data` (USERDATA mounted at `/data` via fstab).
+* The panel is unstyled without an icon theme: only the 4-desktop pager
+  draws until `~/.config/lxqt/panel.conf` is supplied.
+* `xwd` (Alpine) is the only screenshot path; `/dev/fb0` reads are stubbed,
+  `fbdump` mmaps instead.

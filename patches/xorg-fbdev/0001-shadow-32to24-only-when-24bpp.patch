@@ -1,0 +1,22 @@
+Only pick the 32to24 shadow blit when the screen really is 24bpp.
+
+fbdev forces shadow24 when the framebuffer is 24bpp (`fbbpp == 24`), then
+FBDevCreateScreenResources() unconditionally installs fbdevUpdate32to24 as
+the blit. On a 32bpp screen pixmap shadowUpdate32to24() writes 3 bytes per
+pixel, so the last 25% of every row (180 of 720 px here) is never written and
+keeps whatever was in the framebuffer - a solid white band down the right
+edge of the panel.
+
+Reproduced on samsung-j7elte (vendor 3.10.108, fb 720x1280 32bpp,
+Xorg 21.1.18, xf86-video-fbdev 0.5.0-r6): /dev/fb0 dump shows bytes 540..719
+as 0xffffffff for the full height, while XGetImage() has no such band.
+
+--- a/src/fbdev.c
++++ b/src/fbdev.c
+@@ -718,7 +718,7 @@
+ 
+     if (fPtr->shadow24)
++    if (fPtr->shadow24 && pScrn->bitsPerPixel == 24)
+         update = fbdevUpdate32to24;
+     else if (fPtr->rotate)
+         update = fbdevUpdateRotatePacked;

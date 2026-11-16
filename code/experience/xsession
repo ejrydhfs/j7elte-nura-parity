@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+name="xsession"
+description="Nura touch launcher on /dev/fb0"
+supervisor="supervise-daemon"
+command="/usr/local/bin/start-ui.sh"
+respawn_delay=3
+respawn_max=0
+respawn_period=30
+output_log="/var/log/xsession.log"
+error_log="/var/log/xsession.log"
