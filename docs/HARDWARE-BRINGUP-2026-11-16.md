@@ -405,6 +405,12 @@ udev's `v4l_id` was the suspect: masking
 `v4l_id.disabled` produces a boot with zero FIMC-IS messages, after which the
 sensor opens cleanly.
 
+**DT verified, not the cause.** Extracted the three DTBs from the boot image
+(`DTBH` container, FDTs at 0x800/0x19800/0x33000) and decompiled them with
+`dtc`: every one carries `sensor_i2c_addr = <0x5a>`, `sensor_i2c_ch = <0x00>`,
+`mclk_ch = <0x00>` for `fimc-is_sensor_3l2@0`, matching the stock ROM DT. The
+`/proc/device-tree` read that looked empty was a shell/od artefact.
+
 **Current blocker (kernel-side).** With a clean boot the open succeeds, but a
 kworker then hangs in `exynos5_i2c_xfer` and the driver loops
 `[@][WRN]sensor is not yet power off`, leaving the caller in D-state in
