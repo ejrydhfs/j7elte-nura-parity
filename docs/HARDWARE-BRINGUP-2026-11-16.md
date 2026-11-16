@@ -341,3 +341,34 @@ usable GL: `HANDOFF-3D.md`). Lomiri has the same constraint.
 Build: `gcc -O2 -o /usr/local/bin/nura-shell nura-shell.c $(pkg-config
 --cflags --libs cairo x11) -lm`. Started by `code/experience/start-ui.sh`
 under the openrc `xsession` service, with `LD_PRELOAD` set for the server.
+
+## 14. Shell input wiring and app lifecycle
+
+Verified on the device:
+
+| Node | Device | Values |
+|---|---|---|
+| `/dev/input/event2` | `sec_touchscreen` | ABS_MT_POSITION_X 0..720, ABS_MT_POSITION_Y 0..1280 (already screen units; the shell scales by the reported range anyway) |
+| `/dev/input/event5` | `gpio_keys.21` | KEY code **172** (`KEY_HOMEPAGE`) — the physical Home key |
+
+The shell finds the touchscreen by capability (`EVIOCGBIT(EV_ABS)` has
+`ABS_MT_POSITION_X`) instead of hardcoding an event node, and handles both
+Protocol-B release (`ABS_MT_TRACKING_ID` = -1) and `BTN_TOUCH`.
+
+App lifecycle bug found on hardware: the first launch worked, every later tap
+was a no-op. `child` was only ever set, never cleared, so `launch()` returned
+early forever. Fixed by reaping on `SIGCHLD`, raising the shell and redrawing
+when a child exits, and treating `kill(child, 0) != 0` as "already gone".
+
+Taps and launches are logged to `/var/log/xsession.log`:
+
+```
+touch: /dev/input/event2 range x 0..720 y 0..1280
+down 117,696 hit 4
+up 114,681 hit 4
+launch megapixels -> pid 11486
+sh: line 0: megapixels: not found
+```
+
+`megapixels` (Camera tile) is not installed; replace the tile command or
+install the app. Tiles run through `sh -c`, so any command works.

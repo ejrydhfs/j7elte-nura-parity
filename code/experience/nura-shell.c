@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -62,9 +63,11 @@ static int touch_fd = -1;
 static int key_fd = -1;
 static int touch_x = -1, touch_y = -1;	/* current finger, device coords */
 static int touch_down;
+static int touch_min_x, touch_max_x, touch_min_y, touch_max_y;
 static int pressed = -1;
 static int child_running;
 static pid_t child = -1;
+static volatile sig_atomic_t child_exited;
 
 static void rgba(cairo_t *c, const char *hex)
 {
@@ -174,10 +177,19 @@ static void draw(void)
 	XFlush(dpy);
 }
 
+static void on_sigchld(int sig)
+{
+	(void)sig;
+	child_exited = 1;
+}
+
 static void launch(int i)
 {
-	if (child > 0)
-		return;
+	if (child > 0) {
+		if (kill(child, 0) == 0)
+			return;		/* previous app still running */
+		child = -1;
+	}
 	child = fork();
 	if (child == 0) {
 		setsid();
@@ -187,6 +199,7 @@ static void launch(int i)
 	if (child > 0) {
 		apps[i].pid = child;
 		child_running = 1;
+		fprintf(stderr, "launch %s -> pid %d\n", apps[i].cmd, child);
 	}
 }
 
@@ -216,32 +229,53 @@ static int hit(double x, double y)
 	return -1;
 }
 
+static void touch_press(void)
+{
+	if (touch_down)
+		return;
+	touch_down = 1;
+	pressed = hit(touch_x, touch_y);
+	fprintf(stderr, "down %d,%d hit %d\n", touch_x, touch_y, pressed);
+	draw();
+}
+
+static void touch_release(void)
+{
+	int a;
+	if (!touch_down)
+		return;
+	touch_down = 0;
+	a = hit(touch_x, touch_y);
+	fprintf(stderr, "up %d,%d hit %d\n", touch_x, touch_y, a);
+	if (a >= 0 && a == pressed)
+		launch(a);
+	pressed = -1;
+	draw();
+}
+
 static void handle_input(int fd)
 {
 	if (fd == touch_fd) {
 		struct input_event ev;
 		while (read(fd, &ev, sizeof ev) == sizeof ev) {
-			if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_X)
-				touch_x = ev.value;
-			if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_Y)
-				touch_y = ev.value;
-			if (ev.type == EV_ABS && ev.code == ABS_X)
-				touch_x = ev.value;
-			if (ev.type == EV_ABS && ev.code == ABS_Y)
-				touch_y = ev.value;
-			if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
-				if (ev.value) {
-					touch_down = 1;
-					pressed = hit(touch_x, touch_y);
-					draw();
-				} else if (touch_down) {
-					touch_down = 0;
-					int a = hit(touch_x, touch_y);
-					if (a >= 0 && a == pressed)
-						launch(a);
-					pressed = -1;
-					draw();
-				}
+			if (ev.type == EV_ABS &&
+			    (ev.code == ABS_MT_POSITION_X || ev.code == ABS_X))
+				touch_x = (ev.value - touch_min_x) * W /
+					  (((touch_max_x - touch_min_x) > 0 ? (touch_max_x - touch_min_x) : 1));
+			if (ev.type == EV_ABS &&
+			    (ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y))
+				touch_y = (ev.value - touch_min_y) * H /
+					  (((touch_max_y - touch_min_y) > 0 ? (touch_max_y - touch_min_y) : 1));
+			if (ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID) {
+				if (ev.value >= 0)
+					touch_press();
+				else
+					touch_release();
+			} else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+				if (ev.value)
+					touch_press();
+				else
+					touch_release();
 			}
 		}
 	} else if (fd == key_fd) {
@@ -253,6 +287,32 @@ static void handle_input(int fd)
 				close_child();
 		}
 	}
+}
+
+static int open_touch_device(void)
+{
+	char path[64];
+	for (int i = 0; i < 32; i++) {
+		snprintf(path, sizeof path, "/dev/input/event%d", i);
+		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+		unsigned long absbits[(ABS_MAX + 63) / 64] = { 0 };
+		if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof absbits), absbits) < 0 ||
+		    !(absbits[ABS_MT_POSITION_X / 64] & (1UL << (ABS_MT_POSITION_X % 64)))) {
+			close(fd);
+			continue;
+		}
+		struct input_absinfo ax, ay;
+		ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &ax);
+		ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &ay);
+		touch_min_x = ax.minimum; touch_max_x = ax.maximum;
+		touch_min_y = ay.minimum; touch_max_y = ay.maximum;
+		fprintf(stderr, "touch: %s range x %d..%d y %d..%d\n", path,
+			ax.minimum, ax.maximum, ay.minimum, ay.maximum);
+		return fd;
+	}
+	return -1;
 }
 
 int main(void)
@@ -277,10 +337,10 @@ int main(void)
 	XSelectInput(dpy, win, ExposureMask | StructureNotifyMask);
 	XMapRaised(dpy, win);
 
-	touch_fd = open("/dev/input/event2", O_RDONLY | O_NONBLOCK);
+	touch_fd = open_touch_device();
 	key_fd = open("/dev/input/event5", O_RDONLY | O_NONBLOCK);
 
-	signal(SIGCHLD, SIG_IGN);
+	signal(SIGCHLD, on_sigchld);
 	draw();
 
 	for (;;) {
@@ -292,6 +352,14 @@ int main(void)
 		if (key_fd >= 0) { FD_SET(key_fd, &fds); if (key_fd > maxfd) maxfd = key_fd; }
 		struct timeval tv = { 1, 0 };
 		int r = select(maxfd + 1, &fds, NULL, NULL, &tv);
+		if (child_exited) {
+			child_exited = 0;
+			while (waitpid(-1, NULL, WNOHANG) > 0)
+				;
+			child = -1;
+			XRaiseWindow(dpy, win);
+			draw();
+		}
 		if (r > 0) {
 			while (XPending(dpy)) {
 				XEvent ev;
