@@ -20,6 +20,7 @@ cross-compilation, static analysis and emulated selftests.
 | [`docs/HANDOFF-SESSION.md`](docs/HANDOFF-SESSION.md) | Full session handoff: state, commands, next work, ownership |
 | [`docs/HANDOFF-3D.md`](docs/HANDOFF-3D.md) | Mesa/kbase hardware-GL continuation |
 | [`docs/SESSION-README.md`](docs/SESSION-README.md) | Original session README (deliverables and detailed status) |
+| [`docs/HARDWARE-BRINGUP-2026-11-16.md`](docs/HARDWARE-BRINGUP-2026-11-16.md) | **Hardware bring-up on a real SM-J700M**: flat install, DECON window commit, GTK blocker, working Xlib/Cairo UI |
 | [`docs/reports/`](docs/reports/) | 46 per-subsystem reports with evidence and limits |
 | [`patches/`](patches/) | 27 patches + series apply/header files |
 | [`code/userspace/`](code/userspace/) | RIL, GPS, camera, sensors, audio, connectivity, GPU sources |

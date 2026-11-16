@@ -1,0 +1,19 @@
+Prefer a specific root filesystem by UUID.
+
+Both SYSTEM and USERDATA can carry the pmOS_root label (the flat install
+labels SYSTEM; moving the rootfs to the 12.6 GiB USERDATA partition creates
+a second one). Look the UUID up first and fall back to the label.
+
+--- a/init_functions.sh
++++ b/init_functions.sh
+@@ find_root_partition() {
+ 	# mount_subpartitions() must get executed before calling
+ 	# find_root_partition(), so partitions from b) also get found.
++	# Prefer the USERDATA rootfs by UUID; SYSTEM may still carry the same
++	# pmOS_root label.
++	if [ -z "$PMOS_ROOT" ]; then
++		PMOS_ROOT="$(find_partition "e1a93fd5-2e76-4cf8-b775-47f6a165f683" "" "" "")"
++	fi
+ 	if [ -z "$PMOS_ROOT" ]; then
+ 		PMOS_ROOT="$(find_partition "$root_uuid" "$root_path" "pmOS_root" "TYPE=crypto_LUKS")"
+ 	fi

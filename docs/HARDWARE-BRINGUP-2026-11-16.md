@@ -1,0 +1,198 @@
+# Hardware bring-up: Nura on a real SM-J700M (2026-11-16)
+
+First hardware validation of this port on an actual `samsung-j7elte`
+(SM-J700M, Exynos 7580, 1.5 GB RAM, 16 GB eMMC, 720x1280 AMOLED).
+Everything below was observed on the device; no emulation.
+
+## 1. Installation: the recovery-zip method hangs, a flat install works
+
+`pmbootstrap install --android-recovery-zip` + TWRP sideload completes, but
+the initramfs then wedges the whole kernel shortly after the USB gadget is
+set up (host cannot even `SET_CONFIG`; the device answers ping but nothing
+else). The installer had written an **MBR partition table inside the SYSTEM
+partition**, and the initramfs' `mount_subpartitions()` losetup probe is the
+last thing that runs before the hang.
+
+Flat install on SYSTEM works and is what the device runs today:
+
+```sh
+mke2fs -t ext4 -L pmOS_root /dev/block/mmcblk0p20
+mount -t ext4 /dev/block/mmcblk0p20 /mnt/pmOS
+unzip -p pmos.zip rootfs.tar.gz | tar -xz -C /mnt/pmOS
+dd if=boot.img of=/dev/block/mmcblk0p10
+```
+
+Two install scripts must be provided by hand because the recovery zip's
+installer normally does it: `/home/<user>` (skel copy, uid 10000) and a
+non-empty `/etc/fstab` (the initramfs otherwise waits for a `pmOS_boot`
+partition that does not exist and drops to `fail_halt_boot`):
+
+```
+# /etc/fstab — boot.img device, no separate /boot
+tmpfs /tmp tmpfs rw,nosuid,nodev,mode=1777 0 0
+```
+
+## 2. S-Boot rewrites the kernel command line
+
+`/proc/cmdline` is exactly `console=ttySAC1`, regardless of the cmdline
+inside boot.img. Consequences:
+
+* `pmos.debug-shell`, `console=tty0`, `loglevel=`, `ramoops.*` cannot be
+  passed from the boot image. Debugging must be done from the initramfs
+  (patch `init_2nd.sh` to force `debug_shell=y`) or by other means.
+* The initramfs' debug shell (telnet port 23, 172.16.42.1) is reachable
+  once it is forced; the networking itself works.
+
+## 3. Display: the driver is fine, userspace never starts scanout
+
+Vendor fbdev (`CONFIG_EXYNOS_DECON_EXYNOS7580`, `s3c-fb`) initialises
+correctly:
+
+```
+/ea8061_wxga is founded
+ea8061_probe / ea8061_read_init_info
+dsim_read_hl_data read ret : 3 / 32 / 56 / 7 / 18   (panel answers)
+dsim_panel_probe: done
+pclk_decon_int: 100 Mhz / mipi-dsi driver(VIDEO mode) probed
+decon_probe start / real_size=921600 (720.1280) / virt_size=1843200
+decon window[0..2] create / decon registered successfully
+dsim_panel_set_brightness / MDD : ea8061_displayon was called
+```
+
+But the panel stays black. Two independent findings explain it:
+
+1. `decon_fb_write()` in `drivers/video/exynos/decon_7580/decon_core.c` is
+   literally `return 0;` — writing to `/dev/fb0` writes nothing and returns
+   0, which makes writers loop forever (this was misread as a kernel hang).
+2. DECON only scans out after userspace commits a window the way Android's
+   HWC does: `S3CFB_WIN_CONFIG` (`_IOW('F', 209, struct
+   decon_win_config_data)`) with an **ION buffer**, followed by
+   `FBIOPAN_DISPLAY`. Nothing in pmOS does this.
+
+Minimal proof of concept: `code/experience/fbwin.c` allocates an ION buffer
+(heap `1 << 4`, falling back to `1 << 0` when the DMA heap is out of
+memory), fills it white, and commits window 0
+(`state=DECON_WIN_STATE_BUFFER`, `idma_type=IDMA_G0`,
+`format=DECON_PIXEL_FORMAT_XRGB_8888`, `src/dst = 720x1280`,
+**`fence_fd = -1`** — 0 is interpreted as a real fence fd and yields
+`EINVAL`). The panel lights up white. `FBIOPAN_DISPLAY` then points the
+window at the framebuffer's own memory
+(`decon_pan_display()` writes `info->fix.smem_start + offset` to VIDW_ADD0),
+so anything that draws into `/dev/fb0` (X, a launcher) becomes visible.
+
+`fbwin pand` keeps issuing a pan every 200 ms; X's own pans are not enough
+to (re)start the DMA after boot.
+
+Pixel order is swapped relative to the commit format (`XRGB_8888` renders
+red as blue); use `XBGR_8888` for correct colours, or keep `XRGB` and treat
+it as an RGB/BGR swap.
+
+## 4. GTK/XFCE cannot run on this kernel
+
+`xfwm4` aborts in `libwnck` (`default_icon_at_size: assertion failed
+(base)`) because every pixbuf load fails:
+
+```
+Loader process exited early ... bwrap --unshare-all --die-with-parent
+  --seccomp 12 .../glycin-loaders/2+/glycin-image-rs
+```
+
+Alpine's gdk-pixbuf delegates decoding to glycin, which sandboxes the
+loader with bubblewrap. `bwrap` needs user namespaces, and this kernel has
+`# CONFIG_USER_NS is not set` (`bwrap: Can't open source /usr: Function
+not implemented`). Enabling `CONFIG_USER_NS` does **not** compile in this
+3.10 tree: `cred.h`, `fs/proc/base.c` and `kernel/cgroup.c` fail on
+`kuid_t`/`uid_t` conversions — the tree predates the user-namespace
+conversion.
+
+Consequences: XFCE, LXQt-GTK, Phosh and anything else GTK-based is out.
+Qt6 works at the toolkit level but its xcb platform plugin needs
+`xcb-util-cursor` (`qt.qpa.plugin: From 6.5.0, xcb-cursor0 ... is needed`).
+
+## 5. Working UI: Xlib + Cairo launcher
+
+`code/experience/launcher.c` is a 720x1280 fullscreen Xlib/Cairo touch
+launcher (no GTK, no Qt, no pixbuf): six tiles (Terminal, Keyboard,
+Wi-Fi scan, Reboot, Poweroff, About) that `fork/exec` a shell. Touch input
+arrives through libinput as core pointer events. `matchbox-keyboard` is the
+on-screen keyboard.
+
+The session is started by openrc:
+
+* `/usr/local/bin/start-ui.sh` — one `fbwin` commit, then `fbwin pand` in
+  the background, then `xinit /usr/local/bin/nura-launcher -- :0 vt1
+  -config /etc/X11/xorg.conf.d/99-fbdev.conf -dpms -s 0 -noreset`.
+* `/etc/init.d/xsession` — `supervise-daemon`, respawn forever.
+
+`99-fbdev.conf` must be:
+
+```
+Section "Device"
+    Identifier "fbdev"
+    Driver "fbdev"
+    Option "fbdev" "/dev/fb0"
+    Option "ShadowFB" "false"
+EndSection
+Section "Screen"
+    Identifier "screen"
+    Device "fbdev"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Weight 8 8 8
+        Modes "720x1280"
+    EndSubSection
+EndSection
+```
+
+Notes:
+
+* `busybox reboot` does not reset this device; use
+  `echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger`
+  (the launcher's Reboot/Poweroff tiles do exactly this).
+* `lightdm` never starts: it finds no DRM seat (fbdev only, no
+  `/dev/dri`).
+* `msm-fb-refresher` must stay disabled; it competes with the window
+  commit and the pan daemon.
+
+## 6. Storage map and the eMMC behaviour
+
+| Partition | Device | Size | Use |
+| --- | --- | --- | --- |
+| BOOT | mmcblk0p10 | 32 MiB | kernel + initramfs (`boot.img`) |
+| RECOVERY | mmcblk0p11 | 38 MiB | TWRP (untouched by Nura) |
+| SYSTEM | mmcblk0p20 | 2.0 GiB | flat `pmOS_root` rootfs |
+| CACHE | mmcblk0p21 | 200 MiB | unused (used experimentally for kernel-log drip) |
+| HIDDEN | mmcblk0p22 | 140 MiB | unused |
+| USERDATA | mmcblk0p23 | 12.6 GiB | spare ext4, currently copied rootfs |
+
+The pmOS vendor kernel occasionally wedges its dw_mmc controller after a
+forced reset: every block read/write then returns EIO (`Buffer I/O error on
+device mmcblk0p20`, journal aborted, remount read-only). TWRP on the same
+device reads and writes the same partitions at ~150-180 MB/s, so the flash
+is healthy. A cold power cycle restores normal operation.
+
+USERDATA works normally from the running system (mounted, 1.7 GB copied
+into it), but **booting with the rootfs on USERDATA wedges before
+userspace** even with a stock initramfs and only `p23` carrying the
+`pmOS_root` label — open issue. The 2 GiB SYSTEM is therefore the rootfs in
+production and space is reclaimed by dropping development packages.
+
+## 7. Access
+
+* USB networking: device `172.16.42.1`, host `172.16.42.2`.
+* SSH `user@172.16.42.1` (password `nura`); host internet NAT is set up via
+  the host's NetworkManager shared profile.
+* TWRP: `adb` as usual; recovery partition is `mmcblk0p11`.
+
+## 8. Artifacts in this repository
+
+* `code/experience/fbwin.c` — ION + `S3CFB_WIN_CONFIG` + pan tool
+  (`fbwin`, `fbwin nopan`, `fbwin panonly`, `fbwin fbfill`,
+  `fbwin single`, `fbwin dump`, `fbwin pand`).
+* `code/experience/launcher.c` — Xlib/Cairo touch launcher.
+* `code/experience/start-ui.sh`, `code/experience/xsession.initd` — openrc
+  session wiring.
+* `patches/initramfs/0001-prefer-userdata-by-uuid.patch` — experimental
+  initramfs change to prefer a specific root UUID (kept for reference; the
+  label relabel approach is simpler).
