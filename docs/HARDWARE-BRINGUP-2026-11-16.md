@@ -298,3 +298,46 @@ shows 11.8 GiB with 9.4 GiB free, and the X session comes up unchanged.
 The old `/usr` on SYSTEM is deliberately left in place as a fallback: if the
 bind fails, the system still boots on the 2 GiB copy. USERDATA is also
 mounted at `/data` (fstab), so the bind source stays reachable.
+
+## 12. X rendering: `fbScreenInit` must be 32bpp too
+
+The shadow-blit fix alone left every image upload wrong: text and rectangles
+were squeezed to 3/4 width and R/B swapped (`XPutImage` of a 720-wide image
+put its right edge at x=537). `xdpyinfo` reports `depth 24, bits_per_pixel 32`,
+but the server's fb layer was initialised with 24bpp: fbdev forces
+`shadow24` and calls `fbScreenInit(..., 24)` on a 32bpp framebuffer, so every
+fill/image path writes 3 bytes per pixel into a 4-byte stride.
+
+`code/experience/shadowfix.c` is preloaded into the server only and now does
+two things:
+
+* interposes `fbScreenInit()` and forces `bpp = 32` (the symbol is exported
+  by `/usr/libexec/Xorg`);
+* routes `shadowUpdate32to24` to the server's `shadowUpdatePacked` (the white
+  band from section 9).
+
+Both fixes verified from `/dev/fb0` (`fbdump`): a 4px border drawn at the
+window edges appears at x=0..3 and x=716..719, and known colours come back
+byte-exact (accent `#3b82f6` -> `(59,130,246)`).
+
+## 13. `nura-shell`: phone UI without GL or a compositor
+
+Plasma Mobile is packaged (`plasma-mobile 6.8.3`) but its shell is
+Wayland-only: `plasmashell` exits with `Failed to create wl_display`, and
+`kwin_wayland` has no backend for a fbdev-only device (no `/dev/dri`, no
+usable GL: `HANDOFF-3D.md`). Lomiri has the same constraint.
+
+`code/experience/nura-shell.c` is a WM-less phone shell for this display:
+
+* override-redirect 720x1280 window, Cairo `CAIRO_FORMAT_RGB24` image surface
+  pushed with `XPutImage` (the Cairo Xlib surface compresses 3/4 here);
+* status bar (clock, battery from `/sys/class/power_supply`), 2x3 tile grid,
+  tap-to-launch, pressed feedback;
+* touch is read straight from `/dev/input/event2` (ABS_MT_POSITION_X/Y,
+  BTN_TOUCH); the physical Home key (`/dev/input/event5`, KEY_HOMEPAGE/KEY_BACK)
+  kills the child app and raises the shell;
+* launched apps run without a WM, i.e. fullscreen, and `Home` returns.
+
+Build: `gcc -O2 -o /usr/local/bin/nura-shell nura-shell.c $(pkg-config
+--cflags --libs cairo x11) -lm`. Started by `code/experience/start-ui.sh`
+under the openrc `xsession` service, with `LD_PRELOAD` set for the server.
