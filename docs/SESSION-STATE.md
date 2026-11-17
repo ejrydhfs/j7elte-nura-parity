@@ -65,3 +65,16 @@ Front camera: `/usr/local/bin/j7cam7 -f` (uses ss1 with the shared 30s/30c group
   table users), then emit it from `fimc_is_ischain_power` before the firmware's
   `OPEN_SENSOR`, mirroring `HIC_I2C_CONTROL_LOCK`
   (`fimc-is-interface.c:3418`).
+
+### HIC_ISP_I2C_CONTROL sent (2026-11-17)
+Implemented `fimc_is_hw_isp_i2c_control()` + call in `fimc_is_ischain_power`
+right after `set_bit(FIMC_IS_ISCHAIN_LOADED)` (channel from the module pdata).
+
+Result on hardware: `isp i2c control(instance 0, ch 0)` -> `-> 0`, firmware
+accepts it and advances (`OpenStream`, `MAP VERSION check: SUCCESS`,
+`CRC error check: SUCCESS`), but `OPEN_SENSOR` **still NACKs** on 0x5a
+(`PushData I2C NACK ... ERROR_SENSOR_I2C_FAIL`).
+So the command id is right and the command is accepted, but the payload
+(param1=ch, rest 0) is not what configures the ISP I2C. Next: recover the real
+parameter block for command 27 from the firmware handler, or try
+param1 = ch|0x0100-style encodings used elsewhere in this driver.
