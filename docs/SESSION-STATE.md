@@ -52,3 +52,16 @@ Front camera: `/usr/local/bin/j7cam7 -f` (uses ss1 with the shared 30s/30c group
 - Host scratch: `/tmp/bimg/` (kernel, ramdisk, dt, cmdline), `/tmp/rom.zip`
   (stock ROM), `/tmp/fw.bin` (ISP firmware), `/tmp/cam2/` (tool source tree),
   kernel tree on `/run/media/asdf/db69437b-.../j7k/`.
+
+### Latest firmware RE (2026-11-17, continued)
+- `fimc_is_fw2_3l2.bin` stores its message-name table as **file offsets** (base 0),
+  e.g. `HIC_OPEN_SENSOR` string at `0x2a293e`, referenced at `0x2acd48`;
+  `HIC_SET_ISP_I2C_CONTROL` at `0x2a2841`, referenced at `0x2acd70`.
+- Index distance between them is 10 entries = exactly the kernel enum
+  (`HIC_OPEN_SENSOR` 17 -> `HIC_ISP_I2C_CONTROL` 27), so **firmware and kernel
+  agree on command numbering**; no version mismatch. The command is simply
+  never sent by the host.
+- Next: recover the parameter block for command 27 (handler code near the
+  table users), then emit it from `fimc_is_ischain_power` before the firmware's
+  `OPEN_SENSOR`, mirroring `HIC_I2C_CONTROL_LOCK`
+  (`fimc-is-interface.c:3418`).
