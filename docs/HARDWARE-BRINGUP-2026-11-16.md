@@ -547,3 +547,38 @@ before the firmware boots, then re-test.
 
 Kernel currently flashed: FD-optional build (`patches/camera/0001/0002`), boots
 and reaches this stage.
+
+## 19. Where the ISP/AP sensor-I2C switch actually lives (RE result)
+
+The pinctrl switch to the ISP side is **board-conditional**, not DT:
+
+```c
+/* sensor/module/fimc-is-device-3l2.c */
+#if defined(CONFIG_MACH_SMDK7580)
+	SET_PIN(..., GPIO_SCENARIO_ON,  gpio_none, "pin", PIN_FUNCTION, 0, 0);
+	...
+	SET_PIN(..., GPIO_SCENARIO_OFF, gpio_none, "pin", PIN_FUNCTION, 1, 0);
+#endif
+```
+
+Only the SMDK7580 development board flips `pin0`/`pin1`; retail board data
+(what j7elte builds) contains no `PIN_FUNCTION` entry for the sensor, so the
+state is never changed by the kernel. The `pin_ctrl(... nm(pin) ...)` line seen
+in the boot log comes from the SMDK branch being compiled **out** on this
+config; what remains is the regulator sequence.
+
+Consequence: on retail hardware the sensor I2C must be handed to the ISP by
+the **firmware handshake** (the ISP firmware drives the sensor bus and expects
+MCLK/power arranged through the ischain messages), not by a pinctrl state
+change. The failure
+`[OPEN_SENSOR] I2C ch(0) Addr(0x5A) ... NACK(4)` therefore points at that
+handshake: the firmware is talking on the bus while the sensor is not yet
+clocked/reset from the ISP's point of view.
+
+Config sanity check on the built kernel: `CONFIG_MACH_SMDK7580` is **not** set
+(`arch/arm64/configs/exynos7580-j7elte_defconfig` has no such symbol; the
+retail defconfigs only list the board DTs), which matches the code path above.
+
+Next: trace the ischain message handler for the sensor-open sequence
+(`IHC_OPEN_SENSOR` / `fimc_is_hw_sensor_mode`, `fimc_is_hw_set_sensor_mclk`)
+and compare which of those messages the AH `j7elte-cam` sequence is missing.
