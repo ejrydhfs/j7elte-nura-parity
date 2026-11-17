@@ -477,3 +477,41 @@ sequence has to be derived from the driver sources
 issues `S_INPUT` with the leader encoding, and only then EOS — but which
 node carries the leader encoding and what `open_cnt` accounting the driver
 expects still needs to be traced.
+
+## 17. Camera: FD library and the sensor-I2C handover
+
+With `patches/camera/0001` (firmware fallback) and `patches/camera/0002`
+(FD optional) in the kernel, a **clean boot** (udev `v4l_id` disabled) gets the
+pipeline much further:
+
+```
+fimc_is_sensor_open():0 ... fimc_is_sensor_s_input(8, 0):0
+fimc_is_ischain_loadfd:1333: FD library loading is fail
+[@][WRN] FD library unavailable (-22), continuing without FD
+fimc_is_ischain_config_secure : PA_FIMC_IS_GIC_C : 0x000000fc
+fimc_is_ischain_power(1):0
+fimc_is_ischain_open():0
+<TS:...> CALDATA_BASE/SIZE = 0x01fd0000/0x00014000
+<TS:...> [INFO][FROM HEADER, STREAM ID:0] CRC error check: SUCCESS!
+<TS:...> [FD  ] FdTaskEntry
+<TS:...> [ERROR]Sensor I2C doesn't work. I2C ch(0),Addr:0x5a -
+         Interrupt Status Register: 0x5100
+<TS:...> [ERROR][send] Sensor I2C doesn't work. I2C ch(0) m_I2CNackErrCount(1)
+```
+
+So: sensor power/EEPROM, Secure-OS signature of the ISP firmware, firmware
+boot and ischain open all work. The current blocker is the **sensor I2C
+ownership** between the AP and the ISP firmware: the kernel's thema read of the
+module EEPROM (address 0x5a, ch 0) succeeds, but the firmware's own transfer
+to the same address gets a NACK (status 0x5100). On stock the HAL never touches
+that bus from the kernel side; the ISP owns it after handover, and the DT's
+`pinctrl-0/1` ("pin0"/"pin1") plus the driver's pin-control scenario table are
+what flips the routing (`fimc-is-dt.c: get_pin_lookup_state`,
+`exynos_fimc_is_module_soc_pin_control`). The next step is to make the driver
+select the ISP-side state (or quiesce the AP i2c controller) before the
+firmware's first transfer.
+
+Note: each failed attempt leaves the ischain half-open (VRA/interface
+"already open", `open_cnt`), so **one attempt per boot**; the tool itself is
+otherwise correct up to this point (`j7elte-cam` reordered EOS/S_INPUT
+variants were tried and are not the issue).

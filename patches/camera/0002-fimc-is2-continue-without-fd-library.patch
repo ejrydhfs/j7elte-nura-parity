@@ -1,0 +1,29 @@
+fimc-is2: continue without the FD library when it cannot be loaded
+
+fimc_is_ischain_loadfd() requires the FD blob (fimc_is_fd.bin) to pass a
+TrustZone SMC_CMD_CHECK_SIGNATURE check.  On j7elte with the stock boot chain
+that check returns -EINVAL, and ischain power-on aborts with
+"failed to fimc_is_lib_fd_load (-22)" - which blocks every other camera stage
+(EEPROM read, firmware boot, capture).
+
+FD is face detection: not needed for still capture.  Log and continue.
+
+Verified on hardware: with this patch the vendor firmware boots
+("CALDATA_BASE/SIZE", "CRC error check: SUCCESS", "FdTaskEntry"),
+fimc_is_ischain_open() returns 0 and the next stage (sensor I2C ownership
+between the AP and the ISP firmware) is reached.
+
+--- a/drivers/media/platform/exynos/fimc-is2/fimc-is-device-ischain.c
++++ b/drivers/media/platform/exynos/fimc-is2/fimc-is-device-ischain.c
+@@ -2649,8 +2649,10 @@
+ 		ret = fimc_is_ischain_loadfd(device);
+ 		if (ret) {
+-			err("failed to fimc_is_lib_fd_load (%d)", ret);
+-			ret = -EINVAL;
+-			goto p_err;
++			/* FD needs a TrustZone signature check this boot chain does
++			 * not provide; it is not needed for still capture. */
++			warn("FD library unavailable (%d), continuing without FD", ret);
++			ret = 0;
+ 		}
+ #endif
