@@ -423,3 +423,57 @@ of `linux-samsung-j7elte`; reusing the parity tree
 Until then the Camera tile should not launch a capture tool. Field state:
 `/lib/udev/v4l_id.disabled`, masked v4l rule, firmware blobs installed
 (proprietary, not committed).
+
+## 16. Building and flashing the kernel (works), camera state
+
+**Build.** `code/kernel/build.sh` reproduces it:
+
+* source `LineageOS/android_kernel_samsung_universal7580@2a746c1b`
+  (tarball ~133 MB; codeload is slow, ~50 kB/s here),
+* config `code/pmaports/device/archived/linux-samsung-j7elte/config-samsung-j7elte.aarch64`,
+* all patches from the same directory, `yes "" | make oldconfig`,
+* `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS="-Wno-error" -j2 Image`
+  (GCC 16.2 needs `-Wno-error`: `arch/arm64/kernel/setup.c` trips
+  `-Warray-bounds`, which is fatal otherwise; build ~10 min),
+* boot image via `mkboot.py` with the existing ramdisk and **the stock
+  `dt.img`**.
+
+**Do not replace the DTBs.** Replacing the DTB payloads inside the `DTBH`
+container (same slots, padded) makes S-Boot hang before USB comes up; the
+rebuilt DTBs are not needed because the DT content is unchanged. Kernel-only
+flashes boot fine (`3.10.108 #1 SMP ... Mon Nov 16 15:34`).
+
+**Flashing.** `dd` the image to `/dev/mmcblk0p10` from the running system with
+`conv=fsync` + `sync`, or from TWRP via `adb`. `sysrq-b` does *not* sync —
+always `sync` before rebooting or the last writes are lost (this truncated
+the firmware blobs to 0 bytes once).
+
+**Camera progress with the new kernel.** The `request_firmware` fallback from
+`patches/camera/0001` now works:
+
+```
+Camera: read cal data from Rear EEPROM, headerOnly(0)
+Camera: EEPROM Cal map_version = V001
+Camera: I2C read cal data
+Camera: /system/vendor/firmware/fimc_is_fw2_3l2.bin is not available, trying request_firmware
+```
+
+so module EEPROM, sensor power, MCLK and firmware load are all functional.
+The remaining failure is the driver's ischain state machine driven by
+`j7elte-cam`:
+
+* `VIDIOC_S_CTRL(0x9a103a = V4L2_CID_IS_END_OF_STREAM, 1)` returns `-EMFILE`
+  (`fimc_is_ischain_open_wrap`: `already open` / `open_cnt > ENTRY_END`);
+* issuing EOS *after* the `S_INPUT`s instead makes `S_INPUT` fail `-EMFILE`
+  (`fimc_is_ischain_init_wrap` needs the ischain open);
+* each failed attempt leaves the ischain half-open, so the next node open
+  fails and a reboot is required between attempts (a clean boot is essential:
+  udev's `v4l_id` must stay disabled, see section 15).
+
+The Android FIMC-IS3 HAL that defines the correct order is not public
+(`hardware/samsung_slsi/exynos5` only ships the pre-FIMC-IS HAL), so the
+sequence has to be derived from the driver sources
+(`fimc-is-video*.c`, `fimc-is-device-ischain.c`): the HAL opens every node,
+issues `S_INPUT` with the leader encoding, and only then EOS — but which
+node carries the leader encoding and what `open_cnt` accounting the driver
+expects still needs to be traced.
