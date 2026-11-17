@@ -582,3 +582,32 @@ retail defconfigs only list the board DTs), which matches the code path above.
 Next: trace the ischain message handler for the sensor-open sequence
 (`IHC_OPEN_SENSOR` / `fimc_is_hw_sensor_mode`, `fimc_is_hw_set_sensor_mclk`)
 and compare which of those messages the AH `j7elte-cam` sequence is missing.
+
+## 20. Handover proof: pin1 is selected, the firmware still NACKs
+
+`patches/camera/0003` selects the ISP pin state in `fimc_is_ischain_power()`
+after the kernel's EEPROM read and before the firmware download (the retail
+board table only does it in the never-run OFF path).  On hardware:
+
+```
+[@]sensor I2C handed to ISP (pin1): 0
+[TS:00000002 ms][MAIN] Init success while in OpenSensor
+[TS:00000004 ms][SENS][00|00][08|08] [OpenSensor] is called. I2c Ch:0
+[TS:00000024 ms][ERROR]Sensor I2C doesn't work. I2C ch(0),Addr:0x5a -
+                        Interrupt Status Register: 0x5100
+[TS:00000024 ms][ERROR][send] ... m_I2CNackErrCount(1)
+```
+
+`pinctrl_select_state()` succeeds, so the AP/ISP pin routing is switchable and
+not the blocker.  The kernel's own transfer to the same address works, and the
+AP i2c runtime-PM pinning does not change anything either (tested).  What is
+left is the ISP-side I2C clock/power domain (the firmware configures
+`g_I2C_SCLK = 26 MHz` itself and reports a NACK rather than a timeout), i.e.
+the sensor is not responding to the ISP controller.  Resolving this needs the
+vendor HAL behaviour for `OPEN_SENSOR` (the blob is `camera.universal7580.so` /
+`libexynoscamera.so`, extracted from the stock ROM and kept out of the repo) or
+a stock-kernel trace.
+
+Pipeline status at this point: sensor open + EEPROM + trustzone firmware boot +
+ischain open all succeed; `OPEN_SENSOR` inside the firmware is the first
+failure.  Kernel currently flashed: FD-optional + handover builds.
