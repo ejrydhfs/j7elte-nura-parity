@@ -515,3 +515,35 @@ Note: each failed attempt leaves the ischain half-open (VRA/interface
 "already open", `open_cnt`), so **one attempt per boot**; the tool itself is
 otherwise correct up to this point (`j7elte-cam` reordered EOS/S_INPUT
 variants were tried and are not the issue).
+
+## 18. Camera: the ISP firmware's sensor I2C NACK
+
+Skipping the AP-side EEPROM read (tried, reverted) does **not** help: the ISP
+firmware's own transfer still fails.
+
+```
+[I2CHAL_SetI2CSpeedInfo](Ch:0,DevNum:1) Addr(0x5A), Speed(400000)
+[SENS][00|00][08|08] [OpenSensor] is called. I2c Ch:0
+[ERROR]Sensor I2C doesn't work. I2C ch(0),Addr:0x5a - Interrupt Status Register: 0x5100
+[ERROR][read:1] ... m_I2CNackErrCount(4)
+[ERROR][PushData] I2C NACK error when opening sensor !!!
+[ERROR][EC__][S0][SEN0] 524296 can not open
+```
+
+The kernel's raw-I2C EEPROM read of the *same* address succeeds, so the sensor
+is powered and the bus works from the AP. The driver's pin-control log shows
+it selects the AP state:
+
+```
+pin_ctrl(act(4), pin(0), val(0), nm(pin)     # PIN_FUNCTION -> pinctrl state
+```
+
+i.e. `pinctrl-names = "pin0","pin1"` with **pin0 = AP I2C**, and nothing in this
+path selects **pin1 = ISP I2C** before `fimc_is_ischain_power()`. The sensor
+node has no `pin_ctrls` table in the (stock, verified) DT, so
+`get_pin_lookup_state()` has nothing to install and the state is never
+switched. Next step: select `pin1` (or quiesce the AP i2c controller) right
+before the firmware boots, then re-test.
+
+Kernel currently flashed: FD-optional build (`patches/camera/0001/0002`), boots
+and reaches this stage.
