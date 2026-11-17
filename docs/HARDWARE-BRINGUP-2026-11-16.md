@@ -611,3 +611,29 @@ a stock-kernel trace.
 Pipeline status at this point: sensor open + EEPROM + trustzone firmware boot +
 ischain open all succeed; `OPEN_SENSOR` inside the firmware is the first
 failure.  Kernel currently flashed: FD-optional + handover builds.
+
+## 21. Power + mux both correct, firmware still NACKs
+
+`run_fw_sel()` powers the sensor rails down after the EEPROM read; the
+firmware then opens the sensor itself.  Re-enabling the rails at the handover
+point and switching to `pin1` both succeed:
+
+```
+[@]sensor rails on before FW boot: 0
+[@]sensor I2C handed to ISP (pin1): 0
+[TS:...] CRC error check: SUCCESS!
+[TS:...] Read_DW9807_CalData CRC error check: SUCCESS!
+[TS:...] [OpenSensor] is called. I2c Ch:0
+[TS:00000024 ms][ERROR]Sensor I2C doesn't work. ... status 0x5100
+```
+
+So at the moment of `OPEN_SENSOR` the sensor is powered, its rails are on, the
+pins are in the ISP state, and the firmware still gets no ACK on `0x5a`.
+Every kernel-controllable precondition is now satisfied and verified in the
+log; what remains is inside the ISP I2C path itself (its clock gate or the
+firmware's own bus configuration), which is not described by the open sources
+available here.
+
+Verified preconditions: sensor open + S_INPUT (kernel), EEPROM + cal data CRC,
+signed firmware load, FD skip, rails on, pin1 mux, ischain open. First failing
+step: firmware `OPEN_SENSOR` -> `ERROR_SENSOR_I2C_FAIL` (NACK).
