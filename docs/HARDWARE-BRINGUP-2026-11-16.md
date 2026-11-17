@@ -637,3 +637,28 @@ available here.
 Verified preconditions: sensor open + S_INPUT (kernel), EEPROM + cal data CRC,
 signed firmware load, FD skip, rails on, pin1 mux, ischain open. First failing
 step: firmware `OPEN_SENSOR` -> `ERROR_SENSOR_I2C_FAIL` (NACK).
+
+## 22. Front sensor fails identically: not a rear-camera hardware fault
+
+`j7elte-cam -f` originally looked for `31s/31c`, which this driver does not
+register; the front S5K5E3 shares the single 3AA/ISP group (`30s/30c/i0s/scp`)
+and differs only in the sensor node (`ss1`) and sensor id. Patched the tool to
+do that; the pipeline then runs for the front sensor:
+
+```
+[@][1][SEN:D] fimc_is_sensor_s_input(17, 0):0
+[TS:...] [SENS][00|00][17|05] [OpenSensor] is called. I2c Ch:1
+[TS:...][ERROR]Sensor I2C doesn't work. I2C ch(1),Addr:0x20 -
+                         Interrupt Status Register: 0x5100
+[TS:...][ERROR][send] ... m_I2CNackErrCount(1)
+```
+
+Different sensor (S5K5E3), different ISP I2C channel (1) and different address
+(0x20) - **identical NACK**. So the rear camera module is not faulty; the
+shared ISP firmware -> sensor I2C path fails for both cameras. That also
+matches the DEAD actuator/flash ids the firmware reports (`Actuator 0,
+Flash 5` for the front, vs `13/11` for the rear) being read from the same
+non-working bus.
+
+Consequence for the remaining work: debug the ISP I2C block itself (clock
+gate / bus init inside FIMC-IS), not the sensor, the mux or the rails.
