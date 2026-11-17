@@ -662,3 +662,32 @@ non-working bus.
 
 Consequence for the remaining work: debug the ISP I2C block itself (clock
 gate / bus init inside FIMC-IS), not the sensor, the mux or the rails.
+
+## 23. Firmware RE: the missing HIC_ISP_I2C_CONTROL path
+
+The ISP firmware (`fimc_is_fw2_3l2.bin`, 2.8 MB, raw ARM image) contains its
+own I2C stack:
+
+```
+[ISP_I2C_WaitForBusReady][ch %d] timeout (ErrCnt:%d)
+[I2CHAL_CalcInit] g_I2C_SCLK is NULL.
+[EC__] I2C Clock : Host = %d --> g_I2C_SCLK = %d (Fixed:%s)
+Sensor I2C doesn't work. I2C ch(%d),Addr:0x%02x - Interrupt Status Register: 0x%X
+HIC_SET_ISP_I2C_CONTROL
+```
+
+`HIC_SET_ISP_I2C_CONTROL` names the host-interface command that configures
+that I2C block.  The kernel enum has it
+(`include/fimc-is-cmd.h: HIC_ISP_I2C_CONTROL`), **but no driver code sends or
+handles it** - the only I2C-related HIC in the message switch is
+`HIC_I2C_CONTROL_LOCK` (`fimc-is-interface.c:1073` handles it, `:3418` sends
+it).  So the firmware's ISP I2C block is never configured by the host, which
+matches the NACK on an otherwise fully powered, muxed, open pipeline, and it
+matches the firmware complaining after programming `g_I2C_SCLK = 26 MHz`
+itself.
+
+Next concrete step: implement the host side of `HIC_ISP_I2C_CONTROL` (reply to
+the request / send the configuration the stock host sends - parameters can be
+recovered by disassembling the surrounding code of that string in the firmware,
+or the stock HAL's callers), or find the V4L2 control in the vendor HAL that
+triggers it.
