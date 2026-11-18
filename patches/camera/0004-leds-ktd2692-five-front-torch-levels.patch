@@ -1,0 +1,37 @@
+leds: ktd2692: expose five front torch current levels
+
+The KTD2692 has 16 movie-current steps but the Samsung sysfs node only used
+the DT default, so userspace could only switch the torch on/off.  Map the
+sysfs value 1..5 to movie-current steps 3/6/9/12/15 (5 visible levels), clamp
+values above 5, and keep 0 as off.  /sys/devices/virtual/camera/flash/
+front_torch_flash now selects the level directly.
+
+Measured on J700M with a fixed-exposure laptop camera (mean grey, p99):
+off 118.7/158, L1 123.3/185, L2 128.1/195, L3 133.8/204, L4 136.5/209,
+L5 138.6/214.
+
+--- a/drivers/leds/leds-ktd2692.c
++++ b/drivers/leds/leds-ktd2692.c
+@@ ktd2692_store()
+ 	int value = 0;
+ 	int ret = 0;
+ 	unsigned long flags = 0;
+ 	struct pinctrl *pinctrl;
++	u8 movie_level = global_ktd2692data->movie_current_value;
+ 
+ 	if ((buf == NULL) || kstrtouint(buf, 10, &value)) {
+ 		return -1;
+ 	}
+ 
++	if (value > 5)
++		value = 5;
++	if (value > 0) {
++		static const u8 movie_levels[5] = { 3, 6, 9, 12, 15 };
++		movie_level = movie_levels[value - 1];
++	}
++
+ 	global_ktd2692data->sysfs_input_data = value;
+@@
+-			ktd2692_write_data(global_ktd2692data->movie_current_value|
++			ktd2692_write_data(movie_level|
+ 							KTD2692_ADDR_MOVIE_CURRENT_SETTING);

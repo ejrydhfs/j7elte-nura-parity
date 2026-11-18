@@ -1,0 +1,45 @@
+fimc-is2: keep sensor MCLK on and power the right module before FW boot
+
+fimc_is_ischain_power() re-runs the module ON scenario after
+fimc_is_sec_run_fw_sel(), because run_fw_sel() powers the sensor rails down
+again after the EEPROM read and the firmware opens the sensor itself.
+
+Two corrections against the earlier "pin1 handover" patch:
+
+- Do not select pinctrl state "pin1": it maps the MCLK pin to input
+  (fimc_is_mclk0_in/fimc_is_mclk1_in).  The I2C function is identical in
+  pin0/pin1, so pin1 only kills MCLK.  The ON scenario already selects
+  "pin0", which is the MCLK output function.
+- Resolve the module from device->sensor (set by fimc_is_ischain_init_wrap
+  for the module actually being initialised), not from
+  core->current_position.  For the front sensor the two can differ.
+
+Hardware evidence (J700M, stock DTB/firmware):
+  j7 clk sclk_isp_sensor1 rate=26000000
+  j7 mclk pad gpe1-3 func=2
+  j7 mclk dat gpe1-3 ones=8802/20000   (pad toggling)
+  gpe1 con=0x00002001, CMU EN_SCLK_TOP_ISP bit4=1
+
+--- a/drivers/media/platform/exynos/fimc-is2/fimc-is-device-ischain.c
++++ b/drivers/media/platform/exynos/fimc-is2/fimc-is-device-ischain.c
+@@ fimc_is_ischain_power(), after fimc_is_sec_run_fw_sel()
++		{
++			/* run_fw_sel() powers the sensor rails down again; the firmware
++			 * opens the sensor itself and needs them on.  Re-run the ON
++			 * scenario for the sensor the ischain is actually initialising
++			 * (device->sensor), and keep the MCLK pin in "pin0" (output). */
++			struct fimc_is_module_enum *module = NULL;
++			struct fimc_is_device_sensor *sens =
++				device->sensor ? device->sensor :
++				&core->sensor[core->current_position];
++			int sret = fimc_is_sensor_g_module(sens, &module);
++			if (!sret && module && module->pdata) {
++				if (module->pdata->gpio_cfg) {
++					int aret = module->pdata->gpio_cfg(module->pdev,
++						SENSOR_SCENARIO_NORMAL, GPIO_SCENARIO_ON);
++					info("sensor rails+pins on before FW boot: %d\n", aret);
++				}
++			} else {
++				info("sensor power lookup failed (%d)\n", sret);
++			}
++		}

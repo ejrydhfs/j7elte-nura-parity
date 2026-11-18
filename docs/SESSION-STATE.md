@@ -25,17 +25,47 @@ Updated: 2026-11-17. Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
   `/etc/udev/rules.d/60-persistent-v4l.rules -> /dev/null`. **Re-apply after any
   apk transaction that reinstalls v4l-utils/udev.**
 
-## Camera status
-Green (verified): sensor open/S_INPUT, module EEPROM+cal CRC, signed firmware
-load, ischain open, rails on before FW boot, ISP pin mux (`pin1`), FD skipped.
-Red: firmware `OPEN_SENSOR` -> `I2C ch(0/1) NACK status 0x5100` for **both**
-sensors -> not a rear-module fault.
+## Camera status (2026-11-18)
+Green: sensor power sequencing, rails at voltage, reset high, MCLK 26 MHz
+toggling at the pad, module EEPROM+cal CRC over I2C, signed firmware load,
+ischain open, FD skipped.
 
-**Lead (docs §23):** the firmware's ISP I2C stack is configured by host command
-`HIC_ISP_I2C_CONTROL`, which exists in `include/fimc-is-cmd.h` but is neither
-sent nor handled anywhere in the driver. Implement the host side / find the
-V4L2 control that the vendor HAL uses. Firmware strings of interest:
-`ISP_I2C_WaitForBusReady`, `[I2CHAL_CalcInit] g_I2C_SCLK`, `HIC_SET_ISP_I2C_CONTROL`.
+Red: **both sensors are electrically silent on I2C.** A bit-bang master in
+`fimc_is_ischain_power` (AP GPIOs gpf0-0/1 for ch0, gpf0-2/3 for ch1) scanned
+0x08-0x77 at 100 kHz while the module was powered:
+- rear: `VDD_CAM_SENSOR_A2P8 2.8 V, VDD_CAM_1P2 1.2 V, VDDIO 1.8 V,
+  VDDAF 2.8 V`, reset gpe0-4 high, MCLK gate/rate/pad verified, full scan
+  `none`;
+- front: `VDD_VTCAM_A2P8 2.8 V, VDD_VTCAM_1P2 1.2 V, VDDIO_1.8V_VT 1.8 V`,
+  `gpios_cam_en` toggling, reset gpe0-3 high, full scan finds **only the
+  EEPROM at 0x10**, sensor at 0x20/0x5a never ACKs;
+- rail power-cycle + 9-clock bus recovery + 100 ms reset delay changed
+  nothing.
+- The same NACK occurs with the **stock 3.10.61 vendor kernel** (boots the
+  Nura rootfs), so this is not our kernel build.
+
+Conclusion: the ISP-I2C/pin-mux theory is dead; the buses, EEPROMs, rails,
+reset and MCLK are all verified good. The sensor dies themselves do not
+respond, on both modules. Next step is hardware: reseat/measure the camera
+connectors and the sensor core rails at the module.
+
+### HIC_ISP_I2C_CONTROL (corrected)
+Firmware command 28 is `HIC_SET_ISP_I2C_CONTROL` (index 28, not 27; kernel
+enum agrees). Sending it with `param1=ch` is accepted but does not change the
+NACK. Firmware uses fixed `g_I2C_SCLK=26 MHz`; I2CHAL computes
+406 kHz/32 prescaler. Command 28's handler copies host data into a per-sensor
+firmware buffer (AP->ISP I2C shadow), it does not initialise the ISP I2C block.
+
+### Front flash + proximity (2026-11-18)
+- Front flash (KTD2692, `front_torch_flash`) works. Patched for 5 levels
+  (`patches/camera/0004`): laptop camera means 118.7/123.3/128.1/133.8/
+  136.5/138.6 for off/L1..L5, p99 158->214. Confirms the front module is
+  seated and powered.
+- Proximity STK3013 on i2c-0 0x48 works: after
+  `echo 1 > /sys/class/input/event4/device/enable`, `raw_data`/`state` read
+  2 (far) and drop to 1 when covered. The input event only reports on
+  transitions; polling the sysfs node is reliable.
+- The camera sensors themselves still do not ACK; see Camera status above.
 
 ## Test loop (one attempt per boot!)
 ```
