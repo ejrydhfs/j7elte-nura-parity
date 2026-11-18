@@ -1,6 +1,16 @@
 # Session state (survives context compaction)
 
-Updated: 2026-11-17. Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
+Updated: 2026-11-18 (camera RE dropped; audio UCM fix). Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
+
+## Audio / UCM (2026-11-18)
+- ADMA prealloc: `sound/soc/samsung/dma.c` `preallocate_dma_buffer_of()`
+  ignored a failed `ioremap()` of the DT `samsung,tx-buf`; it now falls back to
+  `dma_alloc_coherent()`. Built image `/tmp/kernel-boot.img`; auto-flash TWRP
+  zip `/home/asdf/kernel-audiofix.zip` (dd p10 + reboot).
+- UCM: `HiFi.conf`/`VoiceCall.conf` referenced `HPL/HPR/EP/SPK Mixer ADCL/ADCR`;
+  the driver exposes `... DACL/DACR`. Fixed in `code/userspace/audio/ucm2` and
+  the pmaports package. Verified on the stock kernel: Speaker route + 440 Hz.
+- Camera RE: dropped per user; no further camera work.
 
 ## Device access
 - USB net: host `172.16.42.2/24`, device `172.16.42.1`; SSH `user@172.16.42.1` (password `nura`).

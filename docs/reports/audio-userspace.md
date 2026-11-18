@@ -5,6 +5,12 @@
 stock ROM mixer graph, so that the already parity-verified kernel driver
 (`parity/reports/audio.md`) can be driven by postmarketOS userspace.
 
+> **Correction (2026-11-18):** the driver registers `DACL`/`DACR` mixer
+> switches; the first revision here used `ADCL`/`ADCR`, which `alsaucm`
+> rejects and which leaves the speaker path disconnected. `HiFi.conf` and
+> `VoiceCall.conf` are fixed to `DACL`/`DACR`; Speaker playback was then
+> verified on hardware.
+
 **No hardware was available.** Everything below is static validation:
 cross-compilation-independent file/source checks, ALSA configuration parsing
 with the host `alsaucm` (alsa-lib 1.2.16.1), and an automated control-name /
