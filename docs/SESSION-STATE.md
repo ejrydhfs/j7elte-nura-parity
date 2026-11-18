@@ -7,9 +7,12 @@ Updated: 2026-11-18 (camera RE dropped; audio UCM fix). Target: **samsung-j7elte
   ignored a failed `ioremap()` of the DT `samsung,tx-buf`; it now falls back to
   `dma_alloc_coherent()`. Built image `/tmp/kernel-boot.img`; auto-flash TWRP
   zip `/home/asdf/kernel-audiofix.zip` (dd p10 + reboot).
-- UCM: `HiFi.conf`/`VoiceCall.conf` referenced `HPL/HPR/EP/SPK Mixer ADCL/ADCR`;
-  the driver exposes `... DACL/DACR`. Fixed in `code/userspace/audio/ucm2` and
-  the pmaports package. Verified on the stock kernel: Speaker route + 440 Hz.
+- UCM: playback verbs only disabled the `ADCL/ADCR` analog-bypass mixers and
+  never enabled the `DACL/DACR` DAC mixers. Speaker also required PCM 1
+  (`hw:${CardId},1`, the secondary DAI), S2801 `CH1 DOUT Select=AIF4IN`,
+  `SRC1/MCKO/HQ En`, `MIX1_LVL=3`, and DAC soft-mute off. Fixed in
+  `code/userspace/audio/ucm2` and the pmaports package; speaker and earpiece
+  confirmed on hardware.
 - Camera RE: dropped per user; no further camera work.
 
 ## Device access

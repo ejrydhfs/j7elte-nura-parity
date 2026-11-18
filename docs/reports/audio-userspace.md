@@ -5,11 +5,12 @@
 stock ROM mixer graph, so that the already parity-verified kernel driver
 (`parity/reports/audio.md`) can be driven by postmarketOS userspace.
 
-> **Correction (2026-11-18):** the driver registers `DACL`/`DACR` mixer
-> switches; the first revision here used `ADCL`/`ADCR`, which `alsaucm`
-> rejects and which leaves the speaker path disconnected. `HiFi.conf` and
-> `VoiceCall.conf` are fixed to `DACL`/`DACR`; Speaker playback was then
-> verified on hardware.
+> **Correction (2026-11-18):** playback was silent because every verb turned
+> the **ADCL/ADCR** analog-bypass mixers off and never enabled the
+> **DACL/DACR** DAC mixers; the driver exposes both pairs. The Speaker also
+> needs **PCM 1** (`hw:${CardId},1`, the secondary DAI to the S2801), S2801
+> `CH1 DOUT Select=AIF4IN`, `SRC1/MCKO/HQ En`, `MIX1_LVL=3`, and DAC soft-mute
+> off. With those, speaker and earpiece were confirmed on hardware.
 
 **No hardware was available.** Everything below is static validation:
 cross-compilation-independent file/source checks, ALSA configuration parsing
