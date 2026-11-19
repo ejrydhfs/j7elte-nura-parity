@@ -1,0 +1,60 @@
+shaders@glsl-vs-arrays
+shaders@glsl-vs-functions
+shaders@glsl-vs-if-bool
+shaders@glsl-fs-bug25902
+shaders@glsl-fs-color-matrix
+shaders@glsl-fs-discard-02
+shaders@glsl-uniform-interstage-limits@1 vs, 520 fs
+shaders@glsl-uniform-interstage-limits@300 vs, 300 fs
+shaders@glsl-uniform-interstage-limits@350 vs, 350 fs
+shaders@glsl-fs-loop
+shaders@glsl-fs-loop-nested
+shaders@glsl-vs-loop
+shaders@glsl-vs-loop-nested
+glx@glx-multithread-texture
+object namespace pollution@texture with glbitmap
+object namespace pollution@texture with glblitframebuffer
+object namespace pollution@texture with glclear
+object namespace pollution@vertex-array with glbitmap
+object namespace pollution@vertex-array with glblitframebuffer
+object namespace pollution@vertex-array with glclear
+object namespace pollution@vertex-array with glcleartexsubimage
+shaders@glsl-fs-sampler-numbering
+spec@!opengl 2.0@gl-2.0-active-sampler-conflict
+spec@!opengl 2.0@max-samplers
+spec@!opengl 2.0@max-samplers border
+object namespace pollution@buffer with glgeneratemipmap
+object namespace pollution@framebuffer with glgeneratemipmap
+object namespace pollution@program with glgeneratemipmap
+object namespace pollution@renderbuffer with glgeneratemipmap
+spec@3dfx_texture_compression_fxt1@fbo-generatemipmap-formats
+spec@arb_depth_buffer_float@fbo-generatemipmap-formats
+spec@arb_depth_texture@fbo-generatemipmap-formats
+spec@arb_es2_compatibility@fbo-generatemipmap-formats
+object namespace pollution@buffer with glgetteximage-compressed
+object namespace pollution@framebuffer with glgetteximage-compressed
+object namespace pollution@program with glgetteximage-compressed
+object namespace pollution@renderbuffer with glgetteximage-compressed
+spec@!opengl 2.0@incomplete-cubemap-format
+spec@!opengl 2.0@incomplete-cubemap-size
+spec@!opengl 3.0@generatemipmap-cubemap
+spec@amd_seamless_cubemap_per_texture@amd_seamless_cubemap_per_texture
+spec@!opengl 2.0@tex3d-npot
+spec@arb_pixel_buffer_object@cubemap npot pbo
+spec@arb_texture_cube_map@cubemap npot
+spec@ext_framebuffer_object@fbo-generatemipmap-npot
+spec@arb_direct_state_access@compressedtextureimage gl_compressed_rgba_s3tc_dxt5_ext
+spec@arb_framebuffer_object@fbo-generatemipmap-cubemap s3tc_dxt1
+spec@arb_texture_cube_map_array@fbo-generatemipmap-cubemap array s3tc_dxt1
+spec@ext_texture_array@fbo-generatemipmap-array s3tc_dxt1
+glx@glx-visuals-depth
+glx@glx-visuals-depth -pixmap
+hiz@hiz-depth-read-fbo-d24-s0
+hiz@hiz-depth-read-fbo-d24-s8
+glx@glx-visuals-stencil
+glx@glx-visuals-stencil -pixmap
+hiz@hiz-depth-read-window-stencil0
+hiz@hiz-depth-read-window-stencil1
+spec@!opengl 1.0@gl-1.0-scissor-bitmap
+spec@!opengl 1.0@gl-1.0-scissor-clear
+spec@!opengl 1.0@gl-1.0-scissor-copypixels

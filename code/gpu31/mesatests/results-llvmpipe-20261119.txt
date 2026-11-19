@@ -1,0 +1,60 @@
+pass | glx@glx-multithread-texture
+fail | glx@glx-visuals-depth
+fail | glx@glx-visuals-depth -pixmap
+fail | glx@glx-visuals-stencil
+fail | glx@glx-visuals-stencil -pixmap
+pass | hiz@hiz-depth-read-fbo-d24-s0
+skip | hiz@hiz-depth-read-fbo-d24-s8 | FBO incomplete (status 0x8cdd), no D24+S8 config
+pass | hiz@hiz-depth-read-window-stencil0
+pass | hiz@hiz-depth-read-window-stencil1
+pass | object namespace pollution@buffer with glgeneratemipmap
+pass | object namespace pollution@buffer with glgetteximage-compressed
+pass | object namespace pollution@framebuffer with glgeneratemipmap
+pass | object namespace pollution@framebuffer with glgetteximage-compressed
+pass | object namespace pollution@program with glgeneratemipmap
+pass | object namespace pollution@program with glgetteximage-compressed
+pass | object namespace pollution@renderbuffer with glgeneratemipmap
+pass | object namespace pollution@renderbuffer with glgetteximage-compressed
+pass | object namespace pollution@texture with glbitmap
+pass | object namespace pollution@texture with glblitframebuffer
+pass | object namespace pollution@texture with glclear
+skip | object namespace pollution@vertex-array with glbitmap | needs GL_APPLE_vertex_array_object
+skip | object namespace pollution@vertex-array with glblitframebuffer | needs GL_APPLE_vertex_array_object
+skip | object namespace pollution@vertex-array with glclear | needs GL_APPLE_vertex_array_object
+skip | object namespace pollution@vertex-array with glcleartexsubimage | needs GL_APPLE_vertex_array_object
+pass | shaders@glsl-fs-bug25902
+pass | shaders@glsl-fs-color-matrix
+pass | shaders@glsl-fs-discard-02
+pass | shaders@glsl-fs-loop
+pass | shaders@glsl-fs-loop-nested
+pass | shaders@glsl-fs-sampler-numbering
+pass | shaders@glsl-uniform-interstage-limits@1 vs, 520 fs
+pass | shaders@glsl-uniform-interstage-limits@300 vs, 300 fs
+pass | shaders@glsl-uniform-interstage-limits@350 vs, 350 fs
+pass | shaders@glsl-vs-arrays
+pass | shaders@glsl-vs-functions
+pass | shaders@glsl-vs-if-bool
+pass | shaders@glsl-vs-loop
+pass | shaders@glsl-vs-loop-nested
+pass | spec@!opengl 1.0@gl-1.0-scissor-bitmap
+pass | spec@!opengl 1.0@gl-1.0-scissor-clear
+pass | spec@!opengl 1.0@gl-1.0-scissor-copypixels
+pass | spec@!opengl 2.0@gl-2.0-active-sampler-conflict
+pass | spec@!opengl 2.0@incomplete-cubemap-format
+pass | spec@!opengl 2.0@incomplete-cubemap-size
+pass | spec@!opengl 2.0@max-samplers
+pass | spec@!opengl 2.0@max-samplers border
+pass | spec@!opengl 2.0@tex3d-npot
+pass | spec@!opengl 3.0@generatemipmap-cubemap
+pass | spec@3dfx_texture_compression_fxt1@fbo-generatemipmap-formats
+pass | spec@amd_seamless_cubemap_per_texture@amd_seamless_cubemap_per_texture
+pass | spec@arb_depth_buffer_float@fbo-generatemipmap-formats
+pass | spec@arb_depth_texture@fbo-generatemipmap-formats
+pass | spec@arb_direct_state_access@compressedtextureimage gl_compressed_rgba_s3tc_dxt5_ext
+pass | spec@arb_es2_compatibility@fbo-generatemipmap-formats
+pass | spec@arb_framebuffer_object@fbo-generatemipmap-cubemap s3tc_dxt1
+pass | spec@arb_pixel_buffer_object@cubemap npot pbo
+pass | spec@arb_texture_cube_map@cubemap npot
+pass | spec@arb_texture_cube_map_array@fbo-generatemipmap-cubemap array s3tc_dxt1
+pass | spec@ext_framebuffer_object@fbo-generatemipmap-npot
+pass | spec@ext_texture_array@fbo-generatemipmap-array s3tc_dxt1

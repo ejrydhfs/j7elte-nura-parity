@@ -38,7 +38,7 @@ MIN_DISTINCT=100
 DURATION=2.0
 GEARS_SECS=15
 GLMARK_TIMEOUT=110
-SKIP_GEARS=0 SKIP_GLMARK=0 SKIP_2D=0 SKIP_GPU=0
+SKIP_GEARS=0 SKIP_GLMARK=0 SKIP_2D=0 SKIP_GPU=0 SKIP_PIGLIT=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -56,10 +56,9 @@ while [ $# -gt 0 ]; do
 		--gears-secs=*) GEARS_SECS=${1#--gears-secs=}; shift ;;
 		--glmark-timeout) GLMARK_TIMEOUT=${2:?missing value}; shift 2 ;;
 		--glmark-timeout=*) GLMARK_TIMEOUT=${1#--glmark-timeout=}; shift ;;
-		--skip-gears) SKIP_GEARS=1; shift ;;
-		--skip-glmark) SKIP_GLMARK=1; shift ;;
-		--skip-2d) SKIP_2D=1; shift ;;
-		--skip-gpu) SKIP_GPU=1; shift ;;
+		--skip-piglit) SKIP_PIGLIT=1; shift ;;
+		--piglit-subset) PIGSUBSET=${2:?missing value}; shift 2 ;;
+		--piglit-subset=*) PIGSUBSET=${1#--piglit-subset=}; shift ;;
 		--skip-load) SKIP_GEARS=1; SKIP_GLMARK=1; shift ;;
 		-h|--help) sed -n '2,30p' "$0"; exit 0 ;;
 		*) echo "run-harness: unknown argument: $1" >&2; exit 2 ;;
@@ -315,6 +314,46 @@ else
 		fi
 	fi
 fi
+# --- G4c: piglit smoke (WARN-only informational; full 60-test runs use mesatests/run-piglit-subset.sh) ---
+# Runs only when piglit exists on this host (device: /data/pigroot). Else SKIP (hosts stay green).
+# Replays 10 baseline-passing binaries directly (-auto -fbo), one process each, short timeout.
+PIG_RUN=0 PIG_PASS=0 PIG_FAIL=0 PIG_SKIPN=0
+if [ "$SKIP_PIGLIT" -eq 1 ]; then
+	log "piglit smoke: SKIP by flag"
+elif [ ! -d /data/pigroot/usr/lib/piglit ] && [ ! -d /usr/lib/piglit ]; then
+	log "piglit smoke: SKIP (no piglit install on this host; device runs use mesatests/run-piglit-subset.sh)"
+else
+	PIGBIN=/data/pigroot/usr/lib/piglit/bin
+	[ -d "$PIGBIN" ] || PIGBIN=/usr/lib/piglit/bin
+	if [ "$RENDERER_CLASS" = software ]; then
+		export LIBGL_ALWAYS_SOFTWARE=1
+	fi
+	if [ -d /data/pigroot/usr/lib/piglit ]; then
+		export LD_LIBRARY_PATH="/data/pigroot/usr/lib/piglit/lib:/data/pigroot/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+		export PIGLIT_SOURCE_DIR=/data/pigroot/usr/lib/piglit
+	fi
+	: >"$OUT/piglit-smoke.txt"
+	for t in glsl-vs-arrays glsl-fs-loop max-samplers tex3d-npot \
+			'cubemap npot' fbo-generatemipmap-npot \
+			gl-1.0-scissor-clear gl-1.0-scissor-bitmap \
+			hiz-depth-read-fbo-d24-s0 object-namespace-pollution; do
+		b=""
+		for cand in "$PIGBIN/$t" "$PIGBIN/$(printf '%s' "$t" | tr ' ' '-')"; do
+			[ -x "$cand" ] && b=$cand && break
+		done
+		[ -n "$b" ] || { PIG_SKIPN=$((PIG_SKIPN+1)); echo "skip | $t | no binary" >>"$OUT/piglit-smoke.txt"; continue; }
+		PIG_RUN=$((PIG_RUN+1))
+		if timeout 25 "$b" -auto -fbo >"$OUT/piglit-smoke-$PIG_RUN.log" 2>&1; then
+			PIG_PASS=$((PIG_PASS+1)); echo "pass | $t" >>"$OUT/piglit-smoke.txt"
+		else
+			PIG_FAIL=$((PIG_FAIL+1)); echo "fail | $t | rc=$? (see piglit-smoke-$PIG_RUN.log)" >>"$OUT/piglit-smoke.txt"
+		fi
+	done
+	log "piglit smoke: $PIG_PASS pass / $PIG_FAIL fail / $PIG_SKIPN skip of $PIG_RUN run"
+	warn "piglit smoke is WARN-only (llvmpipe baseline 51/5/4; full 60-test diff via mesatests/run-piglit-subset.sh compare)"
+fi
+
+
 
 # --- G5: verdict artifact ---
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -331,11 +370,12 @@ esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 	printf '    "renderer": "%s",\n' "$G_RENDERER"
 	printf '    "glmark": "%s",\n' "$G_GLMARK"
 	printf '    "surface_2d": "%s",\n' "$G_2D"
-	printf '    "gpu_util": "%s"\n' "$G_GPU"
+	printf '    "gpu_util": "%s",\n' "$G_GPU"
+	printf '    "piglit_smoke": "WARN"\n'
 	printf '  },\n'
+	printf '  "piglit": {"run": %d, "pass": %d, "fail": %d, "skip": %d},\n' "$PIG_RUN" "$PIG_PASS" "$PIG_FAIL" "$PIG_SKIPN"
 	printf '  "notes": {"glmark": "%s", "surface_2d": "%s", "gpu": "%s"},\n' \
 		"$(esc "$NOTE_GLMARK")" "$(esc "$NOTE_2D")" "$(esc "$NOTE_GPU")"
-	printf '  "result": "%s"\n}\n' "$RESULT"
 } >"$OUT/verdict.json"
 {
 	echo "glmark-harness verdict: $RESULT"
@@ -344,6 +384,7 @@ esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 	echo "glmark: gate=$G_GLMARK $NOTE_GLMARK"
 	echo "surface_2d: gate=$G_2D $NOTE_2D"
 	echo "gpu_util: gate=$G_GPU $NOTE_GPU"
+	echo "piglit_smoke: run=$PIG_RUN pass=$PIG_PASS fail=$PIG_FAIL skip=$PIG_SKIPN (WARN-only)"
 } >"$OUT/verdict.txt"
 printf '%s\n' "$RESULT" >"$OUT/RESULT"
 log "logs in $OUT"
