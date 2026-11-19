@@ -146,8 +146,16 @@ Full evidence: `docs/reports/gps-bringup.md`, tool
 - NMEA is produced by `glgps`, never by the chip; the remaining vendor stages
   (flow-control search, ESW upload, RF/clock plan, measurement start) are
   run-time computed and the ROM has no ESW blob.
-- Next experiment: one cold-start capture of the stock stack (pad tap or stock
-  boot log) and replay; alternatively disassemble
-  `Bri_ProgramSwFlowControl` (`0x2a6aa0`) against the ACK parser (`0x2a789c`).
-- `j7elte-gpsd --init` must send the NVRAM pair before `RequestHwVersion` and
-  must not abort when autobaud is unannounced (GpsToolchain is implementing).
+- `j7elte-gpsd --init` now sends the NVRAM pair before `RequestHwVersion` and
+  no longer aborts on the unannounced autobaud; verified on hardware
+  (`gps-toolchain.md`), patch regenerated in `patches/userspace/gps/`.
+- Kernel is back to **stock parity**: `sec_gps_bcm4752.c` is the vendor file
+  again (GPIO only, `gpio_direction_output(..., 0)`, no regulator/regmap
+  writes). Built `#33`, flashed, and the full prologue above reproduces
+  unchanged — so no PMIC deviation is needed or wanted.
+- ESW: the chip is **not** hostless; `gpsd` carries the 8051 ESW/RAM patch in
+  `.rodata` and uploads it (`Bri_EswLoadBlockAndRequestCrc`, 24-byte records).
+  Public hardware-verified spec: github.com/mbicz/bcm4752-init (Lenovo Yoga
+  Book). Remaining work: extract the ESW image, implement the escape-pair
+  search (`Bri_ProgramSwFlowControl` 0x2a6aa0), RF plan, then parse GLME and
+  synthesise NMEA host-side (chip never emits NMEA).

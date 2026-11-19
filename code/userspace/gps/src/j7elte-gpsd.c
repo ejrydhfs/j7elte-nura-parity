@@ -621,6 +621,25 @@ static const unsigned char bri_request_debug_sfr[6] = {
 	0xff, 0x00, 0xfd, 0x1f, 0x95, 0xfc,
 };
 
+/* GlMeSrdAsicinit::Bri_RequestNvRamWord7 @0x2a70b8, templates at .rodata
+ * 0x398b40 / 0x398b4c / 0x398b54 (three frames in one function).  glgps
+ * sends all three; on this unit they are the exchanges the chip actually
+ * answers (see docs/reports/gps-toolchain.md). */
+static const unsigned char bri_nvram_word7[10] = {
+	0xfe, 0x00, 0xfd, 0x00, 0x1b, 0x07, 0x00, 0x00, 0x00, 0xfc,
+};
+static const unsigned char bri_nvram_read[6] = {
+	0xff, 0x00, 0xfd, 0x00, 0x1b, 0xfc,
+};
+static const unsigned char bri_request_status[6] = {
+	0xff, 0x00, 0xfd, 0x40, 0x1a, 0xfc,
+};
+
+/* Bytes read off the UART by the BRI handshake; kept only so the exit
+ * summary can distinguish "the chip is mute" from "the chip only spoke
+ * during init". */
+static unsigned long bri_rx_bytes;
+
 struct bri_rx {
 	unsigned char buf[BRI_FRAME_MAX];
 	size_t len;
@@ -744,6 +763,7 @@ static int bri_wait(int fd, struct bri_rx *rx, int timeout_ms,
 				       n == 0 ? "EOF" : strerror(errno));
 				return -1;
 			}
+			bri_rx_bytes += (unsigned long)n;
 			for (i = 0; i < n; i++) {
 				if (bri_rx_byte(rx, chunk[i])) {
 					memcpy(out, rx->buf, rx->len);
@@ -776,19 +796,59 @@ static void bri_log_frame(const char *what, const unsigned char *f, size_t n)
 		logmsg("%s: %s", what, hex);
 }
 
+/* 32-bit little-endian payload word of a 10-byte response frame. */
+static unsigned long bri_word(const unsigned char *f, size_t n)
+{
+	if (n < 10)
+		return 0;
+	return (unsigned long)f[5] | (unsigned long)f[6] << 8 |
+	       (unsigned long)f[7] << 16 | (unsigned long)f[8] << 24;
+}
+
 /*
- * Cold-start handshake, in the order glgps performs it:
- *   "initial" @0x2a1728 -> cfg+autobaud @0x2a5b58 -> BRI wait.
- * Returns 0 if the chip answered the autobaud burst, -1 if it stayed silent
- * (documented residual blocker, see parity/reports/gps-init-impl.md).
+ * Send one request and wait for one response frame.
+ * Returns 1 on a reply, 0 on timeout, -1 on a fatal write/read error.
+ */
+static int bri_step(int fd, struct bri_rx *rx, const char *what,
+		    const unsigned char *req, size_t reqlen, int timeout_ms,
+		    unsigned char *frame, size_t *flen)
+{
+	int got;
+
+	if (bri_send(fd, req, reqlen) < 0)
+		return -1;
+	logmsg("init: %s sent", what);
+	got = bri_wait(fd, rx, timeout_ms, frame, flen);
+	if (got > 0)
+		bri_log_frame("init: reply", frame, *flen);
+	else if (got == 0)
+		logmsg("init: no reply to %s within %d ms", what, timeout_ms);
+	return got;
+}
+
+/*
+ * Cold-start handshake.  The vendor order is
+ *   "initial" @0x2a1728 -> cfg+autobaud @0x2a5b58 -> [BRI wait] ->
+ *   NvRamWord7 @0x2a70b8 -> wait4version @0x2a680c (HwVersion) ->
+ *   wait4asic_ready @0x2a6234 (DebugSfr) -> esw_wait4version (GetOutOfLegacy).
+ *
+ * On j7elte hardware the chip answers nothing at all until it has seen the
+ * 16 x 0x80 autobaud burst, never volunteers the unsolicited BRI announce
+ * frame, and gates Bri_RequestHwVersion on the preceding NvRamWord7 exchange
+ * (the vendor code asserts transport->[4] == 1 at 0x2a6784 before sending
+ * it).  GetOutOfLegacy and DebugSfr stay unanswered even then.  The steps are
+ * therefore sent in the order that the hardware actually answers, and a
+ * silent chip is logged rather than treated as fatal.
+ *
+ * Returns 0 once the sequence has been played, -1 only on a fatal I/O error.
  */
 static int asic_init(int fd)
 {
 	struct bri_rx rx;
 	unsigned char frame[BRI_FRAME_MAX];
 	size_t flen = 0;
-	int attempt, got;
-	unsigned long version = 0;
+	int attempt, got, answered = 0, sent = 0;
+	unsigned long version;
 
 	memset(&rx, 0, sizeof(rx));
 
@@ -798,77 +858,96 @@ static int asic_init(int fd)
 	       sizeof(bri_autobaud), cfg.baud);
 
 	got = bri_wait(fd, &rx, BRI_RESP_MS, frame, &flen);
-	if (got <= 0) {
-		logmsg("init: chip silent for %d ms after autobaud "
-		       "(rx state: %lu bytes discarded)", BRI_RESP_MS,
-		       rx.discarded);
+	if (got > 0) {
+		bri_log_frame("init: BRI frame", frame, flen);
+	} else if (got == 0) {
+		logmsg("init: no unsolicited BRI frame within %d ms "
+		       "(rx state: %lu bytes discarded); sending requests anyway",
+		       BRI_RESP_MS, rx.discarded);
+	}
+
+	/* Bri_RequestNvRamWord7 @0x2a70b8 (templates 0x398b40/4c/54). */
+	sent++;
+	got = bri_step(fd, &rx, "Bri_RequestNvRamWord7",
+		       bri_nvram_word7, sizeof(bri_nvram_word7), BRI_RESP_MS,
+		       frame, &flen);
+	if (got < 0)
 		return -1;
+	answered += got > 0;
+
+	sent++;
+	got = bri_step(fd, &rx, "NvRamWord7 read", bri_nvram_read,
+		       sizeof(bri_nvram_read), BRI_RESP_MS, frame, &flen);
+	if (got < 0)
+		return -1;
+	if (got > 0) {
+		answered++;
+		logmsg("init: NvRamWord7 word 7 = 0x%08lx", bri_word(frame, flen));
 	}
-	bri_log_frame("init: BRI frame", frame, flen);
 
-	/* INIT_STAGE A: "Resending Bri_GetOutOfLegacy %u!" with 50+20n ms
-	 * backoff, up to four trials (@0x2a6508, template @0x2a618c). */
-	for (attempt = 0; attempt < BRI_RETRY_MAX; attempt++) {
-		int backoff = BRI_BACKOFF_MS(attempt);
-
-		if (bri_send(fd, bri_get_out_of_legacy,
-			     sizeof(bri_get_out_of_legacy)) < 0)
-			return -1;
-		logmsg("init: Bri_GetOutOfLegacy sent (trial %d)", attempt + 1);
-
-		got = bri_wait(fd, &rx, backoff, frame, &flen);
-		if (got > 0) {
-			bri_log_frame("init: reply", frame, flen);
-			break;
-		}
+	sent++;
+	got = bri_step(fd, &rx, "status request 0x40/0x1a",
+		       bri_request_status, sizeof(bri_request_status),
+		       BRI_RESP_MS, frame, &flen);
+	if (got < 0)
+		return -1;
+	if (got > 0) {
+		answered++;
+		logmsg("init: status 0x40/0x1a = 0x%08lx", bri_word(frame, flen));
 	}
-	if (got <= 0)
-		logmsg("init: no reply to Bri_GetOutOfLegacy after %d trials",
-		       BRI_RETRY_MAX);
 
 	/* bri_wait4version @0x2a680c sends Bri_RequestHwVersion on entry. */
-	if (bri_send(fd, bri_request_hw_version,
-		     sizeof(bri_request_hw_version)) < 0)
+	sent++;
+	got = bri_step(fd, &rx, "Bri_RequestHwVersion",
+		       bri_request_hw_version, sizeof(bri_request_hw_version),
+		       BRI_RESP_MS, frame, &flen);
+	if (got < 0)
 		return -1;
-	logmsg("init: Bri_RequestHwVersion sent");
-
-	got = bri_wait(fd, &rx, BRI_RESP_MS, frame, &flen);
 	if (got > 0) {
-		bri_log_frame("init: reply", frame, flen);
+		answered++;
 		if (flen >= 10 && frame[3] == 0x00) {
-			version = (unsigned long)frame[5] |
-				  (unsigned long)frame[6] << 8 |
-				  (unsigned long)frame[7] << 16 |
-				  (unsigned long)frame[8] << 24;
+			version = bri_word(frame, flen);
 			/* "GlMeSrdAsicinit::Got BRI HW version(0x%lx)" */
 			logmsg("init: BRI HW version 0x%08lx (asic type byte 0x%02x)",
 			       version, frame[4]);
 		}
-	} else {
-		logmsg("init: no reply to Bri_RequestHwVersion within %d ms",
-		       BRI_RESP_MS);
 	}
 
 	/* bri_wait4asic_ready @0x2a6234 sends Bri_RequestDebugSfr on entry. */
-	if (bri_send(fd, bri_request_debug_sfr,
-		     sizeof(bri_request_debug_sfr)) < 0)
+	sent++;
+	got = bri_step(fd, &rx, "Bri_RequestDebugSfr",
+		       bri_request_debug_sfr, sizeof(bri_request_debug_sfr), 500,
+		       frame, &flen);
+	if (got < 0)
 		return -1;
-	logmsg("init: Bri_RequestDebugSfr sent");
-
-	got = bri_wait(fd, &rx, 500, frame, &flen);	/* 0x1f4 ms @0x2a62ec */
 	if (got > 0) {
-		bri_log_frame("init: reply", frame, flen);
+		answered++;
 		/* the stage checks [0x13c] == 0x95, i.e. sub == 0x95 */
 		if (flen >= 10 && frame[4] == 0x95)
 			logmsg("init: DebugSfr acknowledged");
-	} else {
-		logmsg("init: no DebugSfr reply within 500 ms");
 	}
 
+	/* INIT_STAGE A: "Resending Bri_GetOutOfLegacy %u!" with 50+20n ms
+	 * backoff, up to four trials (@0x2a6508, template @0x2a618c). */
+	for (attempt = 0; attempt < BRI_RETRY_MAX; attempt++) {
+		sent++;
+		got = bri_step(fd, &rx, "Bri_GetOutOfLegacy",
+			       bri_get_out_of_legacy,
+			       sizeof(bri_get_out_of_legacy),
+			       BRI_BACKOFF_MS(attempt), frame, &flen);
+		if (got < 0)
+			return -1;
+		if (got > 0) {
+			answered++;
+			break;
+		}
+	}
+
+	logmsg("init: link check: %d of %d exchanges answered", answered, sent);
 	logmsg("init: stopping here.  The next vendor stages "
 	       "(Bri_ProgramSw/HwFlowControl @0x2a6aa0/0x2a6cfc, ESW/patch "
-	       "loading, RF/clock programming) need the escape-byte search "
-	       "result and the ESW image, which are not available "
+	       "loading, RF/clock programming) need either the escape-byte "
+	       "search result or the ESW image, neither of which is available "
 	       "(see parity/reports/gps-init-impl.md)");
 	return 0;
 }
@@ -1097,7 +1176,9 @@ int main(int argc, char **argv)
 
 	/* If nothing was ever received, say so once more on exit. */
 	if (nmea.total_bytes == 0)
-		logmsg("exiting: no bytes were ever received from %s", cfg.dev);
+		logmsg("exiting: no NMEA bytes were ever received from %s "
+		       "(%lu bytes were consumed by the BRI handshake)",
+		       cfg.dev, bri_rx_bytes);
 	else
 		logmsg("exiting: rx=%lu B, %lu NMEA sentences forwarded, "
 		       "%lu bad checksums, %lu non-NMEA bytes discarded",

@@ -2,10 +2,14 @@
 """
 Off-target test of the --init handshake of j7elte-gpsd.
 
-The BCM4752 is emulated by the test itself on the master side of a PTY:
-it answers the autobaud burst, the GetOutOfLegacy request and the version
-request with the frame shapes recovered from /system/bin/gpsd, and checks
-that the daemon emits exactly the bytes in the reverse-engineered tables.
+The BCM4752 is emulated by the test itself on the master side of a PTY.
+It reproduces what the real chip does on j7elte hardware: it never sends the
+unsolicited BRI announce frame, ignores the 10-byte NvRamWord7 selection, and
+answers the NvRamWord7 read, the 0x40/0x1a status request, the HW version
+request and the DebugSfr request -- in that order and only in that order
+(DebugSfr is state-gated on the NvRamWord7 exchange, as the vendor code
+asserts at 0x2a6784).  The test checks that the daemon emits exactly the
+bytes in the reverse-engineered tables, in the order the hardware answers.
 
 The daemon runs under qemu-aarch64 against the cross sysroot, so this also
 exercises the real termios/poll/write path.
@@ -30,6 +34,9 @@ AUTOBAUD = b"\x80" * 16
 OUT_OF_LEGACY = bytes([0xFE, 0x00, 0xFD, 0x00, 0x00, 0x55, 0xAA, 0x00, 0xFF, 0xFC])
 REQ_HW_VERSION = bytes([0xFF, 0x00, 0xFD, 0x00, 0x00, 0xFC])
 REQ_DEBUG_SFR = bytes([0xFF, 0x00, 0xFD, 0x1F, 0x95, 0xFC])
+NV_SELECT = bytes([0xFE, 0x00, 0xFD, 0x00, 0x1B, 0x07, 0x00, 0x00, 0x00, 0xFC])
+NV_READ = bytes([0xFF, 0x00, 0xFD, 0x00, 0x1B, 0xFC])
+REQ_STATUS = bytes([0xFF, 0x00, 0xFD, 0x40, 0x1A, 0xFC])
 
 
 def resp(cmd, sub, data=b"\x02\x03\x04\x05"):
@@ -80,19 +87,34 @@ def main():
         got = read_exact(master, len(AUTOBAUD))
         check("autobaud burst is 16 x 0x80", got == AUTOBAUD, repr(got))
 
-        os.write(master, resp(0x00, 0x01))          # first BRI frame after boot
-        got = read_exact(master, len(OUT_OF_LEGACY))
-        check("Bri_GetOutOfLegacy frame", got == OUT_OF_LEGACY, repr(got))
-
+        # The real chip never announces itself; answer anyway so that the
+        # daemon's announce window has something to log.
         os.write(master, resp(0x00, 0x01))
+
+        got = read_exact(master, len(NV_SELECT))
+        check("Bri_RequestNvRamWord7 selection frame", got == NV_SELECT, repr(got))
+        # ... which the chip ignores.
+
+        got = read_exact(master, len(NV_READ))
+        check("NvRamWord7 read frame", got == NV_READ, repr(got))
+        os.write(master, resp(0x00, 0x1B, b"\x07\x00\x00\x00"))
+
+        got = read_exact(master, len(REQ_STATUS))
+        check("status 0x40/0x1a frame", got == REQ_STATUS, repr(got))
+        os.write(master, resp(0x40, 0x1A, b"\x02\x00\x10\xa4"))
+
         got = read_exact(master, len(REQ_HW_VERSION))
         check("Bri_RequestHwVersion frame", got == REQ_HW_VERSION, repr(got))
+        os.write(master, resp(0x00, 0x00, b"\x05\x00\x02\x30"))
 
-        os.write(master, resp(0x00, 0x01, b"\x02\x03\x04\x05"))
         got = read_exact(master, len(REQ_DEBUG_SFR))
         check("Bri_RequestDebugSfr frame", got == REQ_DEBUG_SFR, repr(got))
-
         os.write(master, resp(0x1F, 0x95, b"\x00\x00\x00\x00"))
+
+        got = read_exact(master, len(OUT_OF_LEGACY))
+        check("Bri_GetOutOfLegacy frame", got == OUT_OF_LEGACY, repr(got))
+        os.write(master, resp(0x00, 0x01))
+
         time.sleep(0.4)
     finally:
         proc.send_signal(signal.SIGTERM)
@@ -105,11 +127,14 @@ def main():
         text = open(logpath).read()
         log.close()
 
-    check("HW version decoded", "BRI HW version 0x05040302" in text)
+    check("NvRamWord7 word decoded", "NvRamWord7 word 7 = 0x00000007" in text)
+    check("status decoded", "status 0x40/0x1a = 0xa4100002" in text)
+    check("HW version decoded", "BRI HW version 0x30020005" in text)
     check("DebugSfr acknowledged", "DebugSfr acknowledged" in text)
+    check("link check counted", "link check: 5 of 6 exchanges answered" in text)
     check("residual blocker logged", "stopping here" in text)
-    check("no invented bytes after DebugSfr",
-          text.count("Bri_RequestDebugSfr sent") == 1)
+    check("GetOutOfLegacy not repeated after an ack",
+          text.count("Bri_GetOutOfLegacy sent") == 1)
 
     print("\n--- daemon log ---")
     print(text)

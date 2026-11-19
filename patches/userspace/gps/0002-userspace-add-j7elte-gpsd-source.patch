@@ -32,10 +32,10 @@ index 0000000..5eaa11f
 +.PHONY: all check clean
 diff --git a/parity/userspace/gps/src/j7elte-gpsd.c b/parity/userspace/gps/src/j7elte-gpsd.c
 new file mode 100644
-index 0000000..87635d5
+index 0000000..435af96
 --- /dev/null
 +++ b/parity/userspace/gps/src/j7elte-gpsd.c
-@@ -0,0 +1,1114 @@
+@@ -0,0 +1,1195 @@
 +/*
 + * j7elte-gpsd - minimal BCM4752 GPS bridge for Samsung Galaxy J7 (j7elte)
 + *
@@ -659,6 +659,25 @@ index 0000000..87635d5
 +	0xff, 0x00, 0xfd, 0x1f, 0x95, 0xfc,
 +};
 +
++/* GlMeSrdAsicinit::Bri_RequestNvRamWord7 @0x2a70b8, templates at .rodata
++ * 0x398b40 / 0x398b4c / 0x398b54 (three frames in one function).  glgps
++ * sends all three; on this unit they are the exchanges the chip actually
++ * answers (see docs/reports/gps-toolchain.md). */
++static const unsigned char bri_nvram_word7[10] = {
++	0xfe, 0x00, 0xfd, 0x00, 0x1b, 0x07, 0x00, 0x00, 0x00, 0xfc,
++};
++static const unsigned char bri_nvram_read[6] = {
++	0xff, 0x00, 0xfd, 0x00, 0x1b, 0xfc,
++};
++static const unsigned char bri_request_status[6] = {
++	0xff, 0x00, 0xfd, 0x40, 0x1a, 0xfc,
++};
++
++/* Bytes read off the UART by the BRI handshake; kept only so the exit
++ * summary can distinguish "the chip is mute" from "the chip only spoke
++ * during init". */
++static unsigned long bri_rx_bytes;
++
 +struct bri_rx {
 +	unsigned char buf[BRI_FRAME_MAX];
 +	size_t len;
@@ -782,6 +801,7 @@ index 0000000..87635d5
 +				       n == 0 ? "EOF" : strerror(errno));
 +				return -1;
 +			}
++			bri_rx_bytes += (unsigned long)n;
 +			for (i = 0; i < n; i++) {
 +				if (bri_rx_byte(rx, chunk[i])) {
 +					memcpy(out, rx->buf, rx->len);
@@ -814,19 +834,59 @@ index 0000000..87635d5
 +		logmsg("%s: %s", what, hex);
 +}
 +
++/* 32-bit little-endian payload word of a 10-byte response frame. */
++static unsigned long bri_word(const unsigned char *f, size_t n)
++{
++	if (n < 10)
++		return 0;
++	return (unsigned long)f[5] | (unsigned long)f[6] << 8 |
++	       (unsigned long)f[7] << 16 | (unsigned long)f[8] << 24;
++}
++
 +/*
-+ * Cold-start handshake, in the order glgps performs it:
-+ *   "initial" @0x2a1728 -> cfg+autobaud @0x2a5b58 -> BRI wait.
-+ * Returns 0 if the chip answered the autobaud burst, -1 if it stayed silent
-+ * (documented residual blocker, see parity/reports/gps-init-impl.md).
++ * Send one request and wait for one response frame.
++ * Returns 1 on a reply, 0 on timeout, -1 on a fatal write/read error.
++ */
++static int bri_step(int fd, struct bri_rx *rx, const char *what,
++		    const unsigned char *req, size_t reqlen, int timeout_ms,
++		    unsigned char *frame, size_t *flen)
++{
++	int got;
++
++	if (bri_send(fd, req, reqlen) < 0)
++		return -1;
++	logmsg("init: %s sent", what);
++	got = bri_wait(fd, rx, timeout_ms, frame, flen);
++	if (got > 0)
++		bri_log_frame("init: reply", frame, *flen);
++	else if (got == 0)
++		logmsg("init: no reply to %s within %d ms", what, timeout_ms);
++	return got;
++}
++
++/*
++ * Cold-start handshake.  The vendor order is
++ *   "initial" @0x2a1728 -> cfg+autobaud @0x2a5b58 -> [BRI wait] ->
++ *   NvRamWord7 @0x2a70b8 -> wait4version @0x2a680c (HwVersion) ->
++ *   wait4asic_ready @0x2a6234 (DebugSfr) -> esw_wait4version (GetOutOfLegacy).
++ *
++ * On j7elte hardware the chip answers nothing at all until it has seen the
++ * 16 x 0x80 autobaud burst, never volunteers the unsolicited BRI announce
++ * frame, and gates Bri_RequestHwVersion on the preceding NvRamWord7 exchange
++ * (the vendor code asserts transport->[4] == 1 at 0x2a6784 before sending
++ * it).  GetOutOfLegacy and DebugSfr stay unanswered even then.  The steps are
++ * therefore sent in the order that the hardware actually answers, and a
++ * silent chip is logged rather than treated as fatal.
++ *
++ * Returns 0 once the sequence has been played, -1 only on a fatal I/O error.
 + */
 +static int asic_init(int fd)
 +{
 +	struct bri_rx rx;
 +	unsigned char frame[BRI_FRAME_MAX];
 +	size_t flen = 0;
-+	int attempt, got;
-+	unsigned long version = 0;
++	int attempt, got, answered = 0, sent = 0;
++	unsigned long version;
 +
 +	memset(&rx, 0, sizeof(rx));
 +
@@ -836,77 +896,96 @@ index 0000000..87635d5
 +	       sizeof(bri_autobaud), cfg.baud);
 +
 +	got = bri_wait(fd, &rx, BRI_RESP_MS, frame, &flen);
-+	if (got <= 0) {
-+		logmsg("init: chip silent for %d ms after autobaud "
-+		       "(rx state: %lu bytes discarded)", BRI_RESP_MS,
-+		       rx.discarded);
++	if (got > 0) {
++		bri_log_frame("init: BRI frame", frame, flen);
++	} else if (got == 0) {
++		logmsg("init: no unsolicited BRI frame within %d ms "
++		       "(rx state: %lu bytes discarded); sending requests anyway",
++		       BRI_RESP_MS, rx.discarded);
++	}
++
++	/* Bri_RequestNvRamWord7 @0x2a70b8 (templates 0x398b40/4c/54). */
++	sent++;
++	got = bri_step(fd, &rx, "Bri_RequestNvRamWord7",
++		       bri_nvram_word7, sizeof(bri_nvram_word7), BRI_RESP_MS,
++		       frame, &flen);
++	if (got < 0)
 +		return -1;
++	answered += got > 0;
++
++	sent++;
++	got = bri_step(fd, &rx, "NvRamWord7 read", bri_nvram_read,
++		       sizeof(bri_nvram_read), BRI_RESP_MS, frame, &flen);
++	if (got < 0)
++		return -1;
++	if (got > 0) {
++		answered++;
++		logmsg("init: NvRamWord7 word 7 = 0x%08lx", bri_word(frame, flen));
 +	}
-+	bri_log_frame("init: BRI frame", frame, flen);
 +
-+	/* INIT_STAGE A: "Resending Bri_GetOutOfLegacy %u!" with 50+20n ms
-+	 * backoff, up to four trials (@0x2a6508, template @0x2a618c). */
-+	for (attempt = 0; attempt < BRI_RETRY_MAX; attempt++) {
-+		int backoff = BRI_BACKOFF_MS(attempt);
-+
-+		if (bri_send(fd, bri_get_out_of_legacy,
-+			     sizeof(bri_get_out_of_legacy)) < 0)
-+			return -1;
-+		logmsg("init: Bri_GetOutOfLegacy sent (trial %d)", attempt + 1);
-+
-+		got = bri_wait(fd, &rx, backoff, frame, &flen);
-+		if (got > 0) {
-+			bri_log_frame("init: reply", frame, flen);
-+			break;
-+		}
++	sent++;
++	got = bri_step(fd, &rx, "status request 0x40/0x1a",
++		       bri_request_status, sizeof(bri_request_status),
++		       BRI_RESP_MS, frame, &flen);
++	if (got < 0)
++		return -1;
++	if (got > 0) {
++		answered++;
++		logmsg("init: status 0x40/0x1a = 0x%08lx", bri_word(frame, flen));
 +	}
-+	if (got <= 0)
-+		logmsg("init: no reply to Bri_GetOutOfLegacy after %d trials",
-+		       BRI_RETRY_MAX);
 +
 +	/* bri_wait4version @0x2a680c sends Bri_RequestHwVersion on entry. */
-+	if (bri_send(fd, bri_request_hw_version,
-+		     sizeof(bri_request_hw_version)) < 0)
++	sent++;
++	got = bri_step(fd, &rx, "Bri_RequestHwVersion",
++		       bri_request_hw_version, sizeof(bri_request_hw_version),
++		       BRI_RESP_MS, frame, &flen);
++	if (got < 0)
 +		return -1;
-+	logmsg("init: Bri_RequestHwVersion sent");
-+
-+	got = bri_wait(fd, &rx, BRI_RESP_MS, frame, &flen);
 +	if (got > 0) {
-+		bri_log_frame("init: reply", frame, flen);
++		answered++;
 +		if (flen >= 10 && frame[3] == 0x00) {
-+			version = (unsigned long)frame[5] |
-+				  (unsigned long)frame[6] << 8 |
-+				  (unsigned long)frame[7] << 16 |
-+				  (unsigned long)frame[8] << 24;
++			version = bri_word(frame, flen);
 +			/* "GlMeSrdAsicinit::Got BRI HW version(0x%lx)" */
 +			logmsg("init: BRI HW version 0x%08lx (asic type byte 0x%02x)",
 +			       version, frame[4]);
 +		}
-+	} else {
-+		logmsg("init: no reply to Bri_RequestHwVersion within %d ms",
-+		       BRI_RESP_MS);
 +	}
 +
 +	/* bri_wait4asic_ready @0x2a6234 sends Bri_RequestDebugSfr on entry. */
-+	if (bri_send(fd, bri_request_debug_sfr,
-+		     sizeof(bri_request_debug_sfr)) < 0)
++	sent++;
++	got = bri_step(fd, &rx, "Bri_RequestDebugSfr",
++		       bri_request_debug_sfr, sizeof(bri_request_debug_sfr), 500,
++		       frame, &flen);
++	if (got < 0)
 +		return -1;
-+	logmsg("init: Bri_RequestDebugSfr sent");
-+
-+	got = bri_wait(fd, &rx, 500, frame, &flen);	/* 0x1f4 ms @0x2a62ec */
 +	if (got > 0) {
-+		bri_log_frame("init: reply", frame, flen);
++		answered++;
 +		/* the stage checks [0x13c] == 0x95, i.e. sub == 0x95 */
 +		if (flen >= 10 && frame[4] == 0x95)
 +			logmsg("init: DebugSfr acknowledged");
-+	} else {
-+		logmsg("init: no DebugSfr reply within 500 ms");
 +	}
 +
++	/* INIT_STAGE A: "Resending Bri_GetOutOfLegacy %u!" with 50+20n ms
++	 * backoff, up to four trials (@0x2a6508, template @0x2a618c). */
++	for (attempt = 0; attempt < BRI_RETRY_MAX; attempt++) {
++		sent++;
++		got = bri_step(fd, &rx, "Bri_GetOutOfLegacy",
++			       bri_get_out_of_legacy,
++			       sizeof(bri_get_out_of_legacy),
++			       BRI_BACKOFF_MS(attempt), frame, &flen);
++		if (got < 0)
++			return -1;
++		if (got > 0) {
++			answered++;
++			break;
++		}
++	}
++
++	logmsg("init: link check: %d of %d exchanges answered", answered, sent);
 +	logmsg("init: stopping here.  The next vendor stages "
 +	       "(Bri_ProgramSw/HwFlowControl @0x2a6aa0/0x2a6cfc, ESW/patch "
-+	       "loading, RF/clock programming) need the escape-byte search "
-+	       "result and the ESW image, which are not available "
++	       "loading, RF/clock programming) need either the escape-byte "
++	       "search result or the ESW image, neither of which is available "
 +	       "(see parity/reports/gps-init-impl.md)");
 +	return 0;
 +}
@@ -1135,7 +1214,9 @@ index 0000000..87635d5
 +
 +	/* If nothing was ever received, say so once more on exit. */
 +	if (nmea.total_bytes == 0)
-+		logmsg("exiting: no bytes were ever received from %s", cfg.dev);
++		logmsg("exiting: no NMEA bytes were ever received from %s "
++		       "(%lu bytes were consumed by the BRI handshake)",
++		       cfg.dev, bri_rx_bytes);
 +	else
 +		logmsg("exiting: rx=%lu B, %lu NMEA sentences forwarded, "
 +		       "%lu bad checksums, %lu non-NMEA bytes discarded",
@@ -1152,18 +1233,22 @@ index 0000000..87635d5
 +}
 diff --git a/parity/userspace/gps/tests/init_test.py b/parity/userspace/gps/tests/init_test.py
 new file mode 100755
-index 0000000..a90f12b
+index 0000000..0dbc483
 --- /dev/null
 +++ b/parity/userspace/gps/tests/init_test.py
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,147 @@
 +#!/usr/bin/env python3
 +"""
 +Off-target test of the --init handshake of j7elte-gpsd.
 +
-+The BCM4752 is emulated by the test itself on the master side of a PTY:
-+it answers the autobaud burst, the GetOutOfLegacy request and the version
-+request with the frame shapes recovered from /system/bin/gpsd, and checks
-+that the daemon emits exactly the bytes in the reverse-engineered tables.
++The BCM4752 is emulated by the test itself on the master side of a PTY.
++It reproduces what the real chip does on j7elte hardware: it never sends the
++unsolicited BRI announce frame, ignores the 10-byte NvRamWord7 selection, and
++answers the NvRamWord7 read, the 0x40/0x1a status request, the HW version
++request and the DebugSfr request -- in that order and only in that order
++(DebugSfr is state-gated on the NvRamWord7 exchange, as the vendor code
++asserts at 0x2a6784).  The test checks that the daemon emits exactly the
++bytes in the reverse-engineered tables, in the order the hardware answers.
 +
 +The daemon runs under qemu-aarch64 against the cross sysroot, so this also
 +exercises the real termios/poll/write path.
@@ -1188,6 +1273,9 @@ index 0000000..a90f12b
 +OUT_OF_LEGACY = bytes([0xFE, 0x00, 0xFD, 0x00, 0x00, 0x55, 0xAA, 0x00, 0xFF, 0xFC])
 +REQ_HW_VERSION = bytes([0xFF, 0x00, 0xFD, 0x00, 0x00, 0xFC])
 +REQ_DEBUG_SFR = bytes([0xFF, 0x00, 0xFD, 0x1F, 0x95, 0xFC])
++NV_SELECT = bytes([0xFE, 0x00, 0xFD, 0x00, 0x1B, 0x07, 0x00, 0x00, 0x00, 0xFC])
++NV_READ = bytes([0xFF, 0x00, 0xFD, 0x00, 0x1B, 0xFC])
++REQ_STATUS = bytes([0xFF, 0x00, 0xFD, 0x40, 0x1A, 0xFC])
 +
 +
 +def resp(cmd, sub, data=b"\x02\x03\x04\x05"):
@@ -1238,19 +1326,34 @@ index 0000000..a90f12b
 +        got = read_exact(master, len(AUTOBAUD))
 +        check("autobaud burst is 16 x 0x80", got == AUTOBAUD, repr(got))
 +
-+        os.write(master, resp(0x00, 0x01))          # first BRI frame after boot
-+        got = read_exact(master, len(OUT_OF_LEGACY))
-+        check("Bri_GetOutOfLegacy frame", got == OUT_OF_LEGACY, repr(got))
-+
++        # The real chip never announces itself; answer anyway so that the
++        # daemon's announce window has something to log.
 +        os.write(master, resp(0x00, 0x01))
++
++        got = read_exact(master, len(NV_SELECT))
++        check("Bri_RequestNvRamWord7 selection frame", got == NV_SELECT, repr(got))
++        # ... which the chip ignores.
++
++        got = read_exact(master, len(NV_READ))
++        check("NvRamWord7 read frame", got == NV_READ, repr(got))
++        os.write(master, resp(0x00, 0x1B, b"\x07\x00\x00\x00"))
++
++        got = read_exact(master, len(REQ_STATUS))
++        check("status 0x40/0x1a frame", got == REQ_STATUS, repr(got))
++        os.write(master, resp(0x40, 0x1A, b"\x02\x00\x10\xa4"))
++
 +        got = read_exact(master, len(REQ_HW_VERSION))
 +        check("Bri_RequestHwVersion frame", got == REQ_HW_VERSION, repr(got))
++        os.write(master, resp(0x00, 0x00, b"\x05\x00\x02\x30"))
 +
-+        os.write(master, resp(0x00, 0x01, b"\x02\x03\x04\x05"))
 +        got = read_exact(master, len(REQ_DEBUG_SFR))
 +        check("Bri_RequestDebugSfr frame", got == REQ_DEBUG_SFR, repr(got))
-+
 +        os.write(master, resp(0x1F, 0x95, b"\x00\x00\x00\x00"))
++
++        got = read_exact(master, len(OUT_OF_LEGACY))
++        check("Bri_GetOutOfLegacy frame", got == OUT_OF_LEGACY, repr(got))
++        os.write(master, resp(0x00, 0x01))
++
 +        time.sleep(0.4)
 +    finally:
 +        proc.send_signal(signal.SIGTERM)
@@ -1263,11 +1366,14 @@ index 0000000..a90f12b
 +        text = open(logpath).read()
 +        log.close()
 +
-+    check("HW version decoded", "BRI HW version 0x05040302" in text)
++    check("NvRamWord7 word decoded", "NvRamWord7 word 7 = 0x00000007" in text)
++    check("status decoded", "status 0x40/0x1a = 0xa4100002" in text)
++    check("HW version decoded", "BRI HW version 0x30020005" in text)
 +    check("DebugSfr acknowledged", "DebugSfr acknowledged" in text)
++    check("link check counted", "link check: 5 of 6 exchanges answered" in text)
 +    check("residual blocker logged", "stopping here" in text)
-+    check("no invented bytes after DebugSfr",
-+          text.count("Bri_RequestDebugSfr sent") == 1)
++    check("GetOutOfLegacy not repeated after an ack",
++          text.count("Bri_GetOutOfLegacy sent") == 1)
 +
 +    print("\n--- daemon log ---")
 +    print(text)
