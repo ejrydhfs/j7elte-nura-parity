@@ -1,0 +1,438 @@
+From 1c0a83f4b9a0c390ebcd80e572c99634f11acef1 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Wed, 18 Nov 2026 23:34:21 -0500
+Subject: [PATCH 4/5] drm_sched panfrost-job-only shim
+
+---
+ drivers/gpu/drm/drm_sched.c | 293 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_sched.h | 118 +++++++++++++++
+ 2 files changed, 411 insertions(+)
+ create mode 100644 drivers/gpu/drm/drm_sched.c
+ create mode 100644 drivers/gpu/drm/drm_sched.h
+
+diff --git a/drivers/gpu/drm/drm_sched.c b/drivers/gpu/drm/drm_sched.c
+new file mode 100644
+index 0000000..7a584bc
+--- /dev/null
++++ b/drivers/gpu/drm/drm_sched.c
+@@ -0,0 +1,293 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * drm_sched panfrost-job-only shim implementation (Nura 3.10.108).
++ *
++ * Dispatch model: per-entity FIFO on a shared ordered workqueue.
++ * Dependencies gate dispatch: a job with an unsignaled dep parks on the
++ * fence callback and re-queues the pump when the dep fires. Timeout is a
++ * per-job delayed_work armed at dispatch; the fence completion cancels it
++ * on the retirement path (cancel_delayed_work_sync from finish_work --
++ * never from IRQ context).
++ */
++
++#include "drm_sched.h"
++#include <linux/slab.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++
++static void drm_sched_pump(struct work_struct *work);
++static void drm_sched_job_timeout(struct work_struct *work);
++static void drm_sched_job_finish(struct work_struct *work);
++
++static void drm_sched_dep_cb(struct dma_fence *fence,
++			     struct dma_fence_cb *cb)
++{
++	struct drm_sched_job *job =
++		container_of(cb, struct drm_sched_job, finish_cb);
++
++	queue_work(job->entity->wq, &job->entity->sched_work);
++}
++
++int drm_sched_init(struct drm_sched *sched,
++		   const struct drm_sched_backend_ops *ops,
++		   long timeout, const char *name)
++{
++	if (!sched || !ops || !ops->run_job)
++		return -EINVAL;
++
++	sched->wq = alloc_ordered_workqueue("%s", 0, name);
++	if (!sched->wq)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&sched->entities);
++	mutex_init(&sched->lock);
++	sched->ops = ops;
++	sched->timeout = timeout;
++	sched->name = name;
++	sched->ready = true;
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_sched_init);
++
++void drm_sched_fini(struct drm_sched *sched)
++{
++	if (!sched)
++		return;
++
++	mutex_lock(&sched->lock);
++	sched->ready = false;
++	mutex_unlock(&sched->lock);
++
++	flush_workqueue(sched->wq);
++	destroy_workqueue(sched->wq);
++	sched->wq = NULL;
++}
++EXPORT_SYMBOL(drm_sched_fini);
++
++int drm_sched_entity_init(struct drm_sched_entity *entity,
++			  struct drm_sched *sched)
++{
++	if (!entity || !sched)
++		return -EINVAL;
++
++	INIT_LIST_HEAD(&entity->queue_list);
++	spin_lock_init(&entity->queue_lock);
++	entity->in_flight = NULL;
++	entity->wq = sched->wq;
++	INIT_WORK(&entity->sched_work, drm_sched_pump);
++	mutex_init(&entity->lock);
++	init_completion(&entity->entity_idle);
++	complete_all(&entity->entity_idle);
++	atomic_set(&entity->job_count, 0);
++	entity->stopped = false;
++
++	mutex_lock(&sched->lock);
++	list_add_tail(&entity->queue_list, &sched->entities);
++	mutex_unlock(&sched->lock);
++
++	/* Reuse queue_list node removal at fini; re-init the job list. */
++	list_del_init(&entity->queue_list);
++	INIT_LIST_HEAD(&entity->queue_list);
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_sched_entity_init);
++
++void drm_sched_entity_fini(struct drm_sched *sched,
++			   struct drm_sched_entity *entity)
++{
++	struct drm_sched_job *job, *tmp;
++	LIST_HEAD(retire);
++
++	if (!entity)
++		return;
++
++	mutex_lock(&entity->lock);
++	entity->stopped = true;
++	spin_lock(&entity->queue_lock);
++	list_splice_init(&entity->queue_list, &retire);
++	spin_unlock(&entity->queue_lock);
++	mutex_unlock(&entity->lock);
++
++	cancel_work_sync(&entity->sched_work);
++
++	list_for_each_entry_safe(job, tmp, &retire, node) {
++		list_del_init(&job->node);
++		if (job->ops->free_job)
++			job->ops->free_job(job);
++		else
++			kfree(job);
++	}
++
++	if (sched && sched->wq)
++		flush_workqueue(sched->wq);
++}
++EXPORT_SYMBOL(drm_sched_entity_fini);
++
++struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,
++					  const struct drm_sched_backend_ops *ops,
++					  void *owner)
++{
++	struct drm_sched_job *job;
++
++	job = kzalloc(sizeof(*job), GFP_KERNEL);
++	if (!job)
++		return NULL;
++
++	INIT_LIST_HEAD(&job->node);
++	INIT_LIST_HEAD(&job->finish_cb.node);
++	job->entity = entity;
++	job->ops = ops;
++	job->owner = owner;
++	INIT_DELAYED_WORK(&job->timeout_work, drm_sched_job_timeout);
++	INIT_WORK(&job->finish_work, drm_sched_job_finish);
++
++	return job;
++}
++EXPORT_SYMBOL(drm_sched_job_alloc);
++
++void drm_sched_job_cleanup(struct drm_sched_job *job)
++{
++	if (!job)
++		return;
++	dma_fence_remove_callback(job->fence, &job->finish_cb);
++	dma_fence_put(job->fence);
++	job->fence = NULL;
++}
++EXPORT_SYMBOL(drm_sched_job_cleanup);
++
++void drm_sched_job_arm(struct drm_sched_job *job)
++{
++	INIT_LIST_HEAD(&job->finish_cb.node);
++}
++EXPORT_SYMBOL(drm_sched_job_arm);
++
++int drm_sched_job_add_dependency(struct drm_sched_job *job,
++				 struct dma_fence *fence)
++{
++	int ret;
++
++	if (!fence)
++		return 0;
++	if (dma_fence_is_signaled(fence))
++		return 0;
++
++	/* Park the pump on the dep; the cb re-queues dispatch. */
++	ret = dma_fence_add_callback(fence, &job->finish_cb,
++				     drm_sched_dep_cb);
++	if (ret == -ENOENT)
++		return 0;
++
++	return ret;
++}
++EXPORT_SYMBOL(drm_sched_job_add_dependency);
++
++int drm_sched_job_submit(struct drm_sched_job *job)
++{
++	struct drm_sched_entity *entity = job->entity;
++	unsigned long flags;
++
++	spin_lock_irqsave(&entity->queue_lock, flags);
++	list_add_tail(&job->node, &entity->queue_list);
++	atomic_inc(&entity->job_count);
++	spin_unlock_irqrestore(&entity->queue_lock, flags);
++
++	queue_work(entity->wq, &entity->sched_work);
++	return 0;
++}
++EXPORT_SYMBOL(drm_sched_job_submit);
++
++static void drm_sched_job_finish(struct work_struct *work)
++{
++	struct drm_sched_job *job =
++		container_of(work, struct drm_sched_job, finish_work);
++	struct drm_sched_entity *entity = job->entity;
++
++	cancel_delayed_work_sync(&job->timeout_work);
++	dma_fence_put(job->fence);
++	job->fence = NULL;
++
++	if (atomic_dec_and_test(&entity->job_count))
++		complete_all(&entity->entity_idle);
++
++	if (job->ops->free_job)
++		job->ops->free_job(job);
++	else
++		kfree(job);
++
++	/* Keep the FIFO moving after each retirement. */
++	queue_work(entity->wq, &entity->sched_work);
++}
++
++static void drm_sched_fence_cb(struct dma_fence *fence,
++			       struct dma_fence_cb *cb)
++{
++	struct drm_sched_job *job = container_of(cb, struct drm_sched_job,
++						 finish_cb);
++
++	queue_work(job->entity->wq, &job->finish_work);
++}
++
++static void drm_sched_job_timeout(struct work_struct *work)
++{
++	struct drm_sched_job *job = container_of(work, struct drm_sched_job,
++						 timeout_work.work);
++
++	if (job->fence && !dma_fence_is_signaled(job->fence) &&
++	    job->ops->timedout_job)
++		job->ops->timedout_job(job);
++}
++
++static void drm_sched_pump(struct work_struct *work)
++{
++	struct drm_sched_entity *entity =
++		container_of(work, struct drm_sched_entity, sched_work);
++	struct drm_sched_job *job;
++	struct dma_fence *run_fence;
++	unsigned long flags;
++	int ret;
++
++	if (entity->stopped)
++		return;
++
++	spin_lock_irqsave(&entity->queue_lock, flags);
++	if (entity->in_flight) {
++		spin_unlock_irqrestore(&entity->queue_lock, flags);
++		return;
++	}
++	if (list_empty(&entity->queue_list)) {
++		spin_unlock_irqrestore(&entity->queue_lock, flags);
++		return;
++	}
++	job = list_first_entry(&entity->queue_list, struct drm_sched_job,
++			       node);
++	list_del_init(&job->node);
++	entity->in_flight = job;
++	spin_unlock_irqrestore(&entity->queue_lock, flags);
++
++	run_fence = job->ops->run_job(job);
++	if (IS_ERR(run_fence)) {
++		spin_lock_irqsave(&entity->queue_lock, flags);
++		entity->in_flight = NULL;
++		spin_unlock_irqrestore(&entity->queue_lock, flags);
++		queue_work(entity->wq, &entity->sched_work);
++		return;
++	}
++
++	job->fence = run_fence;
++
++	ret = dma_fence_add_callback(run_fence, &job->finish_cb,
++				     drm_sched_fence_cb);
++	if (ret == -ENOENT) {
++		/* Already done (empty batch): retire synchronously. */
++		queue_work(entity->wq, &job->finish_work);
++	} else {
++		queue_delayed_work(entity->wq, &job->timeout_work,
++				   msecs_to_jiffies(5000));
++	}
++
++	spin_lock_irqsave(&entity->queue_lock, flags);
++	entity->in_flight = NULL;
++	spin_unlock_irqrestore(&entity->queue_lock, flags);
++}
+diff --git a/drivers/gpu/drm/drm_sched.h b/drivers/gpu/drm/drm_sched.h
+new file mode 100644
+index 0000000..1d9fe0b
+--- /dev/null
++++ b/drivers/gpu/drm/drm_sched.h
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * drm_sched panfrost-job-only scheduler shim for Nura 3.10.108.
++ *
++ * What this provides: the exact drm_sched surface panfrost_job.c needs --
++ * entity (one runqueue per JM slot context), job (fence-backed unit of
++ * work with .run_job/.timedout_job callbacks), FIFO dispatch on an
++ * ordered workqueue, dependency tracking via dma-fence callbacks, job
++ * timeout via delayed work, and entity flush on release. Panfrost mapping:
++ * one sched per device, one entity per open-file submit context, one job
++ * per SUBMIT ioctl batch; run_job programs the JM slot registers and
++ * installs the returned job fence; hw completion (JOB_INT) signals it.
++ *
++ * What this deliberately OMITs vs mainline drm_sched (2684 LOC: scheduler
++ * + fence + entity): priority runqueues (single FIFO), credit-based load
++ * balancing (one queue = T720 JM slot set), GPU reset/recovery workers,
++ * guilty-job tracking, dynamic job-flow control, and free-job workqueue
++ * batching (synchronous put). This is a correctness shim, not a
++ * performance scheduler: jobs retire in submit order.
++ *
++ * Depends on patches 01+02 (dma-fence). Verified 3.10 primitives:
++ * alloc_ordered_workqueue (workqueue.h:434), INIT_DELAYED_WORK (260),
++ * queue_delayed_work / cancel_delayed_work_sync, complete_all
++ * (completion.h:95), mutex_lock_interruptible (mutex.h:145),
++ * msecs_to_jiffies (jiffies.h). No kthread usage (mainline uses a
++ * dedicated thread; this shim uses an ordered wq -- same FIFO order,
++ * no RT-priority inversion risk on this single-GPU part).
++ */
++#ifndef _DRM_SCHED_BACKPORT_H
++#define _DRM_SCHED_BACKPORT_H
++
++#include <linux/dma-fence.h>
++#include <linux/workqueue.h>
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/completion.h>
++
++struct drm_sched_entity;
++struct drm_sched_job;
++
++enum drm_sched_priority {
++	DRM_SCHED_PRIORITY_MIN,
++	DRM_SCHED_PRIORITY_NORMAL = DRM_SCHED_PRIORITY_MIN,
++	DRM_SCHED_PRIORITY_HIGH_HW,
++	DRM_SCHED_PRIORITY_HIGH_SW,
++	DRM_SCHED_PRIORITY_KERNEL,
++	DRM_SCHED_PRIORITY_COUNT
++};
++
++/**
++ * struct drm_sched_backend_ops - device callbacks, mirrors mainline subset.
++ * @run_job: execute @sched_job; must return the in-flight job fence, or
++ *           ERR_PTR on immediate failure. Called in FIFO submit order.
++ * @timedout_job: called from timeout work when the job fence has not
++ *           signaled in @timeout msecs; backend should reset the JM slot.
++ * @free_job: release backend resources for a retired job (may be NULL).
++ */
++struct drm_sched_backend_ops {
++	struct dma_fence *(*run_job)(struct drm_sched_job *sched_job);
++	void (*timedout_job)(struct drm_sched_job *sched_job);
++	void (*free_job)(struct drm_sched_job *sched_job);
++};
++
++struct drm_sched_job {
++	struct list_head node;
++	struct drm_sched_entity *entity;
++	const struct drm_sched_backend_ops *ops;
++	struct dma_fence *fence;	/* completion fence for this job */
++	struct dma_fence_cb finish_cb;	/* dependency waiter */
++	struct delayed_work timeout_work;
++	struct work_struct finish_work;	/* retirement sweep */
++	int credits;
++	void *owner;			/* backend private (panfrost_job) */
++};
++
++struct drm_sched_entity {
++	struct list_head queue_list;	/* pending jobs, FIFO */
++	spinlock_t queue_lock;
++	struct drm_sched_job *in_flight;
++	struct workqueue_struct *wq;	/* shared ordered wq (borrowed) */
++	struct work_struct sched_work;	/* dispatch pump */
++	struct mutex lock;
++	struct completion entity_idle;
++	atomic_t job_count;
++	bool stopped;
++};
++
++struct drm_sched {
++	struct workqueue_struct *wq;	/* ordered dispatch queue */
++	struct list_head entities;
++	struct mutex lock;
++	const struct drm_sched_backend_ops *ops;
++	long timeout;			/* job timeout, jiffies */
++	const char *name;
++	bool ready;
++};
++
++int drm_sched_init(struct drm_sched *sched,
++		   const struct drm_sched_backend_ops *ops,
++		   long timeout, const char *name);
++void drm_sched_fini(struct drm_sched *sched);
++
++int drm_sched_entity_init(struct drm_sched_entity *entity,
++			  struct drm_sched *sched);
++void drm_sched_entity_fini(struct drm_sched *sched,
++			   struct drm_sched_entity *entity);
++void drm_sched_entity_push_job(struct drm_sched_job *sched_job);
++
++struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,
++					  const struct drm_sched_backend_ops *ops,
++					  void *owner);
++void drm_sched_job_cleanup(struct drm_sched_job *job);
++void drm_sched_job_arm(struct drm_sched_job *job);
++int drm_sched_job_add_dependency(struct drm_sched_job *job,
++				 struct dma_fence *fence);
++int drm_sched_job_submit(struct drm_sched_job *job);
++
++#endif /* _DRM_SCHED_BACKPORT_H */
+-- 
+2.56.0
+

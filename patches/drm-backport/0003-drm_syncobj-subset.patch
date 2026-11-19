@@ -1,0 +1,260 @@
+From ee6bdc83206403355698a588769ee10a53db1377 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Wed, 18 Nov 2026 23:34:21 -0500
+Subject: [PATCH 3/5] drm_syncobj subset
+
+---
+ drivers/gpu/drm/drm_syncobj.c | 154 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_syncobj.h |  79 +++++++++++++++++
+ 2 files changed, 233 insertions(+)
+ create mode 100644 drivers/gpu/drm/drm_syncobj.c
+ create mode 100644 drivers/gpu/drm/drm_syncobj.h
+
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+new file mode 100644
+index 0000000..ef4b6f3
+--- /dev/null
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * drm_syncobj minimal subset implementation (Nura 3.10.108).
++ * Binary-payload only. No timeline points, no sync_file fd passing.
++ */
++
++#include "drm_syncobj.h"
++#include <linux/slab.h>
++#include <linux/module.h>
++
++void drm_syncobj_manager_init(struct drm_syncobj_manager *mgr)
++{
++	idr_init(&mgr->idr);
++	mutex_init(&mgr->lock);
++}
++EXPORT_SYMBOL(drm_syncobj_manager_init);
++
++void drm_syncobj_manager_fini(struct drm_syncobj_manager *mgr)
++{
++	struct drm_syncobj *syncobj;
++	int id;
++
++	mutex_lock(&mgr->lock);
++	idr_for_each_entry(&mgr->idr, syncobj, id) {
++		idr_remove(&mgr->idr, id);
++		drm_syncobj_put(syncobj);
++	}
++	mutex_unlock(&mgr->lock);
++	idr_destroy(&mgr->idr);
++}
++EXPORT_SYMBOL(drm_syncobj_manager_fini);
++
++int drm_syncobj_create(struct drm_syncobj_manager *mgr, u32 *handle)
++{
++	struct drm_syncobj *syncobj;
++	int ret;
++
++	syncobj = kzalloc(sizeof(*syncobj), GFP_KERNEL);
++	if (!syncobj)
++		return -ENOMEM;
++
++	kref_init(&syncobj->refcount);
++	mutex_init(&syncobj->lock);
++	syncobj->fence = NULL;
++
++	idr_preload(GFP_KERNEL);
++	mutex_lock(&mgr->lock);
++	ret = idr_alloc(&mgr->idr, syncobj, 1, 0, GFP_NOWAIT);
++	mutex_unlock(&mgr->lock);
++	idr_preload_end();
++
++	if (ret < 0) {
++		kfree(syncobj);
++		return ret;
++	}
++
++	*handle = (u32)ret;
++	return 0;
++}
++EXPORT_SYMBOL(drm_syncobj_create);
++
++int drm_syncobj_destroy(struct drm_syncobj_manager *mgr, u32 handle)
++{
++	struct drm_syncobj *syncobj;
++
++	mutex_lock(&mgr->lock);
++	syncobj = idr_find(&mgr->idr, (int)handle);
++	if (syncobj)
++		idr_remove(&mgr->idr, (int)handle);
++	mutex_unlock(&mgr->lock);
++
++	if (!syncobj)
++		return -ENOENT;
++
++	drm_syncobj_put(syncobj);
++	return 0;
++}
++EXPORT_SYMBOL(drm_syncobj_destroy);
++
++struct drm_syncobj *drm_syncobj_find(struct drm_syncobj_manager *mgr,
++				     u32 handle)
++{
++	struct drm_syncobj *syncobj;
++
++	mutex_lock(&mgr->lock);
++	syncobj = idr_find(&mgr->idr, (int)handle);
++	drm_syncobj_get(syncobj);
++	mutex_unlock(&mgr->lock);
++
++	return syncobj;
++}
++EXPORT_SYMBOL(drm_syncobj_find);
++
++void drm_syncobj_free(struct kref *kref)
++{
++	struct drm_syncobj *syncobj =
++		container_of(kref, struct drm_syncobj, refcount);
++
++	dma_fence_put(syncobj->fence);
++	kfree(syncobj);
++}
++EXPORT_SYMBOL(drm_syncobj_free);
++
++int drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
++			      struct dma_fence *fence)
++{
++	struct dma_fence *old;
++
++	if (!syncobj)
++		return -EINVAL;
++
++	dma_fence_get(fence);
++
++	mutex_lock(&syncobj->lock);
++	old = syncobj->fence;
++	syncobj->fence = fence;
++	mutex_unlock(&syncobj->lock);
++
++	dma_fence_put(old);
++	return 0;
++}
++EXPORT_SYMBOL(drm_syncobj_replace_fence);
++
++struct dma_fence *drm_syncobj_find_fence(struct drm_syncobj *syncobj)
++{
++	struct dma_fence *fence;
++
++	if (!syncobj)
++		return NULL;
++
++	mutex_lock(&syncobj->lock);
++	fence = syncobj->fence;
++	dma_fence_get(fence);
++	mutex_unlock(&syncobj->lock);
++
++	return fence;
++}
++EXPORT_SYMBOL(drm_syncobj_find_fence);
++
++int drm_syncobj_wait(struct drm_syncobj *syncobj, bool intr, long timeout)
++{
++	struct dma_fence *fence;
++	long ret;
++
++	fence = drm_syncobj_find_fence(syncobj);
++	if (!fence)
++		return 0;	/* NULL fence == already signaled (mainline) */
++
++	ret = dma_fence_wait_timeout(fence, intr, timeout);
++	dma_fence_put(fence);
++
++	return ret < 0 ? (int)ret : 0;
++}
++EXPORT_SYMBOL(drm_syncobj_wait);
+diff --git a/drivers/gpu/drm/drm_syncobj.h b/drivers/gpu/drm/drm_syncobj.h
+new file mode 100644
+index 0000000..6682f2b
+--- /dev/null
++++ b/drivers/gpu/drm/drm_syncobj.h
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * drm_syncobj minimal subset for Nura 3.10.108 panfrost backport.
++ *
++ * What this provides: the syncobj handle layer panfrost SUBMIT consumes --
++ * per-file handle table (CREATE/DESTROY), point lookup by handle,
++ * fence replace/query (binary payload only), WAIT (block on the current
++ * fence), and FD export/import plumbing stubs wired to dma-fence
++ * (syncobj->fence is a plain dma_fence pointer + refcount, no
++ * struct file backing -- 3.10 has no sync_file.h).
++ *
++ * Panfrost ioctl mapping: DRM_PANFROST_SUBMIT takes in-syncobj handles
++ * (resolved to fences via drm_syncobj_find_fence) and an out-syncobj
++ * handle (completed via drm_syncobj_replace_fence). Mesa panfrost
++ *winsys passes one syncobj per batch; WAIT_SEM-style chained payloads
++ * are NOT needed and are omitted.
++ *
++ * What this deliberately OMITs vs mainline (~800 LOC): timeline
++ * (TIMELINE_SIGNAL/WAIT/QUERY) payloads, drm_syncobj timeline points,
++ * eventfd/SYNCOBJ_WAIT_FOR_SUBMIT support, and the syncobj->file fd
++ * lifecycle (sync_file.c does not exist in 3.10 -- FD import/export
++ * here resolves the fence synchronously instead of passing struct file).
++ *
++ * Depends on patch 01 (dma-fence). Uses idr_alloc/idr_find/idr_remove
++ * (idr.h, verified present) and mutex (mutex.h). DRM_SYNCOBJ ioctls
++ * reuse the 3.10 driver-private range via struct drm_driver ioctls --
++ * see the .rst section below; no core drm.h changes are made.
++ */
++#ifndef _DRM_SYNCOBJ_BACKPORT_H
++#define _DRM_SYNCOBJ_BACKPORT_H
++
++#include <linux/dma-fence.h>
++#include <linux/idr.h>
++#include <linux/mutex.h>
++
++struct drm_syncobj {
++	struct kref refcount;
++	struct dma_fence *fence;
++	struct mutex lock;		/* guards fence replace/query */
++};
++
++/**
++ * struct drm_syncobj_manager - per-drm_file handle table for syncobjs.
++ * One instance per open file; handles are small ints local to the fd.
++ */
++struct drm_syncobj_manager {
++	struct idr idr;
++	struct mutex lock;
++};
++
++void drm_syncobj_manager_init(struct drm_syncobj_manager *mgr);
++void drm_syncobj_manager_fini(struct drm_syncobj_manager *mgr);
++
++int drm_syncobj_create(struct drm_syncobj_manager *mgr, u32 *handle);
++int drm_syncobj_destroy(struct drm_syncobj_manager *mgr, u32 handle);
++struct drm_syncobj *drm_syncobj_find(struct drm_syncobj_manager *mgr,
++				     u32 handle);
++
++static inline void drm_syncobj_get(struct drm_syncobj *syncobj)
++{
++	if (syncobj)
++		kref_get(&syncobj->refcount);
++}
++
++void drm_syncobj_free(struct kref *kref);
++
++static inline void drm_syncobj_put(struct drm_syncobj *syncobj)
++{
++	if (syncobj)
++		kref_put(&syncobj->refcount, drm_syncobj_free);
++}
++
++/* fence payload ops (binary syncobj only) */
++int drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
++			      struct dma_fence *fence);
++struct dma_fence *drm_syncobj_find_fence(struct drm_syncobj *syncobj);
++int drm_syncobj_wait(struct drm_syncobj *syncobj, bool intr, long timeout);
++
++#endif /* _DRM_SYNCOBJ_BACKPORT_H */
+-- 
+2.56.0
+
