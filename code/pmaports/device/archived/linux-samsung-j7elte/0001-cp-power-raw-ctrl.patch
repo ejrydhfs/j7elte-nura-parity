@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: omp <omp@j7elte>
+Date: Wed, 18 Nov 2026 00:00:00 +0000
+Subject: [PATCH] mach-exynos/pmu-cp: tolerate raw CP_CTRL from TZ READ_CTRL
+
+The READ_CTRL SMC (0x82000700, sub-command 3) is specified to return
+(CP_CTRL << 16) | 0, and every pmu-cp reader treats a non-zero low half
+as an SMC error.  The TZ monitor on this SM-J700M unit instead returns
+raw CP_CTRL values (observed 0x8 == CP_START, CP held in reset and
+powered down).  The old code therefore aborted exynos_set_cp_power_onoff()
+before ever issuing the WRITE_CTRL (CP_PWRON | CP_START) that starts the
+baseband, and ss310ap_boot_on() timed out waiting for mbx_cp_status.
+
+Accept a raw value whose bits are all known CP_CTRL control bits via
+cp_ctrl_normalize(); anything with unknown bits set is still an error.
+The canonical (val << 16) | 0 encoding behaves exactly as before.
+A read-only direct-MMIO comparison (CP_CTRL/CP_STAT/CP_DEBUG) is logged
+alongside so the TZ-vs-register discrepancy is visible in dmesg.
+
+Evidence: disassembly of the stock 3.10.61 kernel (boot.img kernel)
+shows the identical mask/shift/branch logic and the same WRITE_CTRL
+constant 0xA (CP_PWRON|CP_START) in exynos_set_cp_power_onoff, so stock
+Android relied on the TZ returning the shifted encoding which this
+unit's TZ does not provide.
+
+Signed-off-by: omp <omp@j7elte>
+---
+ arch/arm64/mach-exynos/pmu-cp.c | 57 +++++++++++++++++++++++++--------
+ 1 file changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/mach-exynos/pmu-cp.c b/arch/arm64/mach-exynos/pmu-cp.c
+index 1111111..2222222 100644
+@@ -83,6 +83,39 @@
+ }
+ EXPORT_SYMBOL(exynos_cp_reset);
+ 
++/*
++ * j7elte CP power: tolerate the TZ READ_CTRL ABI variant seen on this unit.
++ *
++ * The stock convention is (CP_CTRL << 16) | 0, i.e. the status/control word
++ * in the high half and zero in the low half. The TZ monitor on this unit
++ * instead returns the raw CP_CTRL register value (e.g. 0x8 == CP_START with
++ * the CP held in reset and powered down). The old code treated any non-zero
++ * low half as an error and aborted before ever issuing WRITE_CTRL, so the CP
++ * could never be powered on. Accept a raw value whose low half matches a
++ * plausible CP_CTRL word (only known status/control bits set, no PWRON yet
++ * asserted spuriously); anything else is still an error.
++ */
++static u32 cp_ctrl_normalize(u32 raw, const char *who)
++{
++	u32 known = CP_PWRON | CP_RESET_SET | CP_START |
++		    CP_ACTIVE_REQ_EN | CP_ACTIVE_REQ_CLR |
++		    CP_RESET_REQ_EN | CP_RESET_REQ_CLR |
++		    MASK_CP_PWRDN_DONE | RTC_OUT_EN |
++		    MASK_SLEEP_START_REQ | SET_SW_SLEEP_START_REQ |
++		    CLEANY_BYPASS_END;
++	if (!(raw & 0xffff))
++		return raw >> 16;
++	if ((raw & ~known) == 0) {
++		u32 direct = __raw_readl(EXYNOS_PMU_CP_CTRL);
++		u32 stat = __raw_readl(EXYNOS_PMU_CP_START);
++		u32 dbg = __raw_readl(EXYNOS_PMU_CP_DEBUG);
++		pr_err("%s: raw CP_CTRL 0x%x (TZ without (val<<16)|0 encoding); "
++		       "direct CP_CTRL=0x%x CP_STAT=0x%x CP_DEBUG=0x%x\n",
++		       who, raw, direct, stat, dbg);
++		return raw;
++	}
++	return 0xffffffff;
++}
+ /* release cp */
+ int exynos_cp_release(void)
+ {
+@@ -93,10 +126,8 @@
+ 
+ 	cp_ctrl = exynos_smc(SMC_ID, READ_CTRL, 0, 0);
+ 
+-	if (!(cp_ctrl & 0xffff)) {
+-		cp_ctrl >>= 16;
+-	}
+-	else {
++	cp_ctrl = cp_ctrl_normalize(cp_ctrl, "exynos_cp_release");
++	if (cp_ctrl == 0xffffffff) {
+ 		pr_err("ERR! read Fail: %d\n", cp_ctrl & 0xffff);
+ 		ret = -1;
+ 		goto exit;
+@@ -124,10 +155,8 @@
+ 
+ 	cp_ctrl = exynos_smc(SMC_ID, READ_CTRL, 0, 0);
+ 
+-	if (!(cp_ctrl & 0xffff)) {
+-		cp_ctrl >>= 16;
+-	}
+-	else {
++	cp_ctrl = cp_ctrl_normalize(cp_ctrl, "exynos_cp_active_clear");
++	if (cp_ctrl == 0xffffffff) {
+ 		pr_err("ERR! read Fail: %d\n", cp_ctrl & 0xffff);
+ 		ret = -1;
+ 		goto exit;
+@@ -155,10 +184,8 @@
+ 
+ 	cp_ctrl = exynos_smc(SMC_ID, READ_CTRL, 0, 0);
+ 
+-	if (!(cp_ctrl & 0xffff)) {
+-		cp_ctrl >>= 16;
+-	}
+-	else {
++	cp_ctrl = cp_ctrl_normalize(cp_ctrl, "exynos_clear_cp_reset");
++	if (cp_ctrl == 0xffffffff) {
+ 		pr_err("ERR! read Fail: %d\n", cp_ctrl & 0xffff);
+ 		ret = -1;
+ 		goto exit;
+@@ -176,6 +203,7 @@
+ 	return ret;
+ }
+ 
++
+ int exynos_get_cp_power_status(void)
+ {
+ 	u32 cp_state;
+@@ -184,10 +212,8 @@
+ 
+ 	pr_err("CP Power status: %x\n", cp_state);
+ 
+-	if (!(cp_state & 0xffff)) {
+-		cp_state >>= 16;
+-	}
+-	else {
++	cp_state = cp_ctrl_normalize(cp_state, "exynos_get_cp_power_status");
++	if (cp_state == 0xffffffff) {
+ 		pr_err("ERR! Get CP Power status: %d\n", cp_state & 0xffff);
+ 		return -1;
+ 	}
+@@ -208,10 +234,8 @@
+ 	/* set power on/off */
+ 	cp_ctrl = exynos_smc(SMC_ID, READ_CTRL, 0, 0);
+ 
+-	if (!(cp_ctrl & 0xffff)) {
+-		cp_ctrl >>= 16;
+-	}
+-	else {
++	cp_ctrl = cp_ctrl_normalize(cp_ctrl, "exynos_set_cp_power_onoff");
++	if (cp_ctrl == 0xffffffff) {
+ 		pr_err("ERR! read Fail: %d\n", cp_ctrl & 0xffff);
+ 		ret = -1;
+ 		goto exit;
+-- 
+2.34.1

@@ -63,6 +63,7 @@
 /* ------------------------------------------------------------------ */
 /* Kernel ABI: drivers/misc/modem_v1/modem_prj.h                       */
 /* ------------------------------------------------------------------ */
+#define IOCTL_MODEM_RESET		_IO('o', 0x21)
 #define IOCTL_MODEM_ON			_IO('o', 0x19)
 #define IOCTL_MODEM_BOOT_ON		_IO('o', 0x22)
 #define IOCTL_MODEM_BOOT_OFF		_IO('o', 0x23)
@@ -71,6 +72,17 @@
 #define IOCTL_MODEM_DL_START		_IO('o', 0x28)
 #define IOCTL_MODEM_FW_UPDATE		_IO('o', 0x29)
 #define IOCTL_MODEM_XMIT_BOOT		_IO('o', 0x40)
+#define IOCTL_SECURITY_REQ		_IO('o', 0x53)
+
+/* modem_prj.h:178 - __packed, sizeof == 16. */
+struct modem_sec_req {
+	uint32_t mode;
+	uint32_t size_boot;
+	uint32_t size_main;
+	uint32_t dummy;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct modem_sec_req) == 16, "modem_sec_req ABI");
 
 /* modem_prj.h:169 - __packed, sizeof == 28 on both 32- and 64-bit ABIs. */
 struct modem_firmware {
@@ -356,6 +368,50 @@ static int cbd_ioctl(unsigned long req, void *arg, const char *name)
 	else
 		VLOG("ioctl %s ok", name);
 	return ret;
+}
+
+/* Stock security handshake (shannon_normal_boot): forward the TZ return
+ * verbatim.  Mode 2 (CP_BOOT_RE_INIT) returns 0; mode 0 (NORMAL) returns
+ * 0xFEED0002 (stock's accepted code, negative as int32).  The security
+ * wrapper's table (0x62b74) accepts {0xFEED02, 0xFEED04, 0xFEED0002}, and
+ * 0xFEED0002 is positive in the wrapper's comparison only because the ROM
+ * reads it as an unsigned response word; treat all three as success. */
+static int security_req(uint32_t mode, uint32_t size_boot, uint32_t size_main)
+{
+	struct modem_sec_req msr;
+	int ret;
+
+	memset(&msr, 0, sizeof(msr));
+	msr.mode = mode;
+	msr.size_boot = size_boot;
+	msr.size_main = size_main;
+
+	if (g.dry_run) {
+		LOG("[dry-run] ioctl SECURITY_REQ(mode%u)(0x%x)", mode,
+		    IOCTL_SECURITY_REQ);
+		return 0;
+	}
+
+	do {
+		ret = ioctl(g.boot_fd, IOCTL_SECURITY_REQ, &msr);
+	} while (ret < 0 && errno == EINTR);
+
+	/* The kernel returns the TZ response word verbatim (errors as
+	 * -errno for transport failures, TZ codes as positive/negative
+	 * int32).  Stock accepts 0xFEED02, 0xFEED04 and 0xFEED0002. */
+	if (ret == 0 || (unsigned)ret == 0xFEED0002u ||
+	    (unsigned)ret == 0x00FEED02u || (unsigned)ret == 0x00FEED04u) {
+		VLOG("ioctl SECURITY_REQ(mode%u) ok (0x%x)", mode,
+		     (unsigned)ret);
+		return 0;
+	}
+	if (ret < 0)
+		LOG("ioctl SECURITY_REQ(mode%u) failed: %s", mode,
+		    strerror(errno));
+	else
+		LOG("ioctl SECURITY_REQ(mode%u) rejected: 0x%x", mode,
+		    (unsigned)ret);
+	return -1;
 }
 
 /* Wait for one 4-byte response word from the CP bootloader. */
@@ -856,10 +912,20 @@ static int boot_cp(const struct cp_toc *toc)
 	} else {
 		LOG("[dry-run] would open %s O_RDWR", g.boot_dev);
 	}
+	/* 0. stock order: reset, then security mode 2 (CP_BOOT_RE_INIT). */
+	if (cbd_ioctl(IOCTL_MODEM_RESET, NULL, "MODEM_RESET") < 0)
+		goto out;
+	if (security_req(2, 0, 0) < 0)
+		goto out;
 
 	/* 1. bootloader into the CP boot region, before power-on. */
 	if (g.xmit_boot && xmit_bootloader(toc) < 0)
 		goto out;
+	/* 1b. stock order: security mode 0 with {BOOT size, TOC data_start}. */
+	if (security_req(0, toc->boot.size, toc->data_start) < 0)
+		goto out;
+
+
 
 	/* 2. power the CP and enter download mode (stock order). */
 	if (cbd_ioctl(IOCTL_MODEM_ON, NULL, "MODEM_ON") < 0)
