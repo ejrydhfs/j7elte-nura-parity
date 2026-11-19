@@ -1,0 +1,47 @@
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -1470,12 +1470,38 @@
+    if (fd < 0)
+       return NULL;
+ 
+-   /* Only kbase character devices are handled here.  DRM fds answer
+-    * drmGetVersion(); refuse them before touching kbase handshake state. */
+-   drmVersionPtr ver = drmGetVersion(fd);
+-   if (ver) {
+-      drmFreeVersion(ver);
+-      return NULL;
++   /* A render node that tunnels the kbase UK 10.6 ABI (H2 shim) is still a
++    * DRM character device, so it answers drmGetVersion().  Probe the UK
++    * handshake instead of trusting the DRM answer: a real DRM driver fails
++    * the handshake (ENOTTY) and is refused here so the DRM backends keep
++    * owning it; a shim passes and is adopted below.  The probe is
++    * side-effect free (version query only; SET_FLAGS runs later on the
++    * adopted fd as before). */
++   {
++      drmVersionPtr ver = drmGetVersion(fd);
++      if (ver) {
++         drmFreeVersion(ver);
++         /* May be an H2 shim: verify with a throwaway UK version check on
++          * a dup so the caller's fd lifetime is unchanged either way. */
++         int probe = fcntl(fd, F_DUPFD_CLOEXEC, 0);
++         struct kbase_uk_version_check vk;
++         if (probe < 0)
++            return NULL;
++         memset(&vk, 0, sizeof(vk));
++         vk.header.id = UKP_FUNC_ID_CHECK_VERSION;
++         vk.major = KBASE_UK_VERSION_MAJOR;
++         vk.minor = KBASE_UK_VERSION_MINOR;
++         int pret = kbase_uk_call(probe, &vk, sizeof(vk));
++         int perr = (pret || vk.header.ret) ? -EPROTO : 0;
++         if (!perr &&
++             !((vk.major == 10 && vk.minor >= 3) || (vk.major > 10)))
++            perr = -EPROTO;
++         close(probe);
++         if (perr)
++            return NULL;
++         /* Shim confirmed: fall through; kbase_handshake() below repeats
++          * the version check plus SET_FLAGS on the real fd. */
++      }
+    }
+ 
+    kdev = pan_kmod_alloc(allocator, sizeof(*kdev));
