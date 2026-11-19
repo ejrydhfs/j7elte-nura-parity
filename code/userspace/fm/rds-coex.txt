@@ -1,0 +1,118 @@
+# rds-coex.txt — RDS attempt + BT/FM coexistence (PARTIAL — device link lost mid-task)
+
+Date: 2026-11-19 ~04:35–05:05 UTC. Status: HELD — no live HCI bytes captured.
+Single W1B(0x14)+R(0x80) RDS pair was prepared but NEVER sent (device link died
+first). Per Main/parent order, all device I/O parked; this file records what was
+established, what was attempted, and exact intent for resume.
+
+## 1. Pre-task device state (own observation, live ssh, verbatim)
+
+- 04:3x UTC: `hciconfig -a hci0` → BD 43:43:A1:12:1F:AC, UP RUNNING PSCAN,
+  `RX bytes:672 ... events:41 / TX bytes:2728 ... commands:41`,
+  Features 0xbf 0xfe 0xcf 0xfe 0xdb 0xff 0x7b 0x87, HCI 4.0 rev 0xe6 /
+  LMP 4.0 sub 0x2209, Mfr Broadcom (15), Name 'Samsung Galaxy J7'.
+- bluetoothd alive, pid 3953 (later 3952 after reboot).
+- ~04:39 UTC device rebooted (ssh refused ~2 min; post-reboot uptime 1 min at
+  04:40:27 UTC). Post-reboot counters reset (events 49–52), NO flood visible.
+
+## 2. Peer coordination (FmLiveTune, same session)
+
+- FmLiveTune re-armed post-reboot: enable chain + TUNE 94.0 MHz + COMMIT all
+  status=0x00 on the new boot. Post-reboot line confirmed QUIET — no 04ff0108
+  flood (drained=1 per step). Flood only ever starts after the W1B(0x4D,1,8)
+  audio-path write (live-fc15-log.txt §4), which FmLiveTune deliberately did
+  NOT send.
+- Peer caution incorporated into plan: reads return dataless 6-byte CCs
+  (no value bytes); R(0x80) CC expected likewise dataless — values need the
+  stack state machine or arrive as vendor events.
+- Agreed plan: single documented pair ONLY, NO audio-path writes (flood re-arm
+  risk), coex numbers grabbed fast (peer warned reboots every few minutes).
+- Peer later confirmed parking as well; FM left enabled @ 94.0 MHz as of last
+  contact (state may have been wiped by subsequent reboot — MUST re-verify
+  before any future attempt).
+
+## 3. RDS attempt: PREPARED, NOT SENT (exact bytes for resume)
+
+Planned single pair (fc15-table.md RDS row: set_rds_mode = W1B(0x14,cfg,0) +
+R(0x80,0,0xF0)):
+
+- W1B(0x14, cfg=0x01, flags=0): payload bytes `14 10 01`, HCI frame
+  `01 15 fc 03 14 10 01` (H4 01 + opcode fc15 LE + plen 03).
+- R(0x80, r1=0, r2=0xF0): payload per read-arg rule = `[80, 0x11 | ...]`.
+  NOTE: r2=0xF0 is the read LENGTH/flag field consumed by the stack-side
+  helper (bta_fm_vnd_cmd_read), NOT an HCI-level arg byte — the on-wire read
+  arg byte is derived from r1 only (r1=0 → arg 0x11; cf. R(0x0A,0,2) → tx
+  `... 02 0a 19` where 0x19 = 0x11|0x08 length-class bit from the table's
+  helper encoding). Exact R(0x80) wire bytes were staged in /tmp/probeAB.py
+  as `01 15 fc 02 80 19`; FmLiveTune's quiet-line CC evidence + hci_raw
+  framing confirm the form, but these bytes were NEVER transmitted — recheck
+  arg encoding against fc15-table.md sec 0 before sending on resume.
+- Expected result (per peer + §6 blocker): CC `04 0e 06 01 15 fc 00` +
+  2-byte subcmd/arg echo, NO RDS payload bytes — record as dataless if so.
+- Full probe script (/tmp/probeAB.py, host scratch, NOT repo) implements:
+  HCI_FILTER all-events → drain → 1 s presample (flood census: count of
+  `04ff0108` vs others) → filter 0x0E-only → drain → Read Local Name 0x0C14
+  (transport proof) → W1B(0x14) → 0.4 s watch → R(0x80) → 1.0 s watch →
+  before/after hciconfig + 3 s event-delta rate + bluetoothd pid/ps.
+
+## 4. Coexistence: NOT MEASURED (device lost before probe ran)
+
+- Intended: hciconfig -a before/after (verbatim), flood rate = (events@t+3s −
+  events@t)/3 from hciconfig counters + socket census of 04ff0108/s, Read
+  Local Name 0x0C14 through 0x0E-only filter as safe BT sanity alongside FM,
+  bluetoothd pid + ps line before/after.
+- Actual: first full probe run timed out at the 28 s ssh-flock deadline
+  (device stopped answering mid-run ~04:45 UTC); subsequent ssh/ping 100%
+  loss for 10+ min (past reboot gaps were ~2 min).
+
+## 5. Link-down forensics (own host-side observation, no device access needed)
+
+- Workstation lost the RNDIS interface entirely (no enp6s0f3u2u3, no route;
+  ping 172.16.42.1 100% loss).
+- Journal: `usb 1-2.3: USB disconnect` 23:41:42 local; re-enumeration as
+  high-speed device number 38, `idVendor=18d1 idProduct=d001`,
+  strings SAMSUNG_Android / SerialNumber 07b6cc6a63e8 (SAME serial as the
+  RNDIS link); `rndis_host ... probe failed with error -110`; no driver
+  bound to 1-2.3:1.0/1.1 afterward (unclaimed CDC/RNDIS composite).
+- lsusb showed `18d1:d001 Google Inc. Nexus 4 (fastboot)` on port 1-2.3 with
+  product string SAMSUNG_Android — i.e. half-enumerated RNDIS/download state
+  on the SAME port+serial, NOT a physical detach; fastboot tool itself saw
+  no device. Later checks showed NO phone USB entry at all (device fully
+  dark). No sudo on workstation; could not rebind/reset USB from this side.
+- VERDICT: host-side USB link down (phone in failed-enumeration or powered
+  state), NOT caused by any HCI command from this slice (nothing was ever
+  sent). BT/FM on-chip state unknown after the outage.
+
+## 6. Flood-mitigation recipe (for the daemon; from live-fc15-log.txt §§4-6 +
+##     probe-baseline.txt + this session's quiet-line confirmation)
+
+- Kernel-side: setsockopt SOL_HCI/HCI_FILTER with type-mask accepting ONLY
+  event 0x0E (Command Complete):
+  `struct.pack('IIIH', 1<<0x0E, 1<<0x0E>>32, 0, 0)` — i.e. type_mask with bit
+  0x0E set, event-mask words selecting 0x0E; exact layout: type_mask u32,
+  event_mask[2] u32, opcode u16 (all-events = ~0,~0,~0,0 per baseline recipe).
+- Userspace pattern per command: (a) set all-events filter + drain socket
+  (nonblocking recv until EAGAIN/timeout, cap ~3000) to clear backlog;
+  (b) set 0x0E-only filter + drain once more; (c) send H4 command
+  `01 <opcode LE> <plen> <payload>`; (d) wait CC with short window (≤2.5 s),
+  matching on opcode and IGNORING non-matching CCs (count as skipped);
+  (e) set all-events filter for the post-command watch window (0.4–1.0 s)
+  to census async vendor traffic (`04ff0108` vs any non-flood data).
+- Defaults: CC window 2.5 s; drain cap 3000; presample 1 s; NEVER issue the
+  W1B(0x4D,1,8) audio-path write except via explicit user action (it re-arms
+  the persistent ~2.9k/s `04 ff 01 08` flood that drowns every CC window —
+  disable leg does NOT stop it); after such a write, re-drain before every
+  subsequent command; treat dataless 6-byte CCs (status + 2-byte echo, zero
+  value bytes) as command-acceptance only, NOT signal confirmation.
+- ALSA capture needs no HCI and is unaffected by the flood (peer FmAudioEv).
+
+## 7. Resume checklist (when Main signals link return)
+
+1. Re-verify: ping/ssh up, uptime + hciconfig counters fresh (reboot wipes
+   chip state); bluetoothd pid alive; FmLiveTune re-arms enable chain and
+   confirms quiet line (drained≈1, no 04ff0108).
+2. Run single planned pair ONLY (recheck R(0x80) arg byte first); log full
+   tx/rx hex including any non-flood vendor data; one attempt, no resends.
+3. Capture coex numbers (before/after hciconfig, 3 s delta rate, 0x0C14
+   sanity, bluetoothd ps) in the SAME run; append verbatim to this file.
+4. Leave FM ENABLED @ current freq; send NO disable leg; stop NO services.
