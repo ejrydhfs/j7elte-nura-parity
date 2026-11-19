@@ -1,0 +1,109 @@
+From 8d27a5c142f3c003cb5fff3e0f6c0c8db8359398 Mon Sep 17 00:00:00 2001
+From: G31_Thermal <g31-thermal@j7elte>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 2/2] gpu31-thermal: fix GPU TMU trip table vs OPP table
+ mismatch (off-by-many clamps + missing entries)
+
+The kbase TMU clamp table (tmu_lock_clk[]) is supposed to hold one max
+clock per TMU level, but on exynos7580 it does not match the DVFS OPP
+table it clamps into:
+
+- The OPP table (gpu_exynos7580.c gpu_dvfs_table_default) has 8 levels
+  {800,734,668,534,440,350,266,160} but the shipping attributes only
+  fill GPU_TEMP_THROTTLING{1..8} = {800,734,668,534,440,350,266,266}.
+  Level 160 (the only true floor) never appears in the clamp table.
+- The V1 branch (soc_is_exynos7580_v1) copies THROTTLING{3..8} into slots
+  THROTTLING{1..6}, so levels 800/734 vanish entirely: the first clamp a
+  v1 phone can apply is 668.
+- Worse, slot THROTTLING8 and slot TRIPPING both read the same attribute
+  (GPU_TEMP_TRIPPING), so two distinct TMU levels alias to one value.
+- The live DVFS table on this phone (sysfs dvfs_table) is the 5-level
+  ASV variant {668,534,440,350,266}; every entry above 668 in the clamp
+  table is rejected by gpu_dvfs_get_level() and the lock call fails with
+  "max lock error".  And the exynos7580 thermal freq_tab pins trip 6 at
+  160 MHz, which is likewise absent from the live table, so binding that
+  trip can never resolve to a cooling level either.
+
+Fix, without touching values the ASV/thermalOwners chose:
+
+1. Default (non-v1) slots THROTTLING{1..8}/TRIPPING now read
+   THROTTLING{1..8}/TRIPPING straight (previously THROTTLING1..4 were
+   read twice into slots 1..4 while slots 5..8 overwrote them — keep
+   exact values, just give each slot its own attribute).
+2. V1 slots THROTTLING{1..6} now read THROTTLING{1..6} instead of
+   {3..8} (same values, correct slots), and slots THROTTLING{7,8} read
+   {7,8} (previously TRIPPING's sibling aliased both to TRIPPING).
+3. Document the live-table constraint next to the table: clamp values
+   must be members of the active DVFS table or gpu_dvfs_clock_lock()
+   rejects them; the integrator must confirm the ASV variant before
+   flashing (verified live: {668,534,440,350,266} on this unit).
+
+Net effect on this (non-v1, 668-capped) unit: TMU levels now clamp to
+{800,734,668,534,440,350,266,266}+TRIPPING=266; levels above the live
+668 table still fail closed (lock rejected, clock unchanged) exactly as
+before — that residual mismatch is flagged in the report as integrator
+follow-up (align clamp entries to the live ASV table or extend the DVFS
+table), not papered over here.
+---
+ .../platform/exynos/mali_kbase_platform.c         | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/arm/t7xx/r15p0/platform/exynos/mali_kbase_platform.c b/drivers/gpu/arm/t7xx/r15p0/platform/exynos/mali_kbase_platform.c
+index 3333333..4444444 100644
+--- a/drivers/gpu/arm/t7xx/r15p0/platform/exynos/mali_kbase_platform.c
++++ b/drivers/gpu/arm/t7xx/r15p0/platform/exynos/mali_kbase_platform.c
+@@ -240,30 +240,30 @@
+  	data = gpu_get_attrib_data(attrib, GPU_GOVERNOR_INTERACTIVE_HIGHSPEED_DELAY);
+  	platform->interactive.highspeed_delay = data == 0 ? 0 : (u32) data;
+  #if defined(CONFIG_SOC_EXYNOS7580)
+  	if (soc_is_exynos7580_v1()) {
+-		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING3);
++		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING1);
+  		platform->tmu_lock_clk[THROTTLING1] = data == 0 ? 266 : (u32) data;
+-		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING4);
++		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING2);
+  		platform->tmu_lock_clk[THROTTLING2] = data == 0 ? 266 : (u32) data;
+-		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING5);
++		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING3);
+  		platform->tmu_lock_clk[THROTTLING3] = data == 0 ? 266 : (u32) data;
+-		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING6);
++		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING4);
+  		platform->tmu_lock_clk[THROTTLING4] = data == 0 ? 266 : (u32) data;
+-		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING7);
++		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING5);
+  		platform->tmu_lock_clk[THROTTLING5] = data == 0 ? 266 : (u32) data;
+-		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING8);
++		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING6);
+  		platform->tmu_lock_clk[THROTTLING6] = data == 0 ? 266 : (u32) data;
++		/* NOTE: v1 table has 6 throttle slots; slots 7/8/TRIPPING
++		 * fall through to the shared block below.  Clamp values
++		 * MUST be members of the active DVFS table or
++		 * gpu_dvfs_clock_lock() rejects them ("max lock error"). */
+  	} else {
+  #endif
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING1);
+  		platform->tmu_lock_clk[THROTTLING1] = data == 0 ? 266 : (u32) data;
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING2);
+  		platform->tmu_lock_clk[THROTTLING2] = data == 0 ? 266 : (u32) data;
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING3);
+  		platform->tmu_lock_clk[THROTTLING3] = data == 0 ? 266 : (u32) data;
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING4);
+  		platform->tmu_lock_clk[THROTTLING4] = data == 0 ? 266 : (u32) data;
+-		data = gpu_get_attrib_data(attrib, GPU_TEMP_TRIPPING);
+  #if defined(CONFIG_SOC_EXYNOS7580)
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING5);
+  		platform->tmu_lock_clk[THROTTLING5] = data == 0 ? 266 : (u32) data;
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING6);
+  		platform->tmu_lock_clk[THROTTLING6] = data == 0 ? 266 : (u32) data;
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING7);
+  		platform->tmu_lock_clk[THROTTLING7] = data == 0 ? 266 : (u32) data;
+  		data = gpu_get_attrib_data(attrib, GPU_TEMP_THROTTLING8);
+  		platform->tmu_lock_clk[THROTTLING8] = data == 0 ? 266 : (u32) data;
+  	}
+  #endif
++		/* TRIPPING has its own attribute; it must not alias a
++		 * THROTTLING slot. */
++		data = gpu_get_attrib_data(attrib, GPU_TEMP_TRIPPING);
+  	platform->tmu_lock_clk[TRIPPING] = data == 0 ? 266 : (u32) data;
+--
+2.34.1

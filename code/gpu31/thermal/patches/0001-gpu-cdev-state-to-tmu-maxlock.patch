@@ -1,0 +1,102 @@
+From 8d27a5c142f3c003cb5fff3e0f6c0c8db8359398 Mon Sep 17 00:00:00 2001
+From: G31_Thermal <g31-thermal@j7elte>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 1/2] gpu31-thermal: route step_wise GPU cdev state into
+ kbase TMU max-lock
+
+The exynos7580 thermal stack and the kbase GPU DVFS driver each own half
+of GPU thermal management, but the two halves are not connected for the
+generic (non-IPA) path:
+
+- drivers/thermal/exynos7580/{thermal_core.c,gpu_cooling.c} creates the
+  "thermal-gpufreq-0" cooling device, binds it to GPU thermal zone trips
+  (exynos_bind), and drives its cur_state via the step_wise governor.
+  On state change it only emits GPU_THROTTLING (= 7) on the private
+  gpu_notifier chain with the raw cooling-state number attached.
+- drivers/gpu/arm/.../platform/exynos/gpu_notifier.c handles only
+  GPU_COLD / GPU_NORMAL / GPU_THROTTLING{1..4} / GPU_TRIPPING on that
+  chain.  GPU_THROTTLING (the only event the cooling device ever sends)
+  falls into the default branch, is logged as "wrong event", and changes
+  nothing.  The graded per-trip handler (gpu_tmu_hot_check_and_work) is
+  therefore dead code on this kernel: it is only reachable from the
+  legacy exynos_thermal.c/exynos7420_thermal.c paths, which are not
+  compiled for this board (the exynos7580/ directory shadows them).
+
+So on a sustained load the zone trips, the cdev cur_state climbs, but the
+GPU max clock never moves: the cooling device is a counter with no
+actuator.
+
+This patch closes the loop inside the kbase notifier: translate the
+cooling-device cur_state (0..max) carried by the GPU_THROTTLING event
+into one of the existing graded TMU states and reuse
+gpu_tmu_hot_check_and_work unchanged:
+
+  cur_state 0            -> GPU_NORMAL (release TMU_LOCK max lock)
+  cur_state 1..3         -> GPU_THROTTLING1..3
+  cur_state >= 4         -> GPU_THROTTLING4 (= floor the GPU at the
+                             THROTTLING4 entry of the per-SoC tmu_lock_clk
+                             table; TRIPPING stays reserved for the HW-trip
+                             path and is never synthesized here)
+
+The mapping is deliberately monotonic and saturating: a larger cdev state
+always means an equal-or-lower max clock, and states beyond the table
+depth pin at the lowest DVFS floor instead of wrapping or erroring out.
+Each transition calls gpu_set_target_clk_vol() via the existing helper
+path, so the clamp applies immediately, honouring all other locks
+(SYSFS/BOOST/PMQOS) through gpu_dvfs_clock_lock().
+
+No behaviour changes when CONFIG_MALI_DVFS is off (helpers compile out),
+when the GPU tmu attribute is disabled (tmu_status gate unchanged), or
+for the COLD/NORMAL/TRIPPING events (handled exactly as before).
+---
+ .../platform/exynos/gpu_notifier.c                | 28 ++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/drivers/gpu/arm/t7xx/r15p0/platform/exynos/gpu_notifier.c b/drivers/gpu/arm/t7xx/r15p0/platform/exynos/gpu_notifier.c
+index 1111111..2222222 100644
+--- a/drivers/gpu/arm/t7xx/r15p0/platform/exynos/gpu_notifier.c
++++ b/drivers/gpu/arm/t7xx/r15p0/platform/exynos/gpu_notifier.c
+@@ -80,6 +80,26 @@ static void gpu_tmu_normal_work(struct kbase_device *kbdev)
+  #endif /* CONFIG_MALI_DVFS */
+  }
+ 
++/*
++ * Translate the generic thermal cooling-device state into a graded TMU
++ * event.  The exynos7580 gpu_cooling driver only ever emits GPU_THROTTLING
++ * with the cdev cur_state attached (see gpufreq_apply_cooling); the
++ * numbered per-trip events are never sent on this platform.  Map:
++ *   0    -> normal (release the TMU max lock)
++ *   1..3 -> THROTTLING1..3
++ *   >=4  -> THROTTLING4 (floor; TRIPPING is reserved for the HW-trip path)
++ */
++static unsigned long gpu_cdev_state_to_tmu_event(unsigned long state)
++{
++	if (state == 0)
++		return GPU_NORMAL;
++	if (state <= (unsigned long)GPU_THROTTLING3 - (unsigned long)GPU_THROTTLING1 + 1)
++		return (unsigned long)GPU_THROTTLING1 + state - 1;
++	return GPU_THROTTLING4;
++}
++
+ static int gpu_tmu_notifier(struct notifier_block *notifier,
+  				unsigned long event, void *v)
+  {
+@@ -97,6 +117,14 @@ static int gpu_tmu_notifier(struct notifier_block *notifier,
+  		platform->voltage_margin = platform->gpu_default_vol_margin;
+  	} else if (event == GPU_NORMAL) {
+  		gpu_tmu_normal_work(pkbdev);
++	} else if (event == GPU_THROTTLING) {
++		/* Generic cooling-device step from the step_wise governor. */
++		unsigned long cdev_state = v ? *(unsigned long *)v : 0;
++		unsigned long tmu_event = gpu_cdev_state_to_tmu_event(cdev_state);
++		if (tmu_event == GPU_NORMAL) {
++			gpu_tmu_normal_work(pkbdev);
++		} else {
++			if (gpu_tmu_hot_check_and_work(pkbdev, tmu_event))
++				GPU_LOG(DVFS_ERROR, DUMMY, 0u, 0u, "%s: failed cdev state %lu", __func__, cdev_state);
++		}
+  	} else if (event >= GPU_THROTTLING1 && event <= GPU_TRIPPING) {
+  		if (gpu_tmu_hot_check_and_work(pkbdev, event))
+  			GPU_LOG(DVFS_ERROR, DUMMY, 0u, 0u, "%s: failed to open device", __func__);
+--
+2.34.1
