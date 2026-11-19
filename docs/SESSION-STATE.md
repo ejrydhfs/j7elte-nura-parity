@@ -122,6 +122,13 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## FM radio (2026-11-19)
+- HCI path works: enable+tune/commit+RSSI all ACK (`status=0x00`) at 94.5 MHz, repeatable across
+  fresh boots; mixer route applied (SRC3, CH3Rec, DOUT=RMIX_OUT, LINEIN on) — see `docs/reports/fm-audio.md`.
+- Audio is blocked **below FM**: `hw:0,0` capture and `hw:0,0`/`hw:0,4` playback hang at the PCM
+  layer (hw_ptr 0, avail 0, 0 bytes), while `hw:0,2` voice works — kernel ABOX/i2s0-pri stall.
+- R(0x0F) CC is dataless on both HCI sockets, so RSSI/SNR values are not recoverable from userspace.
+
 ## GPU M1 boot result (2026-11-19)
 - M1 image (DRM core built, sha256 cf25ed70…) flashed and booted as **#37**:
   USB-net, fbdev X 720x1280, /dev/mali0 all fine; **no /dev/dri** — dmesg has zero
