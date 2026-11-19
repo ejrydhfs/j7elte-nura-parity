@@ -1776,8 +1776,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 + * The -I$(STAGE)/drivers/gpu/drm form below matches the staged dir. */
 +#include <linux/dma-fence.h>		/* 0001 */
 +#include <linux/dma-resv.h>		/* 0002 */
-+#include <drm_syncobj.h>		/* 0003 */
-+#include <drm_sched.h>			/* 0004 */
++#include "drm_syncobj.h"		/* 0003 */
++#include "drm_sched.h"			/* 0004 */
 +
 +#include "panfrost7580_job.h"
 +

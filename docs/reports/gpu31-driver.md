@@ -34,6 +34,7 @@ tristate, default n.
 |---|---|
 | `code/gpu31/driver/0001-panfrost7580-driver-sources.patch` | 17 new files under `drivers/gpu/drm/panfrost/`: 3 new driver files (`_main.c`, `_submit.c`, `_drv.h`) + verbatim snapshots of the 14 live slice sources (GEM×5 incl. UAPI, jobs×3, MMU×2, power×2, devfreq×2) |
 | `code/gpu31/driver/0002-panfrost7580-build-wiring.patch` | `drivers/gpu/drm/{Makefile,Kconfig}` one-line additions + new `drivers/gpu/drm/panfrost/{Kconfig,Makefile}` (`CONFIG_DRM_PANFROST7580`, `default n`, `depends on DRM && ARM64 && MMU`) |
+| (int4 fix, folded 2026-11-19) | panfrost `ccflags-y` gains `-Idrivers/gpu/drm` so the 0003/0004 shim headers (`drm_syncobj.h`/`drm_sched.h`, local files in `drivers/gpu/drm/`, no stock `-I` covers that dir) resolve via quoted includes; `select DRM_GEM_CMA_HELPER` kept, requires the dmabuf slice's `0001-drm-gem-cma-use-dma-attrs-writecombine.patch` (stock `drm_gem_cma_helper.c` uses 32-bit-only `dma_alloc_writecombine`) |
 
 Apply order (integrator): backport 0001–0005 → KMS Mode-B core →
 this series → M1 fragment + D4 fragment.
@@ -98,6 +99,7 @@ Against the pristine tree (`-nostdinc`, `arch/arm64/include` +
   verified in-tree `EXPORT_SYMBOL[_GPL]` (DRM/GEM/PRIME, clk,
   regulator, devres, PM runtime, shmem, devfreq/OPP, MMU) or a staged
   0001–0004 shim export (fence/resv/syncobj/sched).
+- Post-fold re-check (int4 layout: `-I drivers/gpu/drm` + `-I drivers/gpu/drm/panfrost`, quoted shim includes): 8/8 `-c` **PASS**, `ld -r` **PASS**.
 
 NOT verified here (integrator / M1Verify own): full `Image` build,
 boot, `/dev/dri/renderD128` on device, Mesa triangle. No reboot/flash
