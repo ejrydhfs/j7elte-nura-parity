@@ -1,0 +1,47 @@
+# powermetric — GPU power-proxy measurement (host sources + method)
+
+Slice: idle-vs-load power proxy for the Mali-T720 kbase driver
+(kernel 3.10.108 #35, `t7xx/r15p0`, Interactive governor).
+Phone is UP; all device I/O in this slice used short
+`flock /tmp/gpsdev.lock` holds, root via `/usr/local/bin/rootshell`
+(no reboot, no flash — Integrator/M1Verify own those).
+
+## Files
+
+- `gpu-powermetric.sh` — read-only sampler. Copies the exact blocks used
+  for this report: mali clock/vol/utilization/perf/power_state,
+  runtime_status + runtime_active/suspended_time, time_in_state,
+  vdd_g3d (node/microvolts/state/num_users/min/max), battery
+  current_now/current_avg/voltage_now/status/capacity/temp, fuel-gauge
+  current, gpufreq cooling state, thermal zones.
+  `sh gpu-powermetric.sh --samples 3 --interval 5` (add `--reset-tis`
+  to zero time_in_state first).
+- `gpu-job-load.c` — sustained SOFT_JOB load generator (source). Built
+  on the host with
+  `aarch64-linux-gnu-gcc -O2 -static -o gpu-job-load-arm64
+  gpu-job-load.c kbase.c` (kbase.{c,h}/kbase_uapi.h from
+  `code/userspace/gpu/kbase/`), pushed to the device over ssh-stdin and
+  run as root. No policy nodes are touched by either tool.
+
+## DVFS truth (shared tree, read-only)
+
+- OPP table (nominal): `gpu_exynos7580.c:46-55` —
+  800/734/668 @ 1.10 V; 534/440/350 @ 1.00 V; 266/160 @ 0.90 V.
+  Live `asv_table` (ASV-adjusted) on kernel #35:
+  668→1 100 000, 534→1 000 000, 440→937 500, 350→881 250,
+  266→812 500 uV (160 MHz step compiled out: 5 steps live).
+- Thresholds: all steps min 78 / max 85 except top (99/100) and bottom
+  (10/20); interactive highspeed 420 MHz @ load 95, delay 0
+  (`gpu_exynos7580.c:63-88`). Governor tick = `polling_speed` = 30 ms
+  (`mali_kbase_platform.c:234`, `gpu_dvfs_handler.c:402-403`),
+  utilization from `gpu_pm_get_dvfs_utilisation`
+  (`gpu_utilization.c`), step logic in `gpu_dvfs_governor.c:85-157`.
+- `time_in_state` unit = jiffies @ HZ=100 (10 ms each;
+  `gpu_dvfs_api.c:476-498`, defconfig `CONFIG_HZ=100`).
+  `clock`/`utilization` report 0 while `power_state=0` by construction
+  (`gpu_custom_interface.c:show_clock/show_utilization` multiply by
+  `gpu_control_is_power_on`).
+- Battery current: `battery/current_now` in mA (sm5703 fuel-gauge
+  `sm5703_get_curr`, `sm5703_fuelgauge.c:356-378`; positive = charging).
+  `VOLTAGE_AVG=1936420469` in the fg uevent is a stale/unscaled debug
+  field — use `battery/voltage_now` (uV) instead.
