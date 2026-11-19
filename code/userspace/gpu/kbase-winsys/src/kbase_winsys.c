@@ -373,8 +373,13 @@ static int kbw_parse_props(struct kbw_caps *caps, const void *blob)
    caps->core_count = kbw_popcount64(caps->shader_present);
    caps->core_id_range = kbw_fls64(caps->shader_present);
    caps->max_job_slots = kbw_popcount64(caps->js_present);
-   /* mali_base_kernel.h: the selected coherency mode, 0 = not coherent. */
-   caps->io_coherent = caps->coherency_mode != 0;
+   /* mali_midg_coherency.h: the selected mode is ACE_LITE=0, ACE=1,
+    * NONE=31; kbase_device_coherency_init() writes kbdev->system_coherency
+    * over raw_props.coherency_mode (mali_kbase_core_linux.c:3605), so this
+    * is the selected mode, not the coherency_features bitmap. The j7elte DT
+    * has no system-coherency property, so the value is COHERENCY_NONE (31):
+    * IO-coherent walks are OFF. */
+   caps->io_coherent = caps->coherency_mode != 31;
 
    return 0;
 }

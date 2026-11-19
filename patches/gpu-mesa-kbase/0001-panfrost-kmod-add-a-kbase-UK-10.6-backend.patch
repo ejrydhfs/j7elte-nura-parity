@@ -32,7 +32,7 @@ new file mode 100644
 index 0000000..3058e1b
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/kbase_kmod.c
-@@ -0,0 +1,1599 @@
+@@ -0,0 +1,1601 @@
 +/*
 + * Copyright © 2026 Nura userspace effort
 + * SPDX-License-Identifier: MIT
@@ -523,9 +523,11 @@ index 0000000..3058e1b
 +                               PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
 +                               PAN_KMOD_BO_FLAG_NO_MMAP;
 +   props->supported_vm_op_flags = 0;
-+   /* mali_base_kernel.h: raw coherency_mode is the *selected* mode, 0 = the
-+    * platform did not negotiate IO coherency. */
-+   props->is_io_coherent = p->raw_props.coherency_mode != 0;
++   /* mali_midg_coherency.h: selected mode ACE_LITE=0, ACE=1, NONE=31.
++    * kbase_device_coherency_init() overwrites raw_props.coherency_mode with
++    * kbdev->system_coherency (mali_kbase_core_linux.c:3605). No
++    * system-coherency property in the j7elte DT => COHERENCY_NONE (31). */
++   props->is_io_coherent = p->raw_props.coherency_mode != 31;
 +}
 +
 +/* ------------------------------------------------------------------ */

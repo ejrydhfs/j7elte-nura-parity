@@ -153,33 +153,44 @@ void *memcpy(void *d, const void *s, unsigned long n)
 	return d;
 }
 
-/* ---- kbase UK ABI (r15p0 / UK 10.6) ---- */
-struct uk_header {
+/* ---- kbase UK ABI (r15p0 / UK 10.6) ----
+ *
+ * mali_uk.h defines "union uk_header": id and ret alias each other, and
+ * "sizer" only forces 8-byte alignment of the payload. It is 8 bytes, not
+ * 16; every UK call struct is built on that union and the kernel rejects a
+ * call whose _IOC_SIZE does not equal sizeof(struct) exactly (bad_size).
+ */
+union uk_header {
 	u32 id;
 	u32 ret;
-	u64 sizer;	/* keeps 64-bit alignment, must exist */
+	u64 sizer;
 };
 
 struct uku_version_check_args {
-	struct uk_header header;
+	union uk_header header;
 	u16 major;
 	u16 minor;
 	u8  padding[4];
 };
 
 struct kbase_uk_set_flags {
-	struct uk_header header;
+	union uk_header header;
 	u32 create_flags;
 	u32 padding;
 };
 
 #define KBASE_GET_VERSION_BUFFER_SIZE 64
 struct kbase_uk_get_ddk_version {
-	struct uk_header header;
+	union uk_header header;
 	char version_buffer[KBASE_GET_VERSION_BUFFER_SIZE];
 	u32 version_string_size;
 	u32 padding;
 };
+
+/* Compile-time: the kernel compares _IOC_SIZE(cmd) with sizeof() exactly. */
+typedef char kbase_assert_vc_size[(sizeof(struct uku_version_check_args) == 16) ? 1 : -1];
+typedef char kbase_assert_sf_size[(sizeof(struct kbase_uk_set_flags) == 16) ? 1 : -1];
+typedef char kbase_assert_gv_size[(sizeof(struct kbase_uk_get_ddk_version) == 80) ? 1 : -1];
 
 #define UKP_FUNC_ID_CHECK_VERSION 0
 #define UK_FUNC_ID                512
@@ -258,8 +269,10 @@ void _start(void)
 	put(", ret ");
 	put_dec(r);
 	put("\n");
-	if (r < 0) {
-		put("kbase-probe: handshake ioctl failed\n");
+	if (r < 0 || vc.header.ret != 0) {
+		put("kbase-probe: handshake rejected (header.ret ");
+		put_dec(vc.header.ret);
+		put(")\n");
 		sys_close(fd);
 		sc1(SYS_EXIT, 1);
 	}

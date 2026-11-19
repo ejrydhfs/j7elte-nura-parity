@@ -74,7 +74,7 @@ struct kbw_caps {
    uint32_t thread_max_threads;
    uint32_t thread_max_workgroup_size;
    uint32_t thread_max_barrier_size;
-   uint32_t coherency_mode;
+   uint32_t coherency_mode; /* selected mode: 0 ACE_LITE, 1 ACE, 31 NONE */
    uint32_t num_groups;
    uint32_t num_core_groups;
 
@@ -83,7 +83,7 @@ struct kbw_caps {
    uint32_t core_count;
    uint32_t core_id_range;
    uint32_t max_job_slots;
-   bool io_coherent;
+   bool io_coherent;       /* false when coherency_mode == 31 (NONE) */
 };
 
 /* ------------------------------------------------------------------ */
