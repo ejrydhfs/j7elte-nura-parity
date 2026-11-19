@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Thu, 19 Nov 2026 00:00:00 -0500
+Subject: [PATCH 3/3] drm/exynos7580: document CMA sizing + COHERENCY_NONE
+
+Record the two board facts a GEM author must not re-derive:
+
+- CMA: shipping defconfig has CONFIG_CMA_SIZE_MBYTES=0 (no default
+  CMA area; __dma_alloc_coherent falls through to swiotlb), so real
+  GEM/dumb allocations need the 32 MB raised by the display config
+  fragment (covers 720x1280x4 double scanout ~7.4 MB + GEM slack;
+  revisit 64 MB only on measured CMA pressure at the M2 import
+  path). No DT reserved-memory/linux,cma node exists, so the Kconfig
+  knob is the only sizing control (cma= cmdline can still override).
+
+- Coherency: the SoC is non-coherent as far as the GPU is concerned
+  (mali_kbase_core_linux.c:3577 forces COHERENCY_NONE; mali@0x11400000
+  has no system-coherency property). Consequences already handled by
+  the code a panfrost port must mirror: explicit page-table
+  maintenance (kbase_mmu_sync_pgd), DMA-sync discipline on UMM
+  sharing, WC (not cached) CPU mapping for scanout. AS_MEMATTR
+  kbase-vs-panfrost divergence (0x8D884D4F48 vs 0x888D88) stays a
+  correctness item (R4).
+
+Comment-only; no code change.
+
+---
+diff --git a/drivers/gpu/drm/exynos7580/exynos7580_drm.c b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+--- a/drivers/gpu/drm/exynos7580/exynos7580_drm.c
++++ b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+@@ -537,5 +537,27 @@ static const struct dev_pm_ops exynos7580_pm_ops = {
+ };
+ 
+ /* ---------------------------------------------------------------------- */
++/*
++ * CMA sizing (this board): the shipping defconfig sets
++ * CONFIG_CMA_SIZE_MBYTES=0, i.e. no default CMA area, so GEM/dumb
++ * allocations need the 32 MB from the display config fragment
++ * (covers 720x1280x4 double-buffered scanout plus GEM slack).
++ * There is no DT reserved-memory/linux,cma node: the Kconfig knob
++ * (still overridable via the cma= cmdline) is the only control.
++ * Revisit 64 MB only on measured CMA pressure at the M2 import path.
++ *
++ * Coherency (this SoC): COHERENCY_NONE. kbase forces it at
++ * mali_kbase_core_linux.c:3577 (no system-coherency property on
++ * mali@0x11400000), so a panfrost-class GEM/MMU must use
++ * coherent_walk = false + explicit dma_sync after every page-table
++ * update (cf. kbase_mmu_sync_pgd), and WC (Normal Non-Cached) CPU
++ * mappings for scanout need no cache flush. The AS_MEMATTR
++ * kbase-vs-upstream divergence (0x8D884D4F48 vs 0x888D88) remains
++ * correctness item R4: keep the kbase table on this silicon until a
++ * GPU-read test says otherwise.
++ *
++ * The GPU programs its own MMU (AS_TRANSTAB/MEMATTR/COMMAND); no
++ * sysmmu/exynos-iommu involvement exists on the GPU path.
++ */
+ /* GEM/IOMMU helpers							  */
+ /* ---------------------------------------------------------------------- */
+-- 
+2.56.0
