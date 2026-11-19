@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# boot-guard.initd — install ON THE PHONE as /etc/init.d/boot-guard.
+# Starts after the X session; resets the initramfs fallback boot counter.
+# Fail-open: a failing guard must never break the boot (it reports, init
+# continues). Set MILESTONE=M1|M2|M3 per test campaign.
+name="boot-guard"
+description="Nura GPU-test boot-OK marker (resets CACHE boot counter)"
+command="/usr/local/bin/boot-guard.sh"
+command_args=""
+command_background="yes"
+pidfile="/run/boot-guard.pid"
+output_log="/var/log/boot-guard.log"
+error_log="/var/log/boot-guard.log"
+
+depend() {
+  need local
+  after xsession
+}

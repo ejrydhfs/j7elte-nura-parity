@@ -1,0 +1,86 @@
+Nura GPU-test single-slot fallback: boot counter + cached known-good image.
+
+S-Boot boots only BOOT (mmcblk0p10, 32 MiB); there is no A/B slot and
+RECOVERY (p11, TWRP) must stay untouched. S-Boot also rewrites the kernel
+cmdline, so boot state cannot travel in bootargs. Keep it on CACHE
+(mmcblk0p21, 200 MiB, otherwise unused): a boot-attempt counter plus an
+operator-snapshotted known-good boot.img (see
+code/kernel/recovery/cache-snapshot.sh). After BOOT_FAIL_MAX consecutive
+boots with no userspace OK marker (written by boot-guard,
+code/kernel/recovery/boot-guard.sh), restore p10 from the cache copy and
+reboot. Fail-open: any error (CACHE unmountable/unformatted, no valid
+copy, restore dd fails) still boots the flashed kernel. Manual TWRP
+recovery (code/kernel/recovery/RECOVERY.md section 3) is retained as last
+resort.
+
+Install: the integrator copies this file to
+patches/initramfs/0003-bootcount-fallback.patch (applies AFTER
+0001/0002) and rebuilds the ramdisk. Hunk line numbers are indicative;
+re-cut the context against the actual init_2nd.sh at build time. The
+anchor is: after the 0002 /usr-bind block, before the
+"# Mount boot partition into sysroot" comment.
+
+--- irorig/init_2nd.sh
++++ ir/init_2nd.sh
+@@ -64,7 +77,58 @@
+ 			echo "$LOG_PREFIX /usr bind-mounted from USERDATA"
+ 		fi
+ 	fi
+ fi
+
++# Nura GPU-test fallback: single BOOT slot, so count attempts on CACHE and
++# self-restore a cached known-good image after repeated failures. Fail-open:
++# every error path falls through to booting the flashed kernel.
++# Covers initramfs-reachable failures (kernel boots, display/GPU regressed,
++# userspace never marks OK). A completely unbootable Image never reaches
++# this code; that class stays TWRP-only (see RECOVERY.md).
++if [ -b /dev/mmcblk0p10 ] && [ -b /dev/mmcblk0p21 ]; then
++	mkdir -p /fb-fallback
++	if mount -t ext4 -o rw /dev/mmcblk0p21 /fb-fallback 2>/dev/null; then
++		BOOT_FAIL_MAX=3
++		BOOT_COUNT=$(cat /fb-fallback/boot_count 2>/dev/null)
++		case "$BOOT_COUNT" in ''|*[!0-9]*) BOOT_COUNT=0 ;; esac
++		BOOT_COUNT=$((BOOT_COUNT + 1))
++		[ "$BOOT_COUNT" -gt 999 ] && BOOT_COUNT=999
++		echo "$BOOT_COUNT" > /fb-fallback/boot_count
++		if [ "$BOOT_COUNT" -gt "$BOOT_FAIL_MAX" ]; then
++			BOOT_GOOD=/fb-fallback/known-good-boot.img
++			BOOT_GOOD_OK=0
++			if [ -f "$BOOT_GOOD" ]; then
++				BOOT_GSIZE=$(stat -c%s "$BOOT_GOOD" 2>/dev/null || echo 0)
++				case "$BOOT_GSIZE" in ''|*[!0-9]*) BOOT_GSIZE=0 ;; esac
++				if [ "$BOOT_GSIZE" -gt 0 ] && [ "$BOOT_GSIZE" -le 33554432 ]; then
++					if head -c 8 "$BOOT_GOOD" 2>/dev/null | grep -q 'ANDROID!'; then
++						BOOT_GOOD_OK=1
++					fi
++				fi
++			fi
++			if [ "$BOOT_GOOD_OK" = 1 ]; then
++				echo "$LOG_PREFIX fallback: $BOOT_COUNT failed attempts; restoring BOOT from cache copy"
++				if dd if="$BOOT_GOOD" of=/dev/mmcblk0p10 bs=512 conv=fsync 2>/dev/null; then
++					sync
++					echo 0 > /fb-fallback/boot_count
++					sync
++					umount /fb-fallback 2>/dev/null || true
++					echo "$LOG_PREFIX fallback: restored; rebooting"
++					sync
++					reboot -f 2>/dev/null || true
++					sleep 5
++					echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
++					echo b > /proc/sysrq-trigger 2>/dev/null || true
++					sleep 30
++				else
++					echo "$LOG_PREFIX fallback: restore failed; booting flashed kernel"
++				fi
++			else
++				echo "$LOG_PREFIX fallback: $BOOT_COUNT failed attempts, no valid cache copy; booting anyway"
++			fi
++		fi
++		umount /fb-fallback 2>/dev/null || true
++	else
++		echo "$LOG_PREFIX fallback: CACHE mount failed; unavailable this boot"
++	fi
++fi
++
+ # Mount boot partition into sysroot if needed since some
+ # old installations don't have a proper /etc/fstab file. See #2800
