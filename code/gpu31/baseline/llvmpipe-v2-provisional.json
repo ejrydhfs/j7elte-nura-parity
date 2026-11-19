@@ -1,0 +1,143 @@
+{
+ "egltest": {
+  "binary_dir": "code/gpu31/egltest/",
+  "canonical_line": "egltest: [offscreen] 60 draws in 0.008 s = 7972.4 FPS (256x256)",
+  "caveat": "host-throughput smoke evidence, not a benchmark (tiny surfaces; run-to-run variance large); device re-run will re-freeze these numbers",
+  "exit_contract": "0 = all executed checks passed (onscreen skipped with note when no DISPLAY); 1 = EGL/GL setup or API error; 2 = usage error; 3 = pixel self-check MISMATCH",
+  "llvmpipe_env": "bench host, GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1, renderer 'llvmpipe (LLVM 23.1.4, 256 bits)', Mesa 26.2.6-arch1.1 (device LLVM/Mesa rev will differ: LLVM 23.1.5, 128 bits, Mesa 26.3.0)",
+  "llvmpipe_offscreen": "60 draws in 0.008 s = 7972.4 FPS (256x256); second run 60 draws in 0.009 s = 7022.9 FPS",
+  "llvmpipe_onscreen": "60 frames in 0.025 s = 2401.8 FPS (320x240)",
+  "owner": "G31_EglTest",
+  "pixel_proof": "offscreen corner(2,2) RGBA=26,26,102,255 (~26,26,102), center(128,128) RGBA=255,0,0,255 (~255,0,0), RENDER_OK, exit 0",
+  "provenance": "G31_EglTest commit b39adb4, docs/reports/gpu31-egltest.md section 3 (2026-11-19)",
+  "report": "docs/reports/gpu31-egltest.md",
+  "status": "provisional-bench-host"
+ },
+ "env": {
+  "glmark_duration_s": 2.0,
+  "glmark_geometry": "320x240",
+  "gpu": "Mali-T720 MP2 r1p0 (0x0720)",
+  "kbase": "DDK r15p0 / UK 10.6 (/dev/mali0 present; /dev/dri absent)",
+  "kernel": "3.10.108",
+  "llvm": "23.1.5",
+  "mesa": "26.3.0",
+  "phone": "SM-J700M (j7elte)",
+  "soc": "Exynos 7580",
+  "xorg": "fbdev 720x1280, DRISWRAST (AIGLX: Screen 0 is not DRI2 capable)"
+ },
+ "glmark2_es2": {
+  "heavy_lows_fresh": {
+   "ideas": 1,
+   "refract": 4,
+   "terrain": 2
+  },
+  "nonheavy_range_fresh": [
+   19,
+   367
+  ],
+  "prior_run_note": "The earlier gpu-verify run was timeout-cut (29 of 30 scenes reported, no Score line); its per-scene values are verbatim in gpu-verify.md section 3.3 and canonicalised in code/gpu31/tests/scenes.tbl (31 rows).",
+  "provenance": "G31_MesaTests3 fresh full sweep 2026-11-19 (llvmpipe, 320x240, -b :duration=2.0); full per-scene table lives in the gpu31-mesatests report.",
+  "scene_table": "code/gpu31/tests/scenes.tbl (per-scene floors stay canonical there until a deliberate re-baseline)",
+  "score": 103,
+  "score_line": "glmark2 Score: 103"
+ },
+ "glxgears": {
+  "geometry": "320x240",
+  "note": "X11/GLX reference only. This is NOT the egltest fps: egltest is a separate EGL+GLES2 binary owned by G31_EglTest.",
+  "provenance": "gpu-verify.md section 3.3",
+  "range_fps": [
+   173,
+   221
+  ],
+  "runs_fps": [
+   173.678,
+   220.863,
+   188.528
+  ]
+ },
+ "gpu_idle_signature": {
+  "meaning": "Software render leaves the kbase GPU idle; hardware render must move at least one of utilization / tis_total.",
+  "provenance": "gpu31-tests.md gate G4",
+  "time_in_state": "flat (e.g. 440/534/668 MHz rows all 0 cycles)",
+  "utilization": 0
+ },
+ "hw_acceptance": {
+  "H1_renderer": {
+   "command": "run-harness.sh --expect hardware (G1: first renderer-string hit across glxinfo-B.log, es2_info.log, eglinfo-B.log)",
+   "fail": "class software (llvmpipe/swrast/Softpipe), empty, or unknown",
+   "pass": "renderer class is hardware (Mali/mali/Panfrost/ARM/Exynos/kbase/lima)",
+   "severity": "FAIL gate",
+   "warn": "class hardware-unknown (non-software, unrecognised id): PASS but record the id in the verdict notes"
+  },
+  "H2_score": {
+   "command": "glmark2-es2 -s 320x240 -b :duration=2.0 --results fps; parse the 'glmark2 Score: N' line",
+   "fail": "N < 52 (below 50% of the llvmpipe baseline: the driver path is broken, e.g. sync stalls or readbacks)",
+   "pass": "N >= 103 (llvmpipe parity at 320x240)",
+   "severity": "graded gate",
+   "warn": "52 <= N < 103: run carries a written explanation"
+  },
+  "H3_scenes": {
+   "command": "tools/check-floors.sh scenes.tbl glmark2-es2.log (floor = max(baseline x 0.5, 5 FPS))",
+   "fail": "Broken capture only (<5 FPS lines: re-run, never a score FAIL)",
+   "pass": "Every non-heavy scene at/above floor; every heavy scene above its must-exceed value",
+   "severity": "WARN-only (never FAILs on slowness)",
+   "warn": "Below-floor scene, or heavy scene stuck at ideas<=1 / jellyfish<=1 / terrain<=2 / refract<=4: run carries a written explanation"
+  },
+  "H4_surface_2d": {
+   "command": "xwd -root -silent + tools/parse-xwd.py (G3; --geometry 720x1280 --min-distinct 100 on target)",
+   "fail": "Unparseable dump, geometry mismatch, or distinct < 100 (blank/degenerate capture)",
+   "pass": "Parseable dump, geometry 720x1280, distinct >= 100 (llvmpipe proof had 2065)",
+   "severity": "FAIL gate"
+  },
+  "H5_gpu_activity": {
+   "command": "tools/get-gpu-state.sh before vs after the GL load (G4)",
+   "fail": "Sysfs present but unreadable (tooling fault, not a value fault)",
+   "pass": "utilization > 0 or tis_total growth across the load",
+   "severity": "WARN gate",
+   "warn": "Flat-0 (utilization=0, tis unchanged) under a hardware renderer: run carries a written explanation"
+  },
+  "H6_egltest": {
+   "command": "egltest binary default run (offscreen 256x256 + onscreen when DISPLAY set); canonical line is the [offscreen] 60-draws FPS line",
+   "fail": "Nonzero exit (exit 1 self-check failure; exit 3 usage/setup): correctness gate from day one",
+   "pass": "Exit 0 on hardware GL",
+   "severity": "correctness FAIL gate; fps gate deferred",
+   "warn": "provisional (bench-host, not device): record both offscreen and onscreen fps lines; gate on correctness (exit 0) and pixel readbacks; fps comparison activates at device re-freeze"
+  },
+  "overall": "HW PASS requires H1 + H4 PASS, H2 not-FAIL, H6 exit 0, and every H2/H3/H5 WARN paired with a written explanation in the verdict notes.",
+  "version": "thresholds-v1"
+ },
+ "id": "llvmpipe-v2-provisional",
+ "renderer": {
+  "class": "software",
+  "egl": "EGL 1.5, vendor Mesa Project; ES profile renderer llvmpipe (LLVM 23.1.5, 128 bits); GBM/Wayland/X11 platforms eglInitialize failed (no /dev/dri; no X in that shell)",
+  "es2_renderer": "llvmpipe (LLVM 23.1.5, 128 bits)",
+  "es2_vendor": "Mesa",
+  "es_version": "OpenGL ES 3.2 Mesa 26.3.0",
+  "gl_core": "4.6 (Core Profile) Mesa 26.3.0",
+  "glxinfo_accelerated": "no",
+  "glxinfo_device": "llvmpipe (LLVM 23.1.5, 128 bits)"
+ },
+ "schema": "gpu31-baseline/1",
+ "status": "provisional",
+ "supersedes": "llvmpipe-v1 (adds bench-host llvmpipe egltest lines; device re-freeze still pending)",
+ "surface_2d": {
+  "fb0_bpp": 32,
+  "fb0_read_note": "A raw read() on /dev/fb0 returns 0 bytes on this DECON fb, so the XWD of the root window is the surface evidence.",
+  "provenance": "gpu-verify.md section 3.1",
+  "xdpyinfo": "720x1280 pixels, depth of root window 24 planes",
+  "xwd": {
+   "bytes_per_line": 2880,
+   "bytes_per_pixel": 4,
+   "depth": 24,
+   "distinct": 2065,
+   "format": 2,
+   "header_size": 107,
+   "height": 1280,
+   "sample_stride": 4,
+   "sampled": 172800,
+   "top1": "0x00000000 x 29714",
+   "version": 7,
+   "width": 720
+  }
+ }
+}
