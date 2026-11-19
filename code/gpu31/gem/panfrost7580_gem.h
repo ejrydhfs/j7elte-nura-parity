@@ -1,0 +1,168 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
+ * (Exynos 7580 / Nura 3.10.108, j7elte).
+ *
+ * v5.2 reference: drivers/gpu/drm/panfrost/panfrost_gem.{c,h} (96/30 LOC)
+ * against drm_gem_shmem_helper. This tree has NO shmem helper
+ * (gpu31-target.md D5: reuse the present 272-line drm_gem_cma_helper),
+ * so the port below is a clean-room CMA implementation with a private
+ * page-array shmem path. DrmCore's drm_compat_310.h only wires fops;
+ * it does NOT own BO structs or ioctl bodies (agreed split).
+ *
+ * BO model (mirrors v5.2 panfrost_gem_object layout adapted to 3.10):
+ *  - embedded struct drm_gem_object (handle + mmap-offset machinery);
+ *  - backing selector: CMA (dma_alloc_attrs, contiguous, scanout-safe)
+ *    or SHMEM (shmem file + per-page array, import/vmap friendly).
+ *    The selector is P7580_BO_* (private, never on the UAPI wire;
+ *    v5.2 UAPI has no BO flags and CREATE_BO.flags must stay zero).
+ *  - embedded struct dma_resv (0002 shim type; see p7580_bo.resv):
+ *    SUBMIT reserves it, WAIT_BO polls it; BO free path releases it.
+ *    The field is transparent here because the integrator applies the
+ *    0001/0002 backport series BEFORE this driver (series/0002), so
+ *    <linux/dma-resv.h> exists at driver build time. The KINC check in
+ *    the Makefile stages exactly those headers and fails loudly if
+ *    the layout ever drifts.
+ *  - IOVA node: per-BO struct drm_mm_node linked into the per-device
+ *    drm_mm (P7580_IOVA_START/SIZE window); GET_BO_OFFSET and the MMU
+ *    slice read bo->iova (nonzero guaranteed: v5.2 CREATE_BO UAPI
+ *    requires a nonzero offset and the T720 treats IOVA 0 as
+ *    unmapped). Carrying the node (not a bare start/size pair) lets
+ *    free return the range via drm_mm_remove_node; the mutex in
+ *    struct p7580_dev owns the allocator (3.10 drm_mm has no
+ *    per-mm lock of its own).
+ *
+ * Lifetime: CMA path uses drm_gem_object_init + dma_alloc_attrs
+ * (WRITE_COMBINE via dma_attrs, same as the display CMA delta);
+ * SHMEM path uses drm_gem_private_object_init + its own shmem file
+ * (same shmem_file_setup("drm mm object") pattern drm_gem_object_init
+ * uses) + shmem_read_mapping_page per page. PRIME import holds one
+ * dma_buf_get() ref (released in free). vmap pins with the core's own
+ * fault-grab reference (see vunmap): while any vmap is live the GEM
+ * refcount is held, so free cannot race the mapping (review F2 on the
+ * display PRIME patch); the vaddr counting lives in the core, sized by
+ * P7580_VMAP_MAX. No import-by-copy anywhere (review F1).
+ */
+#ifndef PANFROST7580_GEM_H
+#define PANFROST7580_GEM_H
+
+/* F-GEM1 (gpu31-driver-review): the BO embeds the real struct dma_resv
+ * from the 0002 backport header instead of an opaque pad + layout
+ * BUILD_BUG_ONs. The 0001/0002 series is a build prerequisite of this
+ * driver (series/0001-0002 applied first; Makefile KINC stages them),
+ * so the field tracks shim growth automatically. */
+#include <linux/dma-resv.h>
+#include <linux/types.h>
+#include <linux/mutex.h>
+#include <linux/scatterlist.h>
+
+struct device;
+
+#define P7580_BO_CMA		0u
+#define P7580_BO_SHMEM		1u
+
+/* IOVA window: 32 MiB .. 4 GiB, T720 legacy 32-bit window
+ * (panfrost v5.2: PFN 0x8000..0x100000, see panfrost_mmu_map_io_region;
+ *  T720 VA bits unread until M0 runs on silicon, gpu-panfrost.md R3). */
+#define P7580_IOVA_START	(32u << 20)
+#define P7580_IOVA_SIZE		((4ull << 30) - P7580_IOVA_START)
+
+/* CPU-cache attribute for the fault handler (matches exynos update flags). */
+#define P7580_GEM_WC		(1u << 0)
+#define P7580_GEM_CACHABLE	(1u << 1)
+
+/* Max concurrent vmaps per BO. The core pins each vmap with one GEM
+ * reference; the count lets vunmap know when the last mapping went
+ * away. 8 is plenty (importer + CPU writer + fault path + scanout). */
+#define P7580_VMAP_MAX		8u
+
+struct p7580_bo {
+	struct drm_gem_object base;
+	/* 0002 reservation object: SUBMIT locks it, WAIT_BO waits on
+	 * it, prime import shares it with the exporter. Real type
+	 * (linux/dma-resv.h) at build time; see file header. */
+	struct dma_resv resv;
+	/* IOVA allocation state: node linked into the per-device
+	 * drm_mm while valid (iova_valid), start cached for the
+	 * GET_BO_OFFSET fast path. */
+	struct drm_mm_node iova_node;
+	unsigned long iova;
+	int iova_valid;
+	unsigned int backing;
+	unsigned int cache_attr;
+	/* CMA backing. sg table is built on demand by
+	 * p7580_gem_prime_get_sg_table (never cached here). */
+	void *cma_vaddr;
+	dma_addr_t cma_paddr;
+	/* SHMEM backing. */
+	struct file *shmem_filp;
+	struct page **pages;
+	unsigned int nr_pages;
+	/* PRIME import state: set only on the importer. sgt is the live
+	 * exporter attachment mapping (unmapped + detached in free via
+	 * drm_prime_gem_destroy); the dma_buf ref is the get_dma_buf()
+	 * taken at import. Non-imported BOs leave both NULL. */
+	struct sg_table *sgt;
+	struct dma_buf *imported_dmabuf;
+	/* vmap pin: GEM references held while CPU mappings are live;
+	 * count mirrors them (p7580_gem_prime_vmap/vunmap). */
+	void *vaddrs[P7580_VMAP_MAX];
+	unsigned int vmap_count;
+};
+
+/* Per-device GEM state: IOVA allocator + the lock that serialises it
+ * (the driver allocates this in probe and stores it in dev_private;
+ * the GEM helpers below take it by pointer so they stay testable). */
+struct p7580_dev {
+	struct device *dev;
+	struct drm_mm iova_mm;
+	struct mutex iova_lock;
+};
+
+struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj);
+
+int p7580_dev_init(struct p7580_dev *gd, struct device *dev);
+void p7580_dev_fini(struct p7580_dev *gd);
+
+int p7580_gem_create(struct p7580_dev *gd, struct drm_device *dev,
+		     size_t size, unsigned int backing,
+		     unsigned int cache_attr, struct drm_gem_object **out);
+int p7580_gem_create_with_handle(struct p7580_dev *gd,
+				 struct drm_file *file_priv,
+				 struct drm_device *dev, size_t size,
+				 unsigned int backing,
+				 unsigned int cache_attr,
+				 uint32_t *handle);
+void p7580_gem_free_object(struct drm_gem_object *obj);
+int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma);
+long p7580_gem_wait(struct drm_device *dev, struct drm_file *file_priv,
+		    uint32_t handle, long timeout_jiffies, int wait_all);
+
+/* GPU page-table mapping hook (for DriverAssemble / jobs SUBMIT).
+ * GEM allocates an IOVA per BO at create/import but never programs the
+ * Mali page tables itself. The owning driver maps BOs into the
+ * per-context tables with these helpers, then lets jobs SUBMIT pin each
+ * referenced BO (dma_resv lock discipline per the 0002 plain-mutex)
+ * before p7580_job_hw_submit reads the job descriptor. Unmap runs
+ * before free (DriverAssemble teardown walk, F-MMU5).
+ *  - map: for each page 0..npages-1, p7580_mmu_map(mmu,
+ *    bo->iova + idx*PAGE_SIZE, phys, P7580_PROT_RD|WR, memattr), where
+ *    phys comes from p7580_bo_page_phys; then p7580_mmu_invalidate(regs,
+ *    as_nr, iova>>12, npages, sync=0) and p7580_mmu_program_as once
+ *    per context (iommu/panfrost7580_mmu.h, lock/encode in
+ *    mmu/pf7580_as.h). Unmap/invalidate per page before free. */
+unsigned int p7580_bo_npages(struct drm_gem_object *obj);
+phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
+			       unsigned int idx, int *ok);
+struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
+struct drm_gem_object *p7580_gem_prime_import_sg_table(
+		struct drm_device *dev, size_t size, struct sg_table *sgt);
+void *p7580_gem_prime_vmap(struct drm_gem_object *obj);
+void p7580_gem_prime_vunmap(struct drm_gem_object *obj, void *vaddr);
+struct dma_buf *p7580_gem_prime_export(struct drm_device *dev,
+				       struct drm_gem_object *obj, int flags);
+struct drm_gem_object *p7580_gem_prime_import(struct drm_device *dev,
+					      struct dma_buf *dma_buf);
+
+#endif /* PANFROST7580_GEM_H */
