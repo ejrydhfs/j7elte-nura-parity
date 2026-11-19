@@ -100,6 +100,7 @@ Against the pristine tree (`-nostdinc`, `arch/arm64/include` +
   regulator, devres, PM runtime, shmem, devfreq/OPP, MMU) or a staged
   0001–0004 shim export (fence/resv/syncobj/sched).
 - Post-fold re-check (int4 layout: `-I drivers/gpu/drm` + `-I drivers/gpu/drm/panfrost`, quoted shim includes): 8/8 `-c` **PASS**, `ld -r` **PASS**.
+- int4 third find (job.c header comment): the Fences paragraph ran into `#include <linux/io.h>` with no ` */` (G31_Jobs 06f55df fixed canonically; driver 0001 re-snapshotted from live, canonical angle shim includes restored). Post-fix re-check: apply clean, 8/8 `-fsyntax-only` + `-c` **PASS** (zero errors incl. no implicit `msleep`), `ld -r` **PASS**.
 
 NOT verified here (integrator / M1Verify own): full `Image` build,
 boot, `/dev/dri/renderD128` on device, Mesa triangle. No reboot/flash

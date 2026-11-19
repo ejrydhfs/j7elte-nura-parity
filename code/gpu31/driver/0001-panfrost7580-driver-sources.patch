@@ -25,8 +25,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +
 +#include <linux/mutex.h>
 +#include <linux/list.h>
-+#include "drm_syncobj.h"		/* 0003 */
-+#include "drm_sched.h"			/* 0004 */
++#include <drm_syncobj.h>		/* 0003 */
++#include <drm_sched.h>			/* 0004 */
 +#include "panfrost7580_gem.h"
 +#include "panfrost7580_job.h"
 +#include "panfrost7580_mmu.h"
@@ -1720,8 +1720,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#endif /* PANFROST7580_JM_HW_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-19 10:48:44.316998791 -0500
-@@ -0,0 +1,682 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-19 11:15:00.000000000 -0500
+@@ -0,0 +1,683 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -1761,6 +1761,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 + * same fence handed to the sched/out-sync paths; only done_fence is
 + * ever signaled or put. Fault recovery signals done_fence exactly
 + * once so waiters never hang (see p7580_job_recover).
++ */
 +#include <linux/io.h>
 +#include <linux/interrupt.h>
 +#include <linux/spinlock.h>
@@ -1776,8 +1777,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 + * The -I$(STAGE)/drivers/gpu/drm form below matches the staged dir. */
 +#include <linux/dma-fence.h>		/* 0001 */
 +#include <linux/dma-resv.h>		/* 0002 */
-+#include "drm_syncobj.h"		/* 0003 */
-+#include "drm_sched.h"			/* 0004 */
++#include <drm_syncobj.h>		/* 0003 */
++#include <drm_sched.h>			/* 0004 */
 +
 +#include "panfrost7580_job.h"
 +
@@ -2594,8 +2595,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +
 +#include <linux/dma-fence.h>		/* 0001 */
 +#include <linux/dma-resv.h>		/* 0002 */
-+#include "drm_syncobj.h"		/* 0003 */
-+#include "drm_sched.h"			/* 0004 */
++#include <drm_syncobj.h>		/* 0003 */
++#include <drm_sched.h>			/* 0004 */
 +
 +#include "panfrost_drm.h"
 +#include "panfrost7580_gem.h"
@@ -4414,8 +4415,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +#include <linux/dma-fence.h>		/* 0001 */
 +#include <linux/dma-resv.h>		/* 0002 */
-+#include "drm_syncobj.h"		/* 0003 */
-+#include "drm_sched.h"			/* 0004 */
++#include <drm_syncobj.h>		/* 0003 */
++#include <drm_sched.h>			/* 0004 */
 +
 +#include "panfrost_drm.h"
 +#include "panfrost7580_gem.h"
