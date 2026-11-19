@@ -1,0 +1,138 @@
+From 8cb8da8b3f0b31c0d437445ce06c73b23b968d3 Mon Sep 17 00:00:00 2001
+From: omp <omp@postmarketos>
+Date: Tue, 18 Nov 2026 00:00:00 +0000
+Subject: [UNCHECKED] drm/exynos7580: wire GEM PRIME export for kbase UMM import
+
+The new exynos7580 display driver creates CMA GEM objects but exposes no
+PRIME export path (no DRIVER_PRIME, no prime_handle_to_fd/fd_to_handle,
+no gem_prime_{export,import}).  The shipping Mali kbase driver imports
+shared buffers via BASE_MEM_IMPORT_TYPE_UMM as dma-bufs
+(dma_buf_get + dma_buf_attach in
+drivers/gpu/arm/t7xx/r15p0/mali_kbase_mem_linux.c:947,951), so without
+this wiring there is no in-kernel path for a kbase context to import a
+display GEM buffer (M2 render-node / zero-copy scanout fallback).
+
+Follow the legacy exynos pattern
+(drivers/gpu/drm/exynos/exynos_drm_drv.c:264,280-283): set DRIVER_PRIME,
+wire prime_handle_to_fd/fd_to_handle to the generic
+drivers/gpu/drm/drm_prime.c helpers (exported at drm_prime.c:195,252,
+307,362), and add the two thin low-level callbacks the generic
+drm_gem_prime_export/import needs:
+
+- gem_prime_get_sg_table: single-entry table via sg_alloc_table(1) +
+  sg_set_buf(cma_obj->vaddr, size) -- the same construction the display
+  driver's own IOVA path uses (sg_alloc_table + sg_set_buf before
+  iovmm_map).  The generic drm_gem_map_dma_buf (drm_prime.c:67-82) then
+  dma_map_sg()s it for the importer.
+- gem_prime_import_sg_table: fresh drm_gem_cma_create() of the same size
+  (import-by-copy; the sg table only sizes the allocation).
+- gem_prime_vmap/vunmap: return/borrow cma_obj->vaddr (no refcount play;
+  matches the CMA lifetime owned by the GEM object).
+
+Display + fbdev work without this patch; it is only needed for
+DRM<->kbase buffer sharing.
+
+STATUS: UNCHECKED -- written by inspection against the 0001 patch text and
+the 3.10 drm_prime.c / drmP.h API.  NOT applied, NOT compiled, NOT booted.
+Integrator: `git apply --check` this file, build, and smoke-test PRIME
+export (/dev/dri/card0 + kbase UMM import) before keeping it.
+
+---
+ drivers/gpu/drm/exynos7580/exynos7580_drm.c | 67 ++++++++++++++++++++++++---
+ 1 file changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/exynos7580/exynos7580_drm.c b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+--- a/drivers/gpu/drm/exynos7580/exynos7580_drm.c
++++ b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+@@ -649,7 +649,64 @@ static bool exynos7580_mode_is_panel(struct exynos7580_drm *drv,
+ 	return mode->hdisplay == drv->lcd.xres &&
+ 	       mode->vdisplay == drv->lcd.yres;
+ }
+ 
++/* ---------------------------------------------------------------------- */
++/* GEM PRIME export (for kbase BASE_MEM_IMPORT_TYPE_UMM dma-buf import)   */
++/* ---------------------------------------------------------------------- */
++/*
++ * The CMA helper in this tree (drivers/gpu/drm/drm_gem_cma_helper.c)
++ * exposes only dumb create/map/destroy; there is no
++ * drm_gem_cma_prime_get_sg_table yet (appears upstream later).  Provide
++ * the two thin callbacks the 3.10 generic PRIME core
++ * (drivers/gpu/drm/drm_prime.c:drm_gem_map_dma_buf) needs.  Pages stay
++ * CMA-owned; the importer (kbase UMM: dma_buf_get + dma_buf_attach)
++ * resolves them into the GPU's own MMU via kbase_mmu_insert_pages(),
++ * never through the display sysmmu.
++ */
++static struct sg_table *exynos7580_gem_prime_get_sg_table(
++		struct drm_gem_object *obj)
++{
++	struct drm_gem_cma_object *cma_obj = to_drm_gem_cma_obj(obj);
++	struct sg_table *sgt;
++	int ret;
++
++	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
++	if (!sgt)
++		return ERR_PTR(-ENOMEM);
++
++	/* One contiguous CMA extent: same construction as the driver's own
++	 * exynos7580_iova_get() (sg_alloc_table + sg_set_buf + iovmm_map). */
++	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
++	if (ret) {
++		kfree(sgt);
++		return ERR_PTR(ret);
++	}
++	sg_set_buf(sgt->sgl, cma_obj->vaddr, obj->size);
++	return sgt;
++}
++
++static struct drm_gem_object *exynos7580_gem_prime_import_sg_table(
++		struct drm_device *dev, size_t size, struct sg_table *sgt)
++{
++	/* Fresh CMA backing; the sg table only sizes the allocation. */
++	struct drm_gem_cma_object *cma_obj = drm_gem_cma_create(dev, size);
++
++	if (IS_ERR(cma_obj))
++		return ERR_CAST(cma_obj);
++	return &cma_obj->base;
++}
++
++static void *exynos7580_gem_prime_vmap(struct drm_gem_object *obj)
++{
++	return to_drm_gem_cma_obj(obj)->vaddr;
++}
++
++static void exynos7580_gem_prime_vunmap(struct drm_gem_object *obj,
++					void *vaddr)
++{
++	/* vaddr is borrowed from the CMA object; nothing to do. */
++}
++
+ static void exynos7580_crtc_dpms(struct drm_crtc *crtc, int mode)
+ {
+ 	struct exynos7580_drm *drv = crtc_to_drv(crtc);
+diff --git a/drivers/gpu/drm/exynos7580/exynos7580_drm.c b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+--- a/drivers/gpu/drm/exynos7580/exynos7580_drm.c
++++ b/drivers/gpu/drm/exynos7580/exynos7580_drm.c
+@@ -1070,12 +1070,20 @@ static struct drm_driver exynos7580_drm_driver = {
+-	.driver_features	= DRIVER_MODESET | DRIVER_GEM,
++	.driver_features	= DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME,
+ 	.load			= exynos7580_load,
+ 	.unload			= exynos7580_unload,
+ 	.get_vblank_counter	= exynos7580_get_vblank_counter,
+ 	.enable_vblank		= exynos7580_enable_vblank,
+ 	.disable_vblank		= exynos7580_disable_vblank,
+ 	.gem_free_object	= exynos7580_gem_free_object,
+ 	.gem_vm_ops		= &drm_gem_cma_vm_ops,
++	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
++	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
++	.gem_prime_export	= drm_gem_prime_export,
++	.gem_prime_import	= drm_gem_prime_import,
++	.gem_prime_get_sg_table	= exynos7580_gem_prime_get_sg_table,
++	.gem_prime_import_sg_table = exynos7580_gem_prime_import_sg_table,
++	.gem_prime_vmap		= exynos7580_gem_prime_vmap,
++	.gem_prime_vunmap	= exynos7580_gem_prime_vunmap,
+ 	.dumb_create		= drm_gem_cma_dumb_create,
+ 	.dumb_map_offset	= drm_gem_cma_dumb_map_offset,
+ 	.dumb_destroy		= drm_gem_cma_dumb_destroy,
+ 	.fops			= &exynos7580_drm_fops,
+--
+2.43.0
