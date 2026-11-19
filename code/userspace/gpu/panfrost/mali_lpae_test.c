@@ -518,16 +518,27 @@ static void test_as_values(void)
 
 /* ------------------------------------------------------------------ */
 /* 12. Fault decode: class / access / decoder / source / IRQ pairing   */
+/*     Single decoder (F-MMU4): byte-identical with p7580_mmu_fault_   */
+/*     code/atype (iommu), pf7580_fault_exc/access (mmu/pf7580_as.h)   */
+/*     and pf7580_fault_mmu/lpae_* (fault/pf7580_fault.h) after the    */
+/*     short-code (bits 5:3) naming is retired — it mislabelled        */
+/*     silicon faults. ATOMIC names UNKNOWN on this LPAE build.        */
 /* ------------------------------------------------------------------ */
 static void test_fault_decode(void)
 {
 	/* Exception classes (low byte of AS_FAULTSTATUS). */
 	CHECK_EQ(mali_fault_exc_name(0xC0u)[0], 'T');	/* translation */
 	CHECK_EQ(mali_fault_exc_name(0xC4u)[0], 'T');	/* level 4 too */
+	CHECK_EQ(mali_fault_exc_name(0xC7u)[0], 'T');	/* top of range */
 	CHECK_EQ(mali_fault_exc_name(0xC8u)[0], 'P');	/* permission */
+	CHECK_EQ(mali_fault_exc_name(0xD0u)[0], 'T');	/* transtab bus */
 	CHECK_EQ(mali_fault_exc_name(0xD2u)[0], 'T');	/* transtab bus */
+	CHECK_EQ(mali_fault_exc_name(0xD7u)[0], 'T');	/* top of range */
 	CHECK_EQ(mali_fault_exc_name(0xD8u)[0], 'A');	/* access flag */
 	CHECK_EQ(mali_fault_exc_name(0x00u)[0], 'U');	/* unknown */
+	CHECK_EQ(mali_fault_exc_name(0xC9u)[0], 'U');	/* gap: unknown */
+	CHECK_EQ(mali_fault_exc_name(0xCFu)[0], 'U');	/* gap: unknown */
+	CHECK_EQ(mali_fault_exc_name(0xD9u)[0], 'U');	/* gap: unknown */
 
 	/* Access types (bits 9:8). */
 	CHECK_EQ(mali_fault_access_name(0x200u)[0], 'R');	/* read */
@@ -557,9 +568,112 @@ static void test_fault_decode(void)
 	CHECK(mali_irq_is_bus_error(0x00040000u, 2));
 	CHECK(!mali_irq_is_page_fault(0x00000000u, 0));
 
-	/* Old masks are the low-3-bit subset of the full exception byte. */
+	/* Single decoder: the full low byte is the class (the retired
+	 * short-code view masked only bits 5:3 and named ADDRESS_SIZE /
+	 * MEMORY_ATTRIBUTES classes that do not exist on this block). */
 	CHECK_EQ(MALI_AS_FAULTSTATUS_EXC_MASK, 0xFFu);
 	CHECK_EQ(MALI_AS_FAULTSTATUS_EXC_CODE_MASK, (0x7u << 3));
+}
+
+/* ------------------------------------------------------------------ */
+/* 13. F-MMU1: LOCK width grows with the invalidated range (the review */
+/*     blocker: a raw page address locked the minimum width, leaving   */
+/*     stale TLB entries for any multi-page map).                       */
+/* ------------------------------------------------------------------ */
+static void test_lock_width(void)
+{
+	uint64_t one = mali_lock_region(0x100000ULL, 0x1000ULL);
+	uint64_t multi = mali_lock_region(0x100000ULL, 0x4000ULL);
+	uint64_t big = mali_lock_region(0x100000ULL, 0x100000ULL);
+	uint64_t full = mali_lock_region(0ULL, ~0ULL);
+
+	/* Base stays the mapping address; width covers the whole range. */
+	CHECK_EQ(one & ~0x3FULL, 0x100000ULL);
+	CHECK_EQ(multi & ~0x3FULL, 0x100000ULL);
+	/* Wider ranges encode wider locks (monotone). */
+	CHECK((one & 0x3FULL) <= (multi & 0x3FULL));
+	CHECK((multi & 0x3FULL) <= (big & 0x3FULL));
+	/* 4 pages (16 KiB): pow2, exact, width 10 + fls(4) = 13. */
+	CHECK_EQ(multi & 0x3FULL, 13);
+	/* 256 pages (1 MiB): width 10 + fls(256) = 19. */
+	CHECK_EQ(big & 0x3FULL, 19);
+	/* nr = 0 must not encode width 0 / raw address (old F-MMU1 bug). */
+	CHECK((mali_lock_region(0x100000ULL, 0ULL) & 0x3FULL) >= 11);
+	/* Full-TLB shape saturates at the 63 ceiling. */
+	CHECK_EQ(full & 0x3FULL, MALI_LOCK_REGION_MAX_SIZE);
+	CHECK_EQ(MALI_LOCK_REGION_MIN_SIZE, 11);
+	CHECK_EQ(MALI_LOCK_REGION_MAX_SIZE, 63);
+}
+
+/* ------------------------------------------------------------------ */
+/* 14. F-MMU2/3: barrier ordering + bounded poll contract. The kernel  */
+/*     twin (p7580_mmu_invalidate) must wmb() LOCKADDR before LOCK and */
+/*     step the AS_ACTIVE poll (10 us); the register values asserted   */
+/*     here are what that sequence programs.                           */
+/* ------------------------------------------------------------------ */
+static void test_barrier_poll_contract(void)
+{
+	/* wmb before LOCK: LOCKADDR is programmed from the width-encoded
+	 * region, never the raw page address — both halves carry it. */
+	uint64_t region = mali_lock_region(0x200000ULL, 0x8000ULL);
+	uint32_t lo = (uint32_t)(region & 0xFFFFFFFFULL);
+	uint32_t hi = (uint32_t)(region >> 32);
+
+	CHECK_EQ(lo & ~0x3Fu, 0x200000u);
+	CHECK_EQ(lo & 0x3Fu, 14);	/* 8 pages: 10 + fls(8) = 14 */
+	CHECK_EQ(hi, 0u);
+	/* Poll contract: stepped 10 us x 100k (twin of pf7580_as_wait_
+	 * ready), ~1 s ceiling — never a tight readl loop. */
+	CHECK_EQ(MALI_AS_INACTIVE_MAX_LOOPS, 100000);
+	CHECK_EQ(MALI_AS_POLL_STEP_US, 10);
+	/* Command codes the sequence issues, in order LOCK/FLUSH/UNLOCK. */
+	CHECK_EQ(MALI_AS_COMMAND_LOCK, 0x02);
+	CHECK_EQ(MALI_AS_COMMAND_FLUSH_PT, 0x04);
+	CHECK_EQ(MALI_AS_COMMAND_FLUSH_MEM, 0x05);
+	CHECK_EQ(MALI_AS_COMMAND_UPDATE, 0x01);
+}
+
+/* ------------------------------------------------------------------ */
+/* 15. F-MMU5: teardown empties the whole context (recursive walk).    */
+/*     Map N pages across separate L2 sub-trees, unmap+free_empty must  */
+/*     return every table; a second teardown-shaped pass finds none.   */
+/* ------------------------------------------------------------------ */
+static void test_teardown(void)
+{
+	struct mali_pgtable pt;
+	uint64_t pa = 0;
+	int i;
+
+	fixture_init(&pt, 32);
+
+	/* Three pages in three different 2 MiB L2 sub-trees. The two low
+	 * pages share L0[0]/L1[0]/L2[0] paths differently: count tables
+	 * from the builder, not from a hand estimate. */
+	CHECK_EQ(mali_pgtable_map(&pt, 0x000000ULL, 0x90000000ULL,
+				  MALI_ATTR_GPU_RW), MALI_OK);
+	CHECK_EQ(mali_pgtable_map(&pt, 0x200000ULL, 0x90001000ULL,
+				  MALI_ATTR_GPU_RW), MALI_OK);
+	CHECK_EQ(mali_pgtable_map(&pt, 0x400000ULL, 0x90002000ULL,
+				  MALI_ATTR_GPU_RW), MALI_OK);
+	CHECK(heap.used > 0);
+
+	/* Kernel twin: p7580_mmu_teardown() walks levels 0..2 and frees
+	 * every child table, clearing leaves only (BO pages stay GEM's).
+	 * The host builder's free_empty=1 is the same shape bottom-up. */
+	for (i = 0; i < 3; i++) {
+		uint64_t iova = (uint64_t)i * 0x200000ULL;
+
+		CHECK_EQ(mali_pgtable_walk(&pt, iova, &pa, NULL), MALI_OK);
+		CHECK_EQ(mali_pgtable_unmap(&pt, iova, 1), MALI_OK);
+		CHECK_EQ(mali_pgtable_walk(&pt, iova, &pa, NULL),
+			 MALI_ENOENT);
+	}
+	CHECK_EQ(heap.used, 0);
+	CHECK_EQ(heap.frees, heap.allocs);
+
+	/* Teardown of an empty context frees nothing and fails nothing. */
+	CHECK_EQ(mali_pgtable_unmap(&pt, 0x600000ULL, 1), MALI_ENOENT);
+	CHECK_EQ(heap.used, 0);
 }
 
 
@@ -581,6 +695,9 @@ int main(void)
 	test_lock_region();
 	test_as_values();
 	test_fault_decode();
+	test_lock_width();
+	test_barrier_poll_contract();
+	test_teardown();
 
 	printf("-------------------------------------------\n");
 	printf("%d checks, %d failure(s)\n", checks, failures);

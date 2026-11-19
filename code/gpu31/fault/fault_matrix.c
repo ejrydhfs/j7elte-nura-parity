@@ -330,7 +330,10 @@ static void f10_perm_fault(void)
 }
 
 /* F11: full fault-decode table: every JS_STATUS name, fault-vs-benign
- * split, and LPAE byte/access decode for the 4 LPAE classes. */
+ * split, and the single LPAE MMU decoder (F-MMU4) across all four
+ * views — mmu_code/atype and lpae_exc/access agree byte-for-byte, and
+ * the retired short-code classes (ADDRESS_SIZE/MEMORY_ATTRIBUTES) now
+ * decode UNKNOWN. */
 static void f11_decode_table(void)
 {
 	CASE("F11", "fault decode table (JS + MMU + LPAE)");
@@ -365,21 +368,22 @@ static void f11_decode_table(void)
 	CHECK(!p7580_js_status_is_fault(0x02));
 	CHECK(!p7580_js_status_is_fault(0x03));
 	CHECK(!p7580_js_status_is_fault(0x04));
-	CHECK(!strcmp(pf7580_fault_mmu_code(MGPU_MMUS_TRANS_READ),
+	CHECK(!strcmp(pf7580_fault_mmu_code(MGPU_MMUS_LPAE_TRANS),
 		      "TRANSLATION_FAULT"));
-	CHECK(!strcmp(pf7580_fault_mmu_code(MGPU_MMUS_PERM_WRITE),
+	CHECK(!strcmp(pf7580_fault_mmu_code(MGPU_MMUS_LPAE_PERM),
 		      "PERMISSION_FAULT"));
-	CHECK(!strcmp(pf7580_fault_mmu_code(MGPU_MMUS_BUS_READ),
+	CHECK(!strcmp(pf7580_fault_mmu_code(MGPU_MMUS_LPAE_BUS),
 		      "TRANSTAB_BUS_FAULT"));
-	CHECK(!strcmp(pf7580_fault_mmu_code((0x3u << 3)), "ACCESS_FLAG"));
-	CHECK(!strcmp(pf7580_fault_mmu_code((0x4u << 3)),
-		      "ADDRESS_SIZE_FAULT"));
-	CHECK(!strcmp(pf7580_fault_mmu_code((0x5u << 3)),
-		      "MEMORY_ATTRIBUTES_FAULT"));
+	CHECK(!strcmp(pf7580_fault_mmu_code(MGPU_MMUS_LPAE_ACCESS),
+		      "ACCESS_FLAG"));
+	/* Retired short-code classes are UNKNOWN under the single decoder. */
+	CHECK(!strcmp(pf7580_fault_mmu_code((0x4u << 3)), "UNKNOWN"));
+	CHECK(!strcmp(pf7580_fault_mmu_code((0x5u << 3)), "UNKNOWN"));
 	CHECK(!strcmp(pf7580_fault_mmu_atype(MGPU_MMUS_TRANS_READ),
 		      "READ"));
 	CHECK(!strcmp(pf7580_fault_mmu_atype(MGPU_MMUS_PERM_WRITE),
 		      "WRITE"));
+	CHECK(!strcmp(pf7580_fault_mmu_atype(0x000u), "UNKNOWN"));
 	CHECK(!strcmp(pf7580_fault_lpae_exc(MGPU_MMUS_LPAE_TRANS),
 		      "TRANSLATION_FAULT"));
 	CHECK(!strcmp(pf7580_fault_lpae_exc(MGPU_MMUS_LPAE_PERM),

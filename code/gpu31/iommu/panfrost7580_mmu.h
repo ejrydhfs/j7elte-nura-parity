@@ -64,8 +64,15 @@ struct page;
 #define P7580_AS_CMD_FLUSH_PT	0x04
 #define P7580_AS_CMD_FLUSH_MEM	0x05
 /* AS_ACTIVE poll bound (KT mali_kbase_defs.h:1682
- * KBASE_AS_INACTIVE_MAX_LOOPS). */
+ * KBASE_AS_INACTIVE_MAX_LOOPS) with the stepped shape of the
+ * mmu/pf7580_as.h twin (F-MMU3): 10 us between reads. */
 #define P7580_AS_INACTIVE_MAX_LOOPS 100000
+#define P7580_AS_WAIT_STEP_US	10
+
+/* Region-lock width limits (mali_kbase_mmu_hw_direct.c lock_region;
+ * shared with the pf7580_lock_region() twin in mmu/pf7580_as.h). */
+#define P7580_LOCK_MIN_W	11u
+#define P7580_LOCK_MAX_W	63u
 
 /* TRANSTAB value (KT mali_kbase_mmu_mode_lpae.c:89-97,
  * mali_midg_regmap.h:321-326): pgd | TABLE(3) | READ_INNER(4).
@@ -91,8 +98,12 @@ struct page;
 #define P7580_MEMATTR_PANFROST	0x00888D88u
 #define P7580_MEMATTR_IDX_DEFAULT 0u
 
-/* Fault status decode (KT mali_midg_regmap.h:341-353). */
-#define P7580_FAULT_CODE_MASK	(0x7u << 3)
+/* Fault status decode (KT mali_midg_regmap.h:341-353). Single decoder
+ * (F-MMU4), byte-identical with pf7580_fault_exc/access in
+ * mmu/pf7580_as.h: low byte 0xC0-0xC7 translation / 0xC8 permission /
+ * 0xD0-0xD7 transtab bus / 0xD8 access flag; bits 9:8 access type with
+ * ATOMIC unnamed on this LPAE build (UNKNOWN). */
+#define P7580_FAULT_CODE_MASK	(0xFFu)
 #define P7580_FAULT_ATYPE_MASK	(0x3u << 8)
 
 /* Locking contract (mirrors kbase: mmu_lock serialises table walks,
@@ -122,10 +133,17 @@ int p7580_mmu_alloc(struct device *dev, struct p7580_mmu *mmu);
  * entry has been cleared. Exported for the M2/M3 teardown walker; NOT
  * for general use. */
 void p7580_mmu_free_table(struct device *dev, dma_addr_t table_dma);
-/* Free the root only; caller MUST have unmapped every mapping AND freed
- * every child table via p7580_mmu_free_table (no recursive walk here,
- * matching kbase's pool-free teardown). Leaks otherwise. */
+/* Free the root only; caller MUST have emptied the context first via
+ * p7580_mmu_teardown() (recursive unmap+free walk, F-MMU5), matching
+ * kbase's pool-free teardown. Leaks otherwise. */
 void p7580_mmu_free(struct p7580_mmu *mmu);
+/* Recursively clear every mapping and free every child table of this
+ * context (F-MMU5; caller holds the MMU/table lock with the AS already
+ * unbound via pf7580_as_disable/program-off). Level-3 leaves are only
+ * cleared, never freed (BO pages belong to GEM). Call p7580_mmu_free()
+ * afterwards for the root. Wire to file-close/remove; otherwise every
+ * process exit leaks page tables. */
+void p7580_mmu_teardown(struct p7580_mmu *mmu);
 /* Map one 4 KiB page (both addresses 4K-aligned). memattr_idx 0..7.
  * May allocate up to 3 child tables (GFP_KERNEL, may sleep). */
 int p7580_mmu_map(struct p7580_mmu *mmu, u64 iova, phys_addr_t paddr,
@@ -134,8 +152,10 @@ void p7580_mmu_unmap(struct p7580_mmu *mmu, u64 iova);
 /* Invalidate GPU TLBs for [vpfn, vpfn+nr) in address space as_nr.
  * LOCK region -> op (FLUSH_PT async / FLUSH_MEM sync+drain) -> wait-ready
  * -> UNLOCK, mirroring kbase_mmu_hw_do_operation
- * (mali_kbase_mmu_hw_direct.c:298-348). sync != 0 drains prior accesses
- * (kbase sync path); sync == 0 is the map/unmap fast path.
+ * (mali_kbase_mmu_hw_direct.c:298-348). The LOCKADDR carries the
+ * width-encoded region for the whole range (F-MMU1), programmed under
+ * wmb() so it is visible before LOCK (F-MMU2); sync != 0 drains prior
+ * accesses (kbase sync path); sync == 0 is the map/unmap fast path.
  * Returns 0 on ready, -ETIMEDOUT if the AS fails to go ready (caller
  * escalates to GPU reset, as kbase does at mali_kbase_mmu.c:873-886). */
 int p7580_mmu_invalidate(void __iomem *gpu_regs, unsigned int as_nr,

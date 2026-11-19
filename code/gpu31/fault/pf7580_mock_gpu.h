@@ -56,16 +56,18 @@
 #define MGPU_MMU_PF(n)	(1u << (n))
 #define MGPU_MMU_BE(n)	(1u << ((n) + 16))
 
-/* Short-code MMU fault-status words (regmap :341-353 view). */
-#define MGPU_MMUS_TRANS_READ	((0x0u << 3) | (0x2u << 8))
-#define MGPU_MMUS_PERM_WRITE	((0x1u << 3) | (0x3u << 8))
-#define MGPU_MMUS_BUS_READ	((0x2u << 3) | (0x2u << 8))
-
-/* LPAE MMU fault-status words (pf7580_as.h:253-282 view). */
+/* LPAE MMU fault-status words (single decoder, F-MMU4; pf7580_as.h
+ * view). The retired short-code view (bits 5:3) is gone: the TRANS/
+ * PERM/BUS aliases below now name the same LPAE exception bytes with
+ * the access-type bits ORed in (READ/WRITE), matching what the IRQ
+ * handler latches from faulting slots. */
 #define MGPU_MMUS_LPAE_TRANS	0xC3u
 #define MGPU_MMUS_LPAE_PERM	0xC8u
 #define MGPU_MMUS_LPAE_BUS	0xD3u
 #define MGPU_MMUS_LPAE_ACCESS	0xD8u
+#define MGPU_MMUS_TRANS_READ	(MGPU_MMUS_LPAE_TRANS | (0x2u << 8))
+#define MGPU_MMUS_PERM_WRITE	(MGPU_MMUS_LPAE_PERM | (0x3u << 8))
+#define MGPU_MMUS_BUS_READ	(MGPU_MMUS_LPAE_BUS | (0x2u << 8))
 
 /* -EBUSY/-ENOENT/-EINVAL without <linux/errno.h> on the host. */
 #define MGPU_EBUSY	16

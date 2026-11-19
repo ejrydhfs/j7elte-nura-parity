@@ -47,6 +47,48 @@ static void p7580_kunmap_dma(void *cpu)
 	kunmap(cpu);
 }
 
+/* Encode LOCKADDR for [iova, iova+size): page-aligned base with the
+ * pow2-rounded page count folded into bits 5:0 as (10 + fls(pages)).
+ * Byte-identical twin of pf7580_lock_region() in mmu/pf7580_as.h and
+ * mali_lock_region() in userspace mali_mmu.h (one encoder, F-MMU1/4).
+ * Saturates at width 63 for ranges above 2^53 bytes (the LOCK(0,~0UL)
+ * full-TLB shape included). */
+static unsigned int p7580_fls32(u32 x)
+{
+	return x ? 32 - __builtin_clz(x) : 0;
+}
+
+static u64 p7580_lock_region(u64 iova, u64 size)
+{
+	u64 pages, region;
+	unsigned int w;
+
+	if (!size) {
+		pages = 1;
+	} else {
+		pages = (size + 4095ULL) >> 12;
+		if (!pages)
+			pages = ~0ULL;
+	}
+
+	if (pages > (1ULL << (P7580_LOCK_MAX_W - 10))) {
+		w = P7580_LOCK_MAX_W;
+	} else {
+		u32 p = (u32)pages;
+
+		w = 10 + p7580_fls32(p);
+		if (p != (1u << (w - 11)))
+			w += 1;
+		if (w < P7580_LOCK_MIN_W)
+			w = P7580_LOCK_MIN_W;
+		if (w > P7580_LOCK_MAX_W)
+			w = P7580_LOCK_MAX_W;
+	}
+
+	region = iova & ~4095ULL;
+	region |= w;
+	return region;
+}
 /* Sync one page-table page so the non-coherent GPU PTW reads fresh data. */
 static void p7580_sync_pt(struct device *dev, dma_addr_t dma)
 {
@@ -109,15 +151,58 @@ void p7580_mmu_free_table(struct device *dev, dma_addr_t table_dma)
 
 void p7580_mmu_free(struct p7580_mmu *mmu)
 {
-	/* Root only. Caller MUST have unmapped every mapping AND freed
-	 * every child table via p7580_mmu_free_table (no recursive walk
-	 * here: tables are a per-context resource freed at context
-	 * teardown, matching kbase's pool-free path). Leaks otherwise. */
+	/* Root only. Caller MUST have emptied the context first via
+	 * p7580_mmu_teardown() (recursive unmap+free walk, F-MMU5),
+	 * matching kbase's pool-free teardown. Leaks otherwise. */
 	if (!mmu || !mmu->dev || !mmu->root_dma)
 		return;
 	p7580_mmu_free_table(mmu->dev, mmu->root_dma);
 	mmu->dev = NULL;
 	mmu->root_dma = 0;
+}
+
+/* Recursive teardown helper: empty the level-`level` table at `dma`.
+ * Levels 0..2 hold PTEs to child tables: snapshot the child address,
+ * clear the parent entry first (no reader ever sees a dangling
+ * pointer), then recurse. Level-3 entries are leaves (ATE): only
+ * cleared — BO pages belong to GEM, never to the table pool. Frees
+ * every table except the root (level 0), which stays owned by
+ * p7580_mmu_free(). */
+static void p7580_teardown_level(struct device *dev, dma_addr_t dma,
+				 unsigned int level)
+{
+	u64 *cpu;
+	unsigned int i;
+
+	cpu = p7580_kmap_dma(dma);
+	for (i = 0; i < P7580_MMU_ENTRIES; i++) {
+		u64 e = cpu[i];
+		dma_addr_t child;
+
+		if ((e & P7580_PTE_TYPE_MASK) != P7580_PTE_TYPE_PTE)
+			continue;
+		child = e & P7580_ADDR_MASK;
+		cpu[i] = P7580_PTE_TYPE_INVAL;
+		p7580_sync_pt(dev, dma);
+		p7580_kunmap_dma(cpu);
+		p7580_teardown_level(dev, child, level + 1);
+		cpu = p7580_kmap_dma(dma);
+	}
+	p7580_sync_pt(dev, dma);
+	p7580_kunmap_dma(cpu);
+	if (level > 0)
+		p7580_mmu_free_table(dev, dma);
+}
+
+void p7580_mmu_teardown(struct p7580_mmu *mmu)
+{
+	/* Caller holds the MMU/table lock with the AS already unbound
+	 * (pf7580_as_disable / TRANSTAB 0 + UPDATE, waiting !ACTIVE),
+	 * so no PTW walk races this free. Wire to file-close/remove;
+	 * follow with p7580_mmu_free() for the root. */
+	if (!mmu || !mmu->dev || !mmu->root_dma)
+		return;
+	p7580_teardown_level(mmu->dev, mmu->root_dma, 0);
 }
 
 /* Allocate + attach one child table; table page identity-checked as root. */
@@ -295,11 +380,17 @@ int p7580_mmu_invalidate(void __iomem *gpu_regs, unsigned int as_nr,
 
 	/* Caller holds the MMU-HW lock (see header contract). Sequence is
 	 * kbase_mmu_hw_do_operation (mali_kbase_mmu_hw_direct.c:298-348):
-	 * LOCK region -> op -> wait-ready -> UNLOCK. */
-	lock_addr = (vpfn << PAGE_SHIFT) & ~((u64)0xFFF);
+	 * LOCK region -> op -> wait-ready -> UNLOCK. LOCKADDR carries the
+	 * width-encoded region for the whole [vpfn, vpfn+nr) range
+	 * (F-MMU1); wmb() makes it visible before LOCK (F-MMU2). */
+	lock_addr = p7580_lock_region(vpfn << PAGE_SHIFT,
+				      (u64)nr << PAGE_SHIFT);
 	writel((u32)(lock_addr & 0xFFFFFFFFUL), as + P7580_AS_LOCKADDR_LO);
 	writel((u32)((lock_addr >> 32) & 0xFFFFFFFFUL),
 	       as + P7580_AS_LOCKADDR_HI);
+	/* LOCKADDR must be visible before the LOCK command latches it
+	 * (table/memattr discipline in p7580_mmu_program_as above). */
+	wmb();
 	writel(P7580_AS_CMD_LOCK, as + P7580_AS_COMMAND);
 	writel(sync ? P7580_AS_CMD_FLUSH_MEM : P7580_AS_CMD_FLUSH_PT,
 	       as + P7580_AS_COMMAND);
@@ -310,36 +401,38 @@ int p7580_mmu_invalidate(void __iomem *gpu_regs, unsigned int as_nr,
 	return ret;
 }
 
+/* Single fault decoder (F-MMU4), byte-identical with pf7580_fault_exc/
+ * access in mmu/pf7580_as.h and mali_fault_exc/access_name in
+ * userspace mali_mmu.h: low byte 0xC0-0xC7 translation / 0xC8
+ * permission / 0xD0-0xD7 transtab bus / 0xD8 access flag. The old
+ * short-code mask (bits 5:3, 0x0..0x5 classes incl. ADDRESS_SIZE and
+ * MEMORY_ATTRIBUTES) described a different regmap naming and mislabelled
+ * silicon faults; it is retired. */
 const char *p7580_mmu_fault_code(u32 status)
 {
-	switch (status & P7580_FAULT_CODE_MASK) {
-	case (0x0 << 3):
+	u32 e = status & P7580_FAULT_CODE_MASK;
+
+	if (e >= 0xC0u && e <= 0xC7u)
 		return "TRANSLATION_FAULT";
-	case (0x1 << 3):
+	if (e == 0xC8u)
 		return "PERMISSION_FAULT";
-	case (0x2 << 3):
+	if (e >= 0xD0u && e <= 0xD7u)
 		return "TRANSTAB_BUS_FAULT";
-	case (0x3 << 3):
+	if (e == 0xD8u)
 		return "ACCESS_FLAG";
-	case (0x4 << 3):
-		return "ADDRESS_SIZE_FAULT";
-	case (0x5 << 3):
-		return "MEMORY_ATTRIBUTES_FAULT";
-	default:
-		return "UNKNOWN";
-	}
+	return "UNKNOWN";
 }
 
+/* Bits 9:8 access type; ATOMIC names UNKNOWN on this LPAE build
+ * (kbase access_type_name without CONFIG_MALI_GPU_MMU_AARCH64). */
 const char *p7580_mmu_fault_atype(u32 status)
 {
 	switch (status & P7580_FAULT_ATYPE_MASK) {
-	case (0x0 << 8):
-		return "ATOMIC";
-	case (0x1 << 8):
+	case (0x1u << 8):
 		return "EXECUTE";
-	case (0x2 << 8):
+	case (0x2u << 8):
 		return "READ";
-	case (0x3 << 8):
+	case (0x3u << 8):
 		return "WRITE";
 	default:
 		return "UNKNOWN";

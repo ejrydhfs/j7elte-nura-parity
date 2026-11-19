@@ -251,7 +251,10 @@ static inline int pf7580_irq_is_page(unsigned int as_nr, u32 irq_stat)
 }
 
 /* Fault-class names (LPAE build; ATOMIC names UNKNOWN, matching kbase
- * access_type_name without CONFIG_MALI_GPU_MMU_AARCH64). */
+ * access_type_name without CONFIG_MALI_GPU_MMU_AARCH64). Canonical
+ * single decoder (F-MMU4): byte-identical with p7580_mmu_fault_code/
+ * atype in iommu/panfrost7580_mmu.c and mali_fault_exc/access_name in
+ * userspace mali_mmu.h. */
 static inline const char *pf7580_fault_exc(u32 st)
 {
 	u32 e = st & 0xFFu;

@@ -145,7 +145,8 @@ long p7580_gem_wait(struct drm_device *dev, struct drm_file *file_priv,
  * per-context tables with these helpers, then lets jobs SUBMIT pin each
  * referenced BO (dma_resv lock discipline per the 0002 plain-mutex)
  * before p7580_job_hw_submit reads the job descriptor. Unmap runs
- * before free (DriverAssemble teardown walk, F-MMU5).
+ * before free; the context teardown walker is p7580_mmu_teardown()
+ * (iommu/panfrost7580_mmu.h, F-MMU5), wired to file-close/remove.
  *  - map: for each page 0..npages-1, p7580_mmu_map(mmu,
  *    bo->iova + idx*PAGE_SIZE, phys, P7580_PROT_RD|WR, memattr), where
  *    phys comes from p7580_bo_page_phys; then p7580_mmu_invalidate(regs,

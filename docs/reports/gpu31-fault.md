@@ -24,7 +24,7 @@ matrix — no wall sleeps anywhere.
 | Case | Fault injected | Expected driver behaviour (asserted) |
 |---|---|---|
 | F1 valid submit | none (valid BO-backed `jc`) | DONE: fence signaled err 0, slot COMMAND_NEXT 0, no reset, BO frees clean |
-| F2 MMU page fault | `jc` unmapped | ERR + `ADDRESS_RANGE_FAULT`/`TRANSLATION_FAULT`/`READ` (both MMU views + LPAE byte); ISR leaves fence pending, COMMAND_NEXT=NOP; recover → SOFT, fence -EIO, slot idle, MASK rearmed, AS reprogrammed |
+| F2 MMU page fault | `jc` unmapped | ERR + `ADDRESS_RANGE_FAULT`/`TRANSLATION_FAULT`/`READ` (single LPAE MMU decoder, all four views); ISR leaves fence pending, COMMAND_NEXT=NOP; recover → SOFT, fence -EIO, slot idle, MASK rearmed, AS reprogrammed |
 | F3 job timeout | slot hung (`complete_at=-1`) | 5 s virtual poll expires with no fence; recover → SOFT + fence -EIO (timeout parity `P7580_JOB_TIMEOUT_MS == 5000` asserted) |
 | F4 slot hang | `stop_honor=0` (HARD_STOP never drains) | recover returns -ETIMEDOUT (reset bound parity `== 3000` asserted); reset proceeds anyway → SOFT (driver always runs the reset sequence after the drain loop — the errno only reports the stuck slot) |
 | F5 soft-reset failure | `soft_ok=0` (COMPLETED never asserts) | SOFT issued first (`gpu_cmd_log&1`), then HARD fallback (`&2`), kind HARD |
@@ -32,8 +32,8 @@ matrix — no wall sleeps anywhere.
 | F7 submit races | misaligned/zero `jc`, unknown BO, 2nd START on stuck slot | -EINVAL / -ENOENT / -EBUSY (recovery refusal, never a 2nd START on top); slot reusable after recover |
 | F8 multi-slot | fault slot 0 while slot 1 hung | both slots HARD_STOPped, both COMMAND_NEXT 0 after recover, MASK rearmed; faulting BO frees, hung sibling stays busy (its teardown belongs to the error path, asserted -EBUSY) |
 | F9 spurious timeout | timeout check after DONE | signaled fence → no recovery taken (`reset_kind NONE`, no GPU_CMD) — mirrors `job.c:387-395` bail |
-| F10 permission fault | WRITE to read-only mapping (`force_fault 0x43`) | `WRITE_FAULT` + `PERMISSION_FAULT`/`WRITE` (both MMU views); recover → SOFT |
-| F11 decode table | all 21 JS_STATUS names + reserved | full name table, fault-vs-benign split (`>= 0x40`), all 6 short-code classes, all 4 LPAE classes + 4 access kinds |
+| F10 permission fault | WRITE to read-only mapping (`force_fault 0x43`) | `WRITE_FAULT` + `PERMISSION_FAULT`/`WRITE` (single LPAE decoder); recover → SOFT |
+| F11 decode table | all 21 JS_STATUS names + reserved | full name table, fault-vs-benign split (`>= 0x40`), all 4 LPAE classes + 4 access kinds across all four MMU views (retired short-code ADDRESS_SIZE/MEMORY_ATTRIBUTES now UNKNOWN) |
 | F12 register contract | probe/steady-state | MASK `0x10001/0x20002/0x40004` pairing, AS TRANSTAB `0x3F000007`/MEMATTR `0x884D4F48`/`0x00008D88`/TRANSCFG 0, MMU IRQ pairing bits, fault-VA round-trip via FAULTADDR_HI/LO, both timeout parities |
 
 Two deliberate model-expectation corrections during development (both the
@@ -63,11 +63,13 @@ asserts -EBUSY for the sibling. Both are documented in the matrix source.
   guilty fence's retry to userspace/Mesa and reports `-ETIMEDOUT` for a
   stuck drain while still running the reset; the mock signals -EIO
   directly so the matrix can assert waiter wake-up without a scheduler.
-- MMU decode ↔ both kernel views: short-code (`iommu/mmu.c:313-347`,
-  regmap :341-353: bits 5:3 class, 9:8 atype) and LPAE byte
-  (`mmu/pf7580_as.h:253-282`). F11/F12 assert both agree on all classes
-  (TRANSLATION/PERMISSION/TRANSTAB_BUS/ACCESS_FLAG + ATOMIC→UNKNOWN on
-  LPAE), so whichever view the IRQ log path prints, the code is right.
+- MMU decode ↔ single LPAE decoder (F-MMU4): `p7580_mmu_fault_code/atype`
+  (`iommu/panfrost7580_mmu.c`), `pf7580_fault_exc/access`
+  (`mmu/pf7580_as.h:253-282`), `mali_fault_exc/access_name` (userspace
+  `mali_mmu.h`), and `pf7580_fault_mmu/lpae_*` below — low byte
+  0xC0-0xC7/0xC8/0xD0-0xD7/0xD8, bits 9:8 access, ATOMIC→UNKNOWN on
+  LPAE. F11 asserts all four views agree byte-for-byte, so whichever
+  view the IRQ log path prints, the code is right.
 
 ## Verification (exercised, not claimed)
 

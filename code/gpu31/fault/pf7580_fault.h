@@ -14,15 +14,16 @@
  * kernel MMU headers need linux kernel headers and cannot compile on
  * the host (provenance below; cross-checked at runtime in F12).
  *
- * MMU decode provenance (both describe AS_FAULTSTATUS on this block):
- *  - "short code" view: KT mali_midg_regmap.h:341-353, as implemented by
- *    p7580_mmu_fault_code/atype (iommu/panfrost7580_mmu.c:313-347):
- *    bits 5:3 exception class, bits 9:8 access type.
- *  - "LPAE byte" view: KT LPAE fault names, as implemented by
- *    pf7580_fault_exc/access (mmu/pf7580_as.h:253-282): low byte
- *    0xC0-0xC7 translation / 0xC8 permission / 0xD0-0xD7 transtab bus /
- *    0xD8 access flag; bits 9:8 access (ATOMIC decodes UNKNOWN on LPAE).
- */
+ * MMU decode provenance: single LPAE decoder (F-MMU4 fix), implemented
+ * identically in four places — p7580_mmu_fault_code/atype
+ * (iommu/panfrost7580_mmu.c), pf7580_fault_exc/access
+ * (mmu/pf7580_as.h:253-282), mali_fault_exc/access_name (userspace
+ * mali_mmu.h), and pf7580_fault_mmu/lpae_* below: low byte 0xC0-0xC7
+ * translation / 0xC8 permission / 0xD0-0xD7 transtab bus / 0xD8 access
+ * flag; bits 9:8 access (EXECUTE/READ/WRITE, ATOMIC decodes UNKNOWN on
+ * this LPAE build). The old short-code view (bits 5:3, ADDRESS_SIZE /
+ * MEMORY_ATTRIBUTES classes) is retired — it mislabelled silicon
+ * faults. */
 
 #ifndef PF7580_FAULT_H
 #define PF7580_FAULT_H
@@ -52,33 +53,27 @@ enum pf7580_reset_kind {
 	PF7580_RESET_HARD = 2,
 };
 
-/* MMU exception classes, short-code view (regmap :341-353). */
+/* MMU exception classes, single LPAE decoder (F-MMU4; the retired
+ * short-code mask is gone). */
 static inline const char *pf7580_fault_mmu_code(uint32_t status)
 {
-	switch (status & (0x7u << 3)) {
-	case (0x0u << 3):
+	uint32_t e = status & 0xFFu;
+
+	if (e >= 0xC0u && e <= 0xC7u)
 		return "TRANSLATION_FAULT";
-	case (0x1u << 3):
+	if (e == 0xC8u)
 		return "PERMISSION_FAULT";
-	case (0x2u << 3):
+	if (e >= 0xD0u && e <= 0xD7u)
 		return "TRANSTAB_BUS_FAULT";
-	case (0x3u << 3):
+	if (e == 0xD8u)
 		return "ACCESS_FLAG";
-	case (0x4u << 3):
-		return "ADDRESS_SIZE_FAULT";
-	case (0x5u << 3):
-		return "MEMORY_ATTRIBUTES_FAULT";
-	default:
-		return "UNKNOWN";
-	}
+	return "UNKNOWN";
 }
 
-/* MMU access types, short-code view (regmap :341-353). */
+/* MMU access types (bits 9:8; ATOMIC names UNKNOWN on LPAE). */
 static inline const char *pf7580_fault_mmu_atype(uint32_t status)
 {
 	switch (status & (0x3u << 8)) {
-	case (0x0u << 8):
-		return "ATOMIC";
 	case (0x1u << 8):
 		return "EXECUTE";
 	case (0x2u << 8):

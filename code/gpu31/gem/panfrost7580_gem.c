@@ -321,7 +321,8 @@ err_bo:
 /* per-context tables with this hook, then lets jobs SUBMIT pin each  */
 /* referenced BO (dma_resv lock discipline per the 0002 plain-mutex)  */
 /* before p7580_job_hw_submit reads the job descriptor. Unmap runs    */
-/* before free (DriverAssemble teardown walk, F-MMU5).                */
+/* before free; the context teardown walker is p7580_mmu_teardown()   */
+/* (iommu/panfrost7580_mmu.h, F-MMU5), wired to file-close/remove.     */
 /*                                                                    */
 /* Contract (mirrors the review's `driver/` landing checklist):       */
 /*  - map: for each page index 0..npages-1, p7580_mmu_map(mmu,        */

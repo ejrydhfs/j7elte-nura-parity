@@ -1,74 +1,108 @@
-# GPU31 MMU slice — completion report
+# GPU31 MMU slice — F-MMU1..5 fix wave (review ebfc1f5)
 
-Date: 2026-11-19. Slice: `G31_Mmu`. Phone state per Main: UP (#35, SSH/RNDIS
-ok); no reboot/flash performed (Integrator/M1Verify own those); one
-read-only locked SSH check done earlier (sysfs read, no `/dev/dri` node
-expected pre-M1). Shared kernel tree never modified (read-only `-c`/kbuild
-scratch checks only).
+Date: 2026-11-19. Slice: `G31_MmuFix`. Source of defects:
+`docs/reports/gpu31-driver-review.md` (commit ebfc1f5, reviewer
+G31_DriverReview2) §F-MMU1 + §F-MMU2/3/4/5.
 
-## Deliverables (all in repo)
+Phone state per Main: UP (#37). No flash, no device access used by this
+slice (host work only; verification Main's job). Shared kernel tree
+never edited (host `-fsyntax-only` against stub headers + host
+`make check` only).
 
-- `code/userspace/gpu/panfrost/mali_hw.h` — MMU block completed: FAULTEXTRA
-  LO/HI, MMU IRQ pairing (`PAGE_FAULT(n)`/`BUS_ERROR(n)`), TRANSCFG
-  identity/mask + AARCH64 PTW fields (named-but-zero on LPAE), LOCK width
-  limits 11/63, full fault-status decode (exception byte/access/DEC/source
-  ID), LPAE exception classes 0xC0/0xC8/0xD0/0xD8, AS_ACTIVE poll ceiling.
-- `code/userspace/gpu/panfrost/mali_mmu.h` — NEW freestanding AS-lifecycle +
-  invalidate + fault host model: `mali_as_count/select_ok`, 33-bit VA window
-  (`mali_va_limit/in_range`, `mali_l0_entries`), saturating
-  `mali_lock_region`, `mali_as_transtab/transtab_disabled/memattr_kbase`,
-  fault class/access/decoder/source/IRQ-pairing/VA decode. Every sequence
-  cites kbase r15p0 LPAE (COHERENCY_NONE) and panfrost v5.2 file:line.
-- `code/userspace/gpu/panfrost/mali_lpae_test.c` + `Makefile` — 114 M0
-  checks + 71 new (§§8–12: AS select, 33-bit window incl. builder
-  end-to-end at 0x1FFFFF000/0x200000000, LOCK vectors, AS values, fault
-  decode); deps gain `mali_mmu.h`.
-- `code/gpu31/mmu/pf7580_as.h` + `code/gpu31/mmu/README` — NEW data-free
-  kernel static-inline helper: `pf7580_as_enable/disable` (TRANSTAB/MEMATTR/
-  TRANSCFG + wmb + UPDATE, wait !ACTIVE both sides), `pf7580_as_invalidate`
-  (LOCK + FLUSH_PT/MEM + wait), saturating `pf7580_lock_region`, IRQ +
-  fault decode. No 9630 double-UNLOCK: absent from the T720 r1p0 errata
-  list. Packaged as `code/gpu31/mmu/0001-pf7580-as-helper.patch` (new file
-  only under `drivers/gpu/drm/panfrost/`; integrator applies).
-- `docs/reports/gpu31-mmu.md` — this report (acceptance pointer).
+## What the review found
 
-## Verification (all pass)
+| ID | Severity | Defect |
+|---|---|---|
+| F-MMU1 | blocker | `p7580_mmu_invalidate` wrote `vpfn << PAGE_SHIFT` raw into LOCKADDR, ignoring the width field. Page-aligned addresses have low bits zero → minimum width always → multi-page maps left stale TLB entries. |
+| F-MMU2 | required | `p7580_mmu_program_as` has the `wmb()` its twin carries, but the invalidate path programmed LOCKADDR then LOCK with no barrier. |
+| F-MMU3 | required | `p7580_as_wait_ready` (iommu twin) was a tight 100k `readl` loop — no `cpu_relax`/`udelay`; the `pf7580_as.h` twin polls 10 µs-stepped. |
+| F-MMU4 | required | Fault decoders disagreed: `iommu/...:313-330` mapped `0x2<<3`→TRANSTAB_BUS / `0x3<<3`→ACCESS_FLAG (plus ADDRESS_SIZE / MEMORY_ATTRIBUTES classes), while `mmu/pf7580_as.h:256-268` maps `0xD0-0xD7`→TRANSTAB_BUS / `0xD8`→ACCESS_FLAG with different access-type words. One mislabels silicon faults. |
+| F-MMU5 | required | No context-teardown walker existed. `p7580_mmu_free` freed the root only; every process exit leaked page tables. |
 
-- `cd code/userspace/gpu/panfrost && make check`: **185 checks, 0 failures**,
-  native gcc + qemu-aarch64 (`mali_lpae_test.aarch64`).
-- Kernel header: kbuild `M=<scratch> modules` with
-  `CROSS_COMPILE=aarch64-linux-gnu-` against the shared 3.10.108 tree —
-  stage-2 link OK (plain-object harness exercising enable/invalidate/
-  disable; module-macro `cold`-attribute noise under gcc 16 was harness
-  artifact, not this header; scratch removed).
-- Three self-found expectation bugs fixed during development (L0-is-always-0
-  below 2^40 — L1 spans 0..7 at 33 bits; fls(4)=3 width-13 exact-pow2 rule;
-  64-bit LOCK saturation at width 63) — model matched kbase/panfrost in all
-  three; tests corrected, not the sequences.
+## Fixes (all in repo)
 
-## Review disposition (gpu31-review.md @ 625ed18)
+- `code/gpu31/iommu/panfrost7580_mmu.c`:
+  - New `p7580_lock_region()` — byte-identical twin of
+    `pf7580_lock_region()` (`mmu/pf7580_as.h`) and `mali_lock_region()`
+    (userspace `mali_mmu.h`): page-aligned base + pow2-rounded count in
+    bits 5:0, saturating at width 63. `p7580_mmu_invalidate` programs
+    `p7580_lock_region(vpfn<<12, nr<<12)` (F-MMU1).
+  - `wmb()` after LOCKADDR HI/LO, before LOCK (F-MMU2).
+  - `p7580_as_wait_ready` stepped: `udelay(P7580_AS_WAIT_STEP_US)` per
+    iteration (F-MMU3), twin of `pf7580_as_wait_ready`.
+  - Fault decoders reconciled to the single LPAE view (F-MMU4):
+    `0xC0-0xC7` translation / `0xC8` permission / `0xD0-0xD7` transtab
+    bus / `0xD8` access flag; bits 9:8 EXECUTE/READ/WRITE, ATOMIC→UNKNOWN.
+  - New `p7580_mmu_teardown()` + static `p7580_teardown_level()`
+    (F-MMU5): recursive walk, clear-parent-first (no dangling pointers),
+    leaves cleared only (BO pages stay GEM's), every non-root table
+    freed. Wire to file-close/remove, then `p7580_mmu_free()` for root.
+- `code/gpu31/iommu/panfrost7580_mmu.h`: `P7580_LOCK_MIN_W/MAX_W` (11/63),
+  `P7580_AS_WAIT_STEP_US` (10), `P7580_FAULT_CODE_MASK 0xFF` (was
+  `0x7<<3`), `p7580_mmu_teardown()` declaration, invalidate contract
+  rewritten (width + barrier + teardown pointer).
+- `code/gpu31/iommu/0001-panfrost7580-mmu-helper.patch`: regenerated from
+  the fixed `.c/.h` (integrator applies a current patch).
+- `code/gpu31/mmu/pf7580_as.h`: canonical-decoder note (F-MMU4); the
+  twin itself was already the correct LPAE view — unchanged behaviour.
+- `code/gpu31/gem/panfrost7580_gem.{h,c}`: contract comments point at
+  `p7580_mmu_teardown()` (F-MMU5) instead of the old
+  "caller frees child tables by hand" wording. No code change (GEM slice
+  owns the logic; confirmed with G31_Gem3 before editing).
+- `code/gpu31/fault/pf7580_fault.h`, `pf7580_mock_gpu.h`,
+  `fault_matrix.c`, `docs/reports/gpu31-fault.md`: short-code decoder
+  retired (F-MMU4); all four views byte-identical; F11 asserts the
+  retired classes decode UNKNOWN. 12/12 PASS native.
+- `code/userspace/gpu/panfrost/mali_lpae_test.c`: §§13–15 added —
+  F-MMU1 LOCK-width monotonicity + exact densities + nr=0 guard,
+  F-MMU2/3 barrier/poll contract values, F-MMU5 teardown emptiness
+  (map-3/unmap-3 returns every table); §12 extended with gap vectors
+  (0xC9/0xCF/0xD9 UNKNOWN) and single-decoder mask assertion.
+  **227 checks, 0 failures, native + qemu-aarch64.**
 
-No finding applies to this slice: the review names §§1–4 (fence/resv/
-syncobj/sched), §6 display driver, §7 DT, §8 config, §10 iommu-dma PRIME,
-§11 r7p0 stride, §12 Mesa n_slots — zero mentions of `mali_hw.h`,
-`mali_mmu.h`, `mali_lpae_test.c`, `pf7580_as.h`, or `code/gpu31/mmu/`
-(verified by grep; the only "mmu" hit is §10's title word "iommu-dma",
-which is G31_DmaBuf's PRIME patch, not this slice). No patch change
-required; state recorded here explicitly per Main's instruction.
+## Single decoder (F-MMU4 verdict)
 
-Boundary holds: `G31_Iommu` owns `code/gpu31/iommu/panfrost7580_mmu.*`
-(`p7580_mmu_*`/`P7580_*`); this slice is `mali_*` (host) +
-`pf7580_as_*`/`PF7580_*` (kernel). `G31_PanfrostTarget` confirmed no
-collision in `code/userspace/gpu/panfrost/`.
+KT `mali_midg_regmap.h:341-353` names coarse buckets; the LPAE build's
+fault-name table (`pf7580_as.h` view) is what silicon reports on this
+T720, and it is also what the jobs slice's fault path consumes. The
+short-code bits-5:3 naming carried two classes (ADDRESS_SIZE,
+MEMORY_ATTRIBUTES) that do not exist on this block — that view is
+retired everywhere (iommu + fault mirror + mock constants + F11). All
+four decode sites (`p7580_mmu_fault_*`, `pf7580_fault_exc/access`,
+`mali_fault_exc/access_name`, `pf7580_fault_mmu/lpae_*`) are now
+byte-identical.
 
-## Key semantics for the integrator/driver author
+## Verification (exercised)
 
-Enable AS n: TRANSTAB_LO/HI ← pgd | TABLE(3) | READ_INNER(4) (never
-SHARE_OUTER here), MEMATTR ← 0x884D4F48/0x00008D88 (kbase LPAE), TRANSCFG
-← 0, wmb, COMMAND ← UPDATE gated on !AS_ACTIVE before+after. Map/unmap:
-sync table pages (COHERENCY_NONE PTW), LOCK(iova,size) + FLUSH_PT + wait.
-Full TLB: LOCK(0,~0) + FLUSH_MEM + wait. Fault path: mask MMU IRQs, per
-set AS read FAULTADDR_HI/LO + FAULTSTATUS, clear via MMU_INT_CLEAR,
-re-enable; AS_FAULTSTATUS low byte class, bits 9:8 access (ATOMIC→UNKNOWN
-on LPAE), bit 10 decoder/slave, bits 31:16 source ID; 33-bit VA window
-[0, 2^33), L0[0] only.
+```
+cd code/userspace/gpu/panfrost && make check   # 227/227 native + qemu
+cd code/gpu31/fault && make check              # 12/12 native
+gcc -fsyntax-only -I/tmp/mmustub -Icode/gpu31/iommu \
+  code/gpu31/iommu/panfrost7580_mmu.c          # SYNTAX_OK (stub linux/*)
+```
+
+NOT verified (Main's job): kbuild `-c` against the real 3.10.108 tree,
+device MMU fault injection, teardown under process-exit load.
+
+## Boundary / coordination
+
+- GEM contract-comment edits confirmed with G31_Gem3 (owner) before
+  touching; no GEM logic changed.
+- Fault-slice mirror (`pf7580_fault.h`, `pf7580_mock_gpu.h`,
+  `fault_matrix.c`, `gpu31-fault.md`) is shared with the jobs slice's
+  decoder: F11 now pins the single view so drift fails loudly.
+- `code/gpu31/driver/0002-panfrost7580-build-wiring.patch` showed an
+  uncommitted peer diff mid-task — reverted untouched (DriverAssemble
+  owns it).
+- Test binaries (`mali_lpae_test`, `.aarch64`) rebuilt by `make check`
+  are NOT committed (tracked files left untouched).
+
+## Integrator notes
+
+1. Apply `code/gpu31/iommu/0001-panfrost7580-mmu-helper.patch`.
+2. `driver/` land must wire `p7580_mmu_teardown()` to file-close/remove
+   (F-MMU5), per the header contract: AS unbound
+   (TRANSTAB 0 + UPDATE, wait !ACTIVE) → teardown under the MMU/table
+   lock → `p7580_mmu_free()` for the root.
+3. SUBMIT map path: `p7580_mmu_invalidate(regs, as, vpfn, nr, 0)` now
+   encodes the whole range — callers pass the real `nr`, not 1.
