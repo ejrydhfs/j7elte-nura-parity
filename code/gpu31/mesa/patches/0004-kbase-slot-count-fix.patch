@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gpu31-mesa <gpu31-mesa@localhost>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 4/6] kbase: fix n_slots off-by-one in kbase_kmod_submit_job
+
+The atom batch is: [fence-wait atom, optional] + job atom +
+fence-trigger atom.  Every atom needs its own table slot
+(kbase_alloc_slots_locked hands out atom_number values; the trigger
+atom's pre_dep[0] points at job_slot, and cleanup iterates n_slots
+entries).  The old initializer claimed one slot while always emitting
+at least job + trigger (two atoms), so the unconditional
+job_slot/trig_slot assignment consumed two slots[idx++] entries from
+a one-entry reservation.  Without an in-fence this overran the slots
+array (out-of-bounds read at slots[1], n_slots=1 cleanup leaked one
+busy bit); with an in-fence the count happened to be right (1 -> 2 ->
+wait+job+trigger = 2... no: 1+1=2 allocated vs 3 consumed, same
+overrun).
+
+Count job + trigger up front (n_slots = 2), plus one more when an
+in-fence wait atom is emitted.
+
+Provenance: partners G31_Devfreq/G31_Gem nudged the count
+(n_slots = 2 /* job + trigger */); the expedient local patch here
+/fixed/ it.  Kept as its own patch (not folded into 0001) so the
+kbase backend patch stays pristine.
+
+The write-only `bo->mk_flags = alloc.flags` noted in the same review
+is intentionally NOT part of this patch: the field + store live only
+in that uncommitted side tree (never in the repo's 0001 or in-tree
+kbase_kmod.c), so there is nothing to remove here.
+---
+ src/panfrost/lib/kmod/kbase_kmod.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 3058e1b..e42f7c9 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -1198,6 +1198,6 @@ kbase_kmod_submit_job(struct pan_kmod_dev *dev,
+                                              .stream_fd = kdev->tl_fd}};
+    uint8_t slots[3];
+-   unsigned n_atoms = 0, n_slots = 1;
++   unsigned n_atoms = 0, n_slots = 2; /* job + trigger */
+    uint32_t wait_slot = 0, job_slot, trig_slot;
+    int in_fd = -1, out_fd = -1;
+    int64_t deadline;
+--
+2.56.0

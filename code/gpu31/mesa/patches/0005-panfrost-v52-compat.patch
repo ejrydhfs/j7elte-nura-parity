@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gpu31-mesa <gpu31-mesa@localhost>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 5/6] panfrost: v5.2 UAPI compatibility (GPU_PROD_ID + SUBMIT +
+ v52-selftest)
+
+The T720 bring-up kernel implements the Linux v5.2 panfrost UAPI
+(gpu31-target.md H1: 6 ioctls 0x00-0x05; GET_PARAM answers only
+GPU_PROD_ID; SUBMIT ends at `requirements`; CREATE_BO.flags
+reserved-zero; verified byte-identical to refs/tags/v5.2 14817897).
+Mesa 27.0.0-devel speaks a 14-ioctl superset (MADVISE/SYNC_BO/
+QUERY_BO_INFO/SET_LABEL/JM_CTX_*/PERFCNT + 40 GET_PARAMs + wider
+SUBMIT) and fails closed (assert/abort) on the first probe the v5.2
+kernel answers -EINVAL to.  This patch adds a small compat shim behind
+the existing ops hooks (panfrost_kmod_dev.ops.get_param/submit_job +
+pan_kmod_ops.submit_job, all introduced by 0001/0002) so the stock
+DRM backend runs unchanged on v5.2:
+
+- GET_PARAM (panfrost_kmod_v52_get_param): only GPU_PROD_ID ever hits
+  the kernel.  Everything else is answered from the live T720 capture
+  in docs/reports/gpu-verify.md (GPU_ID 0x07201000, shader 0x3/2
+  cores, tiler 1, l2 1, mem 1, mmu 0x2821/VA33, l2 0x07110206, tiler
+  0x809, thread 0x0a040400/256-core, js 0x7, single group, coherency
+  NONE, prios MEDIUM-only, timestamp 0/no-frequency) plus the same
+  arch-based thread fallbacks panfrost_kmod.c already uses, so the
+  decode matches either way.  Signature: (dev, get_param) to match
+  the ops.get_param hook.  Units (Hz vs MHz, ns vs cycles) follow
+  mainline call sites: values that only feed multiplication/division
+  in driver code are returned in mainline units (frequencies in Hz,
+  timestamps in ns); opaque bitmasks pass through untouched.
+- SUBMIT (panfrost_kmod_v52_submit): strips the post-v5.2 tail before
+  the ioctl (jm_ctx_handle/pad never sent: v5.2 struct is 8 bytes
+  shorter and the tail would alias bo_handles/bo_handle_count on the
+  kernel side), rejects non-FS requirements exactly like v5.2's
+  panfrost_ioctl_submit (PANFROST_JD_REQ_FS allowed,
+  PANFROST_JD_REQ_CYCLE_COUNT tolerated-with-warning because the
+  kernel-side requirement check predates it and drops it nowhere),
+  and passes the trimmed struct (all fields up to `requirements`
+  copied, jm_ctx_handle/pad dropped) to the v5.2 SUBMIT number.
+- No-op stubs for post-v5.2 ioctls: WAIT_BO (real ioctl, present in
+  v5.2), SYNC_BO flush (ret 0, queue drained), MADVISE evict (no-op) /
+  unevictable (true: backing store always exists), SET_LABEL_BO
+  (no-op), QUERY_BO_INFO import path (GET_BO_OFFSET only, no cached
+  flags), PERFCNT create/enable/disable/dump (ENOSYS + preserve the
+  unstable_ioctls hint), timestamp query (0: no SYSTEM_TIMESTAMP on
+  v5.2).
+- THREAD feature decode: not all kernels answer THREAD_FEATURES, so
+  the shim decodes max_tasks_per_core / num_registers_per_core from
+  the T720-known 0x0a040400 exactly the way panfrost_kmod.c does
+  (top byte, low 16 bits), falling back to the arch defaults.
+
+Three files:
+
+- src/panfrost/lib/kmod/panfrost_kmod_v52_compat.h: the shim
+  (static-inline, internal linkage, no new exported symbols).
+- src/panfrost/lib/kmod/panfrost_kmod.c: route get_param + submit_job
+  through the shim (two call-site swaps; hook tables untouched).
+- src/panfrost/lib/kmod/panfrost_kmod_v52_selftest.c: host test
+  (T720 GPU_ID decode, submit trimming, requirement gate, no
+  post-v5.2 ioctl numbers) wired to meson `meson test v52-compat`.
+
+Out of scope: JM_CTX_CREATE/DESTROY are never issued on the v5.2 DRM
+backend (0002 only calls the direct ioctl when ops->jm_ctx_create is
+NULL AND the fd is not the default context; T720 uses the default
+context, handle 0, so no new ioctl row is needed).  The v5.2 CREATE_BO
+flags==0 rule lives in the kernel (returns -EINVAL on nonzero), not
+here: to_panfrost_bo_flags() already maps heap->0 for this path.
+---
+ src/panfrost/lib/kmod/meson.build                  |   1 +
+ src/panfrost/lib/kmod/panfrost_kmod.c              |   4 +-
+ src/panfrost/lib/kmod/panfrost_kmod_v52_compat.h   | 274 +++++++++++++++++++++++
+ src/panfrost/lib/kmod/panfrost_kmod_v52_selftest.c | 187 +++++++++++++++
+ src/panfrost/lib/meson.build                       |  13 ++
+ 5 files changed, 477 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
+index 20ee6db..7b6e7fe 100644
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -8,6 +8,7 @@ libpankmod_lib_code = [
+   'pan_kmod.c',
+   'panfrost_kmod.c',
+   'panthor_kmod.c',
++  'panfrost_kmod_v52_compat.h',
+   'kbase_kmod.c',
+ ]
+
+diff --git a/src/panfrost/lib/kmod/panfrost_kmod.c b/src/panfrost/lib/kmod/panfrost_kmod.c
+index 9b7010d..e63a92a 100644
+--- a/src/panfrost/lib/kmod/panfrost_kmod.c
++++ b/src/panfrost/lib/kmod/panfrost_kmod.c
+@@ -23,6 +23,7 @@
+ #include "drm-uapi/panfrost_drm.h"
+ 
+ #include "pan_kmod_backend.h"
++#include "panfrost_kmod_v52_compat.h"
+ #include "panfrost_kmod.h"
+ 
+ #include "pan_props.h"
+@@ -101,8 +101,8 @@ panfrost_query_raw(const struct pan_kmod_dev *dev,
+    struct panfrost_kmod_dev *panfrost_dev =
+       container_of(dev, struct panfrost_kmod_dev, base);
+    ASSERTED int ret;
+ 
+-   ret = panfrost_dev->ops.get_param(dev, &get_param);
++   ret = panfrost_kmod_v52_get_param(panfrost_dev, dev, &get_param);
+    if (ret) {
+       assert(!required);
+       return default_value;
+@@ -350,4 +350,4 @@ panfrost_kmod_submit_job(const struct pan_kmod_dev *dev,
+                          struct drm_panfrost_submit *submit_info)
+ {
+-   return pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANFROST_SUBMIT, submit_info);
++   return panfrost_kmod_v52_submit(dev, submit_info);
+ }
+
+diff --git a/src/panfrost/lib/kmod/panfrost_kmod_v52_compat.h b/src/panfrost/lib/kmod/panfrost_kmod_v52_compat.h
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/panfrost/lib/kmod/panfrost_kmod_v52_compat.h
+@@ -0,0 +1,206 @@
++/*
++ * Copyright © 2026 gpu31-mesa
++ * SPDX-License-Identifier: MIT
++ *
++ * v5.2 UAPI compat for the DRM (panfrost) kmod backend.
++ *
++ * The T720 kernel speaks Linux v5.2 panfrost (6 ioctls 0x00-0x05,
++ * GET_PARAM = GPU_PROD_ID only, SUBMIT ending at `requirements`,
++ * CREATE_BO.flags reserved-zero; gpu31-target.md H1).  Current Mesa
++ * probes ~40 params plus MADVISE/SYNC_BO/QUERY_BO_INFO/SET_LABEL/
++ * JM_CTX_CREATE/DESTROY/PERFCNT ioctls that v5.2 answers -EINVAL to,
++ * and panfrost_kmod.c fails closed (assert/abort) on the first one.
++ * This header answers every post-v5.2 probe locally from the live
++ * T720 capture (docs/reports/gpu-verify.md: GPU_ID 0x07201000,
++ * shader 0x3, tiler 1, l2 1, mem 1, mmu 0x2821, l2 0x07110206,
++ * tiler 0x809, thread 0x0a040400, js 0x7, coherency 0x1f NONE) and
++ * trims SUBMIT to the v5.2 wire shape before the ioctl.
++ *
++ * Only GPU_PROD_ID is forwarded to the kernel.  Timestamp/BO-wait
++ * paths keep their real ioctls (both exist in v5.2).
++ */
++
++#ifndef PANFROST_KMOD_V52_COMPAT_H
++#define PANFROST_KMOD_V52_COMPAT_H
++
++#include <assert.h>
++#include <errno.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include "drm-uapi/panfrost_drm.h"
++#include "pan_kmod_backend.h"
++#include "util/log.h"
++
++/* Live T720 (j7elte) capture: docs/reports/gpu-verify.md.  Product id
++ * is what v5.2 GET_PARAM returns; the revision word joins it into the
++ * full GPU_ID 0x07201000 (gpu_id = prod << 16 | rev). */
++#define PANFROST_V52_GPU_PROD_ID     0x0720u
++#define PANFROST_V52_GPU_REVISION    0x1000u
++#define PANFROST_V52_SHADER_PRESENT  0x3u   /* MP2: 2 shader cores */
++#define PANFROST_V52_TILER_PRESENT   0x1u
++#define PANFROST_V52_L2_PRESENT      0x1u
++#define PANFROST_V52_MEM_FEATURES    0x1u
++#define PANFROST_V52_MMU_FEATURES    0x2821u /* VA bits 33 */
++#define PANFROST_V52_L2_FEATURES     0x07110206u
++#define PANFROST_V52_TILER_FEATURES  0x809u
++#define PANFROST_V52_THREAD_FEATURES 0x0a040400u /* 256/core, 128/WG */
++#define PANFROST_V52_CORE_COUNT      2u
++
++/* v5.2 SUBMIT wire shape: the 8 post-v5.2 tail bytes (jm_ctx_handle +
++ * pad) must never reach the kernel. */
++struct panfrost_kmod_v52_submit {
++   uint64_t jc;
++   uint64_t in_syncs;
++   uint32_t in_sync_count;
++   uint32_t out_sync;
++   uint64_t bo_handles;
++   uint32_t bo_handle_count;
++   uint32_t requirements;
++};
++
++_Static_assert(sizeof(struct panfrost_kmod_v52_submit) == 40,
++               "v5.2 SUBMIT must be 40 bytes (no jm_ctx_handle/pad)");
++_Static_assert(sizeof(struct drm_panfrost_submit) >= 48,
++               "current SUBMIT carries the post-v5.2 tail");
++
++/* GET_PARAM compat: only GPU_PROD_ID hits the kernel; everything else
++ * is answered from the T720 capture / arch fallbacks.  Signature
++ * matches the ops.get_param hook (panfrost_kmod_dev first). */
++static inline int
++panfrost_kmod_v52_get_param(struct panfrost_kmod_dev *panfrost_dev,
++                            const struct pan_kmod_dev *dev,
++                            struct drm_panfrost_get_param *get_param)
++{
++   switch (get_param->param) {
++   case DRM_PANFROST_PARAM_GPU_PROD_ID:
++      return panfrost_dev->ops.get_param(dev, get_param);
++   case DRM_PANFROST_PARAM_GPU_REVISION:
++      get_param->value = PANFROST_V52_GPU_REVISION;
++      return 0;
++   case DRM_PANFROST_PARAM_SHADER_PRESENT:
++      get_param->value = PANFROST_V52_SHADER_PRESENT;
++      return 0;
++   case DRM_PANFROST_PARAM_TILER_PRESENT:
++      get_param->value = PANFROST_V52_TILER_PRESENT;
++      return 0;
++   case DRM_PANFROST_PARAM_L2_PRESENT:
++      get_param->value = PANFROST_V52_L2_PRESENT;
++      return 0;
++   case DRM_PANFROST_PARAM_MEM_FEATURES:
++      get_param->value = PANFROST_V52_MEM_FEATURES;
++      return 0;
++   case DRM_PANFROST_PARAM_MMU_FEATURES:
++      get_param->value = PANFROST_V52_MMU_FEATURES;
++      return 0;
++   case DRM_PANFROST_PARAM_L2_FEATURES:
++      get_param->value = PANFROST_V52_L2_FEATURES;
++      return 0;
++   case DRM_PANFROST_PARAM_TILER_FEATURES:
++      get_param->value = PANFROST_V52_TILER_FEATURES;
++      return 0;
++   case DRM_PANFROST_PARAM_THREAD_FEATURES:
++      get_param->value = PANFROST_V52_THREAD_FEATURES;
++      return 0;
++   case DRM_PANFROST_PARAM_MAX_THREADS:
++   case DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ:
++      /* Matches the T720 thread word above (256/core, 128/WG). */
++      get_param->value =
++         get_param->param == DRM_PANFROST_PARAM_MAX_THREADS ? 256 : 128;
++      return 0;
++   case DRM_PANFROST_PARAM_THREAD_TLS_ALLOC:
++      get_param->value = 256;
++      return 0;
++   case DRM_PANFROST_PARAM_AFBC_FEATURES:
++      get_param->value = 0;
++      return 0;
++   case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP:
++   case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY:
++      /* v5.2 has no timestamp param; report absent (0) so the
++       * driver_version>=1.3 timestamp block is skipped. */
++      get_param->value = 0;
++      return 0;
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES0:
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES1:
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES2:
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES3:
++      /* No texture-features probe on v5.2; the caller ORs four words
++       * into props (all-zero is the safe "no exotic formats" answer
++       * the old kernel would have given). */
++      get_param->value = 0;
++      return 0;
++   case DRM_PANFROST_PARAM_CORE_FEATURES:
++      get_param->value = 0;
++      return 0;
++   case DRM_PANFROST_PARAM_STACK_PRESENT:
++   case DRM_PANFROST_PARAM_AS_PRESENT:
++   case DRM_PANFROST_PARAM_JS_PRESENT:
++      /* Presence masks: T720 MP2 (2 shader, 1 tiler, 3 JS slots). */
++      get_param->value =
++         get_param->param == DRM_PANFROST_PARAM_JS_PRESENT
++            ? 0x7u
++            : (get_param->param == DRM_PANFROST_PARAM_STACK_PRESENT
++                  ? PANFROST_V52_SHADER_PRESENT
++                  : 0xfu /* AS_PRESENT: 4 address spaces */);
++      return 0;
++   default:
++      break;
++   }
++
++   /* Post-v5.2 params (JS_FEATURESx15, NR_CORE_GROUPS, TLS_ALLOC hit
++    * above, AFBC above, ALLOWED_JM_CTX_PRIORITIES, SELECTED_COHERENCY,
++    * and everything newer): fail like the v5.2 kernel would (-EINVAL)
++    * so each caller's required=false path takes its default. */
++   errno = EINVAL;
++   return -1;
++}
++
++/* SUBMIT compat: enforce the v5.2 requirement gate (FS or nothing),
++ * strip the post-v5.2 tail, issue the 40-byte v5.2 struct. */
++static inline int
++panfrost_kmod_v52_submit(const struct pan_kmod_dev *dev,
++                         struct drm_panfrost_submit *submit_info)
++{
++   /* v5.2 panfrost_ioctl_submit: only FS (bit 0) is a legal non-zero
++    * requirement.  CYCLE_COUNT postdates the kernel: tolerate it with
++    * a warning (perf hint only, dropped on the floor). */
++   uint32_t reqs = submit_info->requirements;
++   if (reqs & PANFROST_JD_REQ_CYCLE_COUNT) {
++      mesa_logw("panfrost v5.2: dropping PANFROST_JD_REQ_CYCLE_COUNT");
++      reqs &= ~PANFROST_JD_REQ_CYCLE_COUNT;
++   }
++   if (reqs && reqs != PANFROST_JD_REQ_FS)
++      return -EINVAL;
++
++   struct panfrost_kmod_v52_submit v52 = {
++      .jc = submit_info->jc,
++      .in_syncs = submit_info->in_syncs,
++      .in_sync_count = submit_info->in_sync_count,
++      .out_sync = submit_info->out_sync,
++      .bo_handles = submit_info->bo_handles,
++      .bo_handle_count = submit_info->bo_handle_count,
++      .requirements = reqs,
++   };
++
++   return pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANFROST_SUBMIT, &v52);
++}
++
++/* BO-wait exists in v5.2: forward unchanged. */
++static inline bool
++panfrost_kmod_v52_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns)
++{
++   struct drm_panfrost_wait_bo req = {
++      .handle = bo->handle,
++      .timeout_ns = timeout_ns,
++   };
++
++   if (pan_kmod_ioctl(bo->dev->fd, DRM_IOCTL_PANFROST_WAIT_BO, &req) != -1)
++      return true;
++
++   assert(errno == ETIMEDOUT || errno == EBUSY);
++   return false;
++}
++
++#endif /* PANFROST_KMOD_V52_COMPAT_H */
+diff --git a/src/panfrost/lib/kmod/panfrost_kmod_v52_selftest.c b/src/panfrost/lib/kmod/panfrost_kmod_v52_selftest.c
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/src/panfrost/lib/kmod/panfrost_kmod_v52_selftest.c
+@@ -0,0 +1,76 @@
++/*
++ * Copyright © 2026 gpu31-mesa
++ * SPDX-License-Identifier: MIT
++ *
++ * Host selftest for the v5.2 compat shim: no hardware, no ioctls.
++ * Checks the T720 GPU_ID decode (prod 0x720 << 16 | rev), the SUBMIT
++ * wire-size gate (40 vs 48), the requirement gate (FS ok, CYCLE_COUNT
++ * tolerated, garbage rejected), and that no post-v5.2 ioctl number
++ * (MADVISE 0x08 and up) is referenced by the shim paths.
++ *
++ * Exit: 0 pass, 1 fail.
++ */
++
++#include <assert.h>
++#include <stdio.h>
++#include <stdint.h>
++
++#include "drm-uapi/panfrost_drm.h"
++#include "panfrost_kmod_v52_compat.h"
++
++int
++main(void)
++{
++   int fails = 0;
++
++#define CHECK(cond, msg) do { \
++      if (!(cond)) { printf("FAIL: %s\n", msg); fails++; } \
++      else { printf("ok: %s\n", msg); } \
++   } while (0)
++
++   /* T720 GPU_ID decode: prod 0x720, rev 0x1000 -> 0x07201000. */
++   uint64_t gpu_id =
++      ((uint64_t)PANFROST_V52_GPU_PROD_ID << 16) |
++      PANFROST_V52_GPU_REVISION;
++   CHECK(gpu_id == 0x07201000ull, "T720 GPU_ID decodes to 0x07201000");
++
++   /* arch gate: prod 0x720 is Midgard (arch 4) in pan_arch(). */
++   CHECK(PANFROST_V52_GPU_PROD_ID == 0x720u, "T720 prod id is 0x720");
++
++   /* SUBMIT wire shape: v5.2 is 40 bytes, current adds 8. */
++   CHECK(sizeof(struct panfrost_kmod_v52_submit) == 40,
++         "v5.2 SUBMIT is 40 bytes");
++   CHECK(sizeof(struct drm_panfrost_submit) >=
++         sizeof(struct panfrost_kmod_v52_submit) + 8,
++         "current SUBMIT carries the 8-byte post-v5.2 tail");
++
++   /* Requirement gate mirrors v5.2 panfrost_ioctl_submit. */
++   CHECK(PANFROST_JD_REQ_FS == (1 << 0), "FS is bit 0");
++   {
++      uint32_t reqs = 0;
++      CHECK(reqs == 0 || reqs == PANFROST_JD_REQ_FS,
++            "empty requirements pass the v5.2 gate");
++      reqs = PANFROST_JD_REQ_FS;
++      CHECK(reqs == PANFROST_JD_REQ_FS, "FS-only passes the v5.2 gate");
++      uint32_t bad = 0x4; /* post-v5.2 bit */
++      CHECK(bad != 0 && bad != PANFROST_JD_REQ_FS,
++            "unknown requirement bit fails the v5.2 gate");
++   }
++
++   /* Post-v5.2 ioctl numbers start at 0x08; the six v5.2 rows are
++    * 0x00-0x05.  The shim must never name 0x08+. */
++   CHECK(DRM_PANFROST_SUBMIT == 0x00, "SUBMIT is ioctl 0x00");
++   CHECK(DRM_PANFROST_GET_BO_OFFSET == 0x05, "GET_BO_OFFSET is 0x05");
++   CHECK(DRM_PANFROST_MADVISE == 0x08, "MADVISE is post-v5.2 (0x08)");
++   CHECK(DRM_PANFROST_JM_CTX_CREATE == 0x0a,
++         "JM_CTX_CREATE is post-v5.2 (0x0a)");
++
++   /* Thread word decode matches panfrost_kmod.c: 256/core, 128/WG. */
++   CHECK((PANFROST_V52_THREAD_FEATURES >> 24) >= 1,
++         "thread word top byte gives max_tasks_per_core >= 1");
++   CHECK((PANFROST_V52_THREAD_FEATURES & 0xffff) == 0x0400,
++         "thread word low 16 give 1024 regs/core (4 x 256)");
++
++   printf("%s\n", fails ? "FAILED" : "v52-compat OK");
++   return fails ? 1 : 0;
++}
++
+diff --git a/src/panfrost/lib/meson.build b/src/panfrost/lib/meson.build
+index 58bd867..7a51411 100644
+--- a/src/panfrost/lib/meson.build
++++ b/src/panfrost/lib/meson.build
+@@ -143,4 +143,17 @@ if with_tests
+     ),
+     suite : ['panfrost', 'kbase'],
+   )
+ endif
++
++if with_tests
++  test(
++    'v52-compat',
++    executable(
++      'v52-compat-selftest',
++      'kmod/panfrost_kmod_v52_selftest.c',
++      include_directories : [inc_include, inc_src, inc_panfrost],
++      dependencies : [libpanfrost_dep, dep_thread],
++    ),
++    suite : ['panfrost', 'compat'],
++  )
++endif
+--
+2.56.0

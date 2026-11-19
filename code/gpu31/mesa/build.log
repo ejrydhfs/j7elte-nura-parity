@@ -1,0 +1,64 @@
+# gpu31-mesa build log (2026-11-19, host x86_64, gcc 16.2.1, meson 1.12.1)
+
+Baseline: /home/asdf/mesa-g31 @ 7a0c8ef (0001+0002+0003 applied as commits
+c45bff3/aa8b0f5/7a0c8ef) + pinned tree /home/asdf/mesa-gpu31/mesa-02f13375*
+(@ fd7d003, carries the F1 slot fix + F2 mk_flags removal in its own history).
+
+## 1. Patch check-apply (PASS, real verification)
+
+Scratch repo seeded with the EXACT tree files (panfrost_kmod.c,
+kbase_kmod.c, pan_kmod.c/h, pan_jm.c, both meson.build), then:
+
+- `git apply --check 0004-kbase-slot-count-fix.patch` -> PASS (P4=0)
+- `git apply --check 0005-panfrost-v52-compat.patch` -> PASS (CHECK=0)
+- `git am 0005` in scratch -> applies cleanly, 5 files, +301/-2
+  (whitespace warnings about 2 trailing blank lines fixed; hunk headers
+  corrected to true file line numbers: kmod.c hunks at -23/-102/-350,
+  meson hunk at -143, new-file counts 206/76)
+
+0004 hunk verified against true file line 1200
+(`unsigned n_atoms = 0, n_slots = 1;` -> `= 2; /* job + trigger */`).
+
+## 2. v5.2 UAPI byte-identity (PASS)
+
+`curl raw.githubusercontent.com/torvalds/linux refs/tags/v5.2
+include/uapi/drm/panfrost_drm.h` diffed against
+code/gpu31/gem/panfrost_drm.h: payload identical (only the T720 header
+comment differs) -> GEM-MIRROR-BYTE-IDENTICAL. Same fetch == the
+/tmp/mesa-work reference copy.
+
+v5.2 driver facts used (panfrost_drv.c @ v5.2): 6 ioctls 0x00-0x05;
+GET_PARAM answers GPU_PROD_ID only (default: -EINVAL); SUBMIT rejects
+`requirements && != PANFROST_JD_REQ_FS`; CREATE_BO rejects size==0,
+flags!=0, pad!=0; ioctl table SUBMIT=RENDER_ALLOW|AUTH rest RENDER_ALLOW.
+
+## 3. Meson configure (BLOCKED — host packaging, not a patch bug)
+
+`meson setup` with `-Dgallium-drivers=panfrost,softpipe -Dllvm=disabled ...`
+fails at meson.build:1046 `CLC requires LLVM`: panfrost in
+with_driver_using_cl forces with_clc on, and with_clc demands LLVM +
+LLVMSPIRVLib. With LLVM enabled, configure then fails at meson.build:2115
+`Dependency "LLVMSPIRVLib" not found` (spirv-llvm-translator not installed;
+no root to install). Fix: install spirv-llvm-translator matching LLVM 23.1.x
+and re-run code/gpu31/mesa/aarch64-panfrost-build.sh. llvmpipe was
+deliberately NOT used (requires LLVM too); softpipe is the LLVM-free GL
+fallback for the device recipe.
+
+## 4. Selftest / proof compiles (BLOCKED — broken host toolchain includes)
+
+Host `gcc`/`cc` fails on `#include <stdio.h>` (`stdio: No such file or
+directory`) despite /usr/include/stdio.h existing; trivial no-include
+translation units compile. So neither slot-proof/slot-proof.c nor the
+v52 selftest could be compiled here. Both are small, -Werror-clean by
+inspection (selftest uses only <assert.h>/<stdio.h>/<stdint.h> +
+panfrost_drm.h + the compat header). Re-run: `cc -O2 -Wall -Wextra
+-Werror -o slot-proof slot-proof.c && ./slot-proof` on a healthy host,
+and the recipe runs v52-compat-selftest under qemu-aarch64.
+
+## 5. eglinfo/glxinfo (host llvmpipe evidence, PASS)
+
+- `eglinfo -B`: Mesa 26.2.6, EGL 1.5 (GBM + Wayland + X11 + surfaceless).
+- `glxinfo -B`: radeonsi (AMD Renoir); `LIBGL_ALWAYS_SOFTWARE=1 glxinfo -B`:
+  `OpenGL renderer string: llvmpipe (LLVM 23.1.4, 256 bits)`, GL 4.6 compat.
+  -> llvmpipe present and working on the build host; device-side llvmpipe
+  runs are owned by G31_MesaTests (code/gpu31/mesatests/run-mesatests.sh).

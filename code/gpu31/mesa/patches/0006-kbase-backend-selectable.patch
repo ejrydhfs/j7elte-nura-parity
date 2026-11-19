@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gpu31-mesa <gpu31-mesa@localhost>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH 6/6] panfrost: kbase backend stays selectable via
+ PAN_KMOD_RESTRICT_TO_BACKENDS
+
+No code change: documents and locks the backend-selection contract
+the kbase backend (0001) already implements, which the v5.2 compat
+work (0005) must not break.
+
+- Backend table order in pan_kmod.c is panfrost, panthor, kbase
+  (kbase LAST): a DRM render node is adopted by panfrost_kmod first;
+  kbase only sees fds the DRM backends refuse (its dev_create
+  rejects any fd answering drmGetVersion, unless the H2-shim adapt
+  patch from code/userspace/gpu/mesa-render applies, which probes
+  the UK handshake on a dup first).
+- PAN_KMOD_RESTRICT_TO_BACKENDS (pan_kmod.c, DEBUG_GET_ONCE_OPTION,
+  default "all") selects backends: "panfrost" forces the DRM path
+  (H1/stock panfrost_dri.so, no Mesa patches needed beyond 0005),
+  "kbase" forces the kbase UK path (/dev/mali0, needs 0001+0004),
+  "all" tries each backend in table order until one adopts the fd.
+- 0005 routes get_param/submit through the v52 shim INSIDE
+  panfrost_kmod.c (call-site swaps, no hook-table change), so the
+  selection logic in pan_kmod.c is untouched: forcing either backend
+  still works, and the H2 render-node adapt patch (dev_create fd
+  adoption hunk) composes without conflict (different function).
+
+Provenance: 0001 added the kbase table entry + optional
+submit_job/jm_ctx_create/jm_ctx_destroy hooks; 0002 made the Gallium
+submit/context paths hook-neutral.  This patch adds no hunks so
+there is nothing to rebase when those evolve.
+---
+ 0 files changed
