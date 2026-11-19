@@ -1,0 +1,18 @@
+# drmcore compile log — 2026-11-19T06:46:12Z
+# tree: /run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7k/android_kernel_samsung_universal7580-2a746c1bc1a41eae05988c153f527c8a5dc72d07 (read-only; never modified)
+# gcc: aarch64-linux-gnu-gcc (GCC) 16.2.0
+# headers: code/gpu31/drmcore/{drm_compat_310.h,panfrost_ioctls_310.h} (NEW files only; zero tree hunks, no Makefile/Kconfig wiring)
+# consumer: code/gpu31/drmcore/drm_compat_310_test.c (host-side check only, never in kernel build)
+# live device at check time: Linux nura-j7elte 3.10.108 #35 SMP PREEMPT aarch64; /dev/dri absent; /dev/mali0 + /dev/fb0 present
+
+## -fsyntax-only: drm_compat_310.h
+PASS -fsyntax-only drm_compat_310.h
+## -fsyntax-only: panfrost_ioctls_310.h
+PASS -fsyntax-only panfrost_ioctls_310.h
+
+## -fsyntax-only: drm_compat_310_test.c
+PASS -fsyntax-only drm_compat_310_test.c (zero warnings)
+
+## -c object: drm_compat_310_test.c
+PASS -c drm_compat_310_test.c (zero warnings)
+-rw-r--r-- 1 asdf asdf 4680 Nov 19 01:46 /tmp/drmcore-stage/test/drm_compat_310_test.o
