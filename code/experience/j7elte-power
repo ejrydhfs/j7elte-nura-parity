@@ -1,0 +1,10 @@
+#!/bin/sh
+# Reboot/poweroff for j7elte. busybox reboot(2) does not reset this SoC
+# (the kernel's restart handler parks in the bootloader); sysrq 'b' does.
+set -eu
+sync
+echo 1 > /proc/sys/kernel/sysrq
+case "${1:-reboot}" in
+	poweroff|halt|o) echo o > /proc/sysrq-trigger ;;
+	*)               echo b > /proc/sysrq-trigger ;;
+esac

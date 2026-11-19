@@ -49,7 +49,7 @@ static struct app apps[] = {
 	{ "Keyboard", "matchbox-keyboard", "#a855f7", -1 },
 	{ "Settings", "lxqt-config", "#f59e0b", -1 },
 	{ "Camera",   "megapixels", "#ef4444", -1 },
-	{ "Reboot",   "reboot", "#64748b", -1 },
+	{ "Reboot",   "j7elte-power reboot", "#64748b", -1 },
 };
 
 static Display *dpy;
