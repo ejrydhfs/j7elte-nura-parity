@@ -1,10 +1,13 @@
 # GPU31 master report — hardware 3D on j7elte (Mali-T720 / Exynos 7580 / Nura 3.10.108)
 
 Date: 2026-11-19. Device: SM-J700M (j7elte), Nura Alpine aarch64.
-Kernel target: `3.10.108 #33` tree (`android_kernel_samsung_universal7580-…`).
-Goal: hardware 3D (GL/EGL on Mali-T72x). Today GL is llvmpipe; `/dev/mali0`
-(kbase UK 10.6, DDK r15p0-00rel0, `Mali-T72x MP2 r1p0 0x0720`) works incl. job
-submission. Kernel `CONFIG_DRM=n`, `CONFIG_MODULES=n`.
+Live state (verified 2026-11-19 ~06:27 UTC via locked SSH): phone **UP**,
+kernel `3.10.108 #35 SMP PREEMPT` (gcc 16.2.0, built Wed Nov 18 23:36 EST),
+uptime 1 min (fresh boot — do NOT reboot: cold boot is scarce, GPS/FM share
+the phone). `/dev/mali0` present (`Mali-T72x MP2 r1p0 0x0720`); `/dev/dri`
+absent (running kernel predates M1). Goal: hardware 3D (GL/EGL on Mali-T72x).
+Today GL is llvmpipe; kbase UK 10.6 works incl. job submission.
+
 
 Related: `docs/reports/gpu-verify.md` (HW/userspace ground truth),
 `gpu-drm.md` (M1–M3 milestones + evidence + pending-HW marks),
@@ -16,7 +19,7 @@ first landed slice).
 | Milestone | Definition | Status | Evidence |
 |---|---|---|---|
 | M0 bring-up | kbase works, soft-GL baselined | **DONE** | `gpu-verify.md` §2–§4: kbase-probe handshake 10.6, winsys soft job (223 GPU cycles), SAME_VA BO, fence round-trip; X fbdev 720×1280, 2065-colour XWD; llvmpipe GL 4.6/GLES 3.2, glxgears 173–221 FPS, glmark2-es2 29-scene table |
-| M1 `/dev/dri` + fbdev X intact | `CONFIG_MODULES=y` + minimal `CONFIG_DRM=y` fragment (6 symbols), stock `dt.img`, vendor DECON fbdev keeps panel | **BUILT, flash pending** | `gpu-drm.md` M1: Image 18 094 328 B, boot img 27 234 304 B (`53acd61a…`), readiness READY; `m1-kconfig-check.sh` PASS; `m1-verify.sh` + `run-m1.sh` scripted. **Blocked: device USB-net down** (172.16.42.1 100% loss; `18d1:d001` gadget present, no host driver bind) |
+| M1 `/dev/dri` + fbdev X intact | `CONFIG_MODULES=y` + minimal `CONFIG_DRM=y` fragment (6 symbols), stock `dt.img`, vendor DECON fbdev keeps panel | **BUILT, flash GATED (phone up, #35 running, no /dev/dri)** | `gpu-drm.md` M1: Image 18 094 328 B, boot img 27 234 304 B (`53acd61a…`), readiness READY; `m1-kconfig-check.sh` PASS; `m1-verify.sh` + `run-m1.sh` scripted. **Flash gate: only G31_Integrator builds; only G31_M1Verify flashes, after Main's explicit go. No reboot until then.** |
 | M2 render node | Mali bound to a DRM render node (H1 panfrost UAPI preferred / H2 kbase-UK tunnel fallback) | **Designed, code in flight** | `gpu-drm.md` M2: ADAPT.md + adapt diff (dry-run clean), render-node-probe (`make check` native+qemu pass). gpu31 `wsi/tri-x11.c` (X11/EGL/GLES2 swrast path demo) present; `mesatests/` staged empty |
 | M3 Mesa GL on HW | panfrost v5.2 backport (fence→resv→syncobj→sched shims + GEM/job-slot driver) + Mesa build + glmark harness | **Foundation in flight; driver not written** | `patches/drm-backport/0001-0005` (host series, check+compile PASS); gpu31 `series/` mirror (fence/resv/syncobj/sched + KMS 0001 + wiring + m1 fragment + SHA256SUMS) present. Panfrost GEM/job-slot driver itself: the honest gap (~20–30 person-days per `gpu-panfrost.md` M2) |
 
@@ -41,9 +44,9 @@ Remaining slices (no output yet in repo; owners per roster): Gem, DmaBuf,
 Power, Jobs, Tests, Mesa, Devfreq, ConfigMatrix, Packaging, RenderProbe,
 Firmware, Stress, Review, DrmCore, Suspend, PanfrostTarget, Thermal, Mmu,
 Recovery, KbaseShim, Sched, M1Verify, Kms, PowerMeasure, MesaTests,
-KbaseDocs, Integrator (build/flash owner). Integrator + M1Verify are the
-only slices that build/flash the shared tree; all others are host-side
-(`-fsyntax-only`/`-c` read-only) + device tests via `flock /tmp/gpsdev.lock`.
+KbaseDocs, Integrator (builds only) + M1Verify (flashes only, after Main's
+explicit go). All others are host-side (`-fsyntax-only`/`-c` read-only) +
+read-only device checks via `flock /tmp/gpsdev.lock` (short holds, no reboot).
 
 ## 3. Invariants (hold for every slice)
 
@@ -52,8 +55,10 @@ only slices that build/flash the shared tree; all others are host-side
 - Stock `dt.img` is never rebuilt (S-Boot hangs on rebuilt DTBs); new code
   probes the stock node as-is with in-driver fallbacks (`gpu31-dt.md` §4).
 - Phone must stay bootable with fbdev X working; GPS driver stays stock parity.
+- **Do NOT reboot the phone** (cold boot is scarce; GPS cold-boot runs + FM
+  audio share the device). No flash without Main's explicit go.
 - Root fs 94% full: big writes go to `/data`. Device via
-  `flock /tmp/gpsdev.lock -c '…ssh…'` (<120 s), root via `rootshell`.
+  `flock /tmp/gpsdev.lock -c '…ssh…'` (short holds <120 s), root via `rootshell`.
 
 ## 4. Evidence links
 
@@ -69,9 +74,9 @@ only slices that build/flash the shared tree; all others are host-side
 
 ## 5. Open risks
 
-1. **Device link down** (immediate blocker for M1Verify/flash): USB-net
-   172.16.42.1 unreachable; gadget `1-2.3` visible, `cdc_ether/bind` →
-   `No such device`. Needs re-plug / phone-side USB check (`docs/RESUME.md`).
+1. **M1 flash gate** (phone up on #35, `/dev/dri` absent as expected):
+   M1Verify flashes only after Main's explicit go, then runs `m1-verify.sh`
+   (`docs/RESUME.md` covers the USB-down window if the link drops again).
 2. **Unreviewed in-flight code**: `series/` KMS patch (89 KiB) and shims are
    uncommitted and unaudited against the shared tree; `-fsyntax-only`/`-c`
    vs 3.10.108 headers claimed by authors, not yet verified here.
@@ -91,8 +96,9 @@ only slices that build/flash the shared tree; all others are host-side
 
 ## 6. Next actions
 
-1. Restore device link → Integrator flashes M1 boot img → M1Verify runs
-   `m1-verify.sh` + `run-m1.sh` (card0/controlD64, dmesg, X).
+1. Main gives explicit go → M1Verify flashes M1 boot img → runs
+   `m1-verify.sh` + `run-m1.sh` (card0/controlD64, dmesg, X). No reboot
+   before then.
 2. Land in-flight slices after review: `iommu/` (MMU header), `series/`
    shims (re-verify `-c` vs tree, SHA256SUMS match), `wsi/tri-x11` device run.
 3. M2: render-minor patch (Mode B) → `render-node-probe /dev/dri/renderD128`
