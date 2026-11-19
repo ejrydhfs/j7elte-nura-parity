@@ -2,7 +2,7 @@
 
 Verdict: **gap-patched**. P1, P2, P3 pass. P4 had one fatal Android-path dependency
 (FW version check opened `/system/vendor/firmware/...` with no Linux fallback and aborted
-ischain power-on); patched by `parity/patches/camera/0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch`.
+ischain power-on); patched by `patches/camera/0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch`.
 Firmware install list: `parity/firmware/files-camera.list`.
 
 Trees: ROM = `boot_out/{symbols.txt,vmlinux.elf,dtbs/000_800.dts}`; Nura =
@@ -125,7 +125,7 @@ Any failure returned `-EIO`, and `fimc_is_ischain_power()` aborts with
 `fimc_is_sec_run_fw_sel is fail` (`ischain.c:2613-2616`), so no camera stream can start on a
 Linux filesystem layout. All other consumers already had a `request_firmware()` fallback.
 
-`parity/patches/camera/0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch`
+`patches/camera/0001-fimc-is2-fallback-to-request_firmware-for-fw-version-check.patch`
 (in `drivers/media/platform/exynos/fimc-is2/vendor/fimc-is-sec-define.c` only):
 when `filp_open()` of the vendor path fails, call
 `request_firmware(&fw_blob, sysfs_finfo.load_fw_name, dev)`, take the 11-byte header version

@@ -39,7 +39,7 @@ Details and evidence per package follow.
   `usr/share/alsa/ucm2/j7elte/{HiFi,VoiceCall}.conf`,
   `usr/share/j7elte-audio/jack_alsa_mixer.json`.
 * Package files are byte-identical to the canonical copies under
-  `parity/userspace/audio/ucm2/` and `parity/userspace/audio/rom/` (`diff` empty).
+  `code/userspace/audio/ucm2/` and `code/userspace/audio/rom/` (`diff` empty).
 
 ### 1.2 UCM correctness vs. the kernel
 
@@ -54,7 +54,7 @@ Details and evidence per package follow.
   `alsaucm -c testsnd list _verbs` → `HiFi`, `VoiceCall`; both files and all `Value`
   blocks parsed. `File "/j7elte/HiFi.conf"` resolves below the UCM2 root (confirmed by
   the parse).
-* Control names/types/ranges: re-ran `parity/userspace/audio/validate_controls.py` →
+* Control names/types/ranges: re-ran `code/userspace/audio/validate_controls.py` →
   `RESULT: PASS` (54/54 ROM controls, 53/53 UCM controls, 0 range/enum violations).
   Spot-checked independently in the tree:
   `SOC_SINGLE_TLV("DNC Max Gain", …)`, `SOC_ENUM("Chargepump Mode", …)` with
@@ -73,10 +73,10 @@ Details and evidence per package follow.
    MIT is not accurate for that content. A maintainer must pick the real licence (e.g.
    `unknown`/`proprietary`-style handling per pmaports policy) before merge; I did not
    change it because the correct value is a project decision, not a mechanical fix.
-2. **Stale paths in `parity/reports/audio-userspace.md`.** §P5 references
-   `parity/patches/userspace/audio/0001-device-samsung-j7elte-depend-on-audio-ucm.patch`,
+2. **Stale paths in `docs/reports/audio-userspace.md`.** §P5 references
+   `patches/userspace/audio/0001-device-samsung-j7elte-depend-on-audio-ucm.patch`,
    which does not exist. The device dependency is now in the shared
-   `parity/patches/userspace/0001-device-deps.patch` (it already contains
+   `patches/userspace/0001-device-deps.patch` (it already contains
    `j7elte-audio-ucm`), and the package itself is
    `audio/0002-j7elte-audio-ucm-package.patch`. Only the report is stale; the patches
    apply correctly (see §4).
@@ -112,10 +112,10 @@ is why it passed and this was missed.
   `skip_variant_value()` that understands `u`, `b`, `y`, `s`, `o`, `g`; an unknown
   scalar *type* still fails closed.
 * APKBUILD `sha512sums` entry for `dbus-wire.c` updated to the new file's sum.
-* Canonical copy `parity/userspace/sensors/dbus-wire.c` synced (the aport is generated
+* Canonical copy `code/userspace/sensors/dbus-wire.c` synced (the aport is generated
   from it by `sync-to-aport.sh`).
 * Exported as
-  `parity/patches/userspace/review-a/0001-j7elte-sensors-ignore-unknown-dbus-header-fields.patch`
+  `patches/userspace/review-a/0001-j7elte-sensors-ignore-unknown-dbus-header-fields.patch`
   (pmaports-relative; **apply after** `sensors/0001-add-j7elte-sensors-package.patch`).
 
 **Verification after the fix (all run in this session):**
@@ -180,7 +180,7 @@ is why it passed and this was missed.
 * `systemd-analyze verify` on both units: no parse/ordering errors (only the expected
   missing exotic units in the fake root).
 * Host build and aarch64 GCC 10.3 `-static -Werror` build both clean.
-* `parity/userspace/battery/build-check.sh` run end-to-end (with `TMPDIR` on the session
+* `code/userspace/battery/build-check.sh` run end-to-end (with `TMPDIR` on the session
   disk because `/tmp` is full): host build, GCC 10.3 cross build, uevent parser test,
   checksums, `build()`/`package()` tree, service syntax, six restore-script cases and
   the 12 functional checks — **`all build checks passed`**, independently of the
@@ -213,7 +213,7 @@ taken from the report.
   break boot, but a maintainer with OpenRC can drop it.
 * The report's apply-order note mentions
   `0002-device-samsung-j7elte-depend-on-j7elte-power.patch`, which **no longer exists**;
-  the dependency now lives in the consolidated `parity/patches/userspace/0001-device-deps.patch`.
+  the dependency now lives in the consolidated `patches/userspace/0001-device-deps.patch`.
   This is a documentation staleness, not a packaging error.
 
 ---
@@ -241,9 +241,9 @@ packages), so no extra device-dependency patch is needed for these three.
 ```
 M device/archived/j7elte-sensors/dbus-wire.c
 M device/archived/j7elte-sensors/APKBUILD          (dbus-wire.c sha512sum)
-M parity/userspace/sensors/dbus-wire.c             (canonical copy, kept in sync)
-A parity/patches/userspace/review-a/0001-j7elte-sensors-ignore-unknown-dbus-header-fields.patch
-A parity/reports/review-userspace-a.md
+M code/userspace/sensors/dbus-wire.c             (canonical copy, kept in sync)
+A patches/userspace/review-a/0001-j7elte-sensors-ignore-unknown-dbus-header-fields.patch
+A docs/reports/review-userspace-a.md
 ```
 
 Nothing else was edited; no shared device/kernel config was touched.

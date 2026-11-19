@@ -27,7 +27,7 @@ userspace (`system.raw`, ramdisk) and the CP image, plus cross-compilation and
 host-side (native and `qemu-aarch64` user-mode) dry-run validation. Nothing was
 executed against real modem hardware.
 
-Kernel side is unchanged and needs no change — `parity/reports/modem.md` already
+Kernel side is unchanged and needs no change — `docs/reports/modem.md` already
 established P1–P4 parity for `drivers/misc/modem_v1` + `drivers/misc/mcu`.
 
 ---
@@ -155,7 +155,7 @@ so `max_tx_size == 0` and no multi-frame chunking happens).
 
 ## 4. What was implemented
 
-`parity/userspace/ril/j7elte-cbd.c` (~1 160 lines, C11, POSIX only, no
+`code/userspace/ril/j7elte-cbd.c` (~1 160 lines, C11, POSIX only, no
 dependencies beyond libc) + OpenRC init script, `conf.d`, systemd unit.
 
 It performs §3 steps 0–7 for real, including:
@@ -288,7 +288,7 @@ executed against modem hardware.
 control channel), `/dev/umts_rfs0` (SIPC5 RFS — remote EFS file access),
 `/dev/umts_ramdump0`, `/dev/smd4`, `/dev/multipdp` + `rmnet0…7` (data),
 plus `ipc_loopback0`, `umts_csd`, `umts_router`, `umts_dm0`, `umts_ciq0`
-(20 iodevs from the DT list, see `parity/reports/modem.md` P2).
+(20 iodevs from the DT list, see `docs/reports/modem.md` P2).
 
 Note `rild_ready()` (`link_device_shmem.c:261`) requires **both** `umts_ipc0`
 and `umts_rfs0` to be open before the kernel answers the CP's `PHONE_START`
@@ -399,11 +399,11 @@ untouched from stock (heimdall-bootimg only writes BOOT).
 
 | Path | Content |
 |---|---|
-| `parity/userspace/ril/j7elte-cbd.c` | the loader (canonical source) |
-| `parity/userspace/ril/j7elte-cbd.{initd,confd,service}` | service integration |
+| `code/userspace/ril/j7elte-cbd.c` | the loader (canonical source) |
+| `code/userspace/ril/j7elte-cbd.{initd,confd,service}` | service integration |
 | `parity/pmaports/device/archived/j7elte-cbd/` | APKBUILD + copies of the sources |
-| `parity/patches/userspace/ril/0001-j7elte-cbd-package.patch` | the package as a `git diff` against pmaports `ba682bd` |
-| `parity/reports/ril-userspace.md` | this report |
+| `patches/userspace/ril/0001-j7elte-cbd-package.patch` | the package as a `git diff` against pmaports `ba682bd` |
+| `docs/reports/ril-userspace.md` | this report |
 
 This change does not modify `device-samsung-j7elte/APKBUILD`,
 `linux-samsung-j7elte/config-*` or the kernel tree (other tasks in the tree may

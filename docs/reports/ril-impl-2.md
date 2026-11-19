@@ -9,7 +9,7 @@ automatic incoming-SMS ack and the remaining traced PDP/GPRS frames.
 
 All opcodes, lengths and body offsets come from the stock `libsec-ril.so`
 (ARM32, `09539011…`) instruction streams, read with Ghidra and cross-checked
-against `parity/userspace/ril/spec/{calls,sms,data,messages}.md`. The
+against `code/userspace/ril/spec/{calls,sms,data,messages}.md`. The
 GSM 03.40 encoder is the one part that is new code rather than a traced
 builder; it is validated against the spec's worked example and is called out
 as such below.
@@ -27,7 +27,7 @@ as such below.
 0005 is 54 515 bytes / 1559 lines / 57 hunks and touches:
 
 ```
-parity/userspace/ril/j7elte-ril.c
+code/userspace/ril/j7elte-ril.c
 parity/pmaports/device/archived/j7elte-ril/j7elte-ril.c
 parity/pmaports/device/archived/j7elte-ril/APKBUILD
 ```
@@ -252,10 +252,10 @@ IP configuration 0d/09 (cid + raw u16 flags), GPRS call status 0d/10
 
 | Path | Content |
 |---|---|
-| `parity/patches/userspace/ril/0003-j7elte-ril-call-sms-pdp.patch` | first pass, applied |
-| `parity/patches/userspace/ril/0004-j7elte-ril-extended-call-sms-pdp.patch` | second pass, applied |
-| `parity/patches/userspace/ril/0005-j7elte-ril-sms-encoder-gprs-actions.patch` | this delta |
-| `parity/reports/ril-impl-2.md` | this report |
+| `patches/userspace/ril/0003-j7elte-ril-call-sms-pdp.patch` | first pass, applied |
+| `patches/userspace/ril/0004-j7elte-ril-extended-call-sms-pdp.patch` | second pass, applied |
+| `patches/userspace/ril/0005-j7elte-ril-sms-encoder-gprs-actions.patch` | this delta |
+| `docs/reports/ril-impl-2.md` | this report |
 
 The tree is at the 0004 state (`aef6d045…1069`); 0005 is produced against
 exactly that state. No shared device APKBUILD, kernel config or `j7elte-cbd`

@@ -28,7 +28,7 @@ clocks, regulators and power domains already present in the vendor DT.
 
 ## Configuration
 
-`parity/patches/drm/config-drm-exynos7580.fragment`:
+`patches/drm/config-drm-exynos7580.fragment`:
 
 ```
 CONFIG_DRM=y
@@ -69,8 +69,8 @@ the DECON/DSIM compatibles and the BT `gpc4-2` group.
 
 Patches (apply-checked against `b5e363a`):
 
-- `parity/patches/drm/0001-drm-exynos7580-decon-dsim-kms.patch`
-- `parity/patches/drm/0002-arm64-dts-exynos7580-j7elte-drm-display.patch`
+- `patches/drm/0001-drm-exynos7580-decon-dsim-kms.patch`
+- `patches/drm/0002-arm64-dts-exynos7580-j7elte-drm-display.patch`
 
 ## Design notes
 

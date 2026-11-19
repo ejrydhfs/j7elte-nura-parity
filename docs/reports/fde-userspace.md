@@ -83,9 +83,9 @@ Two consequences worth recording:
   not need it; only a hand-made `aes-cbc-essiv:sha256` volume would.)
 * `/dev/fb0` is created unconditionally when DECON probes
   (`drivers/video/exynos/decon_7580/decon_core.c:4591`, `register_framebuffer` at the end of
-  `decon_probe`; see also `parity/reports/display.md` :178-183), and
+  `decon_probe`; see also `docs/reports/display.md` :178-183), and
   `/sys/class/backlight/panel` is registered by the ea8061 panel driver. Touch firmware is
-  built into the kernel (`parity/reports/touch.md` P4), so the touchscreen is functional in the
+  built into the kernel (`docs/reports/touch.md` P4), so the touchscreen is functional in the
   initramfs without any file in `/lib/firmware`.
 
 So the kernel needs **no patch and no config change**. `CONFIG_FRAMEBUFFER_CONSOLE` is not set
@@ -140,7 +140,7 @@ overflowed, the initramfs itself would have to shrink.
 | `j7elte-fde-check` | read-only prerequisites checker (see below); `--regenerate` additionally runs `mkinitfs` as root; `--quiet`, `--help` |
 
 The `BOOT` size constant (32 MiB) and the 90 % warning threshold live in `j7elte-fde-check`
-and are cross-checked against the PIT by `parity/userspace/fde/validate.sh`.
+and are cross-checked against the PIT by `code/userspace/fde/validate.sh`.
 
 ### `j7elte-fde-check` checks
 
@@ -151,7 +151,7 @@ its `virtual_size`, fb blank state, `/sys/class/backlight/panel` brightness, at 
 root is a dm-crypt mapping (and if not, that FDE requires a reinstall), and
 `/boot/boot.img` against the 32 MiB `BOOT` partition. Exit code 1 on any hard failure.
 
-### `parity/userspace/fde/validate.sh`
+### `code/userspace/fde/validate.sh`
 
 Host-side static harness (no hardware): `sh -n` on both shipped scripts, `shellcheck -s sh -S
 warning` when available, APKBUILD `source=` / `sha512sums=` consistency against the files on
@@ -200,7 +200,7 @@ Ran in this environment (no j7elte hardware):
 ```
 $ sh -n j7elte-fde-check 50-j7elte-fde-fb.sh            # both parse
 $ shellcheck -s sh -S warning <both scripts>            # clean (0.10.0)
-$ parity/userspace/fde/validate.sh                      # 36 passed, 0 failed
+$ code/userspace/fde/validate.sh                      # 36 passed, 0 failed
 $ j7elte-fde-check                                      # exercised on the host:
    #   --help, kernel-config fallback via /proc/config.gz, fb/input/backlight
    #   probing, LUKS detection fallback, boot.img absence path, exit code 1
@@ -232,6 +232,6 @@ Residual risks:
 
 No shared pmaports file was modified (`device-samsung-j7elte/APKBUILD`, `deviceinfo`,
 `linux-samsung-j7elte/config-*` are untouched, and the kernel tree is unmodified). No patch
-under `parity/patches/userspace/fde/` is required: every prerequisite was already present in
+under `patches/userspace/fde/` is required: every prerequisite was already present in
 the kernel and the device package; the gap was purely the missing userspace/initramfs
 enablement shipped as the new `j7elte-fde` package.

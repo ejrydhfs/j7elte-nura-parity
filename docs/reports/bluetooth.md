@@ -14,7 +14,7 @@ baseline and both now have apply-checked fixes:
 * P2 — the `bluetooth` node's `bt_en` pinctrl group targets the wrong pin (gpa1-6
   instead of gpc4-2) on every j7elte board revision. Fixed for **all three ROM
   revisions** (rev00/rev04/rev06) by
-  `parity/patches/bluetooth/0001-j7elte-bt-pinctrl.patch`: a ROM-identical `bt-en`
+  `patches/bluetooth/0001-j7elte-bt-pinctrl.patch`: a ROM-identical `bt-en`
   group (`gpc4-2`, function=1, pud=0, con-pdn=3, pud-pdn=0) is added to each
   per-revision gpio dtsi (`exynos7580-j7elte_gpio_{00,04,06}.dtsi`, inside
   `&pinctrl_7` = `pinctrl@138D0000`, the gpc4 bank, exactly where the ROM puts it)
@@ -27,7 +27,7 @@ baseline and both now have apply-checked fixes:
   `CONFIG_BT_HCIUART=y` + `CONFIG_BT_HCIUART_H4=y` are already applied in the pmaports
   working tree by the parent
   (`parity/pmaports/device/archived/linux-samsung-j7elte/config-samsung-j7elte.aarch64:918-919`)
-  and are captured as `parity/patches/bluetooth/0002-j7elte-bt-hci-config.patch` against
+  and are captured as `patches/bluetooth/0002-j7elte-bt-hci-config.patch` against
   the pmaports baseline.
 
 | Item | Result |
@@ -144,7 +144,7 @@ other gpc4-2 boards) do not. j7elte marks gpa1-6 as `NC`
 (`pin-con-pdn = 3`, i.e. BT_EN driven low in suspend) that the ROM applies to gpc4-2.
 
 Fix (apply-checked; DT ownership `arch/arm64/boot/dts/exynos7580-j7elte*.dts*`):
-`parity/patches/bluetooth/0001-j7elte-bt-pinctrl.patch` adds a ROM-identical `bt-en`
+`patches/bluetooth/0001-j7elte-bt-pinctrl.patch` adds a ROM-identical `bt-en`
 group for gpc4-2 to **each** per-revision gpio dtsi — inside `&pinctrl_7`
 (`pinctrl@138D0000`, the gpc4 bank controller, exactly where the ROM places the group) —
 and points each `bluetooth` node at it. The compiled node name is `bt-en`, matching the
@@ -237,7 +237,7 @@ kernel transport is mandatory for Bluetooth to work at all under Nura.
 
 Config fix — **applied in the pmaports working tree by the parent**
 (`config-samsung-j7elte.aarch64:918-919`), and captured as
-`parity/patches/bluetooth/0002-j7elte-bt-hci-config.patch` against the pmaports baseline.
+`patches/bluetooth/0002-j7elte-bt-hci-config.patch` against the pmaports baseline.
 The working-tree diff of that file is exactly this hunk plus the wifi-parity firmware-path
 changes. Verified with `git -C parity/pmaports apply --check --cached` → `APPLY_OK`
 (`parity/verify.sh` → `OK`):
@@ -325,7 +325,7 @@ acceptable to this consumer, but is not listed to avoid duplicate blobs.
 ### Userspace bring-up that remains (G1)
 
 Firmware installation is covered: the parent's `firmware-samsung-j7elte` pmaports package
-(`parity/patches/pmaports/0003-firmware-samsung-j7elte-package.patch`, working tree
+(`patches/pmaports/0003-firmware-samsung-j7elte-package.patch`, working tree
 `parity/pmaports/device/archived/firmware-samsung-j7elte/`) installs both the bare
 `BCM43430A1.hcd` and the ROM-named `bcm43438A1_V0051.0230.hcd` under
 `/lib/firmware/postmarketos/samsung-j7elte/`. The attach/address/daemon sequence was
@@ -353,8 +353,8 @@ Do **not** use bare `btattach` as the only step on this tree: with no `hci_bcm`/
 
 | Path | Contents | Verification |
 |---|---|---|
-| `parity/patches/bluetooth/0001-j7elte-bt-pinctrl.patch` | ROM-identical `bt-en` group (`gpc4-2`, function=1, pud=0, con-pdn=3, pud-pdn=0) in `exynos7580-j7elte_gpio_{00,04,06}.dtsi` + `bluetooth` node reference in `exynos7580-j7elte_rev{00,04,06}.dts` (fixes P2 on **all three** revisions) | `git -C <kernel-tree> apply --check` **and** `--cached` vs clean baseline → `APPLY_OK`; `parity/verify.sh` → `OK`; all three patched DTBs compile and compare identical to the ROM DTBs (see P2) |
-| `parity/patches/bluetooth/0002-j7elte-bt-hci-config.patch` | `CONFIG_BT_HCIUART=y`, `CONFIG_BT_HCIUART_H4=y` in the pmaports kernel config (fixes P3); already applied in the pmaports working tree by the parent | `git -C parity/pmaports apply --check --cached` → `APPLY_OK`; `parity/verify.sh` → `OK` |
+| `patches/bluetooth/0001-j7elte-bt-pinctrl.patch` | ROM-identical `bt-en` group (`gpc4-2`, function=1, pud=0, con-pdn=3, pud-pdn=0) in `exynos7580-j7elte_gpio_{00,04,06}.dtsi` + `bluetooth` node reference in `exynos7580-j7elte_rev{00,04,06}.dts` (fixes P2 on **all three** revisions) | `git -C <kernel-tree> apply --check` **and** `--cached` vs clean baseline → `APPLY_OK`; `parity/verify.sh` → `OK`; all three patched DTBs compile and compare identical to the ROM DTBs (see P2) |
+| `patches/bluetooth/0002-j7elte-bt-hci-config.patch` | `CONFIG_BT_HCIUART=y`, `CONFIG_BT_HCIUART_H4=y` in the pmaports kernel config (fixes P3); already applied in the pmaports working tree by the parent | `git -C parity/pmaports apply --check --cached` → `APPLY_OK`; `parity/verify.sh` → `OK` |
 
 No `drivers/bluetooth/**` patch is needed: `bcm43xx.c` is symbol- and message-identical to
 the ROM driver, and it is not the firmware consumer in either kernel.

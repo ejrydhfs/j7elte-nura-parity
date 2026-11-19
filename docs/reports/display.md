@@ -247,7 +247,7 @@ inspect that patch first.
 
 ## Patches
 
-None. `parity/patches/display/` intentionally not created — P1–P4 pass and no kernel-side defect
+None. `patches/display/` intentionally not created — P1–P4 pass and no kernel-side defect
 was found. No kernel files were modified; no shared DT was changed.
 
 ## Residual risks / test plan

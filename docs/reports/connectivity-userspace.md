@@ -9,8 +9,8 @@ package name below is traced to a source file, a config line or a package manife
 runtime expectations are marked as such.
 
 The kernel-side work already exists and was **not** modified: `CONFIG_BCM4343=y` with the
-firmware-path patch (`parity/patches/wifi/0001-…`), `CONFIG_BT_HCIUART(_H4)=y`
-(`parity/patches/bluetooth/0002-…`), the BT pinctrl fix (`…/0001-j7elte-bt-pinctrl.patch`)
+firmware-path patch (`patches/wifi/0001-…`), `CONFIG_BT_HCIUART(_H4)=y`
+(`patches/bluetooth/0002-…`), the BT pinctrl fix (`…/0001-j7elte-bt-pinctrl.patch`)
 and `firmware-samsung-j7elte` (blobs at
 `/lib/firmware/postmarketos/samsung-j7elte/`).  This report covers only the userspace
 parts needed for the interfaces to come up.
@@ -88,7 +88,7 @@ missing, generates a MAC and writes it back with `filp_open(..., O_RDWR|O_CREAT,
 (`dhd_linux.c:18106-18140`).  If the **directory** does not exist the write fails and
 `dhd_set_macaddr_from_file()` returns before applying the generated address, so the shared
 NVRAM MAC `00:90:4c:c5:12:38` is used on every device (the residual risk R2 of
-`parity/reports/wifi.md`).
+`docs/reports/wifi.md`).
 
 `j7elte-wifi` therefore:
 
@@ -197,14 +197,14 @@ Balanced line speed: 115200 is the default (`J7ELTE_BT_SPEED`); set it to `30000
 `hciconfig -a` proves a stable link — Alpine patch 002 resets the UART speed after the
 firmware download, and the BCM43438 supports 3 Mbit/s.
 
-### Patches (`parity/patches/userspace/connectivity/`)
+### Patches (`patches/userspace/connectivity/`)
 
 | Patch | Contents | Verification |
 |---|---|---|
 | `0001-j7elte-wifi-package.patch` | adds the six files above under `device/archived/j7elte-wifi/` | `git apply --check` against pmaports baseline `ba682bd` → **APPLY_OK** |
 | `0002-j7elte-bt-package.patch` | adds the five files above under `device/archived/j7elte-bt/` | same → **APPLY_OK** |
 
-Canonical source copies are kept under `parity/userspace/connectivity/{wifi,bt}/`; the
+Canonical source copies are kept under `code/userspace/connectivity/{wifi,bt}/`; the
 package directories contain byte-identical copies (checksums in the APKBUILDs verify
 this).
 
@@ -291,11 +291,11 @@ parity/pmaports/device/archived/j7elte-wifi/{APKBUILD,wpa_supplicant.conf,
     j7elte-wifi.initd,j7elte-wifi.confd,j7elte-wifi.tmpfiles,j7elte-wifi.post-install}
 parity/pmaports/device/archived/j7elte-bt/{APKBUILD,j7elte-bt.initd,
     j7elte-bt.confd,j7elte-bt.service,j7elte-bt-addr,j7elte-bt.post-install}
-parity/userspace/connectivity/wifi/{wpa_supplicant.conf,j7elte-wifi.initd,
+code/userspace/connectivity/wifi/{wpa_supplicant.conf,j7elte-wifi.initd,
     j7elte-wifi.confd,j7elte-wifi.tmpfiles,j7elte-wifi.post-install}
-parity/userspace/connectivity/bt/{j7elte-bt.initd,j7elte-bt.confd,
+code/userspace/connectivity/bt/{j7elte-bt.initd,j7elte-bt.confd,
     j7elte-bt.service,j7elte-bt-addr,j7elte-bt.post-install}
-parity/patches/userspace/connectivity/{0001-j7elte-wifi-package.patch,
+patches/userspace/connectivity/{0001-j7elte-wifi-package.patch,
     0002-j7elte-bt-package.patch}
-parity/reports/connectivity-userspace.md
+docs/reports/connectivity-userspace.md
 ```

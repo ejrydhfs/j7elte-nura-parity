@@ -34,7 +34,7 @@ Extracted with `debugfs` from `system.raw` (an ext4 image whose root *is*
 `/system`, so the paths inside the image are `/bin/rild`, `/lib/…`). All are
 ARM EABI5, Android API 23 bionic, dynamically linked against
 `/system/bin/linker`, stripped; hashes are SHA-256 of the extracted files under
-`parity/userspace/ril/stock/`.
+`code/userspace/ril/stock/`.
 
 | Path in image | Size | ELF | SHA-256 |
 |---|---|---|---|
@@ -75,7 +75,7 @@ BuildID) — dual-SIM variant, same code layout for the parts analysed here.
 
 Everything below is from
 `android_kernel_samsung_universal7580-…/drivers/misc/modem_v1` (referred to as
-`modem_v1/`), which `parity/reports/modem.md` established is at P1–P4 parity
+`modem_v1/`), which `docs/reports/modem.md` established is at P1–P4 parity
 with the ROM kernel.
 
 ### 2.1 Device nodes
@@ -393,7 +393,7 @@ device is opened, and `BOOT_OFF` waits inside the kernel), or after (then
 
 ## 6. Implementation: `j7elte-ril`
 
-`parity/userspace/ril/j7elte-ril.c` (~1 340 lines, C11, POSIX only, libc only),
+`code/userspace/ril/j7elte-ril.c` (~1 340 lines, C11, POSIX only, libc only),
 packaged as `j7elte-ril` with OpenRC + systemd integration.
 
 Commands: `info`, `imei`, `version`, `time`, `operator`, `reg`, `pin`,
@@ -499,7 +499,7 @@ state machine and `rmnet` wiring).
 
 ## 10. Mapping to oFono / standalone control
 
-There is still no AT channel on this platform (`parity/reports/ril-userspace.md`
+There is still no AT channel on this platform (`docs/reports/ril-userspace.md`
 §7 stands: no `umts_calibcmd` iodev, no UART mux driver, no `AT+` strings in
 `libsec-ril.so`), so oFono's `atmodem` cannot be used. What `j7elte-ril`
 provides is the transport + opcode layer a plugin would sit on:
@@ -572,12 +572,12 @@ opcode coverage exists would only move the gap.
 
 | Path | Content |
 |---|---|
-| `parity/reports/ril-re.md` | this report |
-| `parity/userspace/ril/j7elte-ril.c` | daemon/CLI (canonical source) |
-| `parity/userspace/ril/j7elte-ril.{initd,confd,service}` | service integration |
-| `parity/userspace/ril/stock/` | the extracted stock binaries (§1) |
+| `docs/reports/ril-re.md` | this report |
+| `code/userspace/ril/j7elte-ril.c` | daemon/CLI (canonical source) |
+| `code/userspace/ril/j7elte-ril.{initd,confd,service}` | service integration |
+| `code/userspace/ril/stock/` | the extracted stock binaries (§1) |
 | `parity/pmaports/device/archived/j7elte-ril/` | APKBUILD + source copies |
-| `parity/patches/userspace/ril/0002-j7elte-ril-package.patch` | package as a `git diff` against pmaports `ba682bd` |
+| `patches/userspace/ril/0002-j7elte-ril-package.patch` | package as a `git diff` against pmaports `ba682bd` |
 
 Not touched: `device-samsung-j7elte/APKBUILD`, the kernel tree, the shared
 `device/archived/linux-samsung-j7elte` config, and the existing

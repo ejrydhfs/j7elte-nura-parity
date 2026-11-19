@@ -162,7 +162,7 @@ Log (`/tmp/gps-init.log`, full):
 2026-11-19 02:55:55.384 j7elte-gpsd: init: Bri_GetOutOfLegacy sent
 2026-11-19 02:55:55.494 j7elte-gpsd: init: no reply to Bri_GetOutOfLegacy within 110 ms
 2026-11-19 02:55:55.494 j7elte-gpsd: init: link check: 4 of 9 exchanges answered
-2026-11-19 02:55:55.494 j7elte-gpsd: init: stopping here.  The next vendor stages (Bri_ProgramSw/HwFlowControl @0x2a6aa0/0x2a6cfc, ESW/patch loading, RF/clock programming) need either the escape-byte search result or the ESW image, neither of which is available (see parity/reports/gps-init-impl.md)
+2026-11-19 02:55:55.494 j7elte-gpsd: init: stopping here.  The next vendor stages (Bri_ProgramSw/HwFlowControl @0x2a6aa0/0x2a6cfc, ESW/patch loading, RF/clock programming) need either the escape-byte search result or the ESW image, neither of which is available (see docs/reports/gps-init-impl.md)
 2026-11-19 02:55:55.494 j7elte-gpsd: init: handshake sequence finished
 2026-11-19 02:55:57.335 j7elte-gpsd: exiting: no NMEA bytes were ever received from /dev/ttySAC0 (40 bytes were consumed by the BRI handshake)
 2026-11-19 02:55:57.336 j7elte-gpsd: GPS powered off

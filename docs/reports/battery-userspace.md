@@ -2,7 +2,7 @@
 
 **Verdict: implemented (userspace only). No kernel change was needed or made.**
 
-The kernel side was already complete (see `parity/reports/battery.md`): the standard
+The kernel side was already complete (see `docs/reports/battery.md`): the standard
 `power_supply` class is registered for `battery`/`ac`/`usb`/`wireless`/`ps` plus the
 SM5703 charger/fuelgauge devices. UPower therefore gets **battery level, charging state,
 voltage and temperature** with no helper at all. What userspace was missing was the
@@ -172,7 +172,7 @@ without exposing `energy_full`/`charge_full` from the kernel (out of scope, see 
 **No udev rule and no UPower configuration are required or useful.** UPower enumerates
 `/sys/class/power_supply` through libgudev, and every attribute its battery class needs
 for level/state/voltage/temperature is already exported. Accordingly
-`parity/patches/userspace/battery/` contains no udev/UPower files — adding one would be
+`patches/userspace/battery/` contains no udev/UPower files — adding one would be
 a no-op at best and misleading at worst (`CHARGE_LIMIT`).
 
 ---
@@ -335,7 +335,7 @@ session.
   `/usr/libexec/j7elte-power/restore-capacity-max`, `/etc/init.d/j7elte-efs-restore`,
   `/etc/init.d/j7elte-power`, both systemd units, and the abuild install script; there
   is no `/etc/systemd/system` `.wants` tree any more.
-* **Behaviour** — `parity/userspace/battery/test-j7elte-power.sh` drives the daemon
+* **Behaviour** — `code/userspace/battery/test-j7elte-power.sh` drives the daemon
   against a fake `power_supply` tree (**12 checks**):
   latch at 85 % with limit 80; resume at 70 %; release on SIGTERM; release of a stale
   latch left by a killed instance; no write when limiting is disabled; persistence of a
@@ -415,7 +415,7 @@ session.
   `batt_slate_mode` at startup **only when `charge_limit > 0`** and adopts an existing
   latch, so the normal resume path releases it; with limiting disabled the attribute is
   still never read for state nor written. Test 3b covers this.
-* **Reproduce everything**: `parity/userspace/battery/build-check.sh`. It runs the host
+* **Reproduce everything**: `code/userspace/battery/build-check.sh`. It runs the host
   build, the GCC 10.3 and host aarch64 cross builds, the optional aarch64 musl build and
   qemu functional test, the uevent parser test, APKBUILD checksums, the
   `build()`/`package()` tree check, service/script syntax, the restore-script cases and
@@ -504,15 +504,15 @@ parity/pmaports/device/archived/j7elte-power/
     j7elte-power.post-install
     restore-capacity-max.sh
 
-parity/patches/userspace/battery/
+patches/userspace/battery/
     0001-pmaports-add-j7elte-power-package.patch        (new package, all nine files)
     0002-device-samsung-j7elte-depend-on-j7elte-power.patch
 
-parity/userspace/battery/
+code/userspace/battery/
     test-j7elte-power.sh     (12 functional checks against a fake sysfs tree)
     build-check.sh           (host+cross/musl builds, checksums, package tree,
                               service/script syntax, restore cases, tests)
-parity/reports/battery-userspace.md
+docs/reports/battery-userspace.md
 ```
 
 

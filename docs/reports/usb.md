@@ -126,7 +126,7 @@ matching the Nura selection.
 
 ## Patches
 
-None. No `parity/patches/usb/` directory is created.
+None. No `patches/usb/` directory is created.
 
 ## Residual risks / tests
 

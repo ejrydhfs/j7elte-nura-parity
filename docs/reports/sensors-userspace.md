@@ -7,7 +7,7 @@ aarch64. Package/patch verified against pmaports `ba682bd`. No hardware test per
 Scope: a small root daemon that exposes the two evdev sensors implemented by the Nura
 kernel — K2HH accelerometer and CM36672P/STK3013 proximity — on the system bus as
 `net.hadess.SensorProxy`, so existing iio-sensor-proxy consumers work on a kernel whose
-sensor drivers are *not* IIO. This closes residual risk 1 of `parity/reports/sensors.md`
+sensor drivers are *not* IIO. This closes residual risk 1 of `docs/reports/sensors.md`
 (“no userspace consumer”).
 
 Reference kernel: `android_kernel_samsung_universal7580-…` @ `b5e363a` (3.10.108).
@@ -65,7 +65,7 @@ the daemon adds the extension property `LidIsClosed` for it (`docs/reports/hall.
    `released claims of vanished client :1.2`.
 3. **Makefile installed a non-existent file.** `make install` referenced
    `net.hadess.SensorProxy.conf` while the shipped file is `j7elte-sensors.conf`; fixed in
-   `parity/userspace/sensors/Makefile` (the APKBUILD already installed the right file).
+   `code/userspace/sensors/Makefile` (the APKBUILD already installed the right file).
 
 No other interface mismatch: names, event codes, sysfs attribute names, unit scaling and
 0/1 proximity semantics all match the drivers.
@@ -76,7 +76,7 @@ Available toolchain (only aarch64 toolchain in the session):
 `parity/../toolchains/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc`
 (GNU Toolchain 10.3-2021.07, gcc 10.3.1).
 
-Command and output (`parity/userspace/sensors/build-aarch64.log`):
+Command and output (`code/userspace/sensors/build-aarch64.log`):
 
 ```
 make CC=<toolchain>/aarch64-none-linux-gnu-gcc \
@@ -89,7 +89,7 @@ j7elte-sensors: ELF 64-bit LSB executable, ARM aarch64, statically linked
 (no dynamic section)
 ```
 
-Zero warnings with `-Wall -Wextra`. Artifact `parity/userspace/sensors/j7elte-sensors-aarch64`
+Zero warnings with `-Wall -Wextra`. Artifact `code/userspace/sensors/j7elte-sensors-aarch64`
 (sha256 `4104ecd8b903d416a7342ec4fc9c3f51c25fff70695d66d6016f66c36bd249ee`).
 
 **Limitation:** this is a glibc-targeted static binary; the deployment target is
@@ -127,7 +127,7 @@ Default state after install: the unit is installed but not enabled; enable with
 (OpenRC). The daemon runs as root (required by the bus policy and by the 0640 root:input
 event nodes).
 
-Patch: `parity/patches/userspace/sensors/0001-add-j7elte-sensors-package.patch`.
+Patch: `patches/userspace/sensors/0001-add-j7elte-sensors-package.patch`.
 Verified against a clean `git archive ba682bd` export:
 
 ```
@@ -162,7 +162,7 @@ git apply … && diff -r pmaports/device/archived/j7elte-sensors → identical
 
 ### Executed (host, emulated evdev — no hardware)
 
-`parity/userspace/sensors/tests/run-host-test.sh` creates two **uinput** devices with the
+`code/userspace/sensors/tests/run-host-test.sh` creates two **uinput** devices with the
 kernel drivers’ names/capabilities, runs the daemon against a private dbus-daemon, claims
 the sensors and drives test vectors through the emulator. The emulator
 (`tests/test-emu.c`) is test-only, is not part of the package, and every value it emits is

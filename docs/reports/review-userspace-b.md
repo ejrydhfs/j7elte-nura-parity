@@ -133,8 +133,8 @@ is ordered like the OpenRC path.  `systemd-analyze verify` still accepts the uni
 
 Consequential edits: `sha512sums` entry for `j7elte-bt.service` updated in
 `j7elte-bt/APKBUILD`, canonical copy
-`parity/userspace/connectivity/bt/j7elte-bt.service` synced, and
-`parity/patches/userspace/connectivity/0002-j7elte-bt-package.patch` regenerated
+`code/userspace/connectivity/bt/j7elte-bt.service` synced, and
+`patches/userspace/connectivity/0002-j7elte-bt-package.patch` regenerated
 (applies to `ba682bd`, round-trip byte-identical).
 
 Residual (documented, not a defect): `rc-service bluetooth start` is called from
@@ -233,7 +233,7 @@ work while this review ran).  Everything below was re-checked against the state 
    so, and the copy states "Do not edit"), so `MIT` alone misdescribes the work.
 
 `camera-ae` kept all three hunks and regenerated
-`parity/patches/userspace/camera/0001-pmaports-add-j7elte-cam-package.patch` on top;
+`patches/userspace/camera/0001-pmaports-add-j7elte-cam-package.patch` on top;
 that patch applies to `ba682bd` and round-trips byte-identically.
 
 ### 5.2 Camera ABI/interface cross-check (all pass)
@@ -316,7 +316,7 @@ connectivity test, and to stop using `config-nura-j7elte` for these packages.
 Also stale: `connectivity-userspace.md` "Integration still required" says
 `device-samsung-j7elte/APKBUILD` must gain `j7elte-wifi`/`j7elte-bt`.  It already
 has both (and `j7elte-fde`, `j7elte-cam`, …), and the file is byte-identical to
-`parity/patches/userspace/0001-device-deps.patch` applied to `ba682bd`.
+`patches/userspace/0001-device-deps.patch` applied to `ba682bd`.
 
 ## 7. Checks executed (evidence)
 

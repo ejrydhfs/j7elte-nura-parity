@@ -30,7 +30,7 @@ available, so nothing was run on the target. The probe binary was smoke-tested u
 ## 1. What the kernel actually exposes: kbase, not DRM
 
 The kernel builds Samsung's downstream ARM kbase driver (DDK r15p0), as established in
-`parity/reports/gpu.md`:
+`docs/reports/gpu.md`:
 
 - `CONFIG_MALI_MIDGARD=y` (config:2284), `CONFIG_MALI_T7XX=y` (2288),
   `CONFIG_MALI_R15P0=y` (2290); release name `r15p0-00rel0`
@@ -48,7 +48,7 @@ The kernel builds Samsung's downstream ARM kbase driver (DDK r15p0), as establis
   call (`:279-340`).
 - UK version: `BASE_UK_VERSION_MAJOR 10`, `BASE_UK_VERSION_MINOR 6`
   (`mali_kbase_uku.h:69-70`). The ROM's userspace blob is UK 10.0 / DDK `r7p0`
-  (`parity/reports/gpu.md` §7 R1). `GET_VERSION` returns
+  (`docs/reports/gpu.md` §7 R1). `GET_VERSION` returns
   `"K:" MALI_RELEASE_NAME "(GPL)"` (`mali_kbase_core_linux.c:111,719`), i.e.
   `K:r15p0-00rel0(GPL)` for the Nura build.
 - No DRM: `# CONFIG_DRM is not set` (`config-nura-j7elte:2262`). The video path is
@@ -159,7 +159,7 @@ Consequences:
    the blob is r7p0 / UK 10.0. The standard function IDs are compatible, but the Samsung
    vendor block is renumbered (`KBASE_FUNC_HWCNT_UTIL_SETUP` +37→+41, `VSYNC_SKIP`
    +39→+43, `CREATE_SURFACE` +40→+44, …; `KBASE_FUNC_EXT_BUFFER_LOCK` +17 removed) — see
-   `parity/reports/gpu.md` §7 R1. Whether the blob issues those calls is not statically
+   `docs/reports/gpu.md` §7 R1. Whether the blob issues those calls is not statically
    known, so even the chroot route carries an unverified break risk.
 
 For reference, the ARM **Linux** Midgard DDK (the only userspace that legitimately speaks
@@ -237,7 +237,7 @@ described as such.
 
 Both files are diagnostic, not a driver:
 
-- `parity/userspace/gpu/kbase-probe/kbase-probe.c` — freestanding aarch64 (no libc, raw
+- `code/userspace/gpu/kbase-probe/kbase-probe.c` — freestanding aarch64 (no libc, raw
   syscalls; 3.4 KiB `.text`, static, no interpreter). It:
   1. reports `/dev/mali0`, `/dev/dri/renderD128`, `/dev/dri/card0`, `/dev/fb0`;
   2. performs the required kbase UK sequence on `/dev/mali0`:
@@ -263,7 +263,7 @@ Both files are diagnostic, not a driver:
   ```
   On the device it should print `handshake 10.6 -> 10.6`, `GET_VERSION … K:r15p0-00rel0(GPL)`
   and `no DRM node (Mesa Panfrost/GBM cannot bind)`.
-- `parity/userspace/gpu/check-3d.sh` — on-device, read-only status script: device nodes,
+- `code/userspace/gpu/check-3d.sh` — on-device, read-only status script: device nodes,
   platform device/debugfs/sysfs, loaded `mali*` modules, DRM binding, dmesg lines,
   installed Mesa/Xorg packages, `eglinfo`, then runs the probe and prints the
   interpretation.
@@ -273,9 +273,9 @@ only (display userspace is a separate gap).
 
 ## 8. Patches
 
-**None.** `parity/patches/userspace/gpu/` is intentionally absent: no source change can
+**None.** `patches/userspace/gpu/` is intentionally absent: no source change can
 give this kernel a GL driver. The kernel half is already complete (kbase r15p0 —
-`parity/reports/gpu.md`), and the userspace half is impossible without (a) a panfrost DRM
+`docs/reports/gpu.md`), and the userspace half is impossible without (a) a panfrost DRM
 kernel (mainline port) or (b) a proprietary, unavailable, 32-bit Android/glibc DDK.
 
 ## 9. Verification status / residual risks
@@ -284,7 +284,7 @@ kernel (mainline port) or (b) a proprietary, unavailable, 32-bit Android/glibc D
   runtime GL test. The probe's correctness on-device depends on the kbase sequence above;
   its expected output is derived from the in-tree handlers, not observed.
 - If the ROM DDK is ever wanted bit-exactly, the config change in
-  `parity/reports/gpu.md` §7 R1 (`DDK_VERSION_OS="m"`, `MALI_T72X=y`, `MALI_R7P0_T72X=y`)
+  `docs/reports/gpu.md` §7 R1 (`DDK_VERSION_OS="m"`, `MALI_T72X=y`, `MALI_R7P0_T72X=y`)
   is the only lever — and it still yields no Linux GL userspace.
 - Alpine package versions are from the live package index on 2026-10-24; pmOS uses the
   same Alpine binary packages, so availability holds unless the packages are dropped.

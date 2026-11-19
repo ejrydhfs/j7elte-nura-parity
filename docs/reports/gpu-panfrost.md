@@ -4,12 +4,12 @@ Scope: can the Mali-T720 in the Nura 3.10.108 kernel be driven by a Panfrost-cla
 DRM driver, what exactly has to be backported or written, and what can be built
 today without silicon?
 
-Deliverables: `parity/userspace/gpu/panfrost/` (shared register/MMU code + tests + M0
+Deliverables: `code/userspace/gpu/panfrost/` (shared register/MMU code + tests + M0
 kernel module + `design.md`) and this report. **No hardware was available; nothing
 here was run on a j7elte, and no working driver is claimed.**
 
-Base facts reused: `parity/reports/gpu.md` (kbase is complete and at parity),
-`parity/reports/gpu-userspace.md` (today's only Linux 3D path is Mesa llvmpipe).
+Base facts reused: `docs/reports/gpu.md` (kbase is complete and at parity),
+`docs/reports/gpu-userspace.md` (today's only Linux 3D path is Mesa llvmpipe).
 
 ---
 
@@ -197,7 +197,7 @@ Full list with mitigations in `design.md` §5. The ones that matter:
 ## 6. Delivered artifacts
 
 ```
-parity/userspace/gpu/panfrost/
+code/userspace/gpu/panfrost/
 ├── mali_hw.h              register map, GPU-ID/MMU-feature decode, LPAE bits,
 │                          both memattr tables, TRANSTAB encoder (provenance per constant)
 ├── mali_lpae.h            4-level page-table builder (map/walk/unmap, allocator ops)
@@ -211,7 +211,7 @@ parity/userspace/gpu/panfrost/
     ├── Kbuild, Makefile   out-of-tree build against the prepared 3.10 tree
     └── panfrost7580.ko    built artifact (aarch64 relocatable, 3.10.108 vermagic)
 
-parity/patches/userspace/gpu-panfrost/
+patches/userspace/gpu-panfrost/
 └── 0001-arm64-dts-exynos7580-add-mali-t720-compatible.patch
 ```
 
@@ -226,7 +226,7 @@ names, `power-domains`) is documented in `design.md` §8 as a diff, not applied.
 Unit tests (host + cross):
 
 ```
-$ cd parity/userspace/gpu/panfrost && make check
+$ cd code/userspace/gpu/panfrost && make check
 == native ==     114 checks, 0 failure(s)
 == aarch64 (qemu) == 114 checks, 0 failure(s)
 ```

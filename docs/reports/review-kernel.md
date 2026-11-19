@@ -70,13 +70,13 @@ samsung-usb-ethaddr.patch                                     git apply OK
 ```
 
 The BT and camera patch copies inside the package are byte-identical to
-`parity/patches/bluetooth/0001-…` and `parity/patches/camera/0001-…`
+`patches/bluetooth/0001-…` and `patches/camera/0001-…`
 (sha512 `a5d09aa5…` / `767b7afd…`), and the APKBUILD `sha512sums` match the
 actual files (also `4351f862…` config, `75545ccd…` sun patch).
 
 ### 1.2 pmaports series
 
-`parity/patches/pmaports/0005-linux-samsung-j7elte-config-and-parity-patches.patch`
+`patches/pmaports/0005-linux-samsung-j7elte-config-and-parity-patches.patch`
 replaces the old config-sha-only patch and applies to baseline `ba682bd`; it
 adds the BT + camera patch files, updates `source=`/`sha512sums`, and replaces
 the broken sun-patch file with a real 288-byte patch (`arch/arm64/mm/proc.S`,
@@ -184,7 +184,7 @@ pmaports config: `# CONFIG_DRM is not set`, `CONFIG_EXYNOS_DECON_EXYNOS7580=y`,
 camera patches are display-neutral.
 
 The two DRM patches are deliberately **not** in the default package; DRM is
-opt-in via `parity/patches/drm/*` + `config-drm-exynos7580.fragment`.
+opt-in via `patches/drm/*` + `config-drm-exynos7580.fragment`.
 
 ### 3.3 DRM opt-in caveat (verified)
 
@@ -214,7 +214,7 @@ Suggested (non-applied) documentation diff for the fragment header:
 ```diff
 -# Apply on top of the pmaports config-samsung-j7elte.aarch64, then run olddefconfig.
 +# Apply on top of the pmaports config-samsung-j7elte.aarch64, then run
-+# olddefconfig.  The kernel tree MUST already contain parity/patches/drm/0001
++# olddefconfig.  The kernel tree MUST already contain patches/drm/0001
 +# and 0002: without them this fragment disables the vendor fbdev stack while
 +# DRM_EXYNOS7580 does not exist, leaving the device with no display driver.
 ```
@@ -225,7 +225,7 @@ Snapshot output (23 patches): **21 OK + 1 SKIP + 1 FAIL, exit 1**.
 
 * routing is still correct for every patch: 5 kernel patches → kernel tree,
   17 `device/archived/…` patches → pmaports, 1 source-tree patch skipped
-  (`gps/0002`, target `parity/userspace/gps/Makefile`). No false routing.
+  (`gps/0002`, target `code/userspace/gps/Makefile`). No false routing.
 * the single FAIL is a **false negative**:
   `userspace/review-a/0001-j7elte-sensors-ignore-unknown-dbus-header-fields.patch`
   reports “`device/archived/j7elte-sensors/dbus-wire.c: does not exist in
@@ -297,13 +297,13 @@ S=/run/media/user/00000000-0000-4000-8000-000000000000/j7elte-session
 sh $S/parity/verify.sh                 # snapshot: 21 OK + 1 SKIP + 1 FAIL (review-a)
 # config (needs the patched tree):
 mkdir -p /var/tmp/cfg && cp $S/parity/pmaports/device/archived/linux-samsung-j7elte/config-samsung-j7elte.aarch64 /var/tmp/cfg/.config
-cat $S/parity/patches/drm/config-drm-exynos7580.fragment >> /var/tmp/cfg/.config
+cat $S/patches/drm/config-drm-exynos7580.fragment >> /var/tmp/cfg/.config
 make -s -C $S/parity/final-kernel-check O=/var/tmp/cfg ARCH=arm64 olddefconfig
 cmp /var/tmp/cfg/.config $S/parity/final-out/.config       # identical
 # sequential pmaports series (baseline ba682bd, apply sensors before review-a):
 git -C $S/parity/pmaports archive ba682bd | tar -x -C /var/tmp/pm && cd /var/tmp/pm
 git init -q && git add -A && git -c user.name=r -c user.email=r@r commit -qm base
-# then: git apply $S/parity/patches/... in the order listed in §1.2
+# then: git apply $S/patches/... in the order listed in §1.2
 # artifacts:
 strings -a $S/parity/final-out/arch/arm64/boot/Image | grep -E 'exynos7580-decon-drm|trying request_firmware'
 $S/toolchains/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-objdump \

@@ -33,7 +33,7 @@ source walk-through and for the dead `HIC_SET_CAM_CONTROL` path.
 
 ## Tool
 
-`parity/userspace/camera/j7elte-cam/j7elte-cam.c` (single C file, no non-POSIX
+`code/userspace/camera/j7elte-cam/j7elte-cam.c` (single C file, no non-POSIX
 dependencies) supports:
 
 ```
@@ -75,7 +75,7 @@ whether the firmware honoured the manual values.
 - pmaports package `j7elte-cam` (APKBUILD + sources) under
   `parity/pmaports/device/archived/j7elte-cam/`.
 - Exported patch:
-  `parity/patches/userspace/camera/0001-pmaports-add-j7elte-cam-package.patch`
+  `patches/userspace/camera/0001-pmaports-add-j7elte-cam-package.patch`
   (`git apply --check` against pmaports `ba682bd` passes).
 - Runtime dependencies: `firmware-samsung-j7elte` (FIMC-IS firmware/setfiles,
   declared in `depends`) and read access to `/dev/video*` (group `video`).

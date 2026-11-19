@@ -8,7 +8,7 @@ recovered from `/system/bin/gpsd`, with the vendor's timeouts, retries and
 response decoding. The sequence stops at `Bri_ProgramSwFlowControl`, which
 *searches* for a working escape-byte pair instead of emitting a constant
 frame, so it cannot be derived without hardware. Full evidence, address map
-and protocol table: `parity/reports/gps-init-impl.md`.
+and protocol table: `docs/reports/gps-init-impl.md`.
 
 Without `--init` the daemon still works as a NMEA forwarder and as a raw UART
 capture tool.
@@ -17,15 +17,15 @@ Scope: userspace only. No kernel file, no shared pmaports file and no DT was
 touched. No hardware was available: everything below is cross-compilation,
 binary/string analysis and an off-target functional test under `qemu-aarch64`.
 
-Kernel side (unchanged, already at parity — see `parity/reports/gps.md`):
+Kernel side (unchanged, already at parity — see `docs/reports/gps.md`):
 
 | Fact | Evidence |
 |---|---|
 | power GPIO exported as `/sys/class/sec/gps/GPS_PWR_EN/value` | `drivers/gps/sec_gps_bcm4752.c:34` (`sec_device_create(NULL,"gps")`), `:57` (`gpio_direction_output(…, 0)`), `:58-59` (`gpio_export` + `gpio_export_link(gps_dev, "GPS_PWR_EN", …)`) |
 | chip is *off* after probe (output low) | `sec_gps_bcm4752.c:57` |
 | `check_gps_op()` reports the pin level | `sec_gps_bcm4752.c:16-25` |
-| UART is `uart0` → `ttySAC0`, console stays on `ttySAC1` | `parity/reports/gps.md` §P2 |
-| no reset line, no regulator, no clock, no firmware | `parity/reports/gps.md` §P2/P4; `gps.xml` has `GpioNResetPath` unset |
+| UART is `uart0` → `ttySAC0`, console stays on `ttySAC1` | `docs/reports/gps.md` §P2 |
+| no reset line, no regulator, no clock, no firmware | `docs/reports/gps.md` §P2/P4; `gps.xml` has `GpioNResetPath` unset |
 
 ## 1. What the vendor userspace does (evidence)
 
@@ -105,7 +105,7 @@ protocol.
 ## 2. The exact unknowns (why this is PARTIAL)
 
 Resolved since the first revision of this report (see
-`parity/reports/gps-init-impl.md` for the address-level evidence):
+`docs/reports/gps-init-impl.md` for the address-level evidence):
 
 * **Autobaud / legacy-exit pattern** — *resolved*. `Bri_SendAutobaud`
   (`0x2a5ae4`) is `memset(buf, 0x80, 16)` plus one transmit; the legacy exit
@@ -159,7 +159,7 @@ next person does not repeat it blindly.
 
 ## 3. What was implemented
 
-`parity/userspace/gps/` — `j7elte-gpsd`, a dependency-free C daemon
+`code/userspace/gps/` — `j7elte-gpsd`, a dependency-free C daemon
 (1,114 lines, POSIX + Linux):
 
 1. **Power sequencing** — writes `1` to the sysfs attribute exported by
@@ -180,7 +180,7 @@ next person does not repeat it blindly.
    DebugSfr. The sequence then stops and says so, because the next vendor step
    (`Bri_ProgramSwFlowControl`) is a data-dependent escape-byte search. Every
    byte, timeout and retry is cited to an address in
-   `parity/reports/gps-init-impl.md`.
+   `docs/reports/gps-init-impl.md`.
 4. **NMEA extraction** — incremental line framing; a sentence is forwarded only
    if it starts with `$` and contains only printable bytes; CRLF is
    normalised; checksums are verified and counted but never used to drop data;
@@ -324,18 +324,18 @@ Prerequisites: `linux-samsung-j7elte` + this package + `gpsd`.
 
 | Path | Role |
 |---|---|
-| `parity/userspace/gps/src/j7elte-gpsd.c` | daemon source |
-| `parity/userspace/gps/Makefile` | build (`CC` overridable) |
-| `parity/userspace/gps/tests/smoke_test.py` | off-target receive-path test (qemu-aarch64) |
-| `parity/userspace/gps/tests/init_test.py` | off-target `--init` test (qemu-aarch64, PTY emulates the chip) |
-| `parity/reports/gps-init-impl.md` | RE method, address map, protocol table, residual blocker |
+| `code/userspace/gps/src/j7elte-gpsd.c` | daemon source |
+| `code/userspace/gps/Makefile` | build (`CC` overridable) |
+| `code/userspace/gps/tests/smoke_test.py` | off-target receive-path test (qemu-aarch64) |
+| `code/userspace/gps/tests/init_test.py` | off-target `--init` test (qemu-aarch64, PTY emulates the chip) |
+| `docs/reports/gps-init-impl.md` | RE method, address map, protocol table, residual blocker |
 | `parity/pmaports/device/archived/j7elte-gpsd/APKBUILD` | package |
 | `…/j7elte-gpsd.c` | source copy for `abuild` (flat `$srcdir`) |
 | `…/j7elte-gpsd.conf` | default options + gpsd wiring notes |
 | `…/j7elte-gpsd.initd` | OpenRC service |
 | `…/j7elte-gpsd.service` | systemd unit |
-| `parity/patches/userspace/gps/0001-pmaports-add-j7elte-gpsd-package.patch` | package as a patch (applies to `parity/pmaports`) |
-| `parity/patches/userspace/gps/0002-userspace-add-j7elte-gpsd-source.patch` | source tree as a patch (applies at the session root) |
+| `patches/userspace/gps/0001-pmaports-add-j7elte-gpsd-package.patch` | package as a patch (applies to `parity/pmaports`) |
+| `patches/userspace/gps/0002-userspace-add-j7elte-gpsd-source.patch` | source tree as a patch (applies at the session root) |
 
 Both patches were regenerated after the `--init` work, verified with
 `git apply --check` against empty trees, and checked to reproduce the source

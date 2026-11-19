@@ -10,10 +10,10 @@ complete**; no success is claimed for them and no hardware was available.
 This pass took over a concurrently written `j7elte-ril.c` (protocol-41 proxy,
 mock-CP self-test) and fixed the defects below. Detailed reverse-engineering
 addresses and the per-opcode Ghidra listings are in
-`parity/reports/ril-re.md`; this report covers the implementation, build,
+`docs/reports/ril-re.md`; this report covers the implementation, build,
 packaging, validation and the remaining gap.
 
-Final source state: `parity/userspace/ril/j7elte-ril.c`, 1335 lines, sha512
+Final source state: `code/userspace/ril/j7elte-ril.c`, 1335 lines, sha512
 `5ef663ec…8b4f` (full hash in the APKBUILD), cross-built and self-tested as
 described in §4.
 
@@ -253,11 +253,11 @@ Prerequisites: `j7elte-cbd` installed and the CP booted; kernel with
 
 | Path | Content |
 |---|---|
-| `parity/userspace/ril/j7elte-ril.c` | canonical source, 1335 lines |
+| `code/userspace/ril/j7elte-ril.c` | canonical source, 1335 lines |
 | `parity/pmaports/device/archived/j7elte-ril/` | APKBUILD, source copy (same hash), initd, confd, systemd unit |
-| `parity/patches/userspace/ril/0002-j7elte-ril-package.patch` | package diff; regenerated against this source revision, `git apply --check` passes on pmaports `ba682bd`, and the applied tree is byte-identical to the package directory |
-| `parity/reports/ril-impl.md` | this report |
-| `parity/reports/ril-re.md` | reverse-engineering report and per-address evidence (separate artifact) |
+| `patches/userspace/ril/0002-j7elte-ril-package.patch` | package diff; regenerated against this source revision, `git apply --check` passes on pmaports `ba682bd`, and the applied tree is byte-identical to the package directory |
+| `docs/reports/ril-impl.md` | this report |
+| `docs/reports/ril-re.md` | reverse-engineering report and per-address evidence (separate artifact) |
 
 No shared device APKBUILD, kernel config or `j7elte-cbd` file was modified.
 The package copy is byte-identical to the final source, its APKBUILD hash is
@@ -267,7 +267,7 @@ integration agent for the CALL/SMS/PDP consolidation.
 
 ## 8. CALL/SMS/GPRS consolidation
 
-`parity/patches/userspace/ril/0003-j7elte-ril-call-sms-pdp.patch` has since
+`patches/userspace/ril/0003-j7elte-ril-call-sms-pdp.patch` has since
 been applied: the canonical source, package copy and APKBUILD are now at
 SHA-512 `57480ed5…8c83` (2147 lines), and 0002 was regenerated. 0003 added
 CALL answer/release/hold/dial-A/DTMF/flash/voice-privacy and call get-list,
@@ -285,4 +285,4 @@ GSM 03.40 SMS-SUBMIT text encoder for `sms-send NUMBER TEXT`, SIM write
 04/04, automatic incoming-SMS ack in `listen`, PDP actions 2..5, IPv6
 configuration and mobile-data. It is **not applied** here. Details, evidence,
 the new hash and the remaining unsupported messages are in
-`parity/reports/ril-impl-2.md`.
+`docs/reports/ril-impl-2.md`.

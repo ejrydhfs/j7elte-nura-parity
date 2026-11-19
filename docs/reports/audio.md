@@ -184,7 +184,7 @@ this device:
 
 ## P5 — Patch
 
-None. P1–P4 pass, so no patch exists under `parity/patches/audio/`.
+None. P1–P4 pass, so no patch exists under `patches/audio/`.
 
 ## Why "Audio = Partial" is not a kernel gap
 

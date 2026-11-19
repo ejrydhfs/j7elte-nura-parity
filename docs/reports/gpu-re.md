@@ -27,7 +27,7 @@ container and the closed HAL stack along, plus a kernel DDK-revision change
 All paths below are the on-device ones. In `system.raw` the **image root is
 `/system`** (`/bin/linker` is `/system/bin/linker`); `/vendor` is a separate
 tree inside the same partition. Reproduce with
-`parity/userspace/gpu/re-hybris/extract-rom-gles.sh`; full manifest in
+`code/userspace/gpu/re-hybris/extract-rom-gles.sh`; full manifest in
 `extract-manifest.txt`.
 
 | On-device path | Class / ABI | Size | sha256 (first 16) | Interp | NEEDED |
@@ -312,18 +312,18 @@ statically identified.
 
 | File | What it is |
 |---|---|
-| `parity/userspace/gpu/re-hybris/extract-rom-gles.sh` | debugfs extractor + ELF manifest printer (read-only, no root) |
-| `parity/userspace/gpu/re-hybris/extract-manifest.txt` | generated manifest: class/ABI, sha256, NEEDED for 20 objects |
-| `parity/userspace/gpu/re-hybris/miniloader/` | freestanding ARM32 ELF loader: APS2 (SLEB128) + REL/PLT relocations, 284 stub symbols, EGL/kbase probes (`miniloader.c`, `common.h`, `start.S`, `Makefile`) |
-| `parity/userspace/gpu/re-hybris/run-prototype.sh` | builds the loader and runs it on the extracted blob under `qemu-arm` |
-| `parity/userspace/gpu/re-hybris/logs/miniloader.log` | captured run: relocations, EGL export addresses, `eglGetDisplay`, kbase ioctls, blob error text |
-| `parity/userspace/gpu/re-hybris/proto/` | ARM32 bionic harness linked directly against `libGLES_mali.so` (exercises the ROM's linker; currently blocked by the qemu/bionic deadlock) |
-| `parity/userspace/gpu/re-hybris/logs/bionic-linker.log` | strace of the ROM linker mapping the blob and all NEEDED libs, then its startup failure (`page record … not found`, exit 1) |
+| `code/userspace/gpu/re-hybris/extract-rom-gles.sh` | debugfs extractor + ELF manifest printer (read-only, no root) |
+| `code/userspace/gpu/re-hybris/extract-manifest.txt` | generated manifest: class/ABI, sha256, NEEDED for 20 objects |
+| `code/userspace/gpu/re-hybris/miniloader/` | freestanding ARM32 ELF loader: APS2 (SLEB128) + REL/PLT relocations, 284 stub symbols, EGL/kbase probes (`miniloader.c`, `common.h`, `start.S`, `Makefile`) |
+| `code/userspace/gpu/re-hybris/run-prototype.sh` | builds the loader and runs it on the extracted blob under `qemu-arm` |
+| `code/userspace/gpu/re-hybris/logs/miniloader.log` | captured run: relocations, EGL export addresses, `eglGetDisplay`, kbase ioctls, blob error text |
+| `code/userspace/gpu/re-hybris/proto/` | ARM32 bionic harness linked directly against `libGLES_mali.so` (exercises the ROM's linker; currently blocked by the qemu/bionic deadlock) |
+| `code/userspace/gpu/re-hybris/logs/bionic-linker.log` | strace of the ROM linker mapping the blob and all NEEDED libs, then its startup failure (`page record … not found`, exit 1) |
 
 Reproduce:
 
 ```
-cd parity/userspace/gpu/re-hybris
+cd code/userspace/gpu/re-hybris
 ./extract-rom-gles.sh ../../../../system.raw romroot   # manifest + rootfs
 ./run-prototype.sh                                      # needs qemu-arm + clang/lld
 ```

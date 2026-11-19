@@ -7,7 +7,7 @@ run for it. The kernel tree is unmodified (`git status --porcelain` empty).
 
 What is left behind is the self-contained reference header with the verified
 wire layouts and translation helpers:
-`parity/patches/gpu-kbase-compat/mali_kbase_uku_r7p0_compat.h`.
+`patches/gpu-kbase-compat/mali_kbase_uku_r7p0_compat.h`.
 It is not included by any compiled file and has no effect on the build.
 
 ## 1. Confirmed mismatches (source-verified)

@@ -53,7 +53,7 @@ Patch test against a clean worktree of the pinned baseline:
 ```
 pmaports HEAD = ba682bdf2272a1e23c5e33d836c49e2a903ca076 ("baseline: pmaports j7elte packages")
 git worktree add --detach /tmp/pm-clean ba682bd
-git -C /tmp/pm-clean apply --check parity/patches/userspace/gpu/0001-j7elte-gpu-soft-package.patch   -> OK
+git -C /tmp/pm-clean apply --check patches/userspace/gpu/0001-j7elte-gpu-soft-package.patch   -> OK
 git -C /tmp/pm-clean apply         <same patch>                                                     -> OK
   device/archived/j7elte-gpu-soft/10-fbdev.conf    | 15 +++
   device/archived/j7elte-gpu-soft/APKBUILD         | 33 +++
@@ -253,7 +253,7 @@ packages but not `j7elte-gpu-soft` (lines 12-26):
 	j7elte-wifi
 ```
 
-`parity/patches/userspace/0001-device-deps.patch` adds those nine and was
+`patches/userspace/0001-device-deps.patch` adds those nine and was
 created at 21:48; the gpu-soft package directory was created at 21:57, i.e. the
 dependency list was written before the package existed. Effect: a normal
 `pmbootstrap install` for j7elte installs neither the Xorg fbdev config nor the
@@ -262,7 +262,7 @@ software-GL environment, so the only working 3D path documented in
 
 `device-samsung-j7elte` is shared device config owned by another agent, so this
 was **not** edited. Proposed diff, to be folded into
-`parity/patches/userspace/0001-device-deps.patch` (alphabetical position):
+`patches/userspace/0001-device-deps.patch` (alphabetical position):
 
 ```diff
 --- a/device/archived/device-samsung-j7elte/APKBUILD

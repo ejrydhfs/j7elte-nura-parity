@@ -2,8 +2,8 @@
 
 **Scope.** Make headset/headphone insertion switch the ALSA route without
 manual `alsaucm` calls, on top of the UCM2 profile from
-`parity/reports/audio-userspace.md` and the parity-verified kernel
-(`parity/reports/audio.md`).
+`docs/reports/audio-userspace.md` and the parity-verified kernel
+(`docs/reports/audio.md`).
 
 **No hardware was available.** Everything below is static analysis of the
 kernel source/DT plus host-side execution of the daemon against synthetic
@@ -14,13 +14,13 @@ qemu-user).  No real codec, jack or PCM was exercised.
 
 | Deliverable | Path |
 |---|---|
-| Daemon source | `parity/userspace/audio/jack/j7elte-audio-jack.c` |
-| Config | `parity/userspace/audio/jack/j7elte-audio-jack.conf` |
-| OpenRC service | `parity/userspace/audio/jack/j7elte-audio-jack.initd` |
-| systemd unit | `parity/userspace/audio/jack/j7elte-audio-jack.service` |
+| Daemon source | `code/userspace/audio/jack/j7elte-audio-jack.c` |
+| Config | `code/userspace/audio/jack/j7elte-audio-jack.conf` |
+| OpenRC service | `code/userspace/audio/jack/j7elte-audio-jack.initd` |
+| systemd unit | `code/userspace/audio/jack/j7elte-audio-jack.service` |
 | Package | `parity/pmaports/device/archived/j7elte-audio-jack/` (same four files + `APKBUILD`) |
-| Package patch | `parity/patches/userspace/audio/0003-j7elte-audio-jack-package.patch` |
-| Device dependency patch fragment | `parity/patches/userspace/audio/0004-device-samsung-j7elte-depend-on-audio-jack.patch` |
+| Package patch | `patches/userspace/audio/0003-j7elte-audio-jack-package.patch` |
+| Device dependency patch fragment | `patches/userspace/audio/0004-device-samsung-j7elte-depend-on-audio-jack.patch` |
 
 The daemon is single-threaded C11, libc only; runtime dependencies are
 `alsa-utils` (`alsaucm`, `amixer`) and `j7elte-audio-ucm`.
@@ -224,7 +224,7 @@ package: /usr/bin/j7elte-audio-jack, /etc/j7elte-audio-jack.conf,
   `NoNewPrivileges`, `MemoryDenyWriteExecute`.
 * The shared `device-samsung-j7elte/APKBUILD` was **not** edited.  The
   dependency addition is
-  `parity/patches/userspace/audio/0004-device-samsung-j7elte-depend-on-audio-jack.patch`:
+  `patches/userspace/audio/0004-device-samsung-j7elte-depend-on-audio-jack.patch`:
 
   ```diff
   @@ -13,6 +13,7 @@
@@ -238,7 +238,7 @@ package: /usr/bin/j7elte-audio-jack, /etc/j7elte-audio-jack.conf,
   It is baseline-relative to the current working-tree device `APKBUILD`
   (which already carries `j7elte-audio-ucm` from patch 0002) and was
   verified with `patch -p1 --dry-run`.  The consolidated
-  `parity/patches/userspace/0001-device-deps.patch` (owned by the device
+  `patches/userspace/0001-device-deps.patch` (owned by the device
   packaging work) needs the same one-line addition when it is
   regenerated; it was deliberately **not** edited here to avoid
   conflicting with concurrent work on the shared device package.  If the

@@ -135,7 +135,7 @@ and the chip's boot code is what adapts.
 
 ## 4. What `--init` now does
 
-`parity/userspace/gps/src/j7elte-gpsd.c`, new section
+`code/userspace/gps/src/j7elte-gpsd.c`, new section
 "BCM4752 BRI handshake" plus `asic_init()`:
 
 1. `tcflush(TCIFLUSH)`, then write the 16-byte autobaud burst in one write.
@@ -253,11 +253,11 @@ chip.
 
 | Path | Change |
 |---|---|
-| `parity/userspace/gps/src/j7elte-gpsd.c` | BRI handshake + `--init` (+168 lines) |
-| `parity/userspace/gps/tests/init_test.py` | new off-target init test |
-| `parity/userspace/gps/Makefile` | `check` runs both tests |
+| `code/userspace/gps/src/j7elte-gpsd.c` | BRI handshake + `--init` (+168 lines) |
+| `code/userspace/gps/tests/init_test.py` | new off-target init test |
+| `code/userspace/gps/Makefile` | `check` runs both tests |
 | `parity/pmaports/device/archived/j7elte-gpsd/j7elte-gpsd.c` | synced copy |
 | `…/j7elte-gpsd.conf` | documents `--init` |
 | `…/APKBUILD` | refreshed `sha512sums` |
-| `parity/patches/userspace/gps/0001-pmaports-add-j7elte-gpsd-package.patch` | regenerated, `git apply --check` OK, applies to an empty tree and reproduces the directory exactly |
-| `parity/patches/userspace/gps/0002-userspace-add-j7elte-gpsd-source.patch` | regenerated, `git apply --check` OK, reproduces the tree exactly |
+| `patches/userspace/gps/0001-pmaports-add-j7elte-gpsd-package.patch` | regenerated, `git apply --check` OK, applies to an empty tree and reproduces the directory exactly |
+| `patches/userspace/gps/0002-userspace-add-j7elte-gpsd-source.patch` | regenerated, `git apply --check` OK, reproduces the tree exactly |

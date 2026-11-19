@@ -167,7 +167,7 @@ no kernel change is warranted.
 
 ## Patches
 
-None. P1–P4 pass; `parity/patches/modem/` intentionally not created.
+None. P1–P4 pass; `patches/modem/` intentionally not created.
 
 ## Residual risks / tests
 

@@ -118,7 +118,7 @@ carries an explicit unit.
 
 ## 3. What was implemented
 
-`parity/userspace/camera/j7elte-cam/j7elte-cam.c`:
+`code/userspace/camera/j7elte-cam/j7elte-cam.c`:
 
 - `shot_apply_3a()` — writes `ctl.aa.aeMode = AA_AEMODE_OFF`,
   `ctl.aa.aeTargetFpsRange`, `ctl.sensor.exposureTime/frameDuration/

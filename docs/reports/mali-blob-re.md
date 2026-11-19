@@ -4,7 +4,7 @@ Scope: static reverse engineering of `/vendor/lib/egl/libGLES_mali.so` from the 
 `system.raw` (Android 6.0.1, `SM-J700M J700MUBU2BRC2`), plus its Android dependencies.
 Deliverable is a map, not a driver: no code was written for GL, nothing was run on a
 device, and no working userspace stack is claimed. Detailed evidence:
-`parity/userspace/gpu/blob/map.md`.
+`code/userspace/gpu/blob/map.md`.
 
 **Verdict**
 
@@ -14,7 +14,7 @@ device, and no working userspace stack is claimed. Detailed evidence:
 | Does it drive kbase directly? | **Yes.** One `ioctl` site (`0x265480`) with `_IOWR(0x80, id&0xff, size)`; UK handshake 10.0 at `0x265db4`; 23 kbase call sites mapped to UAPI ids (§2). |
 | Can it run on Nura? | **No.** AArch32/bionic, and the Nura kernel is r15p0/UK 10.6 while the blob is r7p0/UK 10.0: 32-byte submit/56-byte atom vs 40/64. First `JOB_SUBMIT` is rejected on size. |
 | Is the compiler the gap? | **No.** Mesa Panfrost already has an open Midgard compiler and command-stream encoder. The blob's Clang 3.6 pipeline is closed and unnecessary. |
-| What is actually missing for the chosen Mesa-kbase path? | The **legacy UK 10.6 kbase winsys** plus a **WSI**. In this session the Mesa tree (`parity/userspace/gpu/mesa/src`, branch `kbase-winsys`) already has `src/panfrost/lib/kmod/kbase_kmod.c` (UK 10.6, commit `79478b3`, with dma-buf/timeline/perf/eviction/timestamps returning `-ENOSYS`) and a screen/context skeleton (`4b96404`, "rendering not implemented"). Remaining: finish the sync/dma-buf surface, wire the Midgard Gallium renderer to kbase submission, provide EGL/WSI (no DRM/GBM; display is fbdev), validate. |
+| What is actually missing for the chosen Mesa-kbase path? | The **legacy UK 10.6 kbase winsys** plus a **WSI**. In this session the Mesa tree (`code/userspace/gpu/mesa/src`, branch `kbase-winsys`) already has `src/panfrost/lib/kmod/kbase_kmod.c` (UK 10.6, commit `79478b3`, with dma-buf/timeline/perf/eviction/timestamps returning `-ENOSYS`) and a screen/context skeleton (`4b96404`, "rendering not implemented"). Remaining: finish the sync/dma-buf surface, wire the Midgard Gallium renderer to kbase submission, provide EGL/WSI (no DRM/GBM; display is fbdev), validate. |
 | Effort | ~**3.5–6 person-months** for GLES 2.0-class acceleration on kbase (finish/validate winsys 2–4 wk, Midgard renderer integration 6–12 wk, EGL/WSI 3–6 wk, validation open-ended), vs 6–18 person-months for mainline Exynos + panfrost. Static estimate; no hardware here. |
 
 ---
@@ -128,7 +128,7 @@ walks the same groups issuing SYNC. This is the exact DDK↔kbase boundary.
 Nura's kernel is r15p0/UK 10.6: `kbase_uk_job_submit` is 40 B and `base_jd_atom_v2` is
 64 B (`core_req` u32 @44). The kernel's size check rejects the blob before payload
 parsing. This independently confirms the r7p0↔r15p0 break established from the kernel
-headers in `parity/userspace/gpu/kbase/analysis.md` §2 — here it is shown from the
+headers in `code/userspace/gpu/kbase/analysis.md` §2 — here it is shown from the
 userspace side, including the strlen of the blob's atom (`56`).
 
 ---
@@ -256,11 +256,11 @@ panfrost. Nothing here was built or run; no runtime claim.
 * No userspace driver code was created; `blob/` contains only extracted binaries, RE
   scripts and analysis output.
 
-Mesa comparison: `parity/userspace/gpu/mesa/src` branch `kbase-winsys` at `4b96404`
+Mesa comparison: `code/userspace/gpu/mesa/src` branch `kbase-winsys` at `4b96404`
 (read-only): `kbase_kmod.c` (UK 10.6, `79478b3`), `panfrost_kbase_skeleton.c`
 (`4b96404`), `pan_cmdstream.c`/`pan_job.c` (Midgard), `midgard_compile.c`.
 
-Artifacts: `parity/userspace/gpu/blob/map.md` (full map),
-`parity/userspace/gpu/blob/` (binaries + `lib/` + `ghidra-out/` + `tools/`),
-`parity/userspace/gpu/blob/ghidra-project-quick/` (Ghidra database), and
+Artifacts: `code/userspace/gpu/blob/map.md` (full map),
+`code/userspace/gpu/blob/` (binaries + `lib/` + `ghidra-out/` + `tools/`),
+`code/userspace/gpu/blob/ghidra-project-quick/` (Ghidra database), and
 `ghidra-out/quick_functions.tsv` / `quick_strings.tsv` (Ghidra exports).

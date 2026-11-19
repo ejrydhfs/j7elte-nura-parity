@@ -2,7 +2,7 @@
 
 **Verdict: spec complete; no runtime verification (no hardware).**
 The `SMS_CMD` (main 0x04) catalog for j7elte is written up in
-[`parity/userspace/ril/spec/sms.md`](../userspace/ril/spec/sms.md):
+[`code/userspace/ril/spec/sms.md`](../userspace/ril/spec/sms.md):
 send, send result, incoming SMS, MTSMS ack, delivery report, SIM storage
 (write/read/delete/count), SMSC address, memory status and cell broadcast,
 with byte offsets and vaddrs for every field.
@@ -10,7 +10,7 @@ with byte offsets and vaddrs for every field.
 ## What was done
 
 * Re-extracted all 9 telephony binaries from `system.raw` with `debugfs`
-  and compared them byte-for-byte with `parity/userspace/ril/stock/`
+  and compared them byte-for-byte with `code/userspace/ril/stock/`
   (identical). SHA-256 recorded in the spec §1.
 * Disassembled `libsec-ril.so` (ARM32/Thumb-2) and decoded its Android
   APS2 packed relocations (SLEB128 group format) so that the C++ vtables
@@ -85,8 +85,8 @@ TP-MR matching for status reports; `SMS_SEL_MEM` request layout (no builder).
 
 | Path | Content |
 |---|---|
-| `parity/userspace/ril/spec/sms.md` | the catalog (hashes, protocol selection, TX/RX layouts, worked PDU example, minimum sequence, SIM storage, unknowns, evidence index) |
-| `parity/reports/ril-sms.md` | this pointer report |
+| `code/userspace/ril/spec/sms.md` | the catalog (hashes, protocol selection, TX/RX layouts, worked PDU example, minimum sequence, SIM storage, unknowns, evidence index) |
+| `docs/reports/ril-sms.md` | this pointer report |
 
 No code, package, APKBUILD, kernel file or shared device config was
 modified.

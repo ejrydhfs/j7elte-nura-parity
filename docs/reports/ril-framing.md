@@ -6,8 +6,8 @@ a tested userspace codec/transport library now exists.  No telephony feature
 was added: command opcodes belong to the RIL client slice.
 
 * Spec (structures, constants, addresses, pseudo-code):
-  [`parity/userspace/ril/spec/framing.md`](../userspace/ril/spec/framing.md)
-* Code: [`parity/userspace/ril/sipc5/`](../userspace/ril/sipc5/) —
+  [`code/userspace/ril/spec/framing.md`](../userspace/ril/spec/framing.md)
+* Code: [`code/userspace/ril/sipc5/`](../userspace/ril/sipc5/) —
   `sipc5.h`, `sipc5.c`, `sipc5-probe.c` (selftest/decode/monitor/send/status),
   `Makefile`.
 

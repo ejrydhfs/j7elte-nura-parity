@@ -206,17 +206,17 @@ Log (verbatim):
 2026-11-19 01:37:35.913 j7elte-gpsd: init: autobaud burst sent (16 x 0x80) at 921600 baud
 2026-11-19 01:37:36.214 j7elte-gpsd: init: chip silent for 300 ms after autobaud (rx state: 0 bytes discarded)
 2026-11-19 01:37:36.214 j7elte-gpsd: init: handshake aborted, falling back to the raw receive loop
-2026-11-19 01:37:46.225 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see parity/reports/gps-init-impl.md)
+2026-11-19 01:37:46.225 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see docs/reports/gps-init-impl.md)
 2026-11-19 01:37:51.231 j7elte-gpsd: probing alternative baud rate 9600
 2026-11-19 01:37:51.232 j7elte-gpsd: opened /dev/ttySAC0 at 9600 8N1, no flow control
-2026-11-19 01:38:01.243 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see parity/reports/gps-init-impl.md)
+2026-11-19 01:38:01.243 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see docs/reports/gps-init-impl.md)
 2026-11-19 01:38:06.249 j7elte-gpsd: stats: rx=0 B nmea=0 bad_cs=0 dropped=0 clients=0
 2026-11-19 01:38:06.249 j7elte-gpsd: probing alternative baud rate 115200
 2026-11-19 01:38:06.249 j7elte-gpsd: opened /dev/ttySAC0 at 115200 8N1, no flow control
-2026-11-19 01:38:16.260 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see parity/reports/gps-init-impl.md)
+2026-11-19 01:38:16.260 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see docs/reports/gps-init-impl.md)
 2026-11-19 01:38:21.266 j7elte-gpsd: probing alternative baud rate 4800
 2026-11-19 01:38:21.267 j7elte-gpsd: opened /dev/ttySAC0 at 4800 8N1, no flow control
-2026-11-19 01:38:31.279 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see parity/reports/gps-init-impl.md)
+2026-11-19 01:38:31.279 j7elte-gpsd: no UART data 10s after power-on: the BCM4752 does not free-run NMEA; try --init (see docs/reports/gps-init-impl.md)
 2026-11-19 01:38:36.285 j7elte-gpsd: stats: rx=0 B nmea=0 bad_cs=0 dropped=0 clients=0
 2026-11-19 01:38:45.674 j7elte-gpsd: exiting: no bytes were ever received from /dev/ttySAC0
 2026-11-19 01:38:45.675 j7elte-gpsd: GPS powered off
@@ -333,7 +333,7 @@ windows, a 70 s daemon run (including the BRI autobaud burst), and the extra
 Conclusion: the BCM4752 TX line is idle. The fault is upstream of UART0's
 receiver: the chip is not booting (or its UART is not enabled) even though
 `GPS_PWR_EN` is high and VDD_LDO10 is enabled. This matches
-`parity/reports/gps-init-impl.md`: BRI never answers, so no protocol-level
+`docs/reports/gps-init-impl.md`: BRI never answers, so no protocol-level
 bring-up is possible until the chip actually starts.
 
 ## Appendix — artefacts

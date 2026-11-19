@@ -8,9 +8,9 @@ Delivered:
 
 | Path | What |
 |---|---|
-| `parity/userspace/gpu/kbase-winsys/` | standalone, ABI-verified kbase winsys library + bring-up self-test |
-| `parity/patches/gpu-mesa-kbase/0001…0003` | Mesa 27.0.0-devel patch series: `pan_kmod` kbase backend, backend-neutral Gallium JM submission, screen/context bring-up skeleton |
-| `parity/userspace/gpu/mesa/src` | Mesa checkout (`main` @ `02f1337`, branch `kbase-winsys` with the three commits) |
+| `code/userspace/gpu/kbase-winsys/` | standalone, ABI-verified kbase winsys library + bring-up self-test |
+| `patches/gpu-mesa-kbase/0001…0003` | Mesa 27.0.0-devel patch series: `pan_kmod` kbase backend, backend-neutral Gallium JM submission, screen/context bring-up skeleton |
+| `code/userspace/gpu/mesa/src` | Mesa checkout (`main` @ `02f1337`, branch `kbase-winsys` with the three commits) |
 
 **No hardware was available. No GL/EGL renderer is claimed**, nothing was
 executed against the GPU, and the winsys self-test reports "bring-up not
@@ -116,7 +116,7 @@ Panfrost Gallium fence implementation possible:
 
 ## 3. Delivered winsys library
 
-`parity/userspace/gpu/kbase-winsys/` (MIT, links the ABI reference client in
+`code/userspace/gpu/kbase-winsys/` (MIT, links the ABI reference client in
 `../kbase/` which is GPL-2.0; the Mesa backend is independent, see §4).
 
 ```
@@ -380,10 +380,10 @@ Working through the Panfrost Gallium flow against this backend:
 
 ```
 # winsys
-cd parity/userspace/gpu/kbase-winsys && make && make aarch64 && make check-abi
+cd code/userspace/gpu/kbase-winsys && make && make aarch64 && make check-abi
 
 # Mesa
-cd parity/patches/gpu-mesa-kbase && ./apply.sh /path/to/mesa
+cd patches/gpu-mesa-kbase && ./apply.sh /path/to/mesa
 cd /path/to/mesa && meson setup build-kbase ... (see §4.4)
 ninja -C build-kbase src/panfrost/lib/kbase-kmod-selftest \
       src/gallium/drivers/panfrost/libpanfrost.a

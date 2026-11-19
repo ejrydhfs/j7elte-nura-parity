@@ -170,7 +170,7 @@ absolute path works and no driver code change is needed.
 
 ### Patch
 
-`parity/patches/wifi/0001-j7elte-wifi-firmware-paths.patch` (pmaports tree, applies to
+`patches/wifi/0001-j7elte-wifi-firmware-paths.patch` (pmaports tree, applies to
 baseline `ba682bd`):
 
 ```

@@ -3,12 +3,12 @@
 **Verdict: implemented (spec + evidence) — calls are now specified at the byte
 level; no code and no hardware run in this pass.**
 
-Full catalog: [`parity/userspace/ril/spec/calls.md`](../userspace/ril/spec/calls.md).
+Full catalog: [`code/userspace/ril/spec/calls.md`](../userspace/ril/spec/calls.md).
 
 ## What was established
 
 * Stock binaries re-extracted from `system.raw` and hashed; hashes match
-  `parity/userspace/ril/stock/` (`libsec-ril.so`
+  `code/userspace/ril/stock/` (`libsec-ril.so`
   `09539011…0a9aa73`, `libsec-ril-dsds.so` `640f0ea0…7cfa0`, `rild`
   `64650e0b…c57f4`). `.dynsym` is intact, so every function below is a symbol,
   not a guess.

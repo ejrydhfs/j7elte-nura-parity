@@ -3,7 +3,7 @@
 **Scope:** build the missing ALSA userspace configuration for the
 `Universal7580-I2S` sound card (COD3022X codec + S2801X aux codec) from the
 stock ROM mixer graph, so that the already parity-verified kernel driver
-(`parity/reports/audio.md`) can be driven by postmarketOS userspace.
+(`docs/reports/audio.md`) can be driven by postmarketOS userspace.
 
 > **Correction (2026-11-18):** playback was silent because every verb turned
 > the **ADCL/ADCR** analog-bypass mixers off and never enabled the
@@ -22,15 +22,15 @@ jack-detect test was performed.
 
 | Deliverable | Path |
 |---|---|
-| ROM mixer paths (extracted) | `parity/userspace/audio/rom/mixer_paths.xml` (96,675 B, 3,381 lines, 908 `<path>`, 1,147 `<ctl>`) |
-| ROM jack HAL config (extracted) | `parity/userspace/audio/rom/jack_alsa_mixer.json` (330 B) |
-| ROM audio policy (extracted, reference) | `parity/userspace/audio/rom/audio_policy.conf` |
-| UCM2 master | `parity/userspace/audio/ucm2/conf.d/Universal7580-I2S/Universal7580-I2S.conf` |
-| UCM2 HiFi | `parity/userspace/audio/ucm2/j7elte/HiFi.conf` |
-| UCM2 VoiceCall | `parity/userspace/audio/ucm2/j7elte/VoiceCall.conf` |
-| Control checker | `parity/userspace/audio/validate_controls.py` |
+| ROM mixer paths (extracted) | `code/userspace/audio/rom/mixer_paths.xml` (96,675 B, 3,381 lines, 908 `<path>`, 1,147 `<ctl>`) |
+| ROM jack HAL config (extracted) | `code/userspace/audio/rom/jack_alsa_mixer.json` (330 B) |
+| ROM audio policy (extracted, reference) | `code/userspace/audio/rom/audio_policy.conf` |
+| UCM2 master | `code/userspace/audio/ucm2/conf.d/Universal7580-I2S/Universal7580-I2S.conf` |
+| UCM2 HiFi | `code/userspace/audio/ucm2/j7elte/HiFi.conf` |
+| UCM2 VoiceCall | `code/userspace/audio/ucm2/j7elte/VoiceCall.conf` |
+| Control checker | `code/userspace/audio/validate_controls.py` |
 | Package | `parity/pmaports/device/archived/j7elte-audio-ucm/APKBUILD` + sources |
-| Device dependency patch | `parity/patches/userspace/audio/0001-device-samsung-j7elte-depend-on-audio-ucm.patch` |
+| Device dependency patch | `patches/userspace/audio/0001-device-samsung-j7elte-depend-on-audio-ucm.patch` |
 
 `validate_controls.py` result: **PASS** — 54/54 distinct ROM control names
 exist in the kernel, 53/53 UCM control names exist, 0 out-of-range values,
@@ -47,9 +47,9 @@ $ debugfs -R 'ls -l /etc' system.raw | grep -Ei 'mixer|jack|audio'
  742  100644  96675     mixer_paths.xml
  699  100644  5532      audio_effects.conf
  700  100644  4753      audio_policy.conf
-$ debugfs -R 'dump /etc/mixer_paths.xml parity/userspace/audio/rom/mixer_paths.xml' system.raw
-$ debugfs -R 'dump /etc/jack_alsa_mixer.json parity/userspace/audio/rom/jack_alsa_mixer.json' system.raw
-$ debugfs -R 'dump /etc/audio_policy.conf parity/userspace/audio/rom/audio_policy.conf' system.raw
+$ debugfs -R 'dump /etc/mixer_paths.xml code/userspace/audio/rom/mixer_paths.xml' system.raw
+$ debugfs -R 'dump /etc/jack_alsa_mixer.json code/userspace/audio/rom/jack_alsa_mixer.json' system.raw
+$ debugfs -R 'dump /etc/audio_policy.conf code/userspace/audio/rom/audio_policy.conf' system.raw
 ```
 
 `mixer_paths.xml` parses as well-formed XML (`xml.etree.ElementTree`;
@@ -223,7 +223,7 @@ end-to-end on this kernel**: the `cp` link uses platform `snd-soc-dummy`
 (`universal7580-cod3022x.c:1064-1074`), i.e. there is no modem audio backend.
 The mixer graph is complete; audible call audio still needs a modem
 driver/userspace stack that j7elte does not have in pmOS (see
-`parity/reports/modem.md`).  This is stated in the VoiceCall.conf header.
+`docs/reports/modem.md`).  This is stated in the VoiceCall.conf header.
 
 ## P4 — Jack
 
@@ -247,7 +247,7 @@ defers probe until the sound card exists (`:606`, flag set at
   be observed on hardware).
 
 Jack detection itself is expected to work through `/dev/input` (sec_jack,
-`CONFIG_SAMSUNG_JACK=y`, DT zones verified in `parity/reports/audio.md`); only
+`CONFIG_SAMSUNG_JACK=y`, DT zones verified in `docs/reports/audio.md`); only
 the *automatic ALSA routing* is missing.
 
 ## P5 — Package
@@ -277,7 +277,7 @@ The package is plain data, no compilation.
 
 The device package is intentionally not edited (shared-file rule); the adding
 of `j7elte-audio-ucm` to `device-samsung-j7elte`'s `depends` is supplied as
-`parity/patches/userspace/audio/0001-device-samsung-j7elte-depend-on-audio-ucm.patch`
+`patches/userspace/audio/0001-device-samsung-j7elte-depend-on-audio-ucm.patch`
 (baseline-relative to pmaports `HEAD`; verified with `patch -p1 --dry-run`
 against `HEAD`.  Other pending device-package changes in the working tree may
 need a trivial rebase of the hunk.)
@@ -286,7 +286,7 @@ need a trivial rebase of the hunk.)
 
 1. **XML**: `mixer_paths.xml` parsed with ElementTree (908 paths, 1,147 ctl
    uses, 54 distinct names).
-2. **Control names/types/ranges**: `python3 parity/userspace/audio/validate_controls.py`
+2. **Control names/types/ranges**: `python3 code/userspace/audio/validate_controls.py`
    → `RESULT: PASS`:
    * kernel controls enumerated from the codec/machine sources: 109;
    * ROM names missing from the kernel: **0**;

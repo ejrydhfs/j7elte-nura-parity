@@ -15,7 +15,7 @@ process — so the only shapes this can take are (a) a 32-bit helper process wit
 IPC that does not exist, or (b) an ARM32 libc/bionic runtime, which does not
 exist in postmarketOS. Both prototypes below measure exactly how far each gets.
 
-Delivered: `parity/userspace/gpu/libhybris/` (two probes, build/run scripts,
+Delivered: `code/userspace/gpu/libhybris/` (two probes, build/run scripts,
 ROM extraction). No package, therefore no patch: there is nothing installable to
 package until a 32-bit GL server exists, and inventing one is the multi-month
 project this report is meant to price.
@@ -209,7 +209,7 @@ to touch these libraries. Today Nura has only llvmpipe/`swrast` over fbdev
 ## 6. What is delivered, and what would have to exist first
 
 ```
-parity/userspace/gpu/libhybris/
+code/userspace/gpu/libhybris/
 ├── extract-rom.sh    # dump the minimum bionic+GL set from system.raw → ./romroot
 ├── eglprobe.c        # ELF32 bionic PIE: dlopen(blob) + eglGetDisplay/eglQueryString
 ├── mloader.c         # freestanding ELF32 loader: PT_LOAD + APS2 relocs + shims + EGL calls

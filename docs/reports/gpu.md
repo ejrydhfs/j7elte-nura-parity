@@ -250,7 +250,7 @@ present in the Nura tree (all 23 ROM-embedded source paths resolve) and was not 
 this analysis; the built revision (r15p0) is a functional superset
 for this GPU, the DT binding matches, and the config is coherent. Patching the r15p0 driver to
 expose r7p0's internal symbol names would be cosmetic. Nothing was added under
-`parity/patches/gpu/`.
+`patches/gpu/`.
 
 ---
 

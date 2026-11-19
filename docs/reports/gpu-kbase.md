@@ -3,8 +3,8 @@
 Scope: map the kbase UAPI that Nura actually builds, compare it with (a) the ROM
 blob's expected UAPI and (b) the modern Mesa kbase backend, and decide whether
 any minimal EGL/GLES can target this kbase revision. Deliverable code lives in
-`parity/userspace/gpu/kbase/`; the detailed reference is
-`parity/userspace/gpu/kbase/analysis.md`.
+`code/userspace/gpu/kbase/`; the detailed reference is
+`code/userspace/gpu/kbase/analysis.md`.
 
 Static analysis + cross-compilation only. **No j7elte hardware and no
 `/dev/mali0`**: the bring-up path was compiled and smoke-tested under
@@ -185,7 +185,7 @@ No driver was fabricated.
 
 ## 6. Delivered artifacts and verification
 
-`parity/userspace/gpu/kbase/`:
+`code/userspace/gpu/kbase/`:
 
 * `kbase_uapi.h` — self-contained UK 10.6 wire header with
   `_Static_assert` size/offset checks.
