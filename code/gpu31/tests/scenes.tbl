@@ -1,0 +1,34 @@
+# Scene baselines for j7elte glmark2-es2 @320x240, -b :duration=2.0.
+# Source: docs/reports/gpu-verify.md section 3.3
+# (Mesa 26.3.0 llvmpipe, LLVM 23.1.5, Xorg 720x1280 fbdev, 29 scenes).
+# Format: key|baseline-fps|heavy  (heavy=1: ~1-FPS CPU-bound scenes,
+# exempt from the floor but must improve on hardware GL).
+# Shared by code/userspace/gpu/glmark-harness/tools/check-floors.sh
+# and code/gpu31/tests/. Do not edit without updating THRESHOLDS.md.
+build-novbo|67|0
+build-vbo|87|0
+texture-nearest|224|0
+texture-linear|232|0
+texture-mipmap|244|0
+shading-gouraud|39|0
+shading-blinn|33|0
+shading-phong|20|0
+shading-cel|23|0
+bump-highpoly|15|0
+bump-normals|110|0
+bump-height|46|0
+effect2d-kernel0|43|0
+effect2d-box|48|0
+pulsar|149|0
+desktop-blur|15|0
+desktop-shadow|30|0
+buffer-map|21|0
+buffer-subdata|32|0
+buffer-interleave|33|0
+ideas|1|1
+jellyfish|1|1
+terrain|1|1
+shadow|21|0
+refract|1|1
+conditionals-step|85|0
+function-low|70|0
