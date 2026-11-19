@@ -1,0 +1,159 @@
+# live-fc15-log.txt — live 0xFC15 FM bring-up on j7elte (BCM43438)
+# Date: 2026-11-18/19 UTC. Transport: python3 AF_BLUETOOTH SOCK_RAW/BTPROTO_HCI,
+# HCI_FILTER=all, H4-prefixed sends (recipe from probe-baseline.txt), as root via
+# /usr/local/bin/rootshell. Each step: ONE command-complete (CC) per command.
+# CC layout: 04 0e <plen> <ncmd=01> <opcode LE: 15 fc> <status> <echo=subcmd,arg[,...]>.
+# NOTE: all CCs here echo ONLY subcmd+arg, zero data bytes (see blocker §6).
+
+## 1. BT state BEFORE touching anything
+# hciconfig -a hci0:
+#   hci0: Type: Primary Bus: UART, BD 43:43:A1:12:1F:AC, ACL MTU 1021:8 SCO 64:1
+#   UP RUNNING PSCAN, RX bytes:2179 acl:0 sco:0 events:59 errors:0,
+#   TX bytes:2802 acl:0 sco:0 commands:59 errors:0
+#   Features: 0xbf 0xfe 0xcf 0xfe 0xdb 0xff 0x7b 0x87
+#   Name: 'Samsung Galaxy J7', Class 0x00020c, HCI 4.0 (0x6) rev 0xe6,
+#   LMP 4.0 (0x6) subver 0x2209, Manufacturer Broadcom (15)
+# BT stack: bluetoothd running (supervise-daemon pid 3949 + /usr/lib/bluetooth/bluetoothd
+# pid 3950). No service stopped, no hciconfig down, no LDO toggles, no reboot by us.
+
+## 2. Minimal enable chain (fc15-table.md sec 3) — ALL status=0x00, no variants needed
+# STEP W1B(0x00,region=1,flags=0)
+#   tx: 0115fc03001001            (H4 01 + opcode fc15 + plen 03 + [00,10,01])
+#   rx: 040e060115fc000010        plen=06 ncmd=01 opcode=0xfc15 status=00 echo=0010
+# STEP W1B(0x02,2,flags=0)
+#   tx: 0115fc03021002
+#   rx: 040e060115fc000210        status=00 echo=0210
+# STEP W4B(0xFB band 8750-10800 flags=8): lo=0x222e=8750 hi=0x2a30=10800
+#   tx: 0115fc06fb482e22302a      (payload fb 48 2e 22 30 2a)
+#   rx: 040e060115fc00fb48        status=00 echo=fb48
+# STEP R(0x4D,0,1)
+#   tx: 0115fc024d11
+#   rx: 040e060115fc004d11        status=00 echo=4d11 (NO data bytes follow)
+# STEP W2B(0x05,0x001D,flags=0x88)
+#   tx: 0115fc0405a81d00          (payload 05 a8 1d 00)
+#   rx: 040e060115fc0005a8        status=00 echo=05a8
+# STEP SANITY R(0x0A,0,2) freq/status
+#   tx: 0115fc020a19
+#   rx: 040e060115fc000a19        status=00 echo=0a19 (NO data bytes follow)
+# => No NAK on any step, so NO region/flag variants were sent (per task: variants
+#    only for NAKed steps; brute force beyond the table avoided).
+
+## 3. Tune + commit + reads at 95.0 MHz (94.0/95.0 etc. all identical, status=0x00)
+#   TUNE W2B(0x0A,9500):  tx 0115fc040a201c25  (0x251c=9500 LE)
+#                         rx 040e060115fc000a20  status=00 echo=0a20
+#   COMMIT W1B(0x09,0,8): tx 0115fc03091800
+#                         rx 040e060115fc000918  status=00 echo=0918
+#   RSSI R(0x0F,0x80,1):  tx 0115fc020f99
+#                         rx 040e060115fc000f99  status=00 echo=0f99 (NO rssi byte)
+#   FREQ R(0x0A,0,2):     tx 0115fc020a19
+#                         rx 040e060115fc000a19  status=00 echo=0a19 (NO freq bytes)
+#   SNR R(0xDF,0x80,1):   tx 0115fc02df99
+#                         rx 040e060115fc00df99  status=00 echo=df99 (NO snr byte)
+# Long-window re-runs (2–4 s capture after each of TUNE/COMMIT/RSSI/FREQ/SNR):
+# zero additional events other than the CC itself (quiet line, no vendor data).
+# Reordering (COMMIT-before-TUNE) and 3x COMMIT repeats: same 6-byte CCs only.
+
+## 4. Audio-path write — TRIGGER for the 04ff0108 event flood (status still 00)
+#   AUD W1B(0x4D,1,flags=8): tx 0115fc034d1801
+#     rx[0]: 040e060115fc004d18   status=00 echo=4d18
+#     rx[1..N]: 04ff0108 04ff0108 ... (vendor evt FF plen 01 data 08, ~2900/sec,
+#       captured 6060 in 2 s; only distinct non-CC frame in the whole session)
+#   AUD W2B(0x05,0x1220,0x88): tx 0115fc0405a82012
+#     rx: 04ff0108 flood only inside the 1 s window (CC drowned, not observed)
+# The flood is chip-spontaneous and persistent: still flowing 10+ min later,
+# across a device reboot (see §7), with nobody sending (verified with a
+# send-nothing listener: 8x 04ff0108 in 0.00 s). Rate ~2885–2900 evts/s
+# (hciconfig events +8670/3 s; per-command drains: 1440–1455 in 0.5 s,
+# 2894–2895 in 1.0 s, 8654–8655 in 3.0 s — exact flood-rate multiples).
+# Disable-leg attempt (all status=00, flood NOT stopped):
+#   W1B(0x4D,0x01,0): tx 0115fc034d1001 -> CC 040e060115fc004d10 (+2895x 04ff0108)
+#   W2B(0x05,0x0002,8): tx 0115fc0405280200 -> CC 040e060115fc000528 (+2894x)
+#   W1B(0x00,0x00,0x88): tx 0115fc03009800 -> CC 040e060115fc000098 (+2894x)
+
+## 5. Band sweep 88–107.5 MHz (tune step W2B(0x0A,freq)+W1B(0x09)+R(0x0F) RSSI)
+# Every tune/commit/read CC status=0x00, zero non-flood events ("interesting=[]").
+# No RSSI/SNR/freq VALUE bytes were ever returned, so no peak exists — table
+# records CC status per point instead of RSSI values (all reads dataless).
+# freq(10kHz)  tune-tx              tune-CC   commit-CC  rssi-tx        rssi-CC
+# 8800         0115fc040a206022     00        00         0115fc020f99   00
+# 9000         0115fc040a202823     00        00         0115fc020f99   00
+# 9200         0115fc040a20f023     00        00         0115fc020f99   00
+# 9400         0115fc040a20b824     00        00         0115fc020f99   00
+# 9600         0115fc040a208025     00        00         0115fc020f99   00
+# 9800         0115fc040a204826     00        00         0115fc020f99   00
+# 10000        0115fc040a201027     00        00         0115fc020f99   00
+# 10200        0115fc040a20d827     00        00         0115fc020f99   00
+# 10400        0115fc040a20a028     00        00         0115fc020f99   00
+# 10600        0115fc040a206829     00        00         0115fc020f99   00
+# 10750        0115fc040a20fe29     00        00         0115fc020f99   00
+# (8750/9500/10500/10800 covered in §3 scouting runs with identical results.)
+# Fine-tune of a peak NOT performed — no peak observable (all RSSI reads dataless).
+# FINAL state left on chip: re-sent TUNE 9400 (tx 0115fc040a20b824 -> CC ...000a20)
+# + COMMIT (tx 0115fc03091800 -> CC ...000918), then FINAL-RSSI/FREQ/SNR reads
+# (tx 0115fc020f99/020a19/02df99 -> CCs ...000f99/...000a19/...00df99, all
+# status=00, dataless). FM left ENABLED and tuned to 94.0 MHz per commit acceptance
+# (readback of actual freq/RSSI/SNR impossible — see blocker).
+# RETUNE after device reboot ~04:33-04:34 UTC (peer FmAudioEv reported tune lost):
+# fresh boot, NO 04ff0108 flood (drained=1 per step = quiet line). Re-sent full
+# enable chain + TUNE 9400 + COMMIT, all status=00:
+# EN00 tx 0115fc03001001 -> CC 040e060115fc000010
+# EN02 tx 0115fc03021002 -> CC 040e060115fc000210
+# ENFB tx 0115fc06fb482e22302a -> CC 040e060115fc00fb48
+# ENR4D tx 0115fc024d11 -> CC 040e060115fc004d11 (dataless)
+# EN05 tx 0115fc0405a81d00 -> CC 040e060115fc0005a8
+# TUNE-9400 tx 0115fc040a20b824 -> CC 040e060115fc000a20
+# COMMIT-09 tx 0115fc03091800 -> CC 040e060115fc000918
+# RSSI tx 0115fc020f99 -> CC 040e060115fc000f99 (dataless)
+# hci0 UP RUNNING PSCAN, events=49/commands=49 (pre-flood baseline). FM ENABLED,
+# tuned 94.0 MHz, audio-path write deliberately NOT re-sent (flood trigger).
+# RETUNE-2 after device reboot ~04:35-04:38 UTC (up 0 min at 04:39:46): identical
+# re-tune, all status=00, drained=1 per step (quiet, no flood), hci0 UP RUNNING
+# events=49/commands=49. Same tx/CC bytes as RETUNE above. FM ENABLED @ 94.0 MHz.
+# RETUNE-3 after device reboot ~04:39-04:40 UTC (up 1 min at 04:40:48, events=52):
+# identical re-arm, all status=00, drained=1 (quiet, NO flood post-reboot),
+# bluetoothd pids 3951/3952 alive, hci0 UP RUNNING. FM ENABLED @ 94.0 MHz.
+# RDS peer (FmRdsCoex) cleared for single W1B(0x14)+R(0x80) attempt on quiet line.
+# USB-LINK OUTAGE ~04:45 UTC (peer FmRdsCoex + self-verified: 172.16.42.1
+# unpingable 100%, no RNDIS iface; host-side USB disconnect, NOT any HCI cmd).
+# No further commands sent after RETUNE-3; on-chip FM state unknown (likely wiped
+# by another reboot during outage). Plan on link return: check uptime/counters,
+# re-arm enable chain + 94.0 MHz tune, then clear RDS peer. No BT restart by us.
+# PARKED per FmBackend2/Main ~04:57+ UTC: link dark 12+ min both sides (audio peer:
+# gw 172.16.42.254 also unreachable, wlan0 UP; RDS peer: RNDIS re-probe -110).
+# Peer states at park: audio = mixer ROUTE-DONE n=20, first 5 s chunk unknown
+# (tmpfs lost); RDS = single W1B(0x14)+R(0x80) HELD, nothing sent, no-flood
+# re-arm confirmed. Last verified tune: RETUNE-3 (94.0 MHz, all 00). No BT
+# restart by us at any point. Resume plan: verify uptime/counters, re-arm,
+# clear peers. No flock held, no retry loops.
+
+## 6. BLOCKER (exact, no failing subcommand — all status bytes are 0x00)
+# a) Every R-type command-complete carries NO data payload: R(0x4D)/R(0x0F)/
+#    R(0x0A)/R(0xDF) CCs are 6 bytes (040e060115fc00 + 2-byte subcmd/arg echo)
+#    with no value bytes, although fc15-table check_reg_param documents value
+#    parsing (cb+0x98/0xa4/0xd2). Values likely arrive as async vendor events
+#    consumed by the FM stack state machine (bta_fm_vsc_cmpl/proc_vse path),
+#    which our raw socket cannot join — or require the audio-path bit first.
+# b) The one command that provoked async traffic, AUD W1B(0x4D,1,8), unleashed a
+#    persistent spontaneous `04ff0108` vendor-event flood (~2.9k evts/s, still
+#    running at hand-off) that drowns every subsequent CC window and makes any
+#    future data-bearing event unrecoverable on this boot. Documented disable
+#    leg (W1B 4D + W2B 05,0002,08 + W1B 00,00,88, all status=00) does NOT stop it.
+# => No nonzero RSSI peak obtainable in this session; tune/RSSI/SNR "success" is
+#    command-acceptance only (status=00), not confirmed signal.
+
+## 7. BT health AFTER (nothing stopped, nothing restarted — nothing needed it)
+# hciconfig -a hci0: UP RUNNING PSCAN, BD 43:43:A1:12:1F:AC,
+#   HCI 4.0 rev 0xe6 / LMP 4.0 sub 0x2209 / mfr Broadcom (unchanged from §1),
+#   RX bytes:4959991 events:1239767 (inflated ONLY by the §4 FM flood),
+#   TX bytes:3318 commands:124 errors:0.
+# bluetoothd STILL RUNNING (supervise-daemon + /usr/lib/bluetooth/bluetoothd,
+# pids 3956/3957). BT sanity: `hcitool -i hci0 cmd 0x03 0x14` (Read Local Name)
+# -> status 00, name 'Samsung Galaxy J7' (full 252-byte CC, head bytes
+# 01140c0053616d73756e672047616c617879204a37...). No service was stopped, so no
+# restart was performed.
+# ENVIRONMENT NOTE: device rebooted once mid-session (~04:17 UTC; ssh refused
+# ~2 min, /tmp wiped, pids changed 3949/3950 -> 3956/3957) — NOT triggered by us
+# (no reboot/ldo/hciconfig commands ever sent; likely watchdog). Post-reboot the
+# enable chain re-ran clean (all status=00, §2 tx/rx above are post-reboot) and
+# the 04ff0108 flood re-armed only after the §4 audio-path write, proving the
+# flood is command-triggered, not boot state.

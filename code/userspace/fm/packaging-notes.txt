@@ -1,0 +1,80 @@
+bcmfm deployment / packaging notes (BCM43438 FM userspace, j7elte)
+====================================================================
+
+1. Host build
+-------------
+  cd code/userspace/fm
+  make            # CC/CROSS_COMPILE friendly; produces ./bcmfm
+  sh -n install.sh   # syntax check (must pass before shipping)
+
+  Toolchain: any C11 gcc (host or CROSS_COMPILE=...-). No configure step.
+
+2. Copy to device
+-----------------
+  scp bcmfm fm-mixer.sh install.sh root@172.16.42.1:/tmp/
+  ssh root@172.16.42.1 'sh /tmp/install.sh'
+  # BINDIR/SRCBIN/SRCMIXER env vars override defaults (/usr/local/bin, ./bcmfm,
+  # ./fm-mixer.sh) if the layout differs.
+
+3. Runtime dependencies
+-----------------------
+  * libc only (musl on postmarketOS/Alpine, glibc on most hosts). No shared
+    libs beyond libc; link adds -static-libgcc where supported.
+  * libcap's `setcap`/`getcap` needed only at install time for the
+    cap_net_admin grant; NOT a runtime dep. Without it, run bcmfm as root.
+  * `amixer` (alsa-utils) needed only for fm-mixer.sh audio routing.
+
+4.Privilege model (udev vs capabilities)
+---------------------------------------
+  Raw HCI (AF_BLUETOOTH/HCI sockets) requires CAP_NET_ADMIN (or root).
+  Choice: file capabilities via setcap (what install.sh does) — simplest,
+  no udev rule needed, works with the stock hci0 node. Alternative is a udev
+  rule + dedicated group for /dev/vhci or hci devnode access, but on this
+  target hci0 is kernel-managed and capability-on-binary is the smaller
+  hammer. OpenRC service sketch below therefore runs as root by default and
+  drops to no special user (bcmfm already carries the cap on its file).
+
+5. postmarketOS packaging sketch (aport)
+----------------------------------------
+  # pmaports/device/testing/bcmfm/APKBUILD (outline):
+  #   pkgname=bcmfm
+  #   pkgver=0.1.0
+  #   pkgrel=0
+  #   arch="all"
+  #   makedepends=""          # host gcc only
+  #   depends="musl"          # libc only (+ alsa-utils optionally for mixer)
+  #   install="$pkgname.post-install"
+  #   build() { make -C "$builddir" CC="${CC:-gcc}"; }
+  #   package() {
+  #     install -Dm755 bcmfm "$pkgdir"/usr/bin/bcmfm
+  #     install -Dm755 fm-mixer.sh "$pkgdir"/usr/bin/fm-mixer.sh
+  #   }
+  # bcmfm.post-install: setcap 'cap_net_admin+ep' /usr/bin/bcmfm 2>/dev/null ||
+  #   echo 'bcmfm needs root or libcap setcap for CAP_NET_ADMIN'
+
+  # Optional OpenRC loopback service (/etc/init.d/fm-loopback sketch):
+  #   #!/sbin/openrc-run
+  #   # Routes FM baseband capture to playback; start AFTER bcmfm enable+tune.
+  #   command="/usr/bin/arecord"
+  #   command_args="-D hw:0,3 -f S16_LE -r 48000 -c 2 | /usr/bin/aplay -D hw:0,0"
+  #   depend() { need bluetooth; after bluetooth; }
+
+6. File manifest (code/userspace/fm/)
+------------------------------------
+  bcmfm.c            FM library: VS 0xFC15 encode/decode (enable/tune/seek/vol/RDS/...).
+  bcmfm.h            Public API for bcmfm.c (state, region/step/path, RDS poll structs).
+  bcmfm-cli.c        CLI wrapper: argv parsing, human-readable info/dump/raw output.
+  hci_raw.c          Raw HCI transport: socket open, HCI_FILTER, send/recv, CC matching.
+  hci_raw.h          Public API for hci_raw.c.
+  Makefile           Host/cross-friendly build (all/clean, -Wall -Wextra -Werror).
+  install.sh         Device installer: installs bcmfm + fm-mixer.sh, setcap, usage/safety.
+  packaging-notes.txt  This file: deployment recipe + postmarketOS packaging sketch.
+  fm-mixer.sh        ALSA routing: FM analog path via cod3022x + S2801 ABOX mixer.
+  fm-audio-route.md  Audio path diagram + control mapping behind fm-mixer.sh.
+  fm-bringup-seq.md  Ordered HCI bring-up sequence (enable -> tune -> audio path).
+  fc15-table.md      0xFC15 subcommand table (opcodes, args, responses).
+  re-notes.txt       Reverse-engineering notes for the BCM FM vendor protocol.
+  probe-baseline.txt Transport recipe + baseline HCI probe transcript.
+  live-fc15-log.txt  Live-device FC15 log, incl. event-flood analysis (§§4-7).
+  bcmfm (built)      Compiled CLI binary (build artifact, not source).
+  *.o (built)        Object files from `make` (build artifacts, not source).

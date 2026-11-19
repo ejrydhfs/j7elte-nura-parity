@@ -1,0 +1,33 @@
+# audio-evidence.txt — FM audio capture attempt (PARTIAL: no audio obtained, link down)
+# Date: 2026-11-18/19 UTC. Device j7elte, FM tuned 94.0 MHz (command-accepted, per live-fc15-log.txt).
+# Verdict: NO VERDICT POSSIBLE — zero audio bytes captured; device link lost mid-task.
+
+## 1. Mixer snapshot (pre-change, `amixer -c0 contents` as root, 620 lines, full dump in /tmp/fm-mix-before.txt on host)
+- Headphone Volume 57,57; Line-in Volume 6,6; MonoMix Disable(0); ADC Left Gain 127; ADC Right Gain 151
+- DAC Gain 127,127; Speaker Volume 6; Chargepump CLASS-G-A(3); DNC Max Gain 24
+- S2801 Mixer En On; SRC3 Off; CH1/2/3/4 Mixer Off; RMIX1/2 Off; CH3 Rec Off
+- CH1/2/3 DOUT Select DMIX_OUT; all ADCL/ADCR Mixer * Switch off; MIC1/MIC2/LINEIN On off
+- HP/EP/SPK On off
+- Post-first-reboot re-dump (/tmp/fm-mix-postboot.txt): diff vs snapshot = EMPTY (identical).
+
+## 2. Capture-side route applied (copy of fm-mixer.sh record path, 20 csets, all accepted)
+S2801 Mixer En On; SRC3 En On; RMIX1 Off; RMIX2 On; CH3 Rec En On; CH1 DOUT RMIX_OUT;
+ADCL LINELL on, LINERL/MIC1L/MIC2L off; ADCR LINELR on, LINERR/MIC1R/MIC2R off;
+MIC1/MIC2 On off; LINEIN On on; Line-in Volume 4; ADC Left 127; ADC Right 127.
+Device replied ROUTE-DONE n=20 (all 20 csets exit 0). No missing controls. No playback sections touched.
+Verify reads: CH3 Rec values=1, LINEIN values=on.
+
+## 3. Capture attempts (all FAILED — 0 bytes of audio)
+(a) arecord -D hw:0,0 -f S16_LE -r 48000 -c 2 -d 10 /tmp/fm-cap.wav via rootshell: ssh rc=124 wall 25 s (killed by wrapper timeout); /tmp not visible to user ns (rootshell private /tmp) — file unrecoverable.
+(b) user-ns arecord to home dir: `write error`, exit 1, 0-byte file — rootfs /dev/mmcblk0p20 100% full (2055048K used, 0 avail). Pre-existing wav files (self.wav 1152044 B etc.) prove capture path works when space exists.
+(c) arecord to /run/user/10000/fm-tuned.wav (tmpfs, 700 MB free): killed by device reboot #2 mid-capture (ssh rc=124); tmpfs wiped — file gone.
+(d) Chunk plan (2x5 s nohup background + scp off): chunk A started, device went dark during it; result unknown, tmpfs lost on next reboot.
+Transfers: none (no file ever completed).
+
+## 4. Control capture (5 s LINEIN-muted): NOT PERFORMED (link lost first).
+
+## 5. Analysis (python3/numpy RMS, peak, DC, spectrum): NOT PERFORMED — no wav exists. No RMS/spectrum numbers.
+
+## 6. Revert: NOT VERIFIED. Link went down (ping 100% loss 10+ min, USB shows bootloader/fastboot per peers, phone physically detached or powered off) before revert. Last known mixer state = §2 route (SRC3 On, RMIX2 On, CH3 Rec On, LINEIN On, Line-in 4, ADC L/R 127) on top of the §1 snapshot baseline (all other controls untouched). On link return: re-dump `amixer -c0 contents`, diff vs §1 values, re-apply snapshot values for the 20 touched controls, re-dump to confirm empty diff.
+
+## 7. Device stability note for resume: 4+ watchdog reboots observed (~04:17, ~04:33, ~04:38, ~04:40 UTC, each ~1-3 min dark), then full link loss ~04:41 UTC still dark at hand-off. Each reboot wipes device /tmp and resets mixer to §1 defaults. Capture only to /run/user/10000 (tmpfs) and copy off-device promptly in ≤5 s chunks (ssh timeout constraint ≤30 s).

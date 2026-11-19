@@ -1,0 +1,125 @@
+# re-notes: 0xFC15 recovery work notes (bluetooth.default.so)
+
+Source blobs (world-readable stock image):
+- image: /run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7stock/system.raw (2.1 GiB ext4)
+- cmds: debugfs -R 'cat lib/hw/bluetooth.default.so' <image> > /tmp/fmx/bluetooth.default.so
+        debugfs -R 'cat lib/libbluetooth_jni.so'  <image> > /tmp/fmx/libbluetooth_jni.so
+- md5: bluetooth.default.so 681475c3e9e45d2c2a6b63bae79ad2e3 (== /tmp/fmre copy)
+       libbluetooth_jni.so  31b7ab03d37f005d74f5f1b1c752547e (== /tmp/fmre copy)
+- scratch: /tmp/fmx/{bluetooth.default.so,libbluetooth_jni.so,calls.py,calls_out.txt,
+           dump*.py,w_*.txt}; peek scripts kept there, NOT in repo.
+
+## 1. Symbol inventory (readelf --dyn-syms -W)
+
+FM-relevant FUNCs (addr size): bta_fm_snd_vendor_cmd c46d0 4c,
+write_1b c4784 18, write_2b c479d 1c, write_search_boundary c47b8 28,
+read c47e0 7c, set_mask c485c 50, enable c2359 88, disable c23e1 42,
+init_delay c22c9 90, sub_2264 c2264 64, sub_21fc c21fc 68, tune c2475 88,
+scan c24fc 550, abort c2a4c 30, read_rds c2acb 40, vsc_cmpl c2a7d 4e,
+disable_cmpl c2425 50, set_rds_mode c31fc 2d8, set_aud_mode c2b0d 50,
+set_audio_path c2b5c 8c, update_aud_data c2be9 32, flag_tout c35ec 1e,
+live_update c353d 24, int_cmpl c38ac 498, deemphasis c2c1a 3e,
+q_evt c2c58 60, next_inq c3d45 34, cur_freq c3560 8c, check_rds c2cb9 3a,
+mute_aud c2cf3 26, set_step c2d19 58, api_enable c4269 4c,
+hdl_event c42b5 18, sm_execute c420c 5c, set_region c2d70 32,
+do_nfe c2da5 9c, chg_rds_type c2e40 56, proc_vse c2e98 24,
+proc_vsc c2ebc f0, blend_mute c2fad cc, volume_ctrl c3079 64 (bta_, not bta_fm_),
+notify c30dd 54, get_rssi c3131 10, get_snr c3141 10, set_rfmute c3151 50,
+check_reg_param c48bc 418, cal_thresh c48ad e, start_nfe c42cd 234,
+BTA_Fm* public posts 0x2300..0x2326 (see fc15-table.md sec 1 tail),
+btif_fm_*: enable 8ad99, get_interface 8dd41, rdsp_cback 8bbb9,
+rt_should_update 8b87d, config_blend_softmute 8ca11, upstreams_evt 8ca5d.
+bta_fm_cb @2c6e14 (680 B), bta_fm_cfg @1c03d4 (52 B), st_tbl @1bc4c0 (28 B),
+action[39] @1becd8, sch_step_size @1b28d8 = 64 00 32 00 (100/50 kHz).
+Helpers resolved by cross-ref: be528=bta_sys_stop_timer, be430=bta_sys_start_timer,
+be324=bta_sys_sendmsg, be21c=GKI_getbuf?, 45688/456d0/456ac=memcpy/memset-ish,
+46408=LogMsg, e7eb8=BTM_VendorSpecificCommand, 8ddf4=bta_fm_co_init,
+8de3c=bta_fm_co_reset_rds_engine, 8de44=bta_fm_co_rds_data,
+c46a0=bta_fm_post_msg, c420c=bta_fm_sm_execute.
+Unknown-but-irrelevant: 6cb60 (2-byte stub called in enable path),
+c4538/c4554/c45c8/c4610/c4674 (vcmd queue internals, behavior read at call level).
+
+## 2. Call-site census (capstone, thumbv2; 54 sites -> helpers)
+
+Generator: /tmp/fmx/calls.py (targets SND c46d0, ENQ c471c, W1B c4784,
+W2B c479c, W4B c47b8, READ c47e0, SETMASK c485c) over all 132 *fm* symbols;
+full per-site context in /tmp/fmx/calls_out.txt (917 lines).
+Counts: W1B ~24, W2B ~12, READ ~15, SETMASK 3, SND 2 (vsc_cmpl + read-fallback),
+W4B 2 (sub_2264 x2 paths). No other bl NZ into these helpers from fm code.
+Quote style used in fc15-table.md: `movs/mov r0,#sub; movs/mov r1,#d; movs/mov r2,#flags; bl #0xc47xx`.
+
+Per-site register triples (r0=sub, r1=data, r2=flags; [cb+off] = cached word):
+- init_delay: W1B(02, 02|03, 00); R(4D, r1=0, 01); W2B(05, [a6]|1c|1d, 88)
+- enable: W1B(00, r7=01|03 region, 00)
+- disable: W1B(4D, a5&7f, 00); W2B(05, 0002, 08); W1B(00, 00, 88)
+- sub_2264: W1B(01, class, 00|88); W4B(FB, lo, hi, 08)
+- sub_21fc: W2B(0A, u16, 00); post 2319; W1B(09, 00, 08)
+- tune: range-check only, then b.w sub_21fc (same bytes as above)
+- scan: W1B(14, .., 00) park; W2B(16, 03e0|0400, 00); W2B(18, r8, 00);
+  W2B(05, [a6]|02, 00); W1B(FC, sb&1, 00); W1B(FC, 03, 00) if seeking;
+  R(FC, 00, 01); W1B(08, .., 00) if ce>1f; W1B(DE, [cf], 00) if d0;
+  W1B(FE, sl, 08); W1B(07, [cd]|b4nib, 08)
+- abort: W1B(09, 01, 08|88 by ac&4)
+- read_rds: R(80, 00|?, F0); then set_mask(88, 00, 3a98) on NULL leg
+- set_audio_path: W1B(4D, a5', 08); W2B(05, ±20 ±10, 88)
+- update_aud_data: R(0F, 00, 01); R(DF, 00, 01); then set_mask tail (shared bytes c2c06..)
+- q_evt/check_rds: W1B(00, 03, 00); R(0A, 00, 02)
+- set_step: W2B(FD, [fcd08+r3], 88)
+- set_region: sub_2264 only (ids 0x0c/0x8c are cb+a3 state tags, not HCI)
+- do_nfe: W1B(FC, 02, 00); W1B(FE, 00, 08); W1B(07, B2, 08)
+- chg_rds_type: W1B(02, 02|03, 88)
+- blend_mute: W2B(05, bic#1, 08); W2B(F8, curve, 00)
+- volume_ctrl: W2B(F8, vol, 00); R(F8, 80, 02)
+- update_maint: W2B(10, [ae], 00)
+- set_rds_mode: W1B(14, cfg, 00); R(80, 00, F0); set_mask(88, 00, 3a98)
+- cur_freq: R(FF, r1, (r0<<2)&fc | C8); R(0F, 00, 01); R(DF, 00, 01); R(0A, 80, 02)
+- sch_cmpl_act: W2B(18, 00, 00); R(80, 00, F0); W1B(14, cfg, 00)
+- vsc_cmpl: SND(sp[1..3]) next-queued; else post 2318; read_rds leg: R(80,..)+set_mask
+- set_mask: R(12, 00, 02); W2B(10, sb, r1|08)
+- set_aud_mode: W1B(01, [efda4+mode], 88)
+- mute_aud: W2B(05, ±02, 88); set_rfmute: W2B(05, ±01, 88); deemphasis: W2B(05, ±40, 88)
+- get_rssi: R(0F, 80, 01); get_snr: R(DF, 80, 01); flag_tout: -> cur_freq
+- set_rfmute: (above); notify: no HCI (memcpy + callback fan-out only)
+- proc_vse: R(12, 00, 02); proc_vsc: queue match only (see sec 0)
+- start_nfe/do_nfe/check_reg_param/cal_thresh: computed/no-HCI except do_nfe triple.
+Hexdump anchors: audio table efda4: 6a 64 67 19 23 7d 3b b1 ...; step table fcd08:
+09 28 0a d9 95 f8 24 10 ...; int_cmpl tbh @c38f4 deltas (22 valid 01..16):
+19 d5 101 28 d2 13f 14e 1f 16 f5 f9 148 14b 153 ff 158 31 31 ff 15d 160 163.
+
+## 3. JNI layer (libbluetooth_jni.so, .text @19488+)
+
+Method-name strings @0x23e2d..0x2401c (rodata): FmNativehandler, enableFmNative,
+disableFmNative, tuneNative, muteNative, searchNative, comboSearchNative,
+searchAbortNative, setRdsModeNative, setRtPsModeNative, setPiEccModeNative,
+setAudioModeNative, setAudioPathNative, setScanStepNative, setRegionNative,
+configureDeemphasisNative, estimateNoiseFloorNative, getAudioQualityNative,
+configureSignalNotificationNative, setFMVolumeNative, setSnrThresholdNative,
+setCOSNative, getCurrentRSSINative, getCurrentSNRNative, setRFMuteNative,
+setFMIntennaNative, setFrequencyOffsetThNative, setPilotPowerThNative,
+setNoisePowerThNative (+ classInit 263d8). Registration via
+register_com_broadcom_fm_service @19d58 (b.w 1b51c, count 0x1f methods).
+INFERENCE: JNI bodies are thunks into btif_fm_* (not disassembled; the
+.text around 0x260b0+ decodes as data/PLT noise under a naive linear sweep —
+needs targeted disasm from the method table pointers, left for batch 2).
+The BTA event ids above (0x2300..) are the btif<->bta contract and match the
+prior /tmp/fmre/dex_bt + f_*.txt JNI traces (tuneNative->2304 etc.).
+
+## 4. Unresolved / inference list
+
+1. [INFERENCE] Semantic labels (seek-complete, stereo, RDS-sync) for
+   check_reg_param bit tests + 0x231b/1c/1e/22 events: bits observed,
+   meanings inferred from handler context. Needs live HCI log to confirm.
+2. [INFERENCE] R(0xFF..) payload meaning (chip-ver/RSSI-cal?) and R(0xFC..)
+   result layout (cb+0xce byte): bytes observed, semantics guessed.
+3. [INFERENCE] W1B(0x00, 01|03) data byte = region class (EU vs US): mapping
+   `tst r2,#0x30 -> 1|3` observed; which region is which inferred.
+4. [INFERENCE] 0x05-word bit meanings (b0 RF-mute, b1 mute, b4 deemph,
+   b5 blend, b6+b7? power): bit positions observed, names inferred.
+5. [BLOCKER-none] disable_cmpl issues a non-FC15 HCI cmd via 0xe7f30
+   (btsnd_hcic_*; bytes `fffffddf` literal pool): exact opcode not decoded —
+   irrelevant to FM userspace (kernel/BT stack owns it), noted only.
+6. [TODO-batch2] bta_fm_co_* RDS callbacks + btif_fm_upstreams_evt event
+   fan-out to the app: symbols listed, bodies not needed for HCI table.
+7. No 0xFC15 traffic was captured live (device slice owned by peers);
+   every byte above is static-disassembly-grounded, NOT wire-verified.
+   Suggested verify: hci snoop while stock BT+FM app tunes (batch 2 daemon).

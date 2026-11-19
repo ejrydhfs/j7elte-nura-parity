@@ -1,0 +1,323 @@
+BCM43438 FM baseline probe (read-only, no 0xFC15 writes, no BT state changes)
+Device: user@172.16.42.1 via flock /tmp/gpsdev.lock ssh wrapper. Date: 2026-11-18.
+
+================================================================
+$ hciconfig -a hci0
+================================================================
+hci0:	Type: Primary  Bus: UART
+	BD Address: 43:43:A1:12:1F:AC  ACL MTU: 1021:8  SCO MTU: 64:1
+	UP RUNNING PSCAN
+	RX bytes:952 acl:0 sco:0 events:44 errors:0
+	TX bytes:2740 acl:0 sco:0 commands:44 errors:0
+	Features: 0xbf 0xfe 0xcf 0xfe 0xdb 0xff 0x7b 0x87
+	Packet type: DM1 DM3 DM5 DH1 DH3 DH5 HV1 HV2 HV3
+	Link policy: RSWITCH SNIFF
+	Link mode: PERIPHERAL ACCEPT
+	Name: 'Samsung Galaxy J7'
+	Class: 0x00020c
+	Service Classes: Unspecified
+	Device Class: Phone, Smart phone
+	HCI Version: 4.0 (0x6)  Revision: 0xe6
+	LMP Version: 4.0 (0x6)  Subversion: 0x2209
+	Manufacturer: Broadcom Corporation (15)
+
+================================================================
+$ hcitool -i hci0 info            (no args -> usage; with BD addr -> refused)
+================================================================
+===INFO===
+info: too few arguments (minimal: 1)
+Usage:
+	info <bdaddr>
+
+$ hcitool -i hci0 info 43:43:A1:12:1F:AC
+Requesting information ...
+Can't create connection: Operation not permitted
+
+================================================================
+$ hcitool -i hci0 cmd 0x04 0x01   (Read Local Version Information)
+================================================================
+< HCI Command: ogf 0x04, ocf 0x0001, plen 0
+> HCI Event: 0x0e plen 12
+  01 01 10 00 06 E6 00 06 0F 00 09 22
+Decode: status=00, HCI ver=0x06 (4.0), HCI rev=0x00E6, LMP ver=0x06 (4.0),
+  manufacturer=0x000F (Broadcom), LMP subver=0x2209.
+Matches hciconfig -a (HCI 4.0 rev 0xe6, LMP 4.0 sub 0x2209, mfr 15).
+
+================================================================
+$ hcitool -i hci0 cmd 0x04 0x03   (Read Local Supported Features)
+================================================================
+< HCI Command: ogf 0x04, ocf 0x0003, plen 0
+> HCI Event: 0x0e plen 12
+  01 03 10 00 BF FE CF FE DB FF 7B 87
+Features = BF FE CF FE DB FF 7B 87 (== hciconfig Features line).
+
+================================================================
+$ hcitool -i hci0 cmd 0x04 0x03 0x00  (with page arg, safe variant)
+================================================================
+< HCI Command: ogf 0x04, ocf 0x0003, plen 1
+  00
+> HCI Event: 0x0e plen 4
+  01 03 10 12
+NOTE: with plen=1 the controller rejects with status 0x12 (Invalid HCI
+Command Parameters); the bare plen=0 form above is the valid read.
+
+================================================================
+$ hcitool -i hci0 cmd 0x04 0x09   (Read BD_ADDR)
+================================================================
+< HCI Command: ogf 0x04, ocf 0x0009, plen 0
+> HCI Event: 0x0e plen 10
+  01 09 10 00 AC 1F 12 A1 43 43
+BD_ADDR = 43:43:A1:12:1F:AC (== hciconfig).
+
+================================================================
+$ hcitool -i hci0 cmd 0x04 0x05   (Read Buffer Size)
+================================================================
+< HCI Command: ogf 0x04, ocf 0x0005, plen 0
+> HCI Event: 0x0e plen 11
+  01 05 10 00 FD 03 40 08 00 01 00
+Decode: status=00, ACL len=0x03FD (1021), SCO len=0x40 (64),
+  ACL pkts=0x0008, SCO pkts=0x0001 (== hciconfig ACL MTU 1021:8 SCO 64:1).
+
+================================================================
+$ hcitool -i hci0 cmd 0x03 0x14   (Read Local Name; safe standard cmd)
+================================================================
+< HCI Command: ogf 0x03, ocf 0x0014, plen 0
+> HCI Event: 0x0e plen 252
+  01 14 0C 00 53 61 6D 73 75 6E 67 20 47 61 6C 61 78 79 20 4A
+  37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  [248-byte name field zero-padded; first bytes decode below]
+Name = 'Samsung Galaxy J7' (== hciconfig Name).
+(full 252-byte payload was zero padding after byte '37'; truncated
+ here for readability — status=00, name bytes 53 61 6D 73 75 6E 67 20
+ 47 61 6C 61 78 79 20 4A 37 00.)
+
+================================================================
+$ hcitool -i hci0 cmd 0x04 0x04 0x00  (Read Local Supported ... page 0)
+================================================================
+< HCI Command: ogf 0x04, ocf 0x0004, plen 1
+  00
+> HCI Event: 0x0e plen 14
+  01 04 10 00 00 01 BF FE CF FE DB FF 7B 87
+Decode: status=00, page=00, max_page=01, LMP features page0 = BF FE CF FE DB FF 7B 87.
+
+================================================================
+$ hcitool -i hci0 cmd 0x04 0x02   (Read Local Supported Commands)
+================================================================
+< HCI Command: ogf 0x04, ocf 0x0002, plen 0
+> HCI Event: 0x0e plen 68
+  01 02 10 00 FF FF FF 03 CC FF EF FF FF FF EC 1F F2 0F E8 FE
+  3F F7 8F FF 1C 00 04 00 61 F7 FF FF 7F F8 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00
+
+================================================================
+$ hcitool -i hci0 revision  (not a valid hcitool subcommand here)
+================================================================
+Unknown command - "revision"
+
+================================================================
+$ cat /proc/asound/cards
+================================================================
+===CARDS===
+ 0 [Universal7580I2]: Universal7580-I - Universal7580-I2S
+                      Universal7580-I2S
+
+================================================================
+$ aplay -l
+================================================================
+**** List of PLAYBACK Hardware Devices ****
+card 0: Universal7580I2 [Universal7580-I2S], device 0: i2s0-pri cod3022x-aif-0 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 1: i2s0-sec cod3022x-aif-1 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 2: voice call cod3022x-aif2-2 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 3: bluetooth audio dummy-aif2-3 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 4: FM audio cod3022x-aif-4 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 5: eax0 cod3022x-aif-5 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 6: eax1 cod3022x-aif-6 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+
+================================================================
+$ arecord -l
+================================================================
+**** List of CAPTURE Hardware Devices ****
+card 0: Universal7580I2 [Universal7580-I2S], device 0: i2s0-pri cod3022x-aif-0 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 2: voice call cod3022x-aif2-2 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: Universal7580I2 [Universal7580-I2S], device 3: bluetooth audio dummy-aif2-3 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+
+================================================================
+$ amixer -c0 scontrols  (full list, 105 controls)
+================================================================
+Simple mixer control 'Headphone',0
+Simple mixer control 'Speaker',0
+Simple mixer control 'Line-in',0
+Simple mixer control 'MonoMix Mode',0
+Simple mixer control 'ADC Left Gain',0
+Simple mixer control 'ADC Right Gain',0
+Simple mixer control 'ADCL Mixer LINELL',0
+Simple mixer control 'ADCL Mixer LINERL',0
+Simple mixer control 'ADCL Mixer MIC1L',0
+Simple mixer control 'ADCL Mixer MIC2L',0
+Simple mixer control 'ADCR Mixer LINELR',0
+Simple mixer control 'ADCR Mixer LINERR',0
+Simple mixer control 'ADCR Mixer MIC1R',0
+Simple mixer control 'ADCR Mixer MIC2R',0
+Simple mixer control 'Chargepump Mode',0
+Simple mixer control 'DAC Gain',0
+Simple mixer control 'DAC Soft Mute',0
+Simple mixer control 'DNC Level',0
+Simple mixer control 'DNC Max Gain',0
+Simple mixer control 'DNC Min Gain',0
+Simple mixer control 'EP EP On',0
+Simple mixer control 'EP Mixer DACL',0
+Simple mixer control 'EP Mixer DACR',0
+Simple mixer control 'Earphone',0
+Simple mixer control 'HP HP On',0
+Simple mixer control 'HPL Mixer DACL',0
+Simple mixer control 'HPL Mixer DACR',0
+Simple mixer control 'HPR Mixer DACL',0
+Simple mixer control 'HPR Mixer DACR',0
+Simple mixer control 'LINEIN LINEIN On',0
+Simple mixer control 'MIC1',0
+Simple mixer control 'MIC1 Boost',0
+Simple mixer control 'MIC1 MIC1 On',0
+Simple mixer control 'MIC2',0
+Simple mixer control 'MIC2 Boost',0
+Simple mixer control 'MIC2 MIC2 On',0
+Simple mixer control 'S2801 ALC LVL Left',0
+Simple mixer control 'S2801 ALC LVL Right',0
+Simple mixer control 'S2801 ALC Max Gain',0
+Simple mixer control 'S2801 ALC Min Gain',0
+Simple mixer control 'S2801 ALC NG HYS',0
+Simple mixer control 'S2801 ALC Noise Gain Threshold',0
+Simple mixer control 'S2801 ALC Start Gain Left',0
+Simple mixer control 'S2801 ALC Start Gain Right',0
+Simple mixer control 'S2801 ALC Window Length',0
+Simple mixer control 'S2801 BCK4 Output Selection',0
+Simple mixer control 'S2801 CH1 BCLK Polarity',0
+Simple mixer control 'S2801 CH1 DOUT Select',0
+Simple mixer control 'S2801 CH1 I2S Data Length',0
+Simple mixer control 'S2801 CH1 I2S Format',0
+Simple mixer control 'S2801 CH1 Input Audio Mode',0
+Simple mixer control 'S2801 CH1 LRCLK Polarity',0
+Simple mixer control 'S2801 CH1 Master PCM Sample Rate',0
+Simple mixer control 'S2801 CH1 Master PCM Slot',0
+Simple mixer control 'S2801 CH1 Mixer En',0
+Simple mixer control 'S2801 CH1 PCM DAD',0
+Simple mixer control 'S2801 CH1 PCM Data Format',0
+Simple mixer control 'S2801 CH1 XFS',0
+Simple mixer control 'S2801 CH2 BCLK Polarity',0
+Simple mixer control 'S2801 CH2 DOUT Select',0
+Simple mixer control 'S2801 CH2 I2S Data Length',0
+Simple mixer control 'S2801 CH2 I2S Format',0
+Simple mixer control 'S2801 CH2 Input Audio Mode',0
+Simple mixer control 'S2801 CH2 LRCLK Polarity',0
+Simple mixer control 'S2801 CH2 Master PCM Sample Rate',0
+Simple mixer control 'S2801 CH2 Master PCM Slot',0
+Simple mixer control 'S2801 CH2 Mixer En',0
+Simple mixer control 'S2801 CH2 PCM DAD',0
+Simple mixer control 'S2801 CH2 PCM Data Format',0
+Simple mixer control 'S2801 CH2 XFS',0
+Simple mixer control 'S2801 CH3 BCLK Polarity',0
+Simple mixer control 'S2801 CH3 DOUT Select',0
+Simple mixer control 'S2801 CH3 I2S Data Length',0
+Simple mixer control 'S2801 CH3 I2S Format',0
+Simple mixer control 'S2801 CH3 Input Audio Mode',0
+Simple mixer control 'S2801 CH3 LRCLK Polarity',0
+Simple mixer control 'S2801 CH3 Master PCM Sample Rate',0
+Simple mixer control 'S2801 CH3 Master PCM Slot',0
+Simple mixer control 'S2801 CH3 Mixer En',0
+Simple mixer control 'S2801 CH3 PCM DAD',0
+Simple mixer control 'S2801 CH3 PCM Data Format',0
+Simple mixer control 'S2801 CH3 Rec En',0
+Simple mixer control 'S2801 CH3 XFS',0
+Simple mixer control 'S2801 CH4 Mixer En',0
+Simple mixer control 'S2801 HQ En',0
+Simple mixer control 'S2801 MCKO En',0
+Simple mixer control 'S2801 MIX1_LVL',0
+Simple mixer control 'S2801 MIX2_LVL',0
+Simple mixer control 'S2801 MIX3_LVL',0
+Simple mixer control 'S2801 MIX4_LVL',0
+Simple mixer control 'S2801 Mixer En',0
+Simple mixer control 'S2801 RMIX1 En',0
+Simple mixer control 'S2801 RMIX1_LVL',0
+Simple mixer control 'S2801 RMIX2 En',0
+Simple mixer control 'S2801 RMIX2_LVL',0
+Simple mixer control 'S2801 SRC1 En',0
+Simple mixer control 'S2801 SRC2 En',0
+Simple mixer control 'S2801 SRC3 En',0
+Simple mixer control 'SPK Mixer DACL',0
+Simple mixer control 'SPK Mixer DACR',0
+Simple mixer control 'SPK SPK On',0
+
+================================================================
+python3 + AF_BLUETOOTH raw-HCI probe (safe opcodes only, NO 0xFC15)
+================================================================
+$ python3 -c constants check
+AF_BLUETOOTH: True
+BTPROTO_HCI: 1
+3.14.10 (main, Oct 27 2026, 09:53:04) [GCC 15.2.0]
+
+$ raw-HCI attempt 1: send H4-prefixed 01 140C 00 with default filter
+sent Read_Local_Name (0x0C14)
+TimeoutError: timed out
+NOTE: default socket filter does not deliver the Command Complete
+event for this opcode; need explicit HCI_FILTER + H4-prefixed send.
+
+$ raw-HCI attempt 2: send without H4 prefix (04-byte struct <HB)
+OSError: [Errno 22] Invalid argument
+NOTE: SOCK_RAW HCI requires the 0x01 command-packet prefix; bare
+opcode+plen is rejected by the kernel.
+
+$ raw-HCI attempt 3 (SUCCESS): set HCI_FILTER to all-events, send
+  struct.pack("<BHB", 0x01, 0x1003, 0x00) = Read Local Supported Features
+filter ok, sending Read_Local_Supported_Features 0x1003
+rx[0]: 040e0c01031000bffecffedbff7b87
+MATCH Read_Local_Supported_Features complete
+Decode: event 04 0E (Cmd Complete), plen 0x0c, ncmd=01, opcode 0x1003,
+  status=00, features bffecffedbff7b87 (== hcitool 0x04 0x03 output).
+
+$ raw-HCI attempt 4 (SUCCESS): same socket setup, Read Local Name 0x0C14
+sent Read_Local_Name 0x0C14
+rx[0]: 040efc01140c0053616d73756e672047616c617879204a3700...00
+MATCH Read_Local_Name status=0 name=b'Samsung Galaxy J7'
+(full 252-byte payload zero-padded after '...4A37 00'; matches hcitool
+ 0x03 0x14 output and hciconfig Name.)
+Recipe that works: SOCK_RAW/BTPROTO_HCI, bind((0,)), setsockopt
+  (SOL_HCI=0, HCI_FILTER=2, pack("IIIH", ~0,~0,~0, 0)), then send H4
+  command packet 01 <opcode LE> <plen> <params> and recv() the 04 0E
+  Command Complete. No 0xFC15 was ever sent.
+
+================================================================
+$ final BT state check: hciconfig hci0 | head -3
+================================================================
+hci0:	Type: Primary  Bus: UART
+	BD Address: 43:43:A1:12:1F:AC  ACL MTU: 1021:8  SCO MTU: 64:1
+	UP RUNNING PSCAN
+
+================================================================
+VERDICT (5 lines)
+================================================================
+1. Chip is Broadcom BCM43438-class: HCI 4.0 rev 0xe6 / LMP 4.0 sub 0x2209, BD 43:43:A1:12:1F:AC, hci0 UP RUNNING at end.
+2. Userspace VS transport is viable: python3 AF_BLUETOOTH+SOCK_RAW/BTPROTO_HCI with HCI_FILTER + H4 send got Command Complete for 0x1003 and 0x0C14; daemon can use same path for 0xFC15.
+3. ALSA FM path present: playback hw:0,4 'FM audio cod3022x-aif-4' exists; capture hw:0,0 present; single card Universal7580-I2S.
+4. Mixer exposes 105 scontrols (cod3022x + S2801 routing/mixer set) for FM audio path bring-up; no FM-named control needed.
+5. Fully read-only: only standard info/version/feature/name/buffer opcodes used, no 0xFC15, no hciconfig down/up, no kills; BT left UP RUNNING PSCAN.
