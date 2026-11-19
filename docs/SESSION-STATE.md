@@ -1,6 +1,6 @@
 # Session state (survives context compaction)
 
-Updated: 2026-11-19 (GPS/BCM4752 BRI handshake verified on hardware; NMEA not chip-generated). Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
+Updated: 2026-11-19 (GPS GLME hand-off + ESW on hardware; modem CP power proven secure-only; GPU M1 built; USB link down pending physical re-plug). Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
 
 ## Audio / UCM (2026-11-18)
 - ADMA prealloc: `sound/soc/samsung/dma.c` `preallocate_dma_buffer_of()`
@@ -121,6 +121,20 @@ So the command id is right and the command is accepted, but the payload
 (param1=ch, rest 0) is not what configures the ISP I2C. Next: recover the real
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
+
+## Modem / CP power (2026-11-19) — impossible without stock TrustZone
+Full evidence: `docs/reports/modem-tz.md`.
+- Userspace (`j7elte-cbd` + `j7elte-ril`) is deployed and replays the stock SIPC/ioctl
+  order (`MODEM_RESET 0x6f21` -> `SECURITY_REQ` mode 2/0 -> `XMIT_BOOT` -> `MODEM_ON`),
+  reaching `INIT_END` on the SIPC link.
+- CP power is a **secure-only** switch: `exynos_smc(0x82000700, ...)` READ returns `8`,
+  WRITE (`0xA = CP_PWRON|CP_START`) is refused with `8`; `CP_CTRL` at PA `0x105C0030`
+  is secure-only (normal-world reads return `+0x34/38/40/6C` only).
+- Kinibi t-base-EXYNOS64-V015 has **no modem TA** (no .tlbin/mcRegistry entry), and
+  `libsec-ril` has no TEE path; bootmode/cmdline/secboot/sys_rev/CP_RST_N/PMIC gates
+  were all excluded by evidence.
+- Verdict: CP cannot be powered from any non-Android kernel; needs the stock Android TZ
+  stack or a bootloader-chain replacement.
 
 ## GPS / BCM4752 (2026-11-19) — chip answers BRI; NMEA not obtainable from it
 Full evidence: `docs/reports/gps-bringup.md`, tool
