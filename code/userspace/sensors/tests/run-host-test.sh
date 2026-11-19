@@ -75,6 +75,10 @@ expect HasAccelerometer "b true"
 expect HasProximity "b true"
 expect HasAmbientLight "b false"
 expect AccelerometerOrientation 's "undefined"'
+# On the real device the initial state comes from
+# /sys/class/sec/sec_key/hall_detect; on this host that file is absent, so the
+# daemon falls back to "open".
+expect LidIsClosed "b false"
 
 call ClaimAccelerometer
 call ClaimProximity
@@ -103,6 +107,15 @@ expect AccelerometerTilt 's "face-up"'
 echo "prox 0" >"$tmp/fifo"            # close
 sleep 0.4
 expect ProximityNear "b true"
+
+# TEST DATA: SW_LID 1 = cover closed, 0 = open.  The input core drops the
+# first 0 because the uinput switch already rests at 0, so send 1 first.
+echo "lid 1" >"$tmp/fifo"
+sleep 0.4
+expect LidIsClosed "b true"
+echo "lid 0" >"$tmp/fifo"
+sleep 0.4
+expect LidIsClosed "b false"
 
 call ReleaseAccelerometer
 call ReleaseProximity

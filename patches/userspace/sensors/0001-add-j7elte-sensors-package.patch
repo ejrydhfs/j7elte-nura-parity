@@ -1,6 +1,6 @@
 diff --git a/device/archived/j7elte-sensors/APKBUILD b/device/archived/j7elte-sensors/APKBUILD
 new file mode 100644
-index 0000000..10ad6baaa4e4d03a91e8f2cd893c3c6db79f4b3e
+index 0000000000000000000000000000000000000000..6fb8c5c939afdb75dfd11896033a489e5e853c79
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/APKBUILD
 @@ -0,0 +1,49 @@
@@ -45,8 +45,8 @@ index 0000000..10ad6baaa4e4d03a91e8f2cd893c3c6db79f4b3e
 +}
 +
 +sha512sums="
-+514b545790a70400480f72458ce4f24a659b5a56132b8b0abe46a5f9aa0c4cdcfdf8514da51ea46f92d52a7298765418ad50394712464f40625b9271dcef782b  j7elte-sensors.c
-+1518a879a7c2543c30b34972fb2f097381572194c476f8be54aa1431e83c117b616bba8d814217e7a2b01f8f17fbc7d9afea38e82e6a6d996e194a2e5f074d88  dbus-wire.c
++d40f4693d74ac53de5a286e3517c7cc8a41ec09b8973921d509954a966481cbb428a6211dc24e84cf7f39f6848675afb73dfcd90d0812113c54ed53507e14093  j7elte-sensors.c
++9c49ea039d5cdfec2cae61f6ce0200aaa368163498be63e07be0793eee8744ce891ddd4d1472de2c685cac9e7acc526096ea712ce721cfa10dff072f96a73304  dbus-wire.c
 +11ddaf7a1895cb09e76c00c3add3ff61cb659ca852bdb3f82b5d89304a11869a0bd54cb65a5054a70ac1a0e21401c120c0a3934270fd4c650b9a1f58a6e890d4  dbus-wire.h
 +9c7944bff72372781cf3887a1389811406dd16a594916cabb7ef55dfb83b4d23f2d19fed9984ea3c0409b7f390369160143b7a026de40acbbd8a6c8643a38b20  Makefile
 +43febf50866f5d7cb7db163066cfce8c3c217a99407444d7b28fcfdd27840b983427413cb292f7615cf3b921301351861a83fa8c196ddf02457b96eb5343b9f9  j7elte-sensors.service
@@ -55,7 +55,7 @@ index 0000000..10ad6baaa4e4d03a91e8f2cd893c3c6db79f4b3e
 +"
 diff --git a/device/archived/j7elte-sensors/Makefile b/device/archived/j7elte-sensors/Makefile
 new file mode 100644
-index 0000000..8f9c12511a431d7ef1fd0eb3978cea6ebbd76f7b
+index 0000000000000000000000000000000000000000..8f9c12511a431d7ef1fd0eb3978cea6ebbd76f7b
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/Makefile
 @@ -0,0 +1,33 @@
@@ -94,10 +94,10 @@ index 0000000..8f9c12511a431d7ef1fd0eb3978cea6ebbd76f7b
 +.PHONY: all install clean
 diff --git a/device/archived/j7elte-sensors/dbus-wire.c b/device/archived/j7elte-sensors/dbus-wire.c
 new file mode 100644
-index 0000000..b870dedd3f67042ea120e653e820e08a7254cd4a
+index 0000000000000000000000000000000000000000..f3c9d5995944090789d286d3409862e9f54d01b0
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/dbus-wire.c
-@@ -0,0 +1,981 @@
+@@ -0,0 +1,1020 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +/*
 + * dbus-wire.c - minimal D-Bus binary protocol implementation
@@ -430,6 +430,35 @@ index 0000000..b870dedd3f67042ea120e653e820e08a7254cd4a
 +		r->off = r->len;
 +}
 +
++/* Skip the value of a variant with type signature sig.  Header fields this
++ * implementation does not interpret are ignored as the D-Bus specification
++ * requires; in practice that is UNIX_FDS (9), which GLib/GDBus clients put
++ * on every method call, with signature "u". */
++static int skip_variant_value(struct dw_reader *r, const char *sig)
++{
++	uint32_t u;
++	uint8_t y;
++	int b;
++	const char *s;
++	size_t n;
++
++	switch (sig[0]) {
++	case 'u':
++		return dw_r_uint32(r, &u);
++	case 'b':
++		return dw_r_bool(r, &b);
++	case 'y':
++		return r_u8(r, &y);
++	case 's':
++	case 'o':
++		return dw_r_string(r, &s, &n);
++	case 'g':
++		return dw_r_signature(r, &s, &n);
++	default:
++		return -1;
++	}
++}
++
 +/* ------------------------------------------------------------------ */
 +/* outgoing messages                                                  */
 +/* ------------------------------------------------------------------ */
@@ -468,6 +497,7 @@ index 0000000..b870dedd3f67042ea120e653e820e08a7254cd4a
 +	HF_DESTINATION = 6,
 +	HF_SENDER = 7,
 +	HF_SIGNATURE = 8,
++	HF_UNIX_FDS = 9,
 +};
 +
 +static void add_field_str(struct dw_writer *w, enum header_field code,
@@ -675,9 +705,18 @@ index 0000000..b870dedd3f67042ea120e653e820e08a7254cd4a
 +			m->reply_serial = u;
 +			m->has_reply_serial = 1;
 +			break;
++		case HF_UNIX_FDS:
++			if (strcmp(sig, "u"))
++				return -1;
++			if (dw_r_uint32(&value, &u) < 0)
++				return -1;
++			break;
 +		default:
-+			/* unknown/unsupported header field */
-+			return -1;
++			/* Unknown header field: ignore its value (D-Bus spec
++			 * requires this; unknown types remain an error). */
++			if (skip_variant_value(&value, sig) < 0)
++				return -1;
++			break;
 +		}
 +		/* values are parsed through a copy; advance the outer reader */
 +		r.off = value.off;
@@ -1081,7 +1120,7 @@ index 0000000..b870dedd3f67042ea120e653e820e08a7254cd4a
 +}
 diff --git a/device/archived/j7elte-sensors/dbus-wire.h b/device/archived/j7elte-sensors/dbus-wire.h
 new file mode 100644
-index 0000000..3696213950c45aeb8ca0fbade47a65a4d56fa64a
+index 0000000000000000000000000000000000000000..3696213950c45aeb8ca0fbade47a65a4d56fa64a
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/dbus-wire.h
 @@ -0,0 +1,123 @@
@@ -1210,10 +1249,10 @@ index 0000000..3696213950c45aeb8ca0fbade47a65a4d56fa64a
 +#endif /* J7ELTE_DBUS_WIRE_H */
 diff --git a/device/archived/j7elte-sensors/j7elte-sensors.c b/device/archived/j7elte-sensors/j7elte-sensors.c
 new file mode 100644
-index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
+index 0000000000000000000000000000000000000000..7ef0ea4cf716784de2e1f7e5d9182aba7ab053a2
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/j7elte-sensors.c
-@@ -0,0 +1,1141 @@
+@@ -0,0 +1,1290 @@
 +/* SPDX-License-Identifier: GPL-3.0-or-later */
 +/*
 + * j7elte-sensors - expose the Samsung Galaxy J7 (j7elte) evdev sensors
@@ -1229,6 +1268,12 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 + *     Control: <input-device>/enable.
 + *   - No ambient-light interface is registered by either proximity driver in
 + *     this kernel (see parity/reports/sensors.md), so HasAmbientLight=false.
++ *   - Flip cover: input device "hall" (drivers/input/flip_cover.c),
++ *     EV_SW SW_LID (0 = cover open, 1 = cover closed).  The driver only
++ *     emits a switch event on a *change*, so the initial state is read from
++ *     /sys/class/sec/sec_key/hall_detect, which the same driver exports.
++ *     iio-sensor-proxy has no lid property; LidIsClosed is an extension of
++ *     this daemon (see docs/reports/hall.md).
 + *
 + * The daemon speaks the D-Bus binary protocol directly (dbus-wire.c) and
 + * implements the iio-sensor-proxy interface so existing desktop consumers
@@ -1255,6 +1300,8 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +#define SENSOR_PROXY_PATH "/net/hadess/SensorProxy"
 +#define ACCEL_INPUT_NAME "accelerometer_sensor"
 +#define PROX_INPUT_NAME "proximity_sensor"
++#define LID_INPUT_NAME "hall"
++#define LID_STATE_PATH "/sys/class/sec/sec_key/hall_detect"
 +
 +/*
 + * k2hh.c enables K2HH_RANGE_4G before streaming (SENSITIVITY_4G = 122 ug/LSB,
@@ -1285,6 +1332,11 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +static struct dw_conn *bus;
 +static struct sensor accel_sensor = { .kind = "accelerometer", .fd = -1 };
 +static struct sensor prox_sensor = { .kind = "proximity", .fd = -1 };
++/* The hall switch has no sysfs enable/poll_delay knobs, so it is not a
++ * struct sensor: it is always on and only reports on change. */
++static int lid_fd = -1;
++static int lid_present;
++static int lid_closed;
 +
 +static volatile sig_atomic_t stop_requested;
 +static int verbose;
@@ -1470,6 +1522,8 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +		dw_w_variant_bool(w, prox_sensor.present);
 +	else if (!strcmp(name, "ProximityNear"))
 +		dw_w_variant_bool(w, proximity_near);
++	else if (!strcmp(name, "LidIsClosed"))
++		dw_w_variant_bool(w, lid_closed);
 +	else
 +		return -1;
 +	return 0;
@@ -1628,6 +1682,116 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +		if (sensor_from_event(i, name, capable, s))
 +			return 1;
 +	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* hall / flip cover                                                  */
++/* ------------------------------------------------------------------ */
++
++static int evdev_is_lid(int fd)
++{
++	unsigned long bits[NBITS(SW_MAX)];
++
++	return evdev_test_bits(fd, EVIOCGBIT(EV_SW, sizeof(bits)), SW_LID,
++			       bits, NBITS(SW_MAX));
++}
++
++/*
++ * flip_cover.c keeps the switch state in the input core, so the core drops a
++ * report equal to the current state.  That includes the report hall_open()
++ * schedules when the device is opened: an open cover produces no event at
++ * all.  hall_detect (same driver, sec_key attribute group) is the only way
++ * to learn the state before the first flip.
++ */
++static int lid_state_from_sysfs(void)
++{
++	char buf[16];
++	ssize_t n;
++	int fd = open(LID_STATE_PATH, O_RDONLY | O_CLOEXEC);
++
++	if (fd < 0)
++		return -1;
++	n = read(fd, buf, sizeof(buf) - 1);
++	close(fd);
++	if (n <= 0)
++		return -1;
++	buf[n] = '\0';
++	if (!strncmp(buf, "OPEN", 4))
++		return 0;
++	if (!strncmp(buf, "CLOSE", 5))
++		return 1;
++	return -1;
++}
++
++static void lid_discover(void)
++{
++	int i;
++
++	for (i = 0; i < MAX_EVENT_DEV; i++) {
++		char path[64], name[256];
++		int state, have_state;
++
++		snprintf(path, sizeof(path), "/dev/input/event%d", i);
++		lid_fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++		if (lid_fd < 0)
++			continue;
++		memset(name, 0, sizeof(name));
++		if (ioctl(lid_fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 ||
++		    strcmp(name, LID_INPUT_NAME) != 0 || !evdev_is_lid(lid_fd)) {
++			close(lid_fd);
++			lid_fd = -1;
++			continue;
++		}
++
++		lid_present = 1;
++		state = lid_state_from_sysfs();
++		have_state = state >= 0;
++		if (!have_state) {
++			logmsg("warning: cannot read %s; reporting the cover "
++			       "as open until the first switch event",
++			       LID_STATE_PATH);
++			state = 0;
++		}
++		lid_closed = state;
++		logmsg("found lid at %s (state: %s, %s)", path,
++		       lid_closed ? "closed" : "open",
++		       have_state ? "initial state from " LID_STATE_PATH :
++		       "state unknown");
++		emit_bool_prop("LidIsClosed", lid_closed);
++		return;
++	}
++}
++
++static void lid_reading(int closed)
++{
++	closed = !!closed;
++	if (closed == lid_closed)
++		return;
++	lid_closed = closed;
++	logdbg("lid: %s", closed ? "closed" : "open");
++	emit_bool_prop("LidIsClosed", closed);
++}
++
++static int handle_lid_events(void)
++{
++	struct input_event ev;
++
++	while (read(lid_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
++		if (getenv("J7ELTE_EVDEV_DEBUG"))
++			fprintf(stderr, "evdev(lid): type=%u code=%u value=%d\n",
++				ev.type, ev.code, ev.value);
++		if (ev.type == EV_SW && ev.code == SW_LID)
++			lid_reading(ev.value);
++	}
++	return 0;
++}
++
++static void lid_close(void)
++{
++	if (lid_fd >= 0)
++		close(lid_fd);
++	lid_fd = -1;
++	lid_present = 0;
 +}
 +
 +/* ------------------------------------------------------------------ */
@@ -1851,6 +2015,7 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +"    <property name=\"LightLevel\" type=\"d\" access=\"read\"/>\n"
 +"    <property name=\"HasProximity\" type=\"b\" access=\"read\"/>\n"
 +"    <property name=\"ProximityNear\" type=\"b\" access=\"read\"/>\n"
++"    <property name=\"LidIsClosed\" type=\"b\" access=\"read\"/>\n"
 +"    <method name=\"ClaimAccelerometer\"/>\n"
 +"    <method name=\"ReleaseAccelerometer\"/>\n"
 +"    <method name=\"ClaimLight\"/>\n"
@@ -1901,6 +2066,7 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +	"LightLevel",
 +	"HasProximity",
 +	"ProximityNear",
++	"LidIsClosed",
 +	NULL,
 +};
 +
@@ -2205,6 +2371,8 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +			}
 +		}
 +	}
++	if (!lid_present)
++		lid_discover();
 +}
 +
 +static void usage(const char *argv0)
@@ -2259,21 +2427,26 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +
 +	discover_sensor(&accel_sensor, ACCEL_INPUT_NAME, evdev_is_accel);
 +	discover_sensor(&prox_sensor, PROX_INPUT_NAME, evdev_is_prox);
++	lid_discover();
 +	if (!accel_sensor.present)
 +		logmsg("warning: '%s' input device not found yet",
 +		       ACCEL_INPUT_NAME);
 +	if (!prox_sensor.present)
 +		logmsg("warning: '%s' input device not found yet",
 +		       PROX_INPUT_NAME);
++	if (!lid_present)
++		logmsg("warning: '%s' input device not found yet",
++		       LID_INPUT_NAME);
 +	logmsg("owning %s as %s", SENSOR_PROXY_NAME,
-+	       accel_sensor.present || prox_sensor.present ?
++	       accel_sensor.present || prox_sensor.present || lid_present ?
 +	       "sensor proxy" : "empty sensor proxy");
 +
 +	while (!stop_requested) {
-+		struct pollfd fds[3];
++		struct pollfd fds[4];
 +		int nfds = 0, dbus_idx, accel_idx = -1, prox_idx = -1;
-+		int timeout = (accel_sensor.present && prox_sensor.present) ?
-+			      -1 : 2000;
++		int lid_idx = -1;
++		int timeout = (accel_sensor.present && prox_sensor.present &&
++			       lid_present) ? -1 : 2000;
 +		int r;
 +
 +		dbus_idx = nfds;
@@ -2291,6 +2464,13 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +		if (prox_sensor.fd >= 0) {
 +			prox_idx = nfds;
 +			fds[nfds].fd = prox_sensor.fd;
++			fds[nfds].events = POLLIN;
++			fds[nfds].revents = 0;
++			nfds++;
++		}
++		if (lid_fd >= 0) {
++			lid_idx = nfds;
++			fds[nfds].fd = lid_fd;
 +			fds[nfds].events = POLLIN;
 +			fds[nfds].revents = 0;
 +			nfds++;
@@ -2333,6 +2513,8 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +			handle_accel_events();
 +		if (prox_idx >= 0 && fds[prox_idx].revents & POLLIN)
 +			handle_prox_events();
++		if (lid_idx >= 0 && fds[lid_idx].revents & POLLIN)
++			handle_lid_events();
 +		if (accel_idx >= 0 &&
 +		    fds[accel_idx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
 +			logmsg("accelerometer input device disappeared");
@@ -2345,19 +2527,25 @@ index 0000000..ec46f72c58b7a898ef0621c068ae71de6c452ce3
 +			sensor_close(&prox_sensor);
 +			emit_bool_prop("HasProximity", 0);
 +		}
++		if (lid_idx >= 0 &&
++		    fds[lid_idx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
++			logmsg("lid input device disappeared");
++			lid_close();
++		}
 +	}
 +
 +	sensor_set_enabled(&accel_sensor, 0);
 +	sensor_set_enabled(&prox_sensor, 0);
 +	sensor_close(&accel_sensor);
 +	sensor_close(&prox_sensor);
++	lid_close();
 +	dw_conn_free(bus);
 +	logmsg("stopped");
 +	return 0;
 +}
 diff --git a/device/archived/j7elte-sensors/j7elte-sensors.conf b/device/archived/j7elte-sensors/j7elte-sensors.conf
 new file mode 100644
-index 0000000..237341daec934b4c65ba39c2b087f44a5cb8d68b
+index 0000000000000000000000000000000000000000..237341daec934b4c65ba39c2b087f44a5cb8d68b
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/j7elte-sensors.conf
 @@ -0,0 +1,21 @@
@@ -2384,7 +2572,7 @@ index 0000000..237341daec934b4c65ba39c2b087f44a5cb8d68b
 +</busconfig>
 diff --git a/device/archived/j7elte-sensors/j7elte-sensors.initd b/device/archived/j7elte-sensors/j7elte-sensors.initd
 new file mode 100755
-index 0000000..24877964c40500221f371eda3c6bd10cc4eba4bb
+index 0000000000000000000000000000000000000000..24877964c40500221f371eda3c6bd10cc4eba4bb
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/j7elte-sensors.initd
 @@ -0,0 +1,12 @@
@@ -2402,7 +2590,7 @@ index 0000000..24877964c40500221f371eda3c6bd10cc4eba4bb
 +}
 diff --git a/device/archived/j7elte-sensors/j7elte-sensors.service b/device/archived/j7elte-sensors/j7elte-sensors.service
 new file mode 100644
-index 0000000..956024d07e3114dcb44b6b1a3eaa2d781de30d6a
+index 0000000000000000000000000000000000000000..956024d07e3114dcb44b6b1a3eaa2d781de30d6a
 --- /dev/null
 +++ b/device/archived/j7elte-sensors/j7elte-sensors.service
 @@ -0,0 +1,24 @@

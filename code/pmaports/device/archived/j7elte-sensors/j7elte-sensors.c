@@ -13,6 +13,12 @@
  *     Control: <input-device>/enable.
  *   - No ambient-light interface is registered by either proximity driver in
  *     this kernel (see parity/reports/sensors.md), so HasAmbientLight=false.
+ *   - Flip cover: input device "hall" (drivers/input/flip_cover.c),
+ *     EV_SW SW_LID (0 = cover open, 1 = cover closed).  The driver only
+ *     emits a switch event on a *change*, so the initial state is read from
+ *     /sys/class/sec/sec_key/hall_detect, which the same driver exports.
+ *     iio-sensor-proxy has no lid property; LidIsClosed is an extension of
+ *     this daemon (see docs/reports/hall.md).
  *
  * The daemon speaks the D-Bus binary protocol directly (dbus-wire.c) and
  * implements the iio-sensor-proxy interface so existing desktop consumers
@@ -39,6 +45,8 @@
 #define SENSOR_PROXY_PATH "/net/hadess/SensorProxy"
 #define ACCEL_INPUT_NAME "accelerometer_sensor"
 #define PROX_INPUT_NAME "proximity_sensor"
+#define LID_INPUT_NAME "hall"
+#define LID_STATE_PATH "/sys/class/sec/sec_key/hall_detect"
 
 /*
  * k2hh.c enables K2HH_RANGE_4G before streaming (SENSITIVITY_4G = 122 ug/LSB,
@@ -69,6 +77,11 @@ struct sensor {
 static struct dw_conn *bus;
 static struct sensor accel_sensor = { .kind = "accelerometer", .fd = -1 };
 static struct sensor prox_sensor = { .kind = "proximity", .fd = -1 };
+/* The hall switch has no sysfs enable/poll_delay knobs, so it is not a
+ * struct sensor: it is always on and only reports on change. */
+static int lid_fd = -1;
+static int lid_present;
+static int lid_closed;
 
 static volatile sig_atomic_t stop_requested;
 static int verbose;
@@ -254,6 +267,8 @@ static int write_prop_variant(struct dw_writer *w, const char *name)
 		dw_w_variant_bool(w, prox_sensor.present);
 	else if (!strcmp(name, "ProximityNear"))
 		dw_w_variant_bool(w, proximity_near);
+	else if (!strcmp(name, "LidIsClosed"))
+		dw_w_variant_bool(w, lid_closed);
 	else
 		return -1;
 	return 0;
@@ -412,6 +427,116 @@ static int discover_sensor(struct sensor *s, const char *name,
 		if (sensor_from_event(i, name, capable, s))
 			return 1;
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* hall / flip cover                                                  */
+/* ------------------------------------------------------------------ */
+
+static int evdev_is_lid(int fd)
+{
+	unsigned long bits[NBITS(SW_MAX)];
+
+	return evdev_test_bits(fd, EVIOCGBIT(EV_SW, sizeof(bits)), SW_LID,
+			       bits, NBITS(SW_MAX));
+}
+
+/*
+ * flip_cover.c keeps the switch state in the input core, so the core drops a
+ * report equal to the current state.  That includes the report hall_open()
+ * schedules when the device is opened: an open cover produces no event at
+ * all.  hall_detect (same driver, sec_key attribute group) is the only way
+ * to learn the state before the first flip.
+ */
+static int lid_state_from_sysfs(void)
+{
+	char buf[16];
+	ssize_t n;
+	int fd = open(LID_STATE_PATH, O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = '\0';
+	if (!strncmp(buf, "OPEN", 4))
+		return 0;
+	if (!strncmp(buf, "CLOSE", 5))
+		return 1;
+	return -1;
+}
+
+static void lid_discover(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_EVENT_DEV; i++) {
+		char path[64], name[256];
+		int state, have_state;
+
+		snprintf(path, sizeof(path), "/dev/input/event%d", i);
+		lid_fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (lid_fd < 0)
+			continue;
+		memset(name, 0, sizeof(name));
+		if (ioctl(lid_fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 ||
+		    strcmp(name, LID_INPUT_NAME) != 0 || !evdev_is_lid(lid_fd)) {
+			close(lid_fd);
+			lid_fd = -1;
+			continue;
+		}
+
+		lid_present = 1;
+		state = lid_state_from_sysfs();
+		have_state = state >= 0;
+		if (!have_state) {
+			logmsg("warning: cannot read %s; reporting the cover "
+			       "as open until the first switch event",
+			       LID_STATE_PATH);
+			state = 0;
+		}
+		lid_closed = state;
+		logmsg("found lid at %s (state: %s, %s)", path,
+		       lid_closed ? "closed" : "open",
+		       have_state ? "initial state from " LID_STATE_PATH :
+		       "state unknown");
+		emit_bool_prop("LidIsClosed", lid_closed);
+		return;
+	}
+}
+
+static void lid_reading(int closed)
+{
+	closed = !!closed;
+	if (closed == lid_closed)
+		return;
+	lid_closed = closed;
+	logdbg("lid: %s", closed ? "closed" : "open");
+	emit_bool_prop("LidIsClosed", closed);
+}
+
+static int handle_lid_events(void)
+{
+	struct input_event ev;
+
+	while (read(lid_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+		if (getenv("J7ELTE_EVDEV_DEBUG"))
+			fprintf(stderr, "evdev(lid): type=%u code=%u value=%d\n",
+				ev.type, ev.code, ev.value);
+		if (ev.type == EV_SW && ev.code == SW_LID)
+			lid_reading(ev.value);
+	}
+	return 0;
+}
+
+static void lid_close(void)
+{
+	if (lid_fd >= 0)
+		close(lid_fd);
+	lid_fd = -1;
+	lid_present = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -635,6 +760,7 @@ static const char introspection_xml[] =
 "    <property name=\"LightLevel\" type=\"d\" access=\"read\"/>\n"
 "    <property name=\"HasProximity\" type=\"b\" access=\"read\"/>\n"
 "    <property name=\"ProximityNear\" type=\"b\" access=\"read\"/>\n"
+"    <property name=\"LidIsClosed\" type=\"b\" access=\"read\"/>\n"
 "    <method name=\"ClaimAccelerometer\"/>\n"
 "    <method name=\"ReleaseAccelerometer\"/>\n"
 "    <method name=\"ClaimLight\"/>\n"
@@ -685,6 +811,7 @@ static const char *const property_names[] = {
 	"LightLevel",
 	"HasProximity",
 	"ProximityNear",
+	"LidIsClosed",
 	NULL,
 };
 
@@ -989,6 +1116,8 @@ static void discover_missing(void)
 			}
 		}
 	}
+	if (!lid_present)
+		lid_discover();
 }
 
 static void usage(const char *argv0)
@@ -1043,21 +1172,26 @@ int main(int argc, char **argv)
 
 	discover_sensor(&accel_sensor, ACCEL_INPUT_NAME, evdev_is_accel);
 	discover_sensor(&prox_sensor, PROX_INPUT_NAME, evdev_is_prox);
+	lid_discover();
 	if (!accel_sensor.present)
 		logmsg("warning: '%s' input device not found yet",
 		       ACCEL_INPUT_NAME);
 	if (!prox_sensor.present)
 		logmsg("warning: '%s' input device not found yet",
 		       PROX_INPUT_NAME);
+	if (!lid_present)
+		logmsg("warning: '%s' input device not found yet",
+		       LID_INPUT_NAME);
 	logmsg("owning %s as %s", SENSOR_PROXY_NAME,
-	       accel_sensor.present || prox_sensor.present ?
+	       accel_sensor.present || prox_sensor.present || lid_present ?
 	       "sensor proxy" : "empty sensor proxy");
 
 	while (!stop_requested) {
-		struct pollfd fds[3];
+		struct pollfd fds[4];
 		int nfds = 0, dbus_idx, accel_idx = -1, prox_idx = -1;
-		int timeout = (accel_sensor.present && prox_sensor.present) ?
-			      -1 : 2000;
+		int lid_idx = -1;
+		int timeout = (accel_sensor.present && prox_sensor.present &&
+			       lid_present) ? -1 : 2000;
 		int r;
 
 		dbus_idx = nfds;
@@ -1075,6 +1209,13 @@ int main(int argc, char **argv)
 		if (prox_sensor.fd >= 0) {
 			prox_idx = nfds;
 			fds[nfds].fd = prox_sensor.fd;
+			fds[nfds].events = POLLIN;
+			fds[nfds].revents = 0;
+			nfds++;
+		}
+		if (lid_fd >= 0) {
+			lid_idx = nfds;
+			fds[nfds].fd = lid_fd;
 			fds[nfds].events = POLLIN;
 			fds[nfds].revents = 0;
 			nfds++;
@@ -1117,6 +1258,8 @@ int main(int argc, char **argv)
 			handle_accel_events();
 		if (prox_idx >= 0 && fds[prox_idx].revents & POLLIN)
 			handle_prox_events();
+		if (lid_idx >= 0 && fds[lid_idx].revents & POLLIN)
+			handle_lid_events();
 		if (accel_idx >= 0 &&
 		    fds[accel_idx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
 			logmsg("accelerometer input device disappeared");
@@ -1129,12 +1272,18 @@ int main(int argc, char **argv)
 			sensor_close(&prox_sensor);
 			emit_bool_prop("HasProximity", 0);
 		}
+		if (lid_idx >= 0 &&
+		    fds[lid_idx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+			logmsg("lid input device disappeared");
+			lid_close();
+		}
 	}
 
 	sensor_set_enabled(&accel_sensor, 0);
 	sensor_set_enabled(&prox_sensor, 0);
 	sensor_close(&accel_sensor);
 	sensor_close(&prox_sensor);
+	lid_close();
 	dw_conn_free(bus);
 	logmsg("stopped");
 	return 0;

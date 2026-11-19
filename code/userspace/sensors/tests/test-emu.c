@@ -2,11 +2,12 @@
 /*
  * test-emu.c - TEST ONLY uinput emulator for j7elte-sensors.
  *
- * Creates two virtual input devices with the same names and capabilities as
+ * Creates three virtual input devices with the same names and capabilities as
  * the j7elte kernel drivers, then accepts commands from a FIFO:
  *
  *   accel <x> <y> <z>   emit REL_X/Y/Z plus SYN_REPORT (raw K2HH LSB, 8192/g)
  *   prox <0|1>          emit ABS_DISTANCE (0 = close, 1 = far)
+ *   lid <0|1>           emit SW_LID (0 = cover open, 1 = cover closed)
  *   quit
  *
  * This exists only to exercise the j7elte-sensors evdev/D-Bus paths on a
@@ -49,7 +50,13 @@ static void emit(int fd, int type, int code, int value)
 		perror("write event");
 }
 
-static int create_uinput(const char *name, int is_abs)
+enum dev_kind {
+	DEV_ACCEL,
+	DEV_PROX,
+	DEV_LID,
+};
+
+static int create_uinput(const char *name, enum dev_kind kind)
 {
 	struct uinput_setup setup;
 	int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
@@ -59,16 +66,24 @@ static int create_uinput(const char *name, int is_abs)
 		return -1;
 	}
 
-	if (is_abs) {
+	switch (kind) {
+	case DEV_PROX:
 		ioctl(fd, UI_SET_EVBIT, EV_ABS);
 		ioctl(fd, UI_SET_ABSBIT, ABS_DISTANCE);
-	} else {
+		break;
+	case DEV_LID:
+		ioctl(fd, UI_SET_EVBIT, EV_SW);
+		ioctl(fd, UI_SET_SWBIT, SW_LID);
+		break;
+	case DEV_ACCEL:
+	default:
 		ioctl(fd, UI_SET_EVBIT, EV_REL);
 		ioctl(fd, UI_SET_RELBIT, REL_X);
 		ioctl(fd, UI_SET_RELBIT, REL_Y);
 		ioctl(fd, UI_SET_RELBIT, REL_Z);
 		ioctl(fd, UI_SET_RELBIT, REL_DIAL);
 		ioctl(fd, UI_SET_RELBIT, REL_MISC);
+		break;
 	}
 
 	memset(&setup, 0, sizeof(setup));
@@ -92,7 +107,7 @@ static int create_uinput(const char *name, int is_abs)
 int main(int argc, char **argv)
 {
 	const char *fifo = argc > 1 ? argv[1] : "/tmp/j7elte-sensors-test.fifo";
-	int accel_fd, prox_fd, fifo_fd;
+	int accel_fd, prox_fd, lid_fd, fifo_fd;
 	struct sigaction sa = { .sa_handler = on_sig };
 
 	if (argc > 2 && !strcmp(argv[2], "--help")) {
@@ -103,9 +118,10 @@ int main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 
-	accel_fd = create_uinput("accelerometer_sensor", 0);
-	prox_fd = create_uinput("proximity_sensor", 1);
-	if (accel_fd < 0 || prox_fd < 0)
+	accel_fd = create_uinput("accelerometer_sensor", DEV_ACCEL);
+	prox_fd = create_uinput("proximity_sensor", DEV_PROX);
+	lid_fd = create_uinput("hall", DEV_LID);
+	if (accel_fd < 0 || prox_fd < 0 || lid_fd < 0)
 		return 1;
 
 	/* O_RDWR keeps the FIFO from reporting EOF when no test writer is open. */
@@ -158,6 +174,19 @@ int main(int argc, char **argv)
 					emit(prox_fd, EV_SYN, SYN_REPORT, 0);
 					fprintf(stderr,
 						"test-emu: prox %d\n", x);
+				} else if (cmd && !strcmp(cmd, "lid") &&
+					   sscanf(save ? save : "", "%d",
+						  &x) == 1) {
+					/*
+					 * The input core drops a switch report
+					 * equal to the current state, exactly
+					 * like the real driver's first open
+					 * report.  Send 1 before 0 in tests.
+					 */
+					emit(lid_fd, EV_SW, SW_LID, x);
+					emit(lid_fd, EV_SYN, SYN_REPORT, 0);
+					fprintf(stderr,
+						"test-emu: lid %d\n", x);
 				} else if (cmd && !strcmp(cmd, "quit")) {
 					stop = 1;
 				}
@@ -172,8 +201,10 @@ int main(int argc, char **argv)
 
 	ioctl(accel_fd, UI_DEV_DESTROY);
 	ioctl(prox_fd, UI_DEV_DESTROY);
+	ioctl(lid_fd, UI_DEV_DESTROY);
 	close(accel_fd);
 	close(prox_fd);
+	close(lid_fd);
 	close(fifo_fd);
 	return 0;
 }

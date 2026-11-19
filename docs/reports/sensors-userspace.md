@@ -44,7 +44,8 @@ Both proximity drivers claim the same `gpa1-4` interrupt in the DT; only the fit
 probes successfully. Discovery picks the first `proximity_sensor` event node, so it works
 with either chip. No poll_delay exists for proximity, therefore none is written.
 
-Hall/flip-cover (`drivers/input/flip_cover.c`) has no SensorProxy property and is not used.
+Hall/flip-cover (`drivers/input/flip_cover.c`) has no upstream SensorProxy property;
+the daemon adds the extension property `LidIsClosed` for it (`docs/reports/hall.md`).
 
 ## 2. Mismatches found and fixed
 

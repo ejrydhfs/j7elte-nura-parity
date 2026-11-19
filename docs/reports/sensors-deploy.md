@@ -11,7 +11,7 @@ phone, installed, enabled as an OpenRC service and verified with real readings:
 | STK3013 proximity | `/dev/input/event4`, `proximity_sensor`, `EV_ABS ABS_DISTANCE` | **works**: chip answers as `PID=0x31 RID=0xc3`, PS enabled, `ProximityNear` follows the driver (0 = far at rest); near/far transition exercised (see §6), physical hand-cover not possible |
 | CM36672P proximity | i2c 0x60 | **not present on this unit** (no ACK; the STK3013 driver owns `proximity_sensor`) |
 | Ambient light | — | **does not exist** in this kernel: `HasAmbientLight=false`, `LightLevel=0.0` |
-| Hall / flip cover | `/dev/input/event6` (`hall`) | not a `SensorProxy` sensor; not used by the daemon |
+| Hall / flip cover | `/dev/input/event6` (`hall`), `EV_SW SW_LID` | **driver bound and event node live**; since this report the daemon exposes it as the extension property `LidIsClosed` (see `docs/reports/hall.md`); physical flip not performed |
 
 The patch's own daemon is the correct target: these drivers are *not* IIO, so the stock
 `iio-sensor-proxy` cannot talk to them (`docs/reports/sensors.md` risk 1). The daemon is a
