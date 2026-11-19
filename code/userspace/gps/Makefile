@@ -16,11 +16,16 @@ all: $(BIN)
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
+# Raw UART experiment driver (no NMEA parsing, no PTY): used to capture the
+# BCM4752 BRI prologue byte by byte on the device.
+gpsprobe: src/gpsprobe.c
+	$(CC) $(CFLAGS) -o $@ $< 
+
 check: $(BIN)
 	python3 tests/smoke_test.py
 	python3 tests/init_test.py
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) gpsprobe
 
 .PHONY: all check clean

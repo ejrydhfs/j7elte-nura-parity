@@ -1,6 +1,6 @@
 # Session state (survives context compaction)
 
-Updated: 2026-11-18 (camera RE dropped; audio UCM fix). Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
+Updated: 2026-11-19 (GPS/BCM4752 BRI handshake verified on hardware; NMEA not chip-generated). Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
 
 ## Audio / UCM (2026-11-18)
 - ADMA prealloc: `sound/soc/samsung/dma.c` `preallocate_dma_buffer_of()`
@@ -121,3 +121,33 @@ So the command id is right and the command is accepted, but the payload
 (param1=ch, rest 0) is not what configures the ISP I2C. Next: recover the real
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
+
+## GPS / BCM4752 (2026-11-19) — chip answers BRI; NMEA not obtainable from it
+Full evidence: `docs/reports/gps-bringup.md`, tool
+`code/userspace/gps/src/gpsprobe.c`.
+
+- The chip is powered and the UART works. The old "chip silent" result was an
+  **ordering bug in `--init`**, not hardware: `RequestHwVersion` is ignored
+  until the NVRAM exchange has run.
+- Verified prologue on `/dev/ttySAC0` 921600 8N1, no flow control, after
+  `GPS_PWR_EN` 0 (1 s) -> 1 (0.25 s):
+  1. `80` x16 autobaud -> no announce (normal);
+  2. `fe00fd001b07000000fc` -> no reply, but stores the word;
+  3. `ff00fd001bfc` -> `fe00fd001b 07000000 fc`;
+  4. `ff00fd401afc` -> `fe00fd401a 00000000 fc` (`020010a4` on a cold boot);
+  5. `ff00fd0000fc` -> `fe00fd0000 05000230 fc` (version `0x30020005`);
+  6. `ff00fd1f95fc` -> `fe00fd1f95 00000000 fc` (sub 0x95 = asic-ready ACK).
+  `GetOutOfLegacy` is **not** answered here; after step 6 the chip is silent
+  for 6 s and polls stay constant — no measurement stream, no NMEA.
+- Flow control is irrelevant: `CRTSCTS`, manual RTS, both, and both after a
+  power cycle gave zero rx over 10 s x3. 14-baud sweep (4800..4M) after a power
+  pulse: zero rx. Pinmux pins 87-90 (gpb0-4..7) -> `13800000.uart`; gpio137
+  writes move the pin `out lo`/`out hi`.
+- NMEA is produced by `glgps`, never by the chip; the remaining vendor stages
+  (flow-control search, ESW upload, RF/clock plan, measurement start) are
+  run-time computed and the ROM has no ESW blob.
+- Next experiment: one cold-start capture of the stock stack (pad tap or stock
+  boot log) and replay; alternatively disassemble
+  `Bri_ProgramSwFlowControl` (`0x2a6aa0`) against the ACK parser (`0x2a789c`).
+- `j7elte-gpsd --init` must send the NVRAM pair before `RequestHwVersion` and
+  must not abort when autobaud is unannounced (GpsToolchain is implementing).
