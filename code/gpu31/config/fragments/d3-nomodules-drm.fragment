@@ -1,0 +1,8 @@
+# D3 — D0 with MODULES off. Answers: does the DRM card0 state need the
+# module loader at all? (No: loader only matters for the M2 kbase-shim
+# module path.) All =y, no .ko. Resolves exactly like D0 otherwise.
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_EXYNOS=y
+CONFIG_DRM_EXYNOS_G2D=y
+CONFIG_DRM_EXYNOS_DMABUF=y

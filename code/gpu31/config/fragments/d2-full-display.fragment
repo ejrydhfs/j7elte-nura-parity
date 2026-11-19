@@ -1,0 +1,25 @@
+# D2 — FULL exynos subdriver set (opt-in modeset experiments ONLY).
+# WARNING: binds display HW. FIMD claims the same DECON/DSIM registers as
+# the vendor EXYNOS_DECON_FB driver (double-drive -> black panel risk);
+# HDMI/Mixer/FIMC probe for HW absent on j7elte; GSC needs ARCH_EXYNOS5
+# (not set) so olddefconfig drops it. Do NOT flash on the shared phone
+# without the integrator gate. Ship helper deps explicitly: MFD_SYSCON
+# (FIMC), FB_MODE_HELPERS (FIMD), VIDEOMODE_HELPERS (FIMD, "is not set"
+# in stock). Expected post-olddefconfig: FIMD/HDMI/VIDI/G2D/IPP/FIMC/
+# ROTATOR=y, GSC dropped ("is not set"), FRAMEBUFFER_CONSOLE still off.
+CONFIG_MODULES=y
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_EXYNOS=y
+CONFIG_MFD_SYSCON=y
+CONFIG_FB_MODE_HELPERS=y
+CONFIG_VIDEOMODE_HELPERS=y
+CONFIG_DRM_EXYNOS_FIMD=y
+CONFIG_DRM_EXYNOS_HDMI=y
+CONFIG_DRM_EXYNOS_G2D=y
+CONFIG_DRM_EXYNOS_DMABUF=y
+CONFIG_DRM_EXYNOS_VIDI=y
+CONFIG_DRM_EXYNOS_IPP=y
+CONFIG_DRM_EXYNOS_FIMC=y
+CONFIG_DRM_EXYNOS_ROTATOR=y
+CONFIG_DRM_EXYNOS_GSC=y

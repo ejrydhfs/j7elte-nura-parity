@@ -1,0 +1,14 @@
+# D1 — D0 + VIDI (virtual display, probe-dead without a board device).
+# Use: on-device check that an extra subdriver registers cleanly while
+# /dev/dri/card0 keeps working and fbdev X is untouched.
+# VIDI evidence: exynos_drm_vidi.c registers platform driver
+# "exynos-drm-vidi", but NO board/DT source registers an "exynos-drm-vidi"
+# device in this tree (arm/arm64 mach + dts grep: zero hits), so
+# vidi_probe never fires — object compiles in, nothing binds.
+CONFIG_MODULES=y
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_EXYNOS=y
+CONFIG_DRM_EXYNOS_G2D=y
+CONFIG_DRM_EXYNOS_DMABUF=y
+CONFIG_DRM_EXYNOS_VIDI=y

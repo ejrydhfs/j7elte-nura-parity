@@ -1,0 +1,14 @@
+# M1 — Mali ON (stock state, restated). DDK r15p0 / UK 10.6, /dev/mali0.
+# kbase winsys selftest evidence (docs/reports/gpu-verify.md): soft-job
+# ran (223 GPU cycles), SAME_VA BO + fence round-trip OK, glxgears leaves
+# GPU util at 0 (llvmpipe signature). Keep for every variant that is not
+# an explicit cutover experiment.
+CONFIG_MODULES=y
+CONFIG_MALI_MIDGARD=y
+CONFIG_MALI_T7XX=y
+CONFIG_MALI_R15P0=y
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_EXYNOS=y
+CONFIG_DRM_EXYNOS_G2D=y
+CONFIG_DRM_EXYNOS_DMABUF=y

@@ -1,0 +1,4 @@
+# C0 — modules only (no DRM). M2 kbase-shim path groundwork.
+# Stock: "# CONFIG_MODULES is not set". Closes to CONFIG_MODULES=y with
+# FORCE_LOAD/UNLOAD/MODVERSIONS/SIG staying "not set" (defaults n).
+CONFIG_MODULES=y

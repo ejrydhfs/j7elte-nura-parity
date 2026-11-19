@@ -1,0 +1,14 @@
+# D0 — M1 state (RECOMMENDED). Minimal /dev/dri/card0, vendor fbdev untouched.
+# Proven by the M1 build (Image + boot.img flashed, §M1 evidence in report).
+# DRM_EXYNOS_G2D is the sole subdriver: its OF match
+# ("samsung,exynos5250-g2d", exynos_drm_g2d.c) has no node in the stock
+# j7elte DT and no board-device source exists, so g2d_probe never fires;
+# it only pushes the subdriver list to fine_cnt>=1 so load() returns 0.
+# No display-HW touchpoint. FRAMEBUFFER_CONSOLE stays off (EXPERT=y stock
+# means DRM_KMS_HELPER selects nothing extra); CMA stays 0.
+CONFIG_MODULES=y
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_EXYNOS=y
+CONFIG_DRM_EXYNOS_G2D=y
+CONFIG_DRM_EXYNOS_DMABUF=y

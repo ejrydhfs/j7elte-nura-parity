@@ -1,0 +1,13 @@
+# M0 — Mali OFF (panfrost-cutover shape, host-side Kconfig proof only).
+# Real cutover needs the panfrost backport + DT/driver work (M2/M3 scope);
+# this fragment proves only that the Kconfig graph closes with the kbase
+# driver deselected. T7XX/R15P0 follow MIDGARD off automatically.
+# CONFIG_MALI_MIDGARD is not set
+# CONFIG_MALI_T7XX is not set
+# CONFIG_MALI_R15P0 is not set
+CONFIG_MODULES=y
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_EXYNOS=y
+CONFIG_DRM_EXYNOS_G2D=y
+CONFIG_DRM_EXYNOS_DMABUF=y

@@ -1,0 +1,9 @@
+# FBCON annotation — do NOT enable while fbdev X owns /dev/fb0.
+# Resolved in-tree: FRAMEBUFFER_CONSOLE=y pulls FONT_8x8 + FONT_8x16 (=y,
+# sources drivers/video/console/font_8x{8,16}.c) and CRC32 (already =y).
+# Observed 2026-11-19: CONFIG_FONTS stays "not set" (fonts.o gate unused
+# on this tree) and DETECT_PRIMARY follows only under DRM_KMS_HELPER's
+# select. KEEP "not set" for all GPU31 boot variants: a console taking
+# /dev/fb0 steals the panel from X. Listed here so the closure checker
+# asserts its absence explicitly.
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
