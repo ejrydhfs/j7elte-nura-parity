@@ -46,6 +46,21 @@
  *   -e       skip the item 0x16 / bank-select writes
  *   -q       query only: prologue + item scan, no upload
  *   -x       do not send the GLME switch frame at the end
+ *   -H N     hand-off variant tried against the chip (default 0 = old path):
+ *            1  stock parity: blocks 0-2 only, switch immediately after the
+ *               last CRC ack, bank 1 still selected, no readbacks
+ *            2  blocks 0-2, the old post-patch readbacks, then switch
+ *            3  all four blocks, re-select bank 1, switch immediately
+ *            4  all four blocks, switch immediately (bank 0 still selected)
+ *            5  blocks 0-2, wait HANDOFF_MS, then switch
+ *            6  blocks 0-2, readbacks, re-select bank 1, then switch
+ *   --golden deterministic vendor hand-off (see docs/reports/gps-glme.md):
+ *            blocks 0-2 only (the 0x7fd2 fixup record is never sent for
+ *            4752_B2), bank 1 left selected, the 0x55aa switch sent
+ *            immediately after the last 2f15 ack, no readbacks, and a 3 s
+ *            banner window.  Equivalent to -H 1 -L 3000.
+ *   -B 1     vendor prologue: 16 x 0x80 immediately followed by the sync
+ *            frame fe00fd210001330e10fc (no 0x001b writes/read)
  *   -n       do not touch GPS_PWR_EN (assume the chip is already up)
  *   -S HEX   first byte of the data frames (default fe)
  *
@@ -104,6 +119,11 @@ static struct {
 	int npost;                       /* -z extra frames after the upload */
 	const char *post[16];
 	int scan_after;                  /* -Q item scan after the upload */
+	int handoff;                     /* -H post-patch hand-off variant */
+	int handoff_ms;                  /* --handoff-delay for -H 5 */
+	int prologue;                    /* -B 1: vendor autobaud+sync order */
+	int golden;                      /* --golden: vendor post-patch hand-off */
+	int glme_ms_set;                 /* -L given on the command line */
 	unsigned char soff;
 } o = {
 	.dev = "/dev/ttySAC0",
@@ -125,6 +145,11 @@ static struct {
 	.no_power = 0,
 	.power_delay_ms = 300,
 	.power_off_ms = 1000,
+	.handoff = 0,
+	.handoff_ms = 100,
+	.prologue = 0,
+	.golden = 0,
+	.glme_ms_set = 0,
 	.soff = 0xfe,
 };
 
@@ -138,6 +163,7 @@ static unsigned g_frames;
 static int crc_ack;      /* 1 when the last CRC request produced a 2f15 */
 static int piece_acks;   /* 2f15 replies for the current record */
 static int piece_fails;
+static int g_banner;     /* 1 when an e0 00 ... e0 01 GLME frame was seen */
 
 /* ---------------------------------------------------------------- utils */
 
@@ -335,6 +361,19 @@ static size_t rx_dump(int fd, int timeout_ms, const char *what)
 			}
 			total += (size_t)n;
 			hexdump(what, buf, (size_t)n);
+			{
+				size_t i, j;
+				for (i = 0; i + 1 < (size_t)n; i++) {
+					if (buf[i] != 0xe0 || buf[i + 1] != 0x00)
+						continue;
+					for (j = i + 2; j + 1 < (size_t)n; j++) {
+						if (buf[j] == 0xe0 && buf[j + 1] == 0x01) {
+							g_banner = 1;
+							break;
+						}
+					}
+				}
+			}
 			/* extract complete fe 00 fd .. fc frames from this burst */
 			{
 				size_t i = 0;
@@ -531,6 +570,10 @@ static const unsigned char f_asic_ready[6] = {
 	0xff, 0x00, 0xfd, 0x1f, 0x95, 0xfc };
 static const unsigned char f_glme[10] = {
 	0xfe, 0x00, 0xfd, 0x00, 0x00, 0x55, 0xaa, 0x00, 0xff, 0xfc };
+/* autobaud/line-rate sync frame: the vendor sends it immediately after the
+ * 16-byte 0x80 burst and the chip echoes it verbatim. */
+static const unsigned char f_sync[10] = {
+	0xfe, 0x00, 0xfd, 0x21, 0x00, 0x01, 0x33, 0x0e, 0x10, 0xfc };
 
 /* Parse a hex string ("fe00fd..." — spaces/colons allowed) and send it. */
 static int send_hex(int fd, const char *hex, const char *what)
@@ -567,29 +610,38 @@ static int send_hex(int fd, const char *hex, const char *what)
 static int prologue(int fd)
 {
 	unsigned char aa[16];
-	size_t got, answered = 0;
+	size_t got, answered = 0, total = 5;
 
 	memset(aa, 0x80, sizeof(aa));
 	logmsg("autobaud burst 16 x 0x80");
 	if (xwrite(fd, aa, sizeof(aa)) < 0)
 		return -1;
-	sleep_ms(50);
-	rx_dump(fd, 150, "        autobaud-rx");
-
-	got = req(fd, f_nv_write, sizeof(f_nv_write), "0x001b <- 07 (NVRAM word 7)");
-	if (got)
-		answered++;
-	got = req(fd, f_nv_read, sizeof(f_nv_read), "read 0x001b");
-	answered += got > 0;
-	got = req(fd, f_status, sizeof(f_status), "read 0x401a");
-	answered += got > 0;
+	if (o.prologue == 1) {
+		/* Vendor order: sync frame right behind the burst, echoed back. */
+		logmsg("autobaud sync frame (vendor order)");
+		got = req(fd, f_sync, sizeof(f_sync), "autobaud sync");
+		answered += got > 0;
+		total = 3;
+	} else {
+		sleep_ms(50);
+		rx_dump(fd, 150, "        autobaud-rx");
+		got = req(fd, f_nv_write, sizeof(f_nv_write), "0x001b <- 07 (NVRAM word 7)");
+		if (got)
+			answered++;
+		got = req(fd, f_nv_read, sizeof(f_nv_read), "read 0x001b");
+		answered += got > 0;
+		got = req(fd, f_status, sizeof(f_status), "read 0x401a");
+		answered += got > 0;
+	}
 	got = req(fd, f_reg0, sizeof(f_reg0), "read register 0 (HW version)");
 	answered += got > 0;
 	got = req(fd, f_asic_ready, sizeof(f_asic_ready), "read item 0x95 (asic ready)");
 	answered += got > 0;
 
-	logmsg("prologue: %zu of 5 exchanges answered", answered);
-	return answered >= 3 ? 0 : -1;
+	logmsg("prologue: %zu of %zu exchanges answered", answered, total);
+	/* old prologue: 3 of 5 answered is enough (0x001b write and 0x401a
+	 * read are optional); vendor prologue: the sync echo or both reads. */
+	return answered >= 3 ? 0 : (total == 3 && answered >= 2 ? 0 : -1);
 }
 
 static void item_scan(int fd)
@@ -754,6 +806,10 @@ int main(int argc, char **argv)
 		{ "glme-listen", required_argument, NULL, 'L' },
 		{ "write",      required_argument, NULL, 'w' },
 		{ "post",       required_argument, NULL, 'z' },
+		{ "handoff",    required_argument, NULL, 'H' },
+		{ "prologue",   required_argument, NULL, 'B' },
+		{ "golden",     no_argument,       NULL, 1001 },
+		{ "handoff-delay", required_argument, NULL, 1000 },
 		{ "help",       no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -761,7 +817,7 @@ int main(int argc, char **argv)
 	int cur_bank = -1;
 	int ack;
 
-	while ((c = getopt_long(argc, argv, "d:b:g:D:V:c:p:C:G:t:L:l:i:eqxnQO:P:S:w:z:h",
+	while ((c = getopt_long(argc, argv, "d:b:g:D:V:c:p:C:G:t:L:l:i:eqxnQO:P:S:w:z:H:B:h",
 				opts, NULL)) != -1) {
 		switch (c) {
 		case 'd': o.dev = optarg; break;
@@ -774,7 +830,7 @@ int main(int argc, char **argv)
 		case 'C': o.piece_max = atoi(optarg); break;
 		case 'G': o.gap_ms = atoi(optarg); break;
 		case 't': o.timeout_ms = atoi(optarg); break;
-		case 'L': o.glme_ms = atoi(optarg); break;
+		case 'L': o.glme_ms = atoi(optarg); o.glme_ms_set = 1; break;
 		case 'l': o.limit = atol(optarg); break;
 		case 'i': o.only_idx = atoi(optarg); break;
 		case 'e': o.no_banksel = 1; break;
@@ -793,6 +849,15 @@ int main(int argc, char **argv)
 			if (o.npost < (int)(sizeof(o.post) / sizeof(o.post[0])))
 				o.post[o.npost++] = optarg;
 			break;
+		case 1001:
+			o.golden = 1;
+			o.handoff = 1;
+			if (!o.glme_ms_set)
+				o.glme_ms = 3000;
+			break;
+		case 'H': o.handoff = atoi(optarg); break;
+		case 'B': o.prologue = atoi(optarg); break;
+		case 1000: o.handoff_ms = atoi(optarg); break;
 		case 'h':
 		default:
 			fprintf(stderr,
@@ -800,7 +865,8 @@ int main(int argc, char **argv)
 				"       [-V 1|2|3] [-c CHUNK] [-p PIECE] [-C PIECE_MAX] [-G MS] [-t MS]\n"
 				"       [-L GLME_MS] [-O OFF_MS]\n"
 				"       [-l BYTES] [-i IDX] [-e] [-q] [-x] [-n] [-P MS]\n"
-				"       [-S HEX] [-w HEX] [-z HEX] [-Q]\n", argv[0]);
+				"       [-S HEX] [-w HEX] [-z HEX] [-Q]\n"
+				"       [-H 0..6] [--handoff-delay MS] [-B 1] [--golden]\n", argv[0]);
 			return c == 'h' ? 0 : 2;
 		}
 	}
@@ -810,6 +876,10 @@ int main(int argc, char **argv)
 	}
 	if (o.piece < 1 || o.piece > 4096)
 		return 2;
+	if (o.handoff < 0 || o.handoff > 6) {
+		logmsg("handoff variant must be 0..6");
+		return 2;
+	}
 
 	{
 		static const struct { int bank; unsigned addr; const char *name; } t[4] = {
@@ -824,6 +894,11 @@ int main(int argc, char **argv)
 			blocks[i].name = t[i].name;
 		}
 	}
+
+	/* The vendor daemon never sends the synthetic 0x7fd2 record for
+	 * 4752_B2: it lies inside block 0 and zeroing it breaks the patch. */
+	if (o.handoff == 1 || o.handoff == 2 || o.handoff == 5 || o.handoff == 6)
+		nblocks = 3;
 
 	if (!o.query_only) {
 		for (i = 0; i < nblocks; i++) {
@@ -909,7 +984,7 @@ int main(int argc, char **argv)
 	if (rc)
 		goto out;
 
-	logmsg("all blocks sent; post-patch state");
+	logmsg("all blocks sent (handoff variant %d); post-patch state", o.handoff);
 	for (i = 0; i < o.npost; i++) {
 		char label[64];
 
@@ -922,17 +997,38 @@ int main(int argc, char **argv)
 	}
 	if (o.scan_after)
 		item_scan(fd);
-	read_item(fd, 0x94, "bank readback after upload");
-	read_item(fd, 0x95, "asic ready after upload");
-	req(fd, f_reg0, sizeof(f_reg0), "read register 0 after upload");
-	req(fd, f_nv_read, sizeof(f_nv_read), "read 0x001b after upload");
+	/* 1 and 5 go straight to the switch, like the vendor daemon: it sends
+	 * the 0x55aa frame as soon as the last 2f15 ack is parsed. */
+	if (o.handoff != 1 && o.handoff != 5) {
+		read_item(fd, 0x94, "bank readback after upload");
+		read_item(fd, 0x95, "asic ready after upload");
+		req(fd, f_reg0, sizeof(f_reg0), "read register 0 after upload");
+		req(fd, f_nv_read, sizeof(f_nv_read), "read 0x001b after upload");
+	}
+	if (o.handoff == 3 || o.handoff == 6) {
+		/* Re-map the patch bank before switching: 61 16 01 + 1f 94. */
+		bank_select(fd, 1);
+		read_item(fd, 0x94, "bank readback after re-select");
+	}
+	if (o.handoff == 5)
+		sleep_ms(o.handoff_ms);
 
 	if (!o.no_glme) {
 		logmsg("GLME switch");
-		if (xwrite(fd, f_glme, sizeof(f_glme)) < 0)
+		g_banner = 0;
+		if (xwrite(fd, f_glme, sizeof(f_glme)) < 0) {
 			rc = 5;
-		else
+		} else {
 			rx_dump(fd, o.glme_ms, "        glme-rx");
+			if (g_banner) {
+				logmsg("GLME banner received: hand-off works");
+			} else {
+				logmsg("no GLME banner in %d ms: chip is mute for BRI; "
+				       "a cold boot (device reboot) is required before "
+				       "another BRI/ESW attempt", o.glme_ms);
+				rc = 7;
+			}
+		}
 	}
 
 	/* final drain so nothing is lost from the transcript */
