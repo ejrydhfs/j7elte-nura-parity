@@ -75,8 +75,9 @@ Nothing changed in this package.
 
 *Dependencies exist and contain the referenced paths* (checked in Alpine aports):
 
-* `bluez-deprecated` → `deprecated()` moves `usr/bin/hciattach` (bluez 5.87) — our
-  `HCIATTACH=/usr/bin/hciattach`.
+* `bluez-deprecated` → `deprecated()` moves `usr/bin/hciattach` (bluez 5.87); the
+  package hardcoded `HCIATTACH=/usr/bin/hciattach`.  Runtime deploy found the image
+  ships it as `/usr/sbin/hciattach` and the service now resolves it with `command -v`.
 * `bluez-openrc` → generated from `bluetooth.initd`, i.e. `/etc/init.d/bluetooth`
   (command `/usr/lib/bluetooth/bluetoothd`, `need dbus localmount hostname`).
 * `util-linux-misc` → `misc()` moves `usr/sbin`, and util-linux installs rfkill via
@@ -109,7 +110,7 @@ does exactly that.
   whose name starts with the controller's local name and ends in `.hcd`.  Alpine
   patch `004-Move-the-43xx-firmware-into-lib-firmware.patch` changes
   `FIRMWARE_DIR` to `/lib/firmware`, so
-  `/lib/firmware/postmarketos/samsung-j7elte/BCM43438A1.hcd`
+  `/lib/firmware/postmarketos/samsung-j7elte/BCM43430A1.hcd`
   (installed by `firmware-samsung-j7elte` together with the ROM filename) is
   reachable.  The report's "recursively scans" claim is confirmed by source.
 
@@ -127,7 +128,8 @@ the opposite of what the package documents, of what the OpenRC service does
 (`depend() … before bluetooth`, then `rc-service bluetooth start` after `hci0`
 appears) and of the connectivity report's own B-section description.  Now the unit
 is ordered like the OpenRC path.  `systemd-analyze verify` still accepts the unit
-(the only message is the expected "host has no /usr/bin/hciattach").
+(the only message is the expected "host has no /usr/bin/hciattach"; runtime deploy uses
+`/usr/sbin/hciattach`).
 
 Consequential edits: `sha512sums` entry for `j7elte-bt.service` updated in
 `j7elte-bt/APKBUILD`, canonical copy
@@ -140,6 +142,12 @@ inside `start()`; OpenRC's `before bluetooth` already guarantees the ordering, s
 the call is the "enable it too" half of the design.  If `bluez-openrc` were replaced
 by a systemd provider this service would fail after a successful attach — the
 integrator's R3 risk, unchanged.
+
+Runtime-deploy update (`bt-deploy.md`): the `before bluetooth` half deadlocked — the
+in-script `rc-service bluetooth start` waited for `j7elte-bt` to finish starting, hit
+the 60 s dependency timeout, then proceeded.  The dependency was removed; the service
+now stops `bluetoothd`, power-cycles the controller, attaches, programs the EFS
+address and starts `bluetoothd`, which works both at boot and on manual restart.
 
 ## 4. `j7elte-fde` — pass
 

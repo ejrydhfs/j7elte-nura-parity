@@ -4,7 +4,9 @@ Scope: ROM `SM-J700M J700MUBU2BRC2` (kernel 3.10.61-13213628) vs Nura kernel tre
 `android_kernel_samsung_universal7580-2a746c1…` (3.10.108). Driver code and config are
 compared statically; the three j7elte device trees are additionally compiled
 (`cpp` + `dtc`) and compared node-for-node against the three ROM DTBs. No kernel code
-was cross-compiled and no runtime test was performed.
+was cross-compiled in the analysis itself. The userspace path was later deployed and
+tested on the device; see `bt-deploy.md` (that run also showed the running `dt.img`
+predates the `0001` DT hunk).
 
 **Verdict: GAP-PATCHED.** The driver source itself is at parity. Two items failed on the
 baseline and both now have apply-checked fixes:
@@ -33,7 +35,7 @@ baseline and both now have apply-checked fixes:
 | P1 symbol coverage | **PASS** — 328/328 ROM BT symbols accounted for (326 exact source matches, 2 macro-generated module init/exit aliases) = 99.4 % raw / 100 % explained |
 | P2 device tree | **FAIL on baseline → GAP-PATCHED (0001)** — `bluetooth` node, gpios, UART pinctrl and `bt_dummy` match on baseline; `bt_en` group is `gpa1-6` (Nura) vs `gpc4-2` (ROM) on all three revisions. With `0001` applied, every BT-relevant node is value-identical to the ROM DTB for rev00/rev04/rev06 |
 | P3 config | **FAIL on baseline → GAP-PATCHED (0002)** — driver builds (`CONFIG_BT=y`), but `CONFIG_BT_HCIUART`/`CONFIG_BT_HCIUART_H4` were unset; the parent has applied them in the pmaports working tree (see P3) |
-| P4 firmware | **PASS (artifact + mapping)** — the ROM blob is extracted and hashed; consumer is userspace, mapping in `parity/firmware/files-bt.list`; blob packaging is handled by the parent's `firmware-samsung-j7elte` pmaports package, userspace attach step still required (G1/R1) |
+| P4 firmware | **PASS (artifact + mapping, runtime-verified)** — the ROM blob is extracted and hashed; consumer is userspace, mapping in `parity/firmware/files-bt.list`; `firmware-samsung-j7elte` installs it as `BCM43430A1.hcd`, which `hciattach` logs as flashed (see `bt-deploy.md`) |
 
 ---
 
@@ -295,20 +297,29 @@ with `Write_RAM` (`bcm43xx_load_firmware`). `FIRMWARE_DIR` is `/etc/firmware` up
 and ships `hciattach` in `bluez-deprecated` (Alpine `main/bluez/APKBUILD`). postmarketOS is
 Alpine-based, so `/lib/firmware` is the effective search root.
 
-Evidence for the basename: the ROM's own loader matches the chip string `BCM43438A1`
-(case-insensitively; `toupper` is imported by `libbt-vendor.so`) and the blob itself
-reports `BCM43438A1`. Installing the blob as **`BCM43438A1.hcd`** therefore satisfies the
-case-sensitive `strncmp(chip_name, entry->d_name, strlen(chip_name))` check.
+Evidence for the basename: after a power cycle the controller's *Read Local Name*
+returns **`BCM43430A1`** (measured on hardware, see `bt-deploy.md`); `hciattach` then
+matches a file whose name starts with that string. The ROM's own loader instead matches
+the chip string `BCM43438A1` (case-insensitively; `toupper` is imported by
+`libbt-vendor.so`) and the blob itself reports `BCM43438A1`, but those are internal
+labels, not the HCI local name. Installing the blob as **`BCM43430A1.hcd`** therefore
+satisfies the case-sensitive `strncmp(chip_name, entry->d_name, strlen(chip_name))`
+check.
+
+A second quirk: once bluetoothd has run it writes the host name (`Samsung Galaxy J7`)
+into the controller, and that name survives an `HCI Reset`. Toggling the rfkill switch
+power-cycles the chip and restores `BCM43430A1`, which is why `j7elte-bt` power-cycles
+before attaching.
 
 Mapping — `parity/firmware/files-bt.list`:
 
 ```
-/vendor/firmware/bcm43438A1_V0051.0230.hcd -> /lib/firmware/postmarketos/samsung-j7elte/BCM43438A1.hcd
+/vendor/firmware/bcm43438A1_V0051.0230.hcd -> /lib/firmware/postmarketos/samsung-j7elte/BCM43430A1.hcd
 ```
 
 The directory prefix is not part of the ABI (`hciattach` scans recursively); it follows
 the WiFi firmware convention already used by this project. A flat
-`/lib/firmware/BCM43438A1.hcd` or `/lib/firmware/brcm/BCM43438A1.hcd` is equally
+`/lib/firmware/BCM43430A1.hcd` or `/lib/firmware/brcm/BCM43430A1.hcd` is equally
 acceptable to this consumer, but is not listed to avoid duplicate blobs.
 
 ### Userspace bring-up that remains (G1)
@@ -316,18 +327,22 @@ acceptable to this consumer, but is not listed to avoid duplicate blobs.
 Firmware installation is covered: the parent's `firmware-samsung-j7elte` pmaports package
 (`parity/patches/pmaports/0003-firmware-samsung-j7elte-package.patch`, working tree
 `parity/pmaports/device/archived/firmware-samsung-j7elte/`) installs both the bare
-`BCM43438A1.hcd` and the ROM-named `bcm43438A1_V0051.0230.hcd` under
-`/lib/firmware/postmarketos/samsung-j7elte/`. Nothing yet unblocks rfkill or attaches the
-UART. Required:
+`BCM43430A1.hcd` and the ROM-named `bcm43438A1_V0051.0230.hcd` under
+`/lib/firmware/postmarketos/samsung-j7elte/`. The attach/address/daemon sequence was
+implemented in `j7elte-bt` and validated on hardware (see `bt-deploy.md`):
 
-1. Unblock the controller (the driver registers rfkill soft-blocked:
-   `rfkill_init_sw_state(..., 0)` then `rfkill_set_sw_state(..., true)`,
-   `bcm43xx.c:329-342`; unblocking calls `bcm43xx_bt_rfkill_set_power` and drives BT_EN):
-   `rfkill unblock bluetooth`
+1. Stop `bluetoothd`, then power-cycle the controller through rfkill (the driver
+   registers the switch soft-blocked: `rfkill_init_sw_state(..., 0)` then
+   `rfkill_set_sw_state(..., true)`, `bcm43xx.c:329-342`; unblocking calls
+   `bcm43xx_bt_rfkill_set_power` and drives BT_EN). The power cycle is what makes the
+   local name `BCM43430A1` again: `rfkill block bluetooth; rfkill unblock bluetooth`.
 2. Attach HCI and let `hciattach` download the patch (needs the P3 config fix):
-   `hciattach -s 115200 /dev/ttySAC3 bcm43xx 3000000 flow`
+   `/usr/sbin/hciattach -n -s 115200 /dev/ttySAC3 bcm43xx 115200 flow`
    (device node from `BT_UPORT 3`; ROM used `/dev/ttySAC3` too).
-3. Start `bluetoothd`; verify with `hciconfig -a` / `bluetoothctl show`.
+3. Bring `hci0` up and program the EFS address with Broadcom's Write_BD_ADDR
+   (OGF 0x3F, OCF 0x0001, address bytes little-endian), then reset the device so the
+   kernel re-reads it: `j7elte-bt-addr /efs/bluetooth/bt_addr`.
+4. Start `bluetoothd`; verify with `hciconfig -a` / `bluetoothctl show`.
 
 Do **not** use bare `btattach` as the only step on this tree: with no `hci_bcm`/`btbcm` in
 3.10, it attaches the line discipline but never downloads the patch-RAM firmware.
@@ -348,31 +363,32 @@ the ROM driver, and it is not the firmware consumer in either kernel.
 
 ## Residual risks / tests
 
-- **R1 (userspace gap):** the firmware is packaged (parent's `firmware-samsung-j7elte`,
-  pmaports patch 0003), but nothing unblocks rfkill, runs `hciattach`, or starts
-  `bluetoothd` yet. Until G1 is implemented, Bluetooth will not come up even after the
-  config fix. Runtime check: `dmesg | grep '\[BT\]'`, `rfkill list`,
-  `hciattach …`, `hciconfig -a`.
-- **R2 (local-name uncertainty):** `hciattach` matches the controller's *Read Local Name*
-  as a case-sensitive prefix. The blob and the ROM vendor library both name the chip
-  `BCM43438A1`, so `BCM43438A1.hcd` is expected to match; if the controller reports a
-  longer name (e.g. with a `UART` suffix), `hciattach` logs
-  “Patch not found, continue anyway” and boots unpatched. Mitigation: read the name from
-  the `hciattach` log/`hcitool` and add an exact-name symlink.
-- **R3 (suspend behaviour — patched, needs runtime proof):** the DT patch restores the
-  ROM's deep-sleep configuration for gpc4-2 (`con-pdn = 3`, BT_EN driven low in suspend)
-  on all three revisions, and the patched DTBs compare identical to the ROM DTBs;
-  runtime suspend/resume power behaviour still needs a measurement on hardware.
+- **R1 (userspace gap) — closed on hardware:** `j7elte-bt` now stops `bluetoothd`,
+  power-cycles the controller, attaches with `hciattach`, programs the EFS address and
+  starts `bluetoothd`; `hci0` is up and discovery works (see `bt-deploy.md`).
+- **R2 (local-name uncertainty) — resolved on hardware:** the controller reports
+  `BCM43430A1` after a power cycle, matching the installed `BCM43430A1.hcd`
+  (`Flash firmware …` in the attach log). Once `bluetoothd` has set the host name, the
+  controller keeps it across `HCI Reset`, so the service power-cycles before attaching;
+  see `bt-deploy.md`.
+- **R3 (suspend behaviour — patched, not yet in the running DT):** the DT patch restores
+  the ROM's deep-sleep configuration for gpc4-2 (`con-pdn = 3`, BT_EN driven low in
+  suspend) on all three revisions, and the patched DTBs compare identical to the ROM
+  DTBs. The running `dt.img` predates the patch (`/proc/device-tree/pinctrl@138D0000`
+  has no `bt-en`; gpc4-2 shows the reset default `CON_PDN(0x0) PUD(0x1)`), so
+  suspend/resume power behaviour still differs from the ROM until the boot image is
+  rebuilt and flashed.
 - **R4 (hciattach deprecation):** `hciattach` ships only in `bluez-deprecated`. A future
   BlueZ without it would need a mainline `btbcm.c`/`hci_bcm.c` backport (with firmware
   then at `brcm/BCM43430A1.hcd`, the mainline chip name for this die) plus a DT compatible
   the driver matches.
-- **R5 (no runtime test):** no rootfs/boot test in this workspace and no kernel-code
-  build was run (static symbol/DT/config comparison plus `cpp`+`dtc` DTB compile/compare
-  and `git apply --check` only).
+- **R5 (runtime test):** the userspace path is now verified on the device (`bt-deploy.md`);
+  the kernel was not rebuilt in that session, so the `0001` DT hunk remains untested at
+  runtime.
 - **R6 (baud/flow):** the ROM vendor code runs HCI over `/dev/ttySAC3`; the exact line
-  speed (3 Mbit/s in the example) and flow control were not observable from static data.
-  Start with 115200/no custom speed and raise after `hciconfig -a` succeeds.
+  speed was not observable from static data. The deployed service uses 115200 with
+  hardware flow control, which enumerates and scans reliably; 3000000 is left as a
+  future option.
 - **R7 (out-of-scope revisions):** `exynos7580-j7elte_usa_tmo_{00,01}.dts` still
   reference the shared gpa1-6 `bt_en` group (`:1530`, `:1486`). The stock ROM ships no
   USA-TMO DTB, so there is no ground truth for those boards; if they too carry BT_EN on

@@ -3,7 +3,7 @@
 # Rebuild firmware.tar.gz with ./extract-firmware.sh <AP-tar.md5>.
 pkgname=firmware-samsung-j7elte
 pkgver=1
-pkgrel=0
+pkgrel=1
 pkgdesc="Proprietary firmware for the Samsung Galaxy J7 (j7elte, Exynos 7580)"
 url="https://opensource.samsung.com"
 arch="aarch64"
@@ -25,9 +25,10 @@ package() {
 	install -Dm644 "$srcdir"/nvram_mfg.txt    "$_wifidir/nvram_mfg.txt"
 
 	# Bluetooth: BCM43438 patch RAM, consumed by BlueZ hciattach bcm43xx
-	# (scans /lib/firmware for <ReadLocalName>*.hcd). Both the ROM filename and
-	# the bare "BCM43438A1.hcd" name are installed.
-	install -Dm644 "$srcdir"/bcm43438A1_V0051.0230.hcd "$_wifidir/BCM43438A1.hcd"
+	# (scans /lib/firmware for <ReadLocalName>*.hcd). After a power cycle the
+	# controller reports the local name "BCM43430A1", so the file must be
+	# installed under that name; the ROM filename is kept for reference.
+	install -Dm644 "$srcdir"/bcm43438A1_V0051.0230.hcd "$_wifidir/BCM43430A1.hcd"
 	install -Dm644 "$srcdir"/bcm43438A1_V0051.0230.hcd "$_wifidir/bcm43438A1_V0051.0230.hcd"
 
 	# Camera (FIMC-IS) and video codec (MFC): request_firmware() names resolve

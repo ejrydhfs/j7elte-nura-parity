@@ -26,3 +26,12 @@ J7ELTE_BT_TIMEOUT=30
 # OpenRC service only: attach attempts and pause between them.
 J7ELTE_BT_RETRIES=3
 J7ELTE_BT_RETRY_DELAY=1
+
+# Local name the controller reports after a power cycle.  hciattach looks for
+# <name>*.hcd under /lib/firmware; firmware-samsung-j7elte installs
+# BCM43430A1.hcd.
+J7ELTE_BT_CHIP_NAME=BCM43430A1
+
+# EFS file with the factory public address; programmed with Broadcom's
+# Write_BD_ADDR vendor command before bluetoothd starts.
+J7ELTE_BT_ADDR_FILE=/efs/bluetooth/bt_addr

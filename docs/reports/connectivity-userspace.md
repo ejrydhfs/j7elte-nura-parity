@@ -24,10 +24,10 @@ parts needed for the interfaces to come up.
 | Wi-Fi interface name | **wlan0**, verified from the built-in driver (see W1) |
 | Wi-Fi userspace config | `wpa_supplicant.conf` template (no network) + `/efs/wifi` MAC-state provisioner; **no udev rule needed** |
 | BT UART | **/dev/ttySAC3**, verified from `BT_UPORT 3` + DT `uart3` alias (B1) |
-| BT firmware name/path | **`/lib/firmware/postmarketos/samsung-j7elte/BCM43438A1.hcd`**, present in `firmware.tar.gz` (B2) |
-| BT userspace | `j7elte-bt` OpenRC service + systemd unit: rfkill unblock → `hciattach … bcm43xx` → `bluetoothd`; disable flag file |
+| BT firmware name/path | **`/lib/firmware/postmarketos/samsung-j7elte/BCM43430A1.hcd`** (controller local name), present in `firmware.tar.gz` (B2); flashed at runtime per `bt-deploy.md` |
+| BT userspace | `j7elte-bt` OpenRC service + systemd unit: stop `bluetoothd` → rfkill power-cycle → `hciattach … bcm43xx` → EFS BD_ADDR → `bluetoothd`; disable flag file. Deployed and verified on hardware (`bt-deploy.md`) |
 | Packages | `j7elte-wifi`, `j7elte-bt` under `parity/pmaports/device/archived/` + apply-checked patches |
-| Hardware test | **not performed** (no device/rootfs); stated in every risk item |
+| Hardware test | BT path performed on hardware (`bt-deploy.md`); Wi-Fi path in `wifi-deploy.md`; other items were not tested |
 
 ---
 
@@ -139,7 +139,7 @@ restrict the channel set.
 ## B2 — Bluetooth firmware and the attach tool
 
 * `firmware-samsung-j7elte/APKBUILD:30-31` installs the ROM blob as
-  `/lib/firmware/postmarketos/samsung-j7elte/BCM43438A1.hcd` (and under the ROM name).
+  `/lib/firmware/postmarketos/samsung-j7elte/BCM43430A1.hcd` (and under the ROM name).
   `firmware.tar.gz` contains `bcm43438A1_V0051.0230.hcd`; its sha512
   `5d563e9d…c8440365` matches `parity/firmware/MANIFEST.sha512` and
   `parity/firmware/files-bt.list`.
@@ -148,8 +148,8 @@ restrict the channel set.
   file whose name starts with the local name and ends in `.hcd`; it then downloads it.
   Alpine patch `004-Move-the-43xx-firmware-into-lib-firmware.patch` changes
   `FIRMWARE_DIR` from `/etc/firmware` to **`/lib/firmware`**, so the recursive scan reaches
-  `postmarketos/samsung-j7elte/BCM43438A1.hcd`.
-* `hciattach` ships in **`bluez-deprecated`** (`/usr/bin/hciattach`, verified via the
+  `postmarketos/samsung-j7elte/BCM43430A1.hcd`.
+* `hciattach` ships in **`bluez-deprecated`** (`/usr/sbin/hciattach` on the image, verified via the
   Alpine package index and the `bluez` APKBUILD `deprecated()` subpackage); the OpenRC
   service is in **`bluez-openrc`** (`/etc/init.d/bluetooth`, verified via the package
   index); `/usr/sbin/rfkill` is in **`util-linux-misc`**.
@@ -184,7 +184,7 @@ restrict the channel set.
 | File | Installed as | Purpose |
 |---|---|---|
 | `APKBUILD` | — | `depends="bluez bluez-deprecated bluez-openrc util-linux-misc"` |
-| `j7elte-bt.initd` | `/etc/init.d/j7elte-bt` | unblock rfkill → `hciattach -n -t 30 -s 115200 /dev/ttySAC3 bcm43xx 115200 flow` with retries (each attempt waits up to `J7ELTE_BT_TIMEOUT` s for `hci0`) → `rc-service bluetooth start`; ordered `before bluetooth`, `need localmount` |
+| `j7elte-bt.initd` | `/etc/init.d/j7elte-bt` | stop `bluetoothd` → rfkill block/unblock (power-cycle) → `hciattach -n -t 30 -s 115200 /dev/ttySAC3 bcm43xx 115200 flow` with retries (each attempt waits up to `J7ELTE_BT_TIMEOUT` s for `hci0`) → `j7elte-bt-addr` (EFS BD_ADDR) → `rc-service bluetooth start`; `need localmount` (no `before bluetooth`: it would deadlock against the in-script start) |
 | `j7elte-bt.confd` | `/etc/conf.d/j7elte-bt` | UART, type, speeds, timeout, retries (plain `KEY=value`, readable by OpenRC and systemd) |
 | `j7elte-bt.service` | `/usr/lib/systemd/system/j7elte-bt.service` | same steps for systemd images (`EnvironmentFile`, `rfkill` in `ExecStartPre`, `-n` foreground attach) |
 | `j7elte-bt.post-install` | — | enable in default runlevel (OpenRC) or `systemctl enable` (systemd) |
@@ -240,7 +240,7 @@ All commands were run in this workspace; nothing was run on the target.
 | APKBUILD source list | every `source=` entry exists in the package dir | **OK** |
 | Patch applicability | `git apply --check` in an extracted `ba682bd` baseline tree | **APPLY_OK** for both |
 | wpa_supplicant config | `wpa_supplicant -c <file>` (parse-only, no interface) | **Parsing succeeded**, rc 0; a deliberately broken control file returns “Parsing failed”, rc 255, proving the test is sensitive |
-| systemd unit | `systemd-analyze verify j7elte-bt.service` | only expected host-only warning: `/usr/bin/hciattach` is not installed on the build host; no unit syntax/ordering errors |
+| systemd unit | `systemd-analyze verify j7elte-bt.service` | only expected host-only warning: `/usr/sbin/hciattach` is not installed on the build host; no unit syntax/ordering errors |
 | BT service logic | simulated OpenRC run with stubbed `start-stop-daemon`, `hciattach`, `rfkill`, `rc-service` and `J7ELTE_BT_TIMEOUT=2` | success path: rfkill → hciattach (`-n -t 30 -s 115200 /dev/ttySAC3 bcm43xx 115200 flow`) → `rc-service bluetooth start`, rc 0, pidfile + hci0 present; failure path: 2 attempts, rc 1 with both error lines; disabled flag: rc 0, no commands invoked; missing UART: rc 1 before rfkill; rfkill failure: rc 1, no hciattach; stop: pidfile removed, rc 0 |
 | Wi-Fi provisioner | simulated run with `J7ELTE_WIFI_MAC_STATE_DIR` in /tmp and a fake `/proc/mounts` | creates the directory, idempotent on second run, skips when `/efs` is mounted |
 | Firmware cross-check | `tar tzf firmware.tar.gz`; `sha512sum` of the extracted HCD vs `MANIFEST.sha512`; path in `firmware-samsung-j7elte/APKBUILD` vs `CONFIG_BCMDHD_*` | blob present, hash matches, install path equals the configured Wi-Fi paths; BT HCD install path is under the recursive `/lib/firmware` scan root |
@@ -253,12 +253,11 @@ runtime test (`ip link`, `iw`, `hciconfig`, `bluetoothctl`) — no hardware.
 
 ## Residual risks
 
-* **R1 — no hardware test.**  The exact `Read Local Name` string is only inferred.  The
-  blob reports `BCM43438A1` and `hciattach` matches `<local name>*.hcd`
-  case-sensitively; if the controller returns a name that is not a prefix of
-  `BCM43438A1.hcd`, hciattach logs “Patch not found, continue anyway” and the link comes
-  up unpatched.  Runtime action: read the name from the hciattach log and add an
-  exact-name symlink in `/lib/firmware/postmarketos/samsung-j7elte/`.
+* **R1 — local name (resolved on hardware).**  After a power cycle the controller
+  reports `BCM43430A1`; the blob is installed under that name and `hciattach` logs
+  `Flash firmware /lib/firmware/postmarketos/samsung-j7elte/BCM43430A1.hcd`.  Once
+  bluetoothd has set the host name, the controller keeps it across `HCI Reset`, so the
+  service power-cycles before attaching.  See `bt-deploy.md`.
 * **R2 — line speed.**  The ROM vendor library did not reveal its baud rate.  115200 is
   the safe default; test 3000000 only after hci0 enumerates reliably.
 * **R3 — init-system choice.**  The dependency set targets OpenRC (postmarketOS default
@@ -291,11 +290,11 @@ runtime test (`ip link`, `iw`, `hciconfig`, `bluetoothctl`) — no hardware.
 parity/pmaports/device/archived/j7elte-wifi/{APKBUILD,wpa_supplicant.conf,
     j7elte-wifi.initd,j7elte-wifi.confd,j7elte-wifi.tmpfiles,j7elte-wifi.post-install}
 parity/pmaports/device/archived/j7elte-bt/{APKBUILD,j7elte-bt.initd,
-    j7elte-bt.confd,j7elte-bt.service,j7elte-bt.post-install}
+    j7elte-bt.confd,j7elte-bt.service,j7elte-bt-addr,j7elte-bt.post-install}
 parity/userspace/connectivity/wifi/{wpa_supplicant.conf,j7elte-wifi.initd,
     j7elte-wifi.confd,j7elte-wifi.tmpfiles,j7elte-wifi.post-install}
 parity/userspace/connectivity/bt/{j7elte-bt.initd,j7elte-bt.confd,
-    j7elte-bt.service,j7elte-bt.post-install}
+    j7elte-bt.service,j7elte-bt-addr,j7elte-bt.post-install}
 parity/patches/userspace/connectivity/{0001-j7elte-wifi-package.patch,
     0002-j7elte-bt-package.patch}
 parity/reports/connectivity-userspace.md

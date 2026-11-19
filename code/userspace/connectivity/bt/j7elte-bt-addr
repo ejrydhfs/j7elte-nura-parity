@@ -1,0 +1,73 @@
+#!/bin/sh
+# Program the Broadcom controller's public BD_ADDR from EFS (j7elte).
+#
+# The BCM43430A1 powers up with its factory address (43:43:A1:12:1F:AC on this
+# unit).  The stock ROM reads /efs/bluetooth/bt_addr and writes it back with
+# Broadcom's vendor Write_BD_ADDR command (OGF 0x3F, OCF 0x0001) before
+# starting its Bluetooth stack, and BlueZ needs the same: bluetoothd caches the
+# controller address when it powers the adapter on.
+#
+# Write_BD_ADDR takes the address little-endian, i.e. the "AA:BB:CC:DD:EE:FF"
+# string from EFS must be sent as 0xFF 0xEE 0xDD 0xCC 0xBB 0xAA.  After the
+# write the HCI device is reset so the kernel re-reads the address from the
+# controller; the write lives in controller RAM until the next power cycle.
+#
+# Usage: j7elte-bt-addr [address-file]
+
+set -u
+
+ADDR_FILE="${1:-/efs/bluetooth/bt_addr}"
+HCI="${HCI:-hci0}"
+HCICONFIG="${HCICONFIG:-$(command -v hciconfig 2>/dev/null)}"
+[ -n "${HCICONFIG}" ] || HCICONFIG=/usr/sbin/hciconfig
+HCITOOL="${HCITOOL:-$(command -v hcitool 2>/dev/null)}"
+[ -n "${HCITOOL}" ] || HCITOOL=/usr/sbin/hcitool
+
+log() {
+	echo "j7elte-bt-addr: $*" >&2
+}
+
+valid_octet() {
+	case "$1" in
+	[0-9A-Fa-f]|[0-9A-Fa-f][0-9A-Fa-f]) return 0 ;;
+	esac
+	return 1
+}
+
+[ -r "${ADDR_FILE}" ] || { log "${ADDR_FILE} is not readable"; exit 1; }
+
+IFS=: read -r b1 b2 b3 b4 b5 b6 _rest < "${ADDR_FILE}" || true
+for b in "${b1:-}" "${b2:-}" "${b3:-}" "${b4:-}" "${b5:-}" "${b6:-}"; do
+	if ! valid_octet "${b}"; then
+		log "${ADDR_FILE} does not contain a valid BD_ADDR"
+		exit 1
+	fi
+done
+
+[ -e "/sys/class/bluetooth/${HCI}" ] || { log "${HCI} does not exist"; exit 1; }
+
+# hcitool needs the device up before it will accept a raw HCI command.
+"${HCICONFIG}" "${HCI}" up || { log "cannot bring ${HCI} up"; exit 1; }
+i=0
+while [ "${i}" -lt 10 ]; do
+	"${HCICONFIG}" "${HCI}" 2>/dev/null | grep -q "UP RUNNING" && break
+	sleep 1
+	i=$((i + 1))
+done
+
+"${HCITOOL}" cmd 0x3f 0x0001 \
+	"0x${b6}" "0x${b5}" "0x${b4}" "0x${b3}" "0x${b2}" "0x${b1}" >/dev/null \
+	|| { log "Write_BD_ADDR vendor command failed"; exit 1; }
+
+"${HCICONFIG}" "${HCI}" reset || { log "${HCI} reset failed"; exit 1; }
+sleep 1
+
+got=$("${HCICONFIG}" "${HCI}" 2>/dev/null | sed -n 's/.*BD Address: *\([0-9A-Fa-f:]*\).*/\1/p')
+want="${b1}:${b2}:${b3}:${b4}:${b5}:${b6}"
+if [ "$(echo "${got}" | tr 'a-f' 'A-F')" != "$(echo "${want}" | tr 'a-f' 'A-F')" ]; then
+	log "address mismatch after reset: ${got:-none} (wanted ${want})"
+	exit 1
+fi
+
+log "public address ${got}"
+exit 0

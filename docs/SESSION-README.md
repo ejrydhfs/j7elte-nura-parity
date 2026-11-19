@@ -186,7 +186,7 @@ New pmaports packages, all pulled in by `device-samsung-j7elte` depends:
 | `j7elte-audio-ucm` | UCM2 routing/mixer for COD3022X (54/54 controls validated) | implemented |
 | `j7elte-audio-jack` | `sec_jack` uevent -> UCM2 speaker/headphone/headset-mic routing | implemented |
 | `j7elte-wifi` | wpa_supplicant template, `/efs/wifi` MAC provisioning | implemented |
-| `j7elte-bt` | rfkill + hciattach + bluetoothd service, BCM43438A1.hcd | implemented |
+| `j7elte-bt` | rfkill + hciattach + bluetoothd service, BCM43430A1.hcd | deployed/verified |
 | `j7elte-sensors` | K2HH/CM36672P/STK3013 to `net.hadess.SensorProxy`; D-Bus UNIX_FDS fix | implemented |
 | `j7elte-power` | power_supply/UPower integration, capacity_max restore | implemented |
 | `j7elte-fde` | unl0kr/fbdev initramfs integration for FDE | implemented |

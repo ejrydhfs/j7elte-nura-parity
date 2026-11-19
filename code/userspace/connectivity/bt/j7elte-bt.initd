@@ -8,14 +8,29 @@
 # -- hciattach's bcm43xx backend resets the chip, matches the firmware by the
 # controller's local name and downloads it.
 #
+# Two hardware quirks drive the ordering below:
+#
+#  * After a fresh power-up the controller reports the local name
+#    "BCM43430A1" and hciattach finds BCM43430A1.hcd.  Once bluetoothd has
+#    run, it writes the host name ("Samsung Galaxy J7") into the controller and
+#    that name survives an HCI Reset, so a later attach would look for
+#    "Samsung Galax*.hcd" and silently skip the patch RAM download.  Toggling
+#    the rfkill switch power-cycles the chip (BT_EN) and restores the default
+#    name, making the firmware lookup deterministic.
+#  * The chip powers up with a factory-default public address
+#    (43:43:A1:...); the stock ROM programs the EFS address with Broadcom's
+#    Write_BD_ADDR vendor command before starting its Bluetooth stack.  That is
+#    what j7elte-bt-addr does.
+#
 # The platform driver registers its rfkill switch soft-blocked
 # (rfkill_init_sw_state(..., 0) followed by rfkill_set_sw_state(..., true) in
 # bcm43xx.c), and only unblocking it drives BT_EN high.  So the order is:
-#   rfkill unblock bluetooth -> hciattach -> bluetoothd
+#   stop bluetoothd -> rfkill power-cycle -> hciattach -> set BD_ADDR
+#   -> bluetoothd
 #
-# Firmware (firmware-samsung-j7elte) installs BCM43438A1.hcd under
-# /lib/firmware/postmarketos/samsung-j7elte/; Alpine's hciattach searches
-# /lib/firmware recursively for "<local name>*.hcd" (bluez patch 004).
+# Firmware (firmware-samsung-j7elte) installs the blob as
+# /lib/firmware/postmarketos/samsung-j7elte/BCM43430A1.hcd; Alpine's hciattach
+# searches /lib/firmware recursively for "<local name>*.hcd" (bluez patch 004).
 #
 # This service is enabled in the default runlevel by its package, unless
 # /etc/j7elte-bt.disabled exists.  To disable permanently:
@@ -35,16 +50,28 @@ description_stop="Detach the BCM43438 Bluetooth HCI transport (j7elte)"
 : "${J7ELTE_BT_TIMEOUT:=30}"
 : "${J7ELTE_BT_RETRIES:=3}"
 : "${J7ELTE_BT_RETRY_DELAY:=1}"
+: "${J7ELTE_BT_CHIP_NAME:=BCM43430A1}"
+: "${J7ELTE_BT_ADDR_FILE:=/efs/bluetooth/bt_addr}"
 
-HCIATTACH=/usr/bin/hciattach
-RFKILL=/usr/sbin/rfkill
+HCIATTACH="${HCIATTACH:-$(command -v hciattach 2>/dev/null)}"
+[ -n "${HCIATTACH}" ] || HCIATTACH=/usr/sbin/hciattach
+RFKILL="${RFKILL:-$(command -v rfkill 2>/dev/null)}"
+[ -n "${RFKILL}" ] || RFKILL=/usr/sbin/rfkill
+ADDR_HELPER="${ADDR_HELPER:-/usr/libexec/j7elte-bt-addr}"
 PIDFILE=/run/j7elte-bt.pid
 LOCKFILE=/etc/j7elte-bt.disabled
+# hciattach prints the attach/firmware progress on stdout/stderr; keep it so
+# the patch-RAM download is visible in the field.
+BTLOG=/var/log/j7elte-bt.log
+BTERR=/var/log/j7elte-bt.err
 
 depend() {
 	need localmount
 	after udev-settle coldplug
-	before bluetooth
+	# NOTE: do not declare "before bluetooth".  bluetoothd must be stopped
+	# while the transport is recreated, and this script starts it again at the
+	# end; with "before bluetooth" OpenRC would make that start wait for this
+	# service to finish starting (deadlock until the dependency timeout).
 }
 
 # hciattach runs with -n so the attach process stays in the foreground and can
@@ -65,6 +92,10 @@ _stop_attach() {
 	return 0
 }
 
+_bluetoothctl_started() {
+	rc-service bluetooth status >/dev/null 2>&1
+}
+
 start() {
 	if [ -e "${LOCKFILE}" ]; then
 		ewarn "j7elte-bt disabled by ${LOCKFILE}; not attaching"
@@ -81,11 +112,36 @@ start() {
 		return 1
 	fi
 
-	ebegin "Unblocking the Bluetooth rfkill switch"
+	if ! command -v find >/dev/null 2>&1 || \
+	   ! find /lib/firmware -type f -name "${J7ELTE_BT_CHIP_NAME}*.hcd" \
+		-print -quit 2>/dev/null | grep -q .; then
+		ewarn "no ${J7ELTE_BT_CHIP_NAME}*.hcd under /lib/firmware;"
+		ewarn "hciattach will attach without patch RAM (install firmware-samsung-j7elte)"
+	fi
+
+	# bluetoothd caches the controller address and sets the local name, so it
+	# must not be running while the transport is (re)created.
+	if _bluetoothctl_started; then
+		ebegin "Stopping bluetoothd for the transport reset"
+		rc-service bluetooth stop
+		eend $?
+	fi
+
+	_stop_attach
+
+	# Power-cycle the controller so it reports its default local name and the
+	# patch RAM lookup is deterministic (see the comment at the top).
+	ebegin "Power-cycling the Bluetooth controller"
+	if ! "${RFKILL}" block bluetooth; then
+		eend 1 "rfkill block bluetooth failed; did bcm43xx probe?"
+		return 1
+	fi
+	sleep 1
 	if ! "${RFKILL}" unblock bluetooth; then
 		eend 1 "rfkill unblock bluetooth failed; did bcm43xx probe?"
 		return 1
 	fi
+	sleep 1
 	eend 0
 
 	attempt=1
@@ -94,7 +150,8 @@ start() {
 		ebegin "Attaching ${J7ELTE_BT_TYPE} on ${J7ELTE_BT_UART} at ${J7ELTE_BT_SPEED} (attempt ${attempt}/${J7ELTE_BT_RETRIES})"
 		_stop_attach
 		start-stop-daemon --start --quiet --background --make-pidfile \
-			--pidfile "${PIDFILE}" --exec "${HCIATTACH}" -- \
+			--pidfile "${PIDFILE}" --exec "${HCIATTACH}" \
+			--stdout "${BTLOG}" --stderr "${BTERR}" -- \
 			-n -t "${J7ELTE_BT_TIMEOUT}" -s "${J7ELTE_BT_INIT_SPEED}" \
 			"${J7ELTE_BT_UART}" "${J7ELTE_BT_TYPE}" \
 			"${J7ELTE_BT_SPEED}" "${J7ELTE_BT_FLOW}"
@@ -121,8 +178,22 @@ start() {
 
 	if ! _attach_ok; then
 		eerror "hciattach did not create hci0 after ${J7ELTE_BT_RETRIES} attempt(s)"
-		eerror "Check dmesg for '[BT]' messages and that BCM43438A1.hcd is installed"
+		eerror "Check dmesg for '[BT]' messages and that ${J7ELTE_BT_CHIP_NAME}.hcd is installed"
 		return 1
+	fi
+
+	# Program the public address from EFS before bluetoothd caches it.
+	if [ -x "${ADDR_HELPER}" ]; then
+		ebegin "Programming the Bluetooth public address from ${J7ELTE_BT_ADDR_FILE}"
+		if "${ADDR_HELPER}" "${J7ELTE_BT_ADDR_FILE}"; then
+			eend 0
+		else
+			# Not fatal: the controller still works, but with its factory
+			# default address instead of the EFS one.
+			eend 1 "could not program the BD_ADDR; check ${J7ELTE_BT_ADDR_FILE}"
+		fi
+	else
+		ewarn "${ADDR_HELPER} missing; controller keeps its factory BD_ADDR"
 	fi
 
 	# bluez-openrc provides this service; it also takes care of D-Bus.

@@ -2,24 +2,27 @@
 #
 # Userspace bring-up for the BCM43438 Bluetooth controller on UART 3
 # (/dev/ttySAC3).  The kernel has CONFIG_BT_HCIUART(_H4)=y but no hci_bcm /
-# btbcm driver, so hciattach must download the patch RAM from
-# /lib/firmware/postmarketos/samsung-j7elte/BCM43438A1.hcd.
+# btbcm driver, so hciattach must download the patch RAM.  After a power cycle
+# the controller reports the local name BCM43430A1, so hciattach looks for
+# BCM43430A1*.hcd; firmware-samsung-j7elte installs
+# /lib/firmware/postmarketos/samsung-j7elte/BCM43430A1.hcd.
 pkgname=j7elte-bt
 pkgver=0.1
-pkgrel=0
+pkgrel=1
 pkgdesc="BCM43438 Bluetooth UART attach (hciattach) for the Samsung Galaxy J7"
 url="https://postmarketos.org"
 arch="noarch"
 license="MIT"
 options="!check"
 # bluez-openrc supplies /etc/init.d/bluetooth, which this service starts after
-# the HCI transport is attached.  hciattach ships in bluez-deprecated;
-# /usr/sbin/rfkill is in util-linux-misc.
+# the HCI transport is attached.  hciattach, hcitool and hciconfig ship in
+# bluez-deprecated; /usr/sbin/rfkill is in util-linux-misc.
 depends="bluez bluez-deprecated bluez-openrc util-linux-misc"
 install="$pkgname.post-install"
 source="j7elte-bt.initd
 	j7elte-bt.confd
 	j7elte-bt.service
+	j7elte-bt-addr
 	j7elte-bt.post-install
 	"
 builddir="$srcdir"
@@ -29,6 +32,8 @@ package() {
 		"$pkgdir"/etc/init.d/j7elte-bt
 	install -Dm644 "$srcdir"/j7elte-bt.confd \
 		"$pkgdir"/etc/conf.d/j7elte-bt
+	install -Dm755 "$srcdir"/j7elte-bt-addr \
+		"$pkgdir"/usr/libexec/j7elte-bt-addr
 
 	# Optional systemd equivalent; on OpenRC images the init script above is
 	# used.  Both read /etc/conf.d/j7elte-bt.
@@ -37,8 +42,9 @@ package() {
 }
 
 sha512sums="
-bcd2d43b543f6a41c4c0a1b219846ce3591f2546e017ac4d4adc5ed4d8c2e15f79308e302845fa5866b6368c133630a53cc0692696a1a19e337b6df6577724f7  j7elte-bt.initd
-89bafe5e5ae79bf7266728db5d329728fa2519d7701648bc12ddadb341d56d8f5256e643fadae006735a68cfbee5d613fe329cce06a5f1edfd09490d64b103dc  j7elte-bt.confd
-d1b8c9a8d38f4e15f3e8471c5ee3095f703f9b726f9c4c2aa3384d7e09ac00409df96022292357bfa2e58f5fcb98a574e52890ba609eb3fd24cf1d514bcb6ed6  j7elte-bt.service
+1fc268d52e15e99517a2bfa1a0a5e4a20e32c5ecdfdce8cfe17b560421027eadea5ec20a55a93555a8da69e275d6977a7d3c15ab09ef1629193510accd7bc518  j7elte-bt.initd
+1d9ccebe95a23982f753008f569a2442ba6a060352d2630bad14a919ea5901c7d327d68affcb136614d98e1467b6dd39ee1de60581c7eb8677456b48cdc45ac0  j7elte-bt.confd
+f62f6a03e12fd3a8bf8409a60aedd7d21980d2a6f784ee3e1e84767f3df057b37ce5d1fb6298d2a84e6d007a956a09bf16eb772a58094448d813e4eb05b97c16  j7elte-bt.service
+4aa9a84bfc41498089b76d32c5a889c1bc51cbdb4c80d5666c83ce2478433d09a9fda3121f556ad9b35caa0ba980580367ff5d392d223f20de607ecb3318dd15  j7elte-bt-addr
 f386625ea6cf9ef49b7a3ef23e5fe268b504ce3f1a8b1a8e30c5a180d081c0233a16f6cbc043a9ae66aacb5cce836e364c26a2bf2ee62d41c2065aedef68df2f  j7elte-bt.post-install
 "

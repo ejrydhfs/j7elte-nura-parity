@@ -2,7 +2,7 @@
 Description=Broadcom BCM43438 Bluetooth HCI attach (j7elte)
 Documentation=file:///etc/conf.d/j7elte-bt
 ConditionPathExists=/dev/ttySAC3
-ConditionPathExists=/usr/bin/hciattach
+ConditionPathExists=/usr/sbin/hciattach
 ConditionPathExists=!/etc/j7elte-bt.disabled
 # The HCI transport must exist before bluetoothd enumerates controllers, so
 # this unit is ordered *before* bluetooth.service (same intent as the OpenRC
@@ -15,8 +15,13 @@ Before=bluetooth.service
 [Service]
 Type=simple
 EnvironmentFile=/etc/conf.d/j7elte-bt
-ExecStartPre=/usr/sbin/rfkill unblock bluetooth
-ExecStart=/usr/bin/hciattach -n -t ${J7ELTE_BT_TIMEOUT} -s ${J7ELTE_BT_INIT_SPEED} ${J7ELTE_BT_UART} ${J7ELTE_BT_TYPE} ${J7ELTE_BT_SPEED} ${J7ELTE_BT_FLOW}
+# Power-cycle the controller first: it then reports its default local name
+# (BCM43430A1), which is what hciattach uses to locate the patch RAM.
+ExecStartPre=/bin/sh -c '/usr/sbin/rfkill block bluetooth; sleep 1; /usr/sbin/rfkill unblock bluetooth; sleep 1'
+ExecStart=/usr/sbin/hciattach -n -t ${J7ELTE_BT_TIMEOUT} -s ${J7ELTE_BT_INIT_SPEED} ${J7ELTE_BT_UART} ${J7ELTE_BT_TYPE} ${J7ELTE_BT_SPEED} ${J7ELTE_BT_FLOW}
+# Program the EFS address once the transport exists and before bluetoothd
+# powers the adapter up.
+ExecStartPost=/usr/libexec/j7elte-bt-addr ${J7ELTE_BT_ADDR_FILE}
 Restart=on-failure
 RestartSec=3
 
