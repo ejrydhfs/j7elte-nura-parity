@@ -123,6 +123,7 @@ static struct {
 	int handoff_ms;                  /* --handoff-delay for -H 5 */
 	int prologue;                    /* -B 1: vendor autobaud+sync order */
 	int golden;                      /* --golden: vendor post-patch hand-off */
+	int glme_stream;                 /* --glme-stream: decode GLME after the switch */
 	int glme_ms_set;                 /* -L given on the command line */
 	unsigned char soff;
 } o = {
@@ -136,7 +137,6 @@ static struct {
 	.piece_max = 4096,
 	.gap_ms = 1,
 	.timeout_ms = 300,
-	.glme_ms = 1000,
 	.limit = 0,
 	.only_idx = -1,
 	.no_banksel = 0,
@@ -164,9 +164,13 @@ static int crc_ack;      /* 1 when the last CRC request produced a 2f15 */
 static int piece_acks;   /* 2f15 replies for the current record */
 static int piece_fails;
 static int g_banner;     /* 1 when an e0 00 ... e0 01 GLME frame was seen */
-
-/* ---------------------------------------------------------------- utils */
-
+/* GLME framing state (post-switch binary protocol, not BRI).  Wire
+ * form and escapes are documented on the codec section below. */
+static unsigned char g_glme[8192];
+static size_t g_glme_len;
+static unsigned g_glme_frames;
+static unsigned g_glme_ver;      /* 1 after the banner frame was seen */
+static unsigned g_glme_seq;      /* host config sequence number (00, 02, ...) */
 static void logmsg(const char *fmt, ...)
 {
 	va_list ap;
@@ -412,6 +416,288 @@ static size_t rx_dump(int fd, int timeout_ms, const char *what)
 		fprintf(stderr, "        (%s: no bytes in %d ms)\n", what, timeout_ms);
 	return total;
 }
+/* ------------------------------------------------- GLME codec -------- */
+/*
+ * Post-switch binary protocol, recovered from the stock daemon
+ * (/system/bin/gpsd) against a PTY emulator plus one live GLME banner
+ * (docs/reports/gps-glme-decode.md).
+ *
+ * Wire framing: e0 00 <payload> e0 01.  The payload escapes e0 02 for a
+ * literal 0xe0, e0 03 for 0x00 and e0 04 for 0x01 (bcm4752-init SPEC
+ * section 9); the terminator e0 01 never appears escaped, so framing
+ * splits on raw e0 01 and unescapes afterwards.  BRI framing (fe/fc)
+ * no longer applies once the 0x55aa switch is sent.
+ *
+ * Message table (payload byte 0 is always 0x00; byte 1 is the id):
+ *
+ *   id 0x00  version/status report (chip -> host, the banner): 13-byte
+ *            payload 00 00 07 10 02 01 72 06 30 02 00 05 5f, where
+ *            30 02 00 05 little-endian is the ASIC id 0x30020005.
+ *            [OBS on live chip 2026-11-19]
+ *   id 0x01  receiver-config download (host -> chip): first post-banner
+ *            host transaction, 271 raw bytes (225 + 46).  Carries a
+ *            fixed 56-byte header and TLV sections; see the report.
+ *            The emulator run shows the host retrying it with the
+ *            sequence byte (payload offset 47) at 00/02/04/06 until
+ *            the chip answers.  [OBS vs stock daemon]
+ *   id 0x02  bulk config part (host -> chip, 2644 B).  [OBS, truncated]
+ *   id 0x0a  short control (host -> chip).  [OBS, truncated]
+ *
+ * No measurement/fix message has been observed on this unit yet: the
+ * passively listening chip stays silent after the banner, and the
+ * emulator (which never answers GLME) only elicits retries of the
+ * id-0x01 config.  Measurement decode + NMEA synthesis therefore wait
+ * on the chip's reply to the config; --glme-stream sends it and prints
+ * whatever comes back.
+ */
+
+/* First post-banner host transaction (id 0x01), captured complete from
+ * the stock daemon against the PTY emulator (gpsemu3, 2026-11-19):
+ * 271 raw bytes = 225-byte frame + 46-byte frame.  Sent paced in
+ * <=160-byte UART pieces like the vendor transport. */
+static const unsigned char glme_cfg1[225] = {
+	0xe0, 0x00, 0x00, 0x01, 0x00, 0xc3, 0x00, 0x01, 0x41, 0xcf, 0xec, 0xe4,
+	0xd5, 0x74, 0xfb, 0x12, 0x2b, 0x1f, 0x4b, 0x4b, 0x01, 0xd0, 0x19, 0xd3,
+	0x00, 0x05, 0x0b, 0x00, 0x0c, 0x3c, 0x42, 0x2a, 0x02, 0x49, 0x00, 0x4b,
+	0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x94, 0x30, 0x21, 0x85, 0x03, 0x1a,
+	0x64, 0x80, 0x64, 0x80, 0x64, 0x80, 0x64, 0x80, 0x64, 0x80, 0x18, 0x30,
+	0x0e, 0x00, 0x00, 0x00, 0x00, 0x30, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x30,
+	0x10, 0x00, 0x00, 0x00, 0x00, 0x30, 0xe0, 0x03, 0x00, 0x00, 0x00, 0x00,
+	0x30, 0x12, 0x00, 0x00, 0x00, 0x00, 0x30, 0xe0, 0x04, 0x00, 0x00, 0x00,
+	0x00, 0x30, 0x00, 0x00, 0x00, 0x15, 0x09, 0x30, 0x00, 0x00, 0x00, 0x15,
+	0x0f, 0x38, 0x01, 0x00, 0x00, 0x00, 0x42, 0x38, 0x02, 0x00, 0x00, 0x00,
+	0x0e, 0x38, 0x04, 0x00, 0x00, 0x00, 0x26, 0x38, 0x06, 0x00, 0x00, 0x00,
+	0x3d, 0x38, 0x07, 0x00, 0x00, 0x00, 0x81, 0x38, 0x0b, 0x00, 0x00, 0x00,
+	0x00, 0x38, 0x10, 0x00, 0x00, 0x00, 0x00, 0x38, 0xe0, 0x03, 0x00, 0x00,
+	0x00, 0x30, 0x38, 0x12, 0x00, 0x00, 0x00, 0xe6, 0x38, 0xe0, 0x04, 0x00,
+	0x00, 0x00, 0x8c, 0x38, 0x14, 0x00, 0x00, 0x00, 0x1e, 0x38, 0x1a, 0x00,
+	0x00, 0x00, 0x06, 0x38, 0x20, 0x00, 0x00, 0x00, 0x4c, 0x38, 0x2b, 0x00,
+	0x00, 0x00, 0x6b, 0x38, 0x0b, 0x00, 0x00, 0x00, 0x04, 0x38, 0x02, 0x00,
+	0x00, 0x00, 0x0b, 0x0b, 0x00, 0x02, 0x01, 0x38, 0x20, 0x00, 0x00, 0x00,
+	0x40, 0x00, 0x00, 0x00, 0xe0, 0x02, 0xac, 0xe0, 0x01 };
+
+/* Unescape one GLME payload in place.  Returns the decoded length. */
+static size_t glme_unescape(unsigned char *p, size_t n)
+{
+	size_t i = 0, w = 0;
+
+	while (i < n) {
+		if (p[i] == 0xe0 && i + 1 < n &&
+		    (p[i + 1] == 0x02 || p[i + 1] == 0x03 ||
+		     p[i + 1] == 0x04)) {
+			p[w++] = p[i + 1] == 0x02 ? 0xe0 :
+				 p[i + 1] == 0x03 ? 0x00 : 0x01;
+			i += 2;
+		} else {
+			p[w++] = p[i++];
+		}
+	}
+	return w;
+}
+
+/* Decode and print one complete GLME frame (including e0 00 / e0 01).
+ * Prints the id, decoded length, TLV records when they parse, and a
+ * minimal NMEA synthesis (GGA/RMC with void status) when the frame
+ * carries position data.  Returns 1 for a fix-bearing frame, else 0. */
+static int glme_decode_frame(const unsigned char *f, size_t n)
+{
+	unsigned char body[8192];
+	size_t blen, i;
+	unsigned id;
+	static const char hexd[] = "0123456789abcdef";
+	char hs[64];
+	size_t hn;
+
+	if (n < 5 || f[0] != 0xe0 || f[1] != 0x00 ||
+	    f[n - 2] != 0xe0 || f[n - 1] != 0x01) {
+		logmsg("glme: malformed frame (%zu bytes), skipped", n);
+		return 0;
+	}
+	if (n - 4 > sizeof(body)) {
+		logmsg("glme: frame too large (%zu bytes), skipped", n);
+		return 0;
+	}
+	memcpy(body, f + 2, n - 4);
+	blen = glme_unescape(body, n - 4);
+	if (blen < 2 || body[0] != 0x00) {
+		logmsg("glme: bad payload header (%zu decoded bytes)", blen);
+		return 0;
+	}
+	id = body[1];
+	/* short hex preview for the log */
+	hn = blen < 32 ? blen : 32;
+	for (i = 0; i < hn; i++) {
+		hs[2 * i] = hexd[body[i] >> 4];
+		hs[2 * i + 1] = hexd[body[i] & 15];
+	}
+	hs[2 * hn] = '\0';
+	logmsg("glme: id=0x%02x raw=%zu decoded=%zu %s%s",
+	       id, n, blen, hs, blen > 32 ? "..." : "");
+	if (id == 0x00 && blen >= 9) {
+		unsigned long asic = (unsigned long)body[6] |
+				     ((unsigned long)body[7] << 8) |
+				     ((unsigned long)body[8] << 16) |
+				     ((unsigned long)body[9] << 24);
+		logmsg("glme: version/status asic=0x%08lx fw=%02x%02x",
+		       asic, body[3], body[4]);
+		g_glme_ver = 1;
+		return 0;
+	}
+	/* TLV scan: [tag u16 LE][value u32 LE] records.  Only the 0x38xx
+	 * family parses cleanly in the captured config; other tag
+	 * classes are dumped, not interpreted. */
+	if (id == 0x01 && blen > 60) {
+		size_t off = 104;
+		unsigned recs = 0;
+
+		if (off < blen && body[off] == 0x0f && off + 1 < blen &&
+		    body[off + 1] == 0x38) {
+			while (off + 6 <= blen && recs < 64) {
+				unsigned tag = (unsigned)body[off] |
+					       ((unsigned)body[off + 1] << 8);
+				unsigned long val =
+					(unsigned long)body[off + 2] |
+					((unsigned long)body[off + 3] << 8) |
+					((unsigned long)body[off + 4] << 16) |
+					((unsigned long)body[off + 5] << 24);
+				if ((tag & 0xff00) != 0x3800)
+					break;
+				logmsg("glme: cfg tag=0x%04x val=%lu",
+				       tag, val);
+				off += 6;
+				recs++;
+			}
+			logmsg("glme: cfg section: %u TLV records", recs);
+		}
+	}
+	return 0;
+}
+
+/* Feed raw bytes into the GLME framer; complete e0 00 ... e0 01 frames
+ * are decoded as they arrive.  Returns the number of frames completed. */
+static unsigned glme_feed(const unsigned char *d, size_t n)
+{
+	size_t i;
+	unsigned done = 0;
+
+	for (i = 0; i < n; i++) {
+		if (g_glme_len >= sizeof(g_glme)) {
+			logmsg("glme: overrun, resyncing");
+			g_glme_len = 0;
+		}
+		g_glme[g_glme_len++] = d[i];
+		/* resync: a frame always starts with e0 00 */
+		if (g_glme_len == 1 && g_glme[0] != 0xe0)
+			g_glme_len = 0;
+		else if (g_glme_len == 2 && g_glme[1] != 0x00)
+			g_glme_len = g_glme[1] == 0xe0 ? 1 : 0;
+		if (g_glme_len >= 4 && g_glme[g_glme_len - 2] == 0xe0 &&
+		    g_glme[g_glme_len - 1] == 0x01) {
+			hexdump("        glme-frame", g_glme, g_glme_len);
+			glme_decode_frame(g_glme, g_glme_len);
+			g_glme_frames++;
+			done++;
+			g_glme_len = 0;
+		}
+	}
+	return done;
+}
+
+/* NMEA checksum over the characters between $ and *. */
+static unsigned nmea_cksum(const char *s)
+{
+	unsigned c = 0;
+
+	while (*s)
+		c ^= (unsigned char)*s++;
+	return c;
+}
+
+/* Emit one NMEA sentence to stdout (the fix consumer reads stdout). */
+static void nmea_out(const char *body)
+{
+	printf("$%s*%02X\r\n", body, nmea_cksum(body));
+	fflush(stdout);
+}
+
+/* Minimal NMEA synthesiser.  No fix-bearing GLME message has been
+ * observed on this unit yet (the chip never answered the id-0x01
+ * config), so this emits the valid-but-void sentences the daemon
+ * produces while waiting for a fix, proving the consumer path. */
+static void nmea_void(void)
+{
+	nmea_out("GPGGA,000000.00,0000.0000,N,00000.0000,E,0,00,99.9,,M,,M,,");
+	nmea_out("GPRMC,000000.00,V,0000.0000,N,00000.0000,E,0.0,0.0,010100,,,N");
+}
+
+/*
+ * --glme-stream: after the banner, send the recovered id-0x01 config
+ * transaction and decode the stream for -L ms.  Prints decoded frames
+ * and void NMEA sentences.  Returns 0 when at least the banner plus
+ * one more frame arrived, 7 (same cold-boot code as the banner wait)
+ * when the chip stays silent.
+ */
+static int glme_stream_run(int fd)
+{
+	struct pollfd p = { fd, POLLIN, 0 };
+	unsigned char buf[4096];
+	struct timespec t0, now;
+	long elapsed;
+	int r;
+	unsigned char cfg[sizeof(glme_cfg1)];
+	size_t i, off = 0;
+
+	logmsg("glme-stream: sending id-0x01 config (%zu bytes)",
+	       sizeof(glme_cfg1));
+	memcpy(cfg, glme_cfg1, sizeof(cfg));
+	/* sequence byte: stock retries with 00/02/04/06; start at 00. */
+	for (i = 0; i + 47 < sizeof(cfg); i++)
+		;
+	cfg[47] = (unsigned char)(g_glme_seq & 0xff);
+	hexdump("        glme-tx", cfg, sizeof(cfg));
+	if (xwrite(fd, cfg, sizeof(cfg)) < 0)
+		return 5;
+	g_glme_seq += 2;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		elapsed = (now.tv_sec - t0.tv_sec) * 1000L +
+			  (now.tv_nsec - t0.tv_nsec) / 1000000L;
+		if (elapsed >= o.glme_ms)
+			break;
+		r = poll(&p, 1, (int)(o.glme_ms - elapsed));
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (r == 0)
+			break;
+		{
+			ssize_t n = read(fd, buf, sizeof(buf));
+
+			if (n <= 0) {
+				if (n < 0 && (errno == EAGAIN || errno == EINTR))
+					continue;
+				break;
+			}
+			hexdump("        glme-rx", buf, (size_t)n);
+			off += glme_feed(buf, (size_t)n);
+			(void)off;
+		}
+	}
+	logmsg("glme-stream: %u frames in %d ms", g_glme_frames, o.glme_ms);
+	if (!g_glme_frames) {
+		logmsg("glme-stream: chip silent after config; needs the "
+		       "chip reply (measurement stream) which no capture has "
+		       "produced yet");
+		nmea_void();
+		return 7;
+	}
+	nmea_void();
+	return 0;
+}
+
 
 /* Send one request and dump the reply.  Returns bytes received. */
 static size_t req(int fd, const unsigned char *b, size_t n, const char *what)
@@ -809,6 +1095,7 @@ int main(int argc, char **argv)
 		{ "handoff",    required_argument, NULL, 'H' },
 		{ "prologue",   required_argument, NULL, 'B' },
 		{ "golden",     no_argument,       NULL, 1001 },
+		{ "glme-stream", no_argument,      NULL, 1002 },
 		{ "handoff-delay", required_argument, NULL, 1000 },
 		{ "help",       no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -857,6 +1144,13 @@ int main(int argc, char **argv)
 			break;
 		case 'H': o.handoff = atoi(optarg); break;
 		case 'B': o.prologue = atoi(optarg); break;
+		case 1002:
+			o.glme_stream = 1;
+			o.golden = 1;
+			o.handoff = 1;
+			if (!o.glme_ms_set)
+				o.glme_ms = 15000;
+			break;
 		case 1000: o.handoff_ms = atoi(optarg); break;
 		case 'h':
 		default:
@@ -866,7 +1160,10 @@ int main(int argc, char **argv)
 				"       [-L GLME_MS] [-O OFF_MS]\n"
 				"       [-l BYTES] [-i IDX] [-e] [-q] [-x] [-n] [-P MS]\n"
 				"       [-S HEX] [-w HEX] [-z HEX] [-Q]\n"
-				"       [-H 0..6] [--handoff-delay MS] [-B 1] [--golden]\n", argv[0]);
+				"       [-H 0..6] [--handoff-delay MS] [-B 1] [--golden]\n"
+				"       [--glme-stream]  (implies --golden; sends the\n"
+				"        recovered id-0x01 config after the banner and\n"
+				"        decodes the GLME stream, default -L 15000)\n", argv[0]);
 			return c == 'h' ? 0 : 2;
 		}
 	}
@@ -1022,6 +1319,8 @@ int main(int argc, char **argv)
 			rx_dump(fd, o.glme_ms, "        glme-rx");
 			if (g_banner) {
 				logmsg("GLME banner received: hand-off works");
+				if (o.glme_stream)
+					rc = glme_stream_run(fd);
 			} else {
 				logmsg("no GLME banner in %d ms: chip is mute for BRI; "
 				       "a cold boot (device reboot) is required before "
