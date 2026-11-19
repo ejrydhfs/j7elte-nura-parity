@@ -153,6 +153,11 @@ Full evidence: `docs/reports/gps-bringup.md`, tool
   again (GPIO only, `gpio_direction_output(..., 0)`, no regulator/regmap
   writes). Built `#33`, flashed, and the full prologue above reproduces
   unchanged — so no PMIC deviation is needed or wanted.
+- **GLME hand-off verified on hardware (2026-11-19)**: cold boot, vendor-parity
+  prologue, ESW blocks 0-2 (skipping the synthetic 0x7fd2 record), CRC acks
+  `f107730c/ec000075/8109aed2/0b05ed95`, then `fe00fd000055aa00fffc` ->
+  `e0 00 00 00 07 10 02 01 72 06 30 02 00 05 5f e0 01`. `gpsesw --golden`
+  exits 0; only one golden run per boot (power gating does not reset the chip).
 - ESW: the chip is **not** hostless; `gpsd` carries the 8051 ESW/RAM patch in
   `.rodata` and uploads it (`Bri_EswLoadBlockAndRequestCrc`, 24-byte records).
   Public hardware-verified spec: github.com/mbicz/bcm4752-init (Lenovo Yoga

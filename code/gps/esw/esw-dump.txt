@@ -1,0 +1,33 @@
+file: /tmp/stock_gpsd (4059464 bytes)
+sha256(file): 9eadb64d5e0ad490377808b8e94697bdc11b29182ec3b9f10a40b2c2254c12fb
+.rodata: vaddr 0x002f0570  file offset 0x002f0570  size 0x000cfa11
+
+== revision 4752_B2 ==
+   table: vaddr 0x003c6d58  file offset 0x003c5d58  records 3
+   idx  bnk  load addr  file off   size    crc32       sha256
+     0     0  0x7000     0x003a4410    4060  0x884e382c  79f09f9d7ee3bff5a86d8e613deff95c70795cb1a68885f854c8b9f5ac29c829
+     1     0  0x7fec     0x003a53f0       4  0xddfac19e  a63be51b45b90365f7c5b8ecb30922c92bfa355a90f90052c92f93ba236e1d46
+     2     1  0x8000     0x003a53f8    6777  0xd4f6cf7f  fdb57d8df7f2da5663d5f5e3fcde7536a9263ef74e122e9f232d032fc017463b
+     3     0  0x7fd2     0x003a6e78       4  0x2144df1c  df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119  (synthetic 4-byte zero block @0x2da196)
+   image: 4 blocks, 10845 bytes, crc32 0x1370aa54, sha256(concat) e3219a3e62aae56f14b47e3cb3ca59ba1b03ae48aa5a617fb4a016605a7e7a9d
+   ranges: bank0:0x7000-0x7fdc bank0:0x7fec-0x7ff0 bank1:0x8000-0x9a79 bank0:0x7fd2-0x7fd6
+
+== revision 4752_B3 ==
+   table: vaddr 0x003c6d88  file offset 0x003c5d88  records 2
+   idx  bnk  load addr  file off   size    crc32       sha256
+     0     0  0x7000     0x003a3428    4060  0x30092ee8  4acc28cfe2569d9b8bf9352fc68cb0b7ccf97fb51836f96c6a6bda84c41497f0
+     1     0  0x7fec     0x003a4408       4  0xa50eb14d  10f55c75cd59da45ccc7dc8a15734ea4d49f406c0e25cd6502bdc1e62c5b3f83
+     2     0  0x7fd2     0x003a6e78       4  0x2144df1c  df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119  (synthetic 4-byte zero block @0x2da196)
+   image: 3 blocks, 4068 bytes, crc32 0xfd002469, sha256(concat) b214df7a4430114ac45bd40c8ecd38d7b027985a581a4d130a2a21ff371790f1
+   ranges: bank0:0x7000-0x7fdc bank0:0x7fec-0x7ff0 bank0:0x7fd2-0x7fd6
+
+== revision 47521_A0 ==
+   table: vaddr 0x003c6d08  file offset 0x003c5d08  records 5
+   idx  bnk  load addr  file off   size    crc32       sha256
+     0     0  0x6000     0x003a6e80    4086  0x2b4b2606  040d7a2bdc891eec9e120170741ddea6ae25b14ddf240f010d9ff3649de38182
+     1     0  0x7000     0x00398ed0    4060  0x43554264  0dc8953eca24cbe3bb3f77caea30616386011a6422ec0645e980d8ab3b7fd76a
+     2     0  0x7fec     0x00399eb0       4  0xddfac19e  a63be51b45b90365f7c5b8ecb30922c92bfa355a90f90052c92f93ba236e1d46
+     3     1  0x8000     0x00399eb8    6956  0xa104315a  faaa96dd2047ef2f38f08a06d4d4b6d72da3ddd6c1da292f5f73c77387954a3e
+     4     2  0x8000     0x0039b9e8   31294  0xc55edd9e  d24a26f81dd4b8a239963c5485f34c84803808a3dab3389917e94f06f14259a9
+   image: 5 blocks, 46400 bytes, crc32 0xf0a81e56, sha256(concat) a388c1be096709e5abe0ee0a6532274bc754c44adcc8b1db8ace15394404a9e0
+   ranges: bank0:0x6000-0x6ff6 bank0:0x7000-0x7fdc bank0:0x7fec-0x7ff0 bank1:0x8000-0x9b2c bank2:0x8000-0xfa3e
