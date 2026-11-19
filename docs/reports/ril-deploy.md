@@ -240,21 +240,43 @@ AUD_PATH_CFG: 0x00000000
 `CP_RST_N` (`gpio-150`) is deasserted (`out hi`), the SHMEM node is correct
 (`reg=<0x90000000 0x05c00000>`, `ipc_offset=0x5800000`, `ipc_size=0x400000`), the
 mailbox IDs match the stock DT (`mbx_cp2ap_status=5`, `mbx_ap2cp_status=4`), and
-`IOCTL_MODEM_XMIT_BOOT` reports success. The stock `cbd` extracted from the ROM's
-`boot.img` (`/sbin/cbd`) was disassembled for comparison: it uses exactly the
-ioctl set our loader uses (0x6f19/0x6f22/0x6f23/0x6f24/0x6f28/0x6f29/0x6f40) and
-does **not** use `IOCTL_SECURITY_REQ` (0x6f53); i.e. our loader is not missing a
-stock userspace step.
+`IOCTL_MODEM_XMIT_BOOT` reports success.
 
-The only SMC call that succeeds in this ABI is `mode=2` (RE_INIT) of
-`IOCTL_SECURITY_REQ`; modes 0/1 return `0xFEED0002`. So the secure monitor is
-present and dispatches the OEM SMC ID, but the CP-control sub-commands this kernel
-uses are rejected. This cannot be fixed from `j7elte-cbd`/`j7elte-ril`: the CP is
-behind the TZ-owned `CP_CTRL` register, `CP_PWRON` is never asserted, and with
-`/dev/mem` disabled (`CONFIG_DEVMEM` off) there is no userspace MMIO path. It
-needs a kernel/bootloader-side investigation (SMC ABI vs the phone's TZ
-version, or the non-secure CP power path), which is out of the assigned scope.
-No kernel/DT/config file was modified.
+The stock `cbd` extracted from the ROM's `boot.img` (`/sbin/cbd`, ARM32/Thumb-2)
+was disassembled for comparison. It uses the same ioctl set our loader uses
+(0x6f19/0x6f22/0x6f23/0x6f24/0x6f28/0x6f29/0x6f40) **plus two calls the package
+does not make**, in `shannon_normal_boot` (calls at `0x21e1e`, `0x21e50`,
+`0x21e88`, `0x21eb8`, `0x21eec`):
+
+| stock step | call | ioctl |
+|---|---|---|
+| before power | `std_boot_modem_reset` (`0x1ccdc`) | `IOCTL_MODEM_RESET` 0x6f21 |
+| before power | security wrapper (`0x1dc8c`) with mode 2 | `IOCTL_SECURITY_REQ` 0x6f53 |
+| before power | per-stage loader loop (`0x21a58` → `0x218cc`) | `IOCTL_MODEM_XMIT_BOOT` 0x6f40 |
+| before power | security wrapper with mode 0, args `{mode, BOOT size, TOC data_start}` | `IOCTL_SECURITY_REQ` 0x6f53 |
+| power | `std_boot_modem_on` (`0x1cca8`) | `IOCTL_MODEM_ON` 0x6f19 |
+
+The mode-0 security request returns `0xFEED0002` and stock treats that as an
+**accepted code** (the wrapper's table at `0x62b74` is
+`{0x00FEED02, 0x00FEED04, 0xFEED0002}`, and `0xFEED0002` is positive, so the
+caller's `bge` continues); the kernel's own log prints it as `-18022398`
+(signed). The exact stock order, including the reset and both security requests,
+was replayed by hand on this unit
+(`0x6f21 → 0x6f53(mode 2) → 0x6f40(BOOT) → 0x6f53(mode 0) → 0x6f19 → 0x6f22`)
+and still ends in `CP Power status: 8` / `ERR! read Fail: 8` and `-EACCES`, so
+the missing calls are a fidelity gap worth fixing for a future bring-up but are
+**not** the cause of the failure on this unit.
+
+The OEM SMC ID is therefore implemented by the secure monitor: `SECURITY_REQ`
+mode 2 returns 0 and mode 0 returns `0xFEED0002` (stock's accepted code). The
+sub-command this kernel needs for power, `READ_CTRL` (`exynos_smc(0x82000700, 3,
+0, 0)`), returns `8`, and every kernel path to `WRITE_CTRL` reads first, so the
+CP-control writes are never issued. This cannot be fixed from
+`j7elte-cbd`/`j7elte-ril`: the CP is behind the TZ-owned `CP_CTRL` register,
+`CP_PWRON` is never asserted, and with `/dev/mem` disabled (`CONFIG_DEVMEM` off)
+there is no userspace MMIO path. It needs a kernel/bootloader-side investigation
+(SMC ABI vs the phone's TZ/bootloader version, or the non-secure CP power path),
+which is out of the assigned scope. No kernel/DT/config file was modified.
 
 ## 5. Verified subset vs. unverified
 
