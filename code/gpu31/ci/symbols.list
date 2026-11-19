@@ -1,0 +1,7 @@
+dma_fence_add_callback
+dma_fence_context_alloc
+drm_sched_init
+drm_sched_job_alloc
+drm_sched_job_submit
+drm_syncobj_create
+exynos_drm_platform_probe
