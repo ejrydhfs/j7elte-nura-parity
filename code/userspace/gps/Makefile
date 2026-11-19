@@ -21,11 +21,17 @@ $(BIN): $(SRC)
 gpsprobe: src/gpsprobe.c
 	$(CC) $(CFLAGS) -o $@ $< 
 
+# Standalone ESW/RAM-patch upload driver: power cycle, prologue, patch upload
+# with selectable frame encodings (-V), bank switches, CRC requests.  The
+# encoder variant that the hardware accepts is the one the daemon uses.
+gpsesw: src/gpsesw.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 check: $(BIN)
 	python3 tests/smoke_test.py
 	python3 tests/init_test.py
 
 clean:
-	rm -f $(BIN) gpsprobe
+	rm -f $(BIN) gpsprobe gpsesw
 
 .PHONY: all check clean

@@ -52,10 +52,10 @@ index 0000000..5b91063
 +"
 diff --git a/device/archived/j7elte-gpsd/j7elte-gpsd.c b/device/archived/j7elte-gpsd/j7elte-gpsd.c
 new file mode 100644
-index 0000000..435af96
+index 0000000..ea697a0
 --- /dev/null
 +++ b/device/archived/j7elte-gpsd/j7elte-gpsd.c
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1594 @@
 +/*
 + * j7elte-gpsd - minimal BCM4752 GPS bridge for Samsung Galaxy J7 (j7elte)
 + *
@@ -80,7 +80,10 @@ index 0000000..435af96
 + * --init replays the part of Broadcom's BRI bring-up that was recovered
 + * byte-for-byte from /system/bin/gpsd (autobaud burst, Bri_GetOutOfLegacy,
 + * Bri_RequestHwVersion, Bri_RequestDebugSfr).  Nothing outside those
-+ * verified frames is ever written to the UART; see
++ * verified frames is written to the UART unless the user passes
++ * --esw DIR, which additionally uploads the 4752_B2 RAM patch extracted
++ * from their own /system/bin/gpsd (see docs/reports/gps-esw-upload.md)
++ * and, with --glme, sends the GLME switch.  See
 + * parity/reports/gps-init-impl.md for the evidence and the residual gap.
 + *
 + * License: MIT
@@ -128,6 +131,8 @@ index 0000000..435af96
 +	bool verbose;
 +	bool probe_baud;
 +	bool do_init;
++	bool glme;
++	const char *esw_dir;
 +	const char *raw_log;
 +} cfg = {
 +	.dev = DEFAULT_DEV,
@@ -141,6 +146,8 @@ index 0000000..435af96
 +	.verbose = false,
 +	.probe_baud = false,
 +	.do_init = false,
++	.glme = false,
++	.esw_dir = NULL,
 +	.raw_log = NULL,
 +};
 +
@@ -884,6 +891,354 @@ index 0000000..435af96
 +	return got;
 +}
 +
++/* --- ESW / RAM-patch upload -------------------------------------------- *
++ *
++ * The 4752_B2 patch is not part of this program: it is Broadcom firmware
++ * that the user extracts from their own /system/bin/gpsd with
++ * code/gps/esw/esw_dump --dump <dir>/b2 (see docs/reports/gps-esw.md).
++ * Four files are expected in --esw DIR:
++ *
++ *   idx bank  addr    size  file                    injected by esw_dump
++ *     0    0  0x7000  4060  b2-4752_B2-0.bin        .rodata
++ *     1    0  0x7fec     4  b2-4752_B2-1.bin        .rodata
++ *     2    1  0x8000  6777  b2-4752_B2-2.bin        .rodata
++ *     3    0  0x7fd2     4  b2-4752_B2-3.bin        synthesised (zeros)
++ *
++ * Wire format (verified on the SM-J700M, docs/reports/gps-esw-upload.md):
++ *
++ *   data  fe <nwords> fd 61 17 de c0 <alo> <ahi> <bytes...> fc
++ *         nwords = ceil(bytes/4), <= 255; a record is sent in <= 1020-byte
++ *         chunks, an unaligned tail is folded into a 4-byte frame at
++ *         addr+chunk-4; the UART write is paced in <= 160-byte pieces.
++ *   crc   fe 00 fd 21 18 <alo> <ahi> <len_lo> <len_hi> fc
++ *         one request per <= 4096-byte record piece; the chip answers
++ *         fe 00 fd 2f 15 <4 bytes> fc.  The 4 bytes are chip-computed, are
++ *         not the host CRC-32, and the vendor daemon only logs them.
++ *   bank  fe 00 fd 61 16 <bank> 00 00 00 fc   (item 0x16 write; no reply)
++ *         read back as item 0x94 (ff 00 fd 1f 94 fc).
++ */
++#define ESW_PIECE_MAX   4096   /* record piece / CRC boundary, [this+4] @0x2a8e24 */
++#define ESW_CHUNK_MAX   1020   /* 0x3fc frame payload limit @0x2a7208 */
++#define ESW_UART_PIECE  160    /* 0xa0 write() piece @0x2a72a4 */
++
++struct esw_block {
++	int bank;
++	unsigned addr;
++	size_t len;
++	const char *name;
++};
++
++static const struct esw_block esw_blocks[] = {
++	{ 0, 0x7000, 4060, "b2-4752_B2-0.bin" },
++	{ 0, 0x7fec,    4, "b2-4752_B2-1.bin" },
++	{ 1, 0x8000, 6777, "b2-4752_B2-2.bin" },
++	{ 0, 0x7fd2,    4, "b2-4752_B2-3.bin" },
++};
++
++/* CRC-32/IEEE, only used to log (and thus cross-check) what was read from
++ * disk against the digests in docs/reports/gps-esw.md §1. */
++static unsigned long esw_crc32(const unsigned char *p, size_t n)
++{
++	unsigned long c = 0xffffffffUL;
++	size_t i;
++	int k;
++
++	for (i = 0; i < n; i++) {
++		c ^= p[i];
++		for (k = 0; k < 8; k++)
++			c = (c >> 1) ^ (0xedb88320UL & (0UL - (c & 1UL)));
++	}
++	return c ^ 0xffffffffUL;
++}
++
++/* Write in <=160-byte pieces with a 1 ms gap, like the vendor transport. */
++static int esw_send_paced(int fd, const unsigned char *buf, size_t len)
++{
++	size_t off = 0;
++
++	while (off < len) {
++		size_t n = len - off;
++		ssize_t w;
++
++		if (n > ESW_UART_PIECE)
++			n = ESW_UART_PIECE;
++		w = write(fd, buf + off, n);
++		if (w < 0) {
++			if (errno == EINTR)
++				continue;
++			if (errno == EAGAIN) {
++				struct pollfd p = { fd, POLLOUT, 0 };
++				if (poll(&p, 1, 1000) <= 0)
++					return -1;
++				continue;
++			}
++			logmsg("esw: write(%s): %s", cfg.dev, strerror(errno));
++			return -1;
++		}
++		off += (size_t)w;
++		if (off < len) {
++			struct timespec ts = { 0, 1000000L };
++			nanosleep(&ts, NULL);
++		}
++	}
++	return 0;
++}
++
++static int esw_data_frame(int fd, unsigned addr, const unsigned char *data,
++			  size_t nbytes)
++{
++	unsigned char hdr[9];
++	unsigned char ft = 0xfc;
++	unsigned nwords = (unsigned)((nbytes + 3) / 4);
++
++	if (nwords > 255) {
++		logmsg("esw: frame too large (%zu bytes)", nbytes);
++		return -1;
++	}
++	hdr[0] = 0xfe;
++	hdr[1] = (unsigned char)nwords;
++	hdr[2] = 0xfd;
++	hdr[3] = 0x61;
++	hdr[4] = 0x17;
++	hdr[5] = 0xde;
++	hdr[6] = 0xc0;
++	hdr[7] = (unsigned char)(addr & 0xff);
++	hdr[8] = (unsigned char)((addr >> 8) & 0xff);
++
++	if (esw_send_paced(fd, hdr, sizeof(hdr)) < 0)
++		return -1;
++	if (nbytes && esw_send_paced(fd, data, nbytes) < 0)
++		return -1;
++	return esw_send_paced(fd, &ft, 1);
++}
++
++/* Ask for the chip-side CRC of one record piece; log the 2f15 reply. */
++static int esw_crc_request(int fd, struct bri_rx *rx, unsigned addr,
++			   unsigned len)
++{
++	unsigned char req[10];
++	unsigned char frame[BRI_FRAME_MAX];
++	size_t flen = 0;
++	int got;
++
++	req[0] = 0xfe;
++	req[1] = 0x00;
++	req[2] = 0xfd;
++	req[3] = 0x21;
++	req[4] = 0x18;
++	req[5] = (unsigned char)(addr & 0xff);
++	req[6] = (unsigned char)((addr >> 8) & 0xff);
++	req[7] = (unsigned char)(len & 0xff);
++	req[8] = (unsigned char)((len >> 8) & 0xff);
++	req[9] = 0xfc;
++
++	got = bri_step(fd, rx, "ESW CRC request 21 18", req, sizeof(req),
++		       BRI_RESP_MS, frame, &flen);
++	if (got < 0)
++		return -1;
++	if (got > 0 && flen >= 10 && frame[3] == 0x2f && frame[4] == 0x15) {
++		logmsg("esw: CRC ack %04x/%u = 0x%08lx", addr, len,
++		       bri_word(frame, flen));
++		return 1;
++	}
++	logmsg("esw: no 2f15 ack for %04x/%u", addr, len);
++	return 0;
++}
++
++/* Item 0x16 = patch bank; read it back as item 0x94. */
++static int esw_bank_switch(int fd, struct bri_rx *rx, int bank)
++{
++	unsigned char req[10];
++	unsigned char frame[BRI_FRAME_MAX];
++	size_t flen = 0;
++	int got, attempt;
++
++	req[0] = 0xfe;
++	req[1] = 0x00;
++	req[2] = 0xfd;
++	req[3] = 0x61;
++	req[4] = 0x16;
++	req[5] = (unsigned char)bank;
++	req[6] = req[7] = req[8] = 0x00;
++	req[9] = 0xfc;
++	got = bri_step(fd, rx, "ESW bank select (item 0x16)", req, sizeof(req),
++		       BRI_RESP_MS, frame, &flen);
++	if (got < 0)
++		return -1;
++
++	for (attempt = 0; attempt < 3; attempt++) {
++		unsigned char rd[6] = { 0xff, 0x00, 0xfd, 0x1f, 0x94, 0xfc };
++
++		got = bri_step(fd, rx, "ESW bank readback (item 0x94)", rd,
++			       sizeof(rd), BRI_RESP_MS, frame, &flen);
++		if (got < 0)
++			return -1;
++		if (got > 0 && flen >= 10 && frame[3] == 0x1f &&
++		    frame[4] == 0x94) {
++			unsigned long v = bri_word(frame, flen);
++
++			if (v == (unsigned long)bank) {
++				logmsg("esw: bank %d selected", bank);
++				return 0;
++			}
++			logmsg("esw: bank readback 0x%lx, wanted %d", v, bank);
++			continue;
++		}
++		break;
++	}
++	logmsg("esw: bank %d not confirmed by item 0x94", bank);
++	return 0;
++}
++
++/* Send one record: <=4096-byte pieces, <=1020-byte frames, CRC per piece. */
++static int esw_send_block(int fd, struct bri_rx *rx,
++			  const struct esw_block *b, const unsigned char *data)
++{
++	size_t done = 0;
++	int acks = 0, fails = 0;
++
++	while (done < b->len) {
++		size_t plen = b->len - done;
++		size_t sent = 0;
++
++		if (plen > ESW_PIECE_MAX)
++			plen = ESW_PIECE_MAX;
++
++		while (sent < plen) {
++			size_t chunk = plen - sent;
++			size_t aligned, tail;
++
++			if (chunk > ESW_CHUNK_MAX)
++				chunk = ESW_CHUNK_MAX;
++			aligned = chunk & ~(size_t)3;
++			tail = chunk - aligned;
++
++			logmsg("esw: frame %04x +%zu bytes (aligned %zu tail %zu)",
++			       b->addr + (unsigned)done + (unsigned)sent,
++			       chunk, aligned, tail);
++			if (aligned &&
++			    esw_data_frame(fd, b->addr + (unsigned)done +
++					   (unsigned)sent,
++					   data + done + sent, aligned) < 0)
++				return -1;
++			if (tail) {
++				unsigned a = (b->addr + (unsigned)done +
++					      (unsigned)sent + (unsigned)chunk - 4) &
++					     0xffff;
++
++				if (esw_data_frame(fd, a,
++						   data + done + sent + chunk - 4,
++						   4) < 0)
++					return -1;
++			}
++			sent += chunk;
++		}
++
++		{
++			int r = esw_crc_request(fd, rx,
++						 b->addr + (unsigned)done,
++						 (unsigned)plen);
++
++			if (r < 0)
++				return -1;
++			if (r > 0)
++				acks++;
++			else
++				fails++;
++		}
++		done += plen;
++	}
++	logmsg("esw: %s: %zu bytes, %d/%d pieces acknowledged",
++	       b->name, b->len, acks, acks + fails);
++	return fails ? 1 : 0;
++}
++
++static int esw_read_block(const char *dir, const struct esw_block *b,
++			  unsigned char **out)
++{
++	char path[512];
++	FILE *f;
++	long sz;
++	size_t n;
++
++	snprintf(path, sizeof(path), "%s/%s", dir, b->name);
++	f = fopen(path, "rb");
++	if (!f) {
++		logmsg("esw: cannot open %s: %s", path, strerror(errno));
++		return -1;
++	}
++	if (fseek(f, 0, SEEK_END) < 0 || (sz = ftell(f)) < 0 ||
++	    fseek(f, 0, SEEK_SET) < 0) {
++		logmsg("esw: %s: seek failed", path);
++		fclose(f);
++		return -1;
++	}
++	if ((size_t)sz != b->len) {
++		logmsg("esw: %s is %ld bytes, expected %zu", path, sz, b->len);
++		fclose(f);
++		return -1;
++	}
++	*out = malloc(b->len ? b->len : 1);
++	if (!*out) {
++		fclose(f);
++		return -1;
++	}
++	n = fread(*out, 1, b->len, f);
++	fclose(f);
++	if (n != b->len) {
++		logmsg("esw: %s: short read (%zu/%zu)", path, n, b->len);
++		free(*out);
++		*out = NULL;
++		return -1;
++	}
++	logmsg("esw: %s: %zu bytes, crc32 0x%08lx", b->name, b->len,
++	       esw_crc32(*out, b->len));
++	return 0;
++}
++
++/*
++ * Upload the four 4752_B2 records in table order, switching the patch bank
++ * when it changes (bank 0 for blocks 0/1/3, bank 1 for block 2).
++ * Returns 0 when every record was sent, 1 when some CRC ack was missing,
++ * -1 on a fatal I/O or file error.
++ */
++static int esw_upload(int fd, struct bri_rx *rx)
++{
++	int cur_bank = -1;
++	int rc = 0;
++	size_t i;
++
++	for (i = 0; i < sizeof(esw_blocks) / sizeof(esw_blocks[0]); i++) {
++		const struct esw_block *b = &esw_blocks[i];
++		unsigned char *data = NULL;
++		int r;
++
++		if (esw_read_block(cfg.esw_dir, b, &data) < 0) {
++			rc = -1;
++			break;
++		}
++		if (b->bank != cur_bank) {
++			if (esw_bank_switch(fd, rx, b->bank) < 0) {
++				free(data);
++				rc = -1;
++				break;
++			}
++			cur_bank = b->bank;
++		}
++		logmsg("esw: loading %s at 0x%04x (bank %d)",
++		       b->name, b->addr, b->bank);
++		r = esw_send_block(fd, rx, b, data);
++		free(data);
++		if (r < 0) {
++			rc = -1;
++			break;
++		}
++		if (r > 0)
++			rc = 1;
++	}
++	return rc;
++}
++
 +/*
 + * Cold-start handshake.  The vendor order is
 + *   "initial" @0x2a1728 -> cfg+autobaud @0x2a5b58 -> [BRI wait] ->
@@ -985,6 +1340,41 @@ index 0000000..435af96
 +			logmsg("init: DebugSfr acknowledged");
 +	}
 +
++	/* ESW / RAM patch: only when the user supplied the extracted blocks.
++	 * The vendor loads the patch here, then switches to GLME. */
++	if (cfg.esw_dir) {
++		int er = esw_upload(fd, &rx);
++
++		if (er < 0) {
++			logmsg("init: ESW upload failed");
++			return -1;
++		}
++		logmsg("init: ESW upload finished (%s)",
++		       er ? "some CRC acks missing" : "all pieces acknowledged");
++		if (cfg.glme) {
++			/* Observed on this unit: the chip stops answering BRI
++			 * after this frame and no e0 banner arrives; one run
++			 * coincided with a device reboot.  Opt-in only. */
++			sent++;
++			got = bri_step(fd, &rx, "Bri_GetOutOfLegacy (after patch)",
++				       bri_get_out_of_legacy,
++				       sizeof(bri_get_out_of_legacy), 1000,
++				       frame, &flen);
++			if (got < 0)
++				return -1;
++			if (got > 0)
++				answered++;
++			logmsg("init: GLME switch %s",
++			       got > 0 ? "answered" : "not answered (BRI may be gone)");
++		} else {
++			logmsg("init: stopping after the patch load "
++			       "(no GLME switch; --glme enables it)");
++		}
++		logmsg("init: link check: %d of %d exchanges answered",
++		       answered, sent);
++		return 0;
++	}
++
 +	/* INIT_STAGE A: "Resending Bri_GetOutOfLegacy %u!" with 50+20n ms
 +	 * backoff, up to four trials (@0x2a6508, template @0x2a618c). */
 +	for (attempt = 0; attempt < BRI_RETRY_MAX; attempt++) {
@@ -1030,6 +1420,11 @@ index 0000000..435af96
 +"  -R, --raw-log PATH    append every received byte to PATH (diagnostics)\n"
 +"  -P, --probe-baud      if no NMEA arrives, retry 9600/115200/4800\n"
 +"  -i, --init            send the recovered BCM4752 BRI handshake first\n"
++"  -E, --esw DIR         after the handshake, upload the BCM4752 patch\n"
++"                        blocks b2-4752_B2-{0..3}.bin from DIR (implies -i;\n"
++"                        extract them with code/gps/esw/esw_dump --dump)\n"
++"  -G, --glme            after a successful upload send the GLME switch\n"
++"                        (experimental: the chip leaves BRI silently)\n"
 +"  -n, --no-power        do not touch the power GPIO\n"
 +"  -f, --foreground      accepted for init-script compatibility (never forks)\n"
 +"  -v, --verbose         log every NMEA sentence and UART state\n"
@@ -1049,6 +1444,8 @@ index 0000000..435af96
 +		{ "raw-log",     required_argument, NULL, 'R' },
 +		{ "probe-baud",  no_argument,       NULL, 'P' },
 +		{ "init",        no_argument,       NULL, 'i' },
++		{ "esw",         required_argument, NULL, 'E' },
++		{ "glme",        no_argument,       NULL, 'G' },
 +		{ "no-power",    no_argument,       NULL, 'n' },
 +		{ "foreground",  no_argument,       NULL, 'f' },
 +		{ "verbose",     no_argument,       NULL, 'v' },
@@ -1072,7 +1469,7 @@ index 0000000..435af96
 +	out.raw_fd = -1;
 +	nmea.total_bytes = 0;
 +
-+	while ((c = getopt_long(argc, argv, "d:b:g:p:r:s:R:PinfvhV", opts, NULL)) != -1) {
++	while ((c = getopt_long(argc, argv, "d:b:g:p:r:s:R:E:GPinfvhV", opts, NULL)) != -1) {
 +		switch (c) {
 +		case 'd': cfg.dev = optarg; break;
 +		case 'b': cfg.baud = atoi(optarg); break;
@@ -1085,6 +1482,8 @@ index 0000000..435af96
 +		case 'R': cfg.raw_log = optarg; break;
 +		case 'P': cfg.probe_baud = true; break;
 +		case 'i': cfg.do_init = true; break;
++		case 'E': cfg.esw_dir = optarg; cfg.do_init = true; break;
++		case 'G': cfg.glme = true; break;
 +		case 'n': cfg.use_power = false; break;
 +		case 'f': cfg.foreground = true; break;
 +		case 'v': cfg.verbose = true; break;

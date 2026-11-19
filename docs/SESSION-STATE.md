@@ -156,6 +156,14 @@ Full evidence: `docs/reports/gps-bringup.md`, tool
 - ESW: the chip is **not** hostless; `gpsd` carries the 8051 ESW/RAM patch in
   `.rodata` and uploads it (`Bri_EswLoadBlockAndRequestCrc`, 24-byte records).
   Public hardware-verified spec: github.com/mbicz/bcm4752-init (Lenovo Yoga
-  Book). Remaining work: extract the ESW image, implement the escape-pair
+  Book). Remaining work: implement the escape-pair
   search (`Bri_ProgramSwFlowControl` 0x2a6aa0), RF plan, then parse GLME and
   synthesise NMEA host-side (chip never emits NMEA).
+- **ESW upload verified** (2026-11-19): the four 4752_B2 records go up as
+  `fe <nwords> fd 61 17 de c0 <addr> … fc` (1020-byte frames, 4096-byte CRC
+  pieces) and all five `21 18` requests are acked with `2f15`
+  (`0x7fec/4` matches the public capture byte for byte). The patch bank is
+  item `0x16`, read back as item `0x94`. The GLME switch stops BRI replies
+  but yields no `e0` banner, so the post-patch jump is the open step.
+  Tools: `j7elte-gpsd --esw DIR [--glme]`, `gpsesw`; evidence in
+  `docs/reports/gps-esw-upload.md`.
