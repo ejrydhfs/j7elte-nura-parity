@@ -1,0 +1,108 @@
+# M1 DRM fragment: leanest path to /dev/dri/* with ZERO display-driver swap.
+# Apply ON TOP of pmaports config-samsung-j7elte.aarch64, then olddefconfig.
+#
+# What it enables:
+#   CONFIG_MODULES=y              -- staging only (M1 acceptance). Adds module
+#                                  loader + FORCE_LOAD/UNLOAD/MODVERSIONS/SIG
+#                                  (all default n). No .ko is built in M1 (all
+#                                  symbols =y); required groundwork for the M2
+#                                  kbase-shim module load path.
+#   CONFIG_DRM=y                  -- DRM core. Depends:
+#                                  (AGP||AGP=n)&&!EMULATED_CMPXCHG&&MMU. Stock:
+#                                  AGP unset (=n, OK), MMU=y, EMULATED_CMPXCHG
+#                                  off. Kconfig auto-selects HDMI, I2C,
+#                                  I2C_ALGOBIT, DMA_SHARED_BUFFER (all already
+#                                  =y in stock; select = force-on, no churn).
+#   CONFIG_DRM_KMS_HELPER=y       -- CRTC/KMS helpers. Selects FB (=y already)
+#                                  and FRAMEBUFFER_CONSOLE iff !EXPERT; stock
+#                                  has EXPERT=y so NO fbcon churn, fbdev X
+#                                  untouched.
+#   CONFIG_DRM_EXYNOS=y           -- In-tree Samsung DRM core
+#                                  (drivers/gpu/drm/exynos/exynos_drm_drv.c).
+#                                  Depends: DRM && (PLAT_SAMSUNG ||
+#                                  ARCH_MULTIPLATFORM); stock PLAT_SAMSUNG=y.
+#                                  Selects DRM_KMS_HELPER + CFB_* trio +
+#                                  VT_HW_CONSOLE_BINDING if FRAMEBUFFER_CONSOLE
+#                                  (off here). Provides exynos DRM core + GEM
+#                                  ioctls; binds ONLY subdrivers whose platform
+#                                  devices exist.
+#   CONFIG_DRM_EXYNOS_G2D=y       -- 2D blitter subdriver. Depends:
+#                                  DRM_EXYNOS && !VIDEO_SAMSUNG_S5P_G2D (stock:
+#                                  that symbol is unset -- OK). SOLE M1
+#                                  display-HW touchpoint, and a SAFE one: the
+#                                  G2D is a standalone blitter with an OF match
+#                                  table ("samsung,exynos5250-g2d"); nothing
+#                                  matches it in the stock j7elte DT, so
+#                                  g2d_probe NEVER FIRES on M1. Its only effect
+#                                  is registering g2d_driver with the exynos
+#                                  subdriver list (fine_cnt>=1, see below).
+#   CONFIG_DRM_EXYNOS_DMABUF=y    -- Zero-cost ioctl surface (depends DRM_EXYNOS
+#                                  only); M2 prime-sharing groundwork, no HW
+#                                  touched.
+#
+# What it DELIBERATELY OMITS (vs the risky display-driver-swap fragment):
+#   NO CONFIG_DRM_KMS_CMA_HELPER -- verified UNNECESSARY for this tree. The
+#     in-tree exynos DRM carries its OWN GEM/buffer backend
+#     (exynos_drm_gem.c + exynos_drm_buf.c, dma_alloc_attrs-based) and
+#     references DRM_GEM_CMA_HELPER / DRM_KMS_CMA_HELPER NOWHERE (grep over
+#     drivers/gpu/drm/exynos/ returns zero hits). No exynos object selects the
+#     CMA helpers (only tilcdc/shmobile/imx do -- all with unsatisfied deps on
+#     arm64: ARM/ARCH_MXC/ARCH_MULTIPLATFORM). CMA over TTM justification is
+#     therefore moot on M1: neither allocator is wired into this exynos
+#     snapshot. Keep the fragment minimal; revisit dumb-buffer helpers at M2
+#     when a modeset driver actually needs fb helpers.
+#   NO CONFIG_DRM_EXYNOS_FIMD/HDMI/MIXER/IPP/FIMC/GSC/ROTATOR -- FIMD binds the
+#     SAME DECON/DSIM registers the vendor EXYNOS_DECON_FB driver owns ->
+#     double-drive = black screen / panel power-sequence collision. HDMI/Mixer
+#     probe missing HW on j7elte. _FIMC needs MFD_SYSCON+OF wiring, _GSC needs
+#     ARCH_EXYNOS5 (off); defer to M2.
+#   NO CONFIG_DRM_EXYNOS_VIDI     -- stock tree has NO "exynos-drm-vidi"
+#     platform-device source (no board-file/DT registration in this 3.10
+#     tree); selecting it compiles the object but its probe never fires --
+#     dead weight, omitted.
+#   NO display Kconfig off-switches -- KEEP CONFIG_EXYNOS_DECON_FB=y,
+#     EXYNOS_DECON_EXYNOS7580=y, EXYNOS_MIPI_DSI=y, EXYNOS_DECON_LCD=y,
+#     PANEL_EA8061_DYNAMIC=y ON. No "is not set" lines for the vendor fbdev.
+#   NO CONFIG_FRAMEBUFFER_CONSOLE=y -- avoids VT/fbcon stealing /dev/fb0 from X
+#     (resolves to "is not set" after closure; framebuffer console stays off).
+#   NO CMA_SIZE_MBYTES bump        -- stock CONFIG_CMA_SIZE_MBYTES=0 (no
+#     default CMA area) stays 0 for M1. M1 only needs /dev/dri/card0 to EXIST
+#     and EXYNOS_GEM_CREATE to succeed, not scanout. Tune CMA (e.g. 64M) at M2
+#     when dumb-buffer/scanout sizing is known.
+#
+# Why /dev/dri/card0 appears with NO modeset driver (honest mechanism):
+#   drm_platform_init(exynos_drm_platform_driver) ALWAYS runs:
+#   platform_device_register_simple("exynos-drm") -> exynos_drm_platform_probe
+#   -> drm_platform_init -> drm_get_platform_dev (drm_platform.c): FIRST
+#   drm_fill_in_dev + drm_get_minor(PRIMARY) create the char node, and ONLY
+#   THEN does load() -> exynos_drm_device_register() iterate the subdriver
+#   list. With M1 the list holds ONLY g2d (manager==NULL path -> fine_cnt++
+#   without encoder/connector), so load() returns 0, CRTCs/planes/vblank init
+#   succeed, fbdev-helper init early-returns 0 (num_connector==0 -> "return 0",
+#   NOT an error), and the already-created primary node survives. EXPECTED M1
+#   STATE (integrator: assert exactly this):
+#     /dev/dri/card0 PRESENT, /dev/dri/controlD64 PRESENT (DRIVER_MODESET set),
+#     NO connector/crtc userspace objects visible (no encoder/connector
+#     created), vendor /dev/fb0 + fbdev X untouched.
+#   If load() ever returned -EINVAL (e.g. zero subdrivers bound),
+#   drm_get_platform_dev's err_g3 path would drm_put_minor the node again --
+#   which is why M1 keeps G2D: exactly one manager-less subdriver guarantees
+#   fine_cnt>=1 while touching no display HW.
+#
+# DT answer (default NO, confirmed): NO in-repo exynos7580 DRM display driver
+#   and NO DT compatible change is needed for M1. The 0001/0002 display-driver
+#   patches (new "samsung,exynos7580-decon-drm"/"-dsim" compatibles + DT edits)
+#   belong to the M2 modeset milestone. M1 compiles ONLY pre-existing in-tree
+#   exynos DRM objects and modifies NO .dts/.dtsi, so the stock dt.img keeps
+#   booting (no S-Boot hang risk).
+#
+# Kconfig-closure proof (private /tmp/m1final, tree untouched, no Image
+# build): cp <pmaports-config> /tmp/m1final/.config, merge 6 symbols,
+# make O=/tmp/m1final ARCH=arm64 olddefconfig. Resolved M1 values quoted in
+# code/kernel/m1/m1-kconfig-check.sh output block.
+CONFIG_MODULES=y
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_EXYNOS=y
+CONFIG_DRM_EXYNOS_G2D=y
+CONFIG_DRM_EXYNOS_DMABUF=y
