@@ -37,6 +37,7 @@
  * same fence handed to the sched/out-sync paths; only done_fence is
  * ever signaled or put. Fault recovery signals done_fence exactly
  * once so waiters never hang (see p7580_job_recover).
+ */
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/spinlock.h>
