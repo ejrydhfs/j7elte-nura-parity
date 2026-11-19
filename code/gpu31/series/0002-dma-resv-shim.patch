@@ -1,0 +1,281 @@
+From 7cb214051a5799060f273048bc6bb592cb77cbf1 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Wed, 18 Nov 2026 23:34:20 -0500
+Subject: [PATCH 2/5] dma-resv shim
+
+---
+ drivers/base/dma-resv.c  | 165 +++++++++++++++++++++++++++++++++++++++
+ include/linux/dma-resv.h |  89 +++++++++++++++++++++
+ 2 files changed, 254 insertions(+)
+ create mode 100644 drivers/base/dma-resv.c
+ create mode 100644 include/linux/dma-resv.h
+
+diff --git a/drivers/base/dma-resv.c b/drivers/base/dma-resv.c
+new file mode 100644
+index 0000000..059245b
+--- /dev/null
++++ b/drivers/base/dma-resv.c
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * dma-resv minimal shim implementation (Nura 3.10.108).
++ * Plain-mutex locking replaces mainline's ww_mutex; fence replacement is
++ * done under resv->lock so readers holding the lock see a stable set.
++ */
++
++#include <linux/dma-resv.h>
++#include <linux/module.h>
++
++int dma_resv_reserve_shared(struct dma_resv *obj, unsigned int num_fences)
++{
++	struct dma_resv_list *new_list, *old_list;
++	unsigned max;
++
++	if (!obj)
++		return -EINVAL;
++
++	old_list = obj->fence_shared;
++	max = old_list ? old_list->shared_max : 0;
++	if (old_list && old_list->shared_count + num_fences <= max)
++		return 0;
++
++	max += max(num_fences, 4u);
++	new_list = kmalloc(sizeof(*new_list) + max * sizeof(*new_list->shared),
++			   GFP_KERNEL);
++	if (!new_list)
++		return -ENOMEM;
++
++	new_list->shared_count = old_list ? old_list->shared_count : 0;
++	new_list->shared_max = max;
++	if (old_list)
++		memcpy(new_list->shared, old_list->shared,
++		       old_list->shared_count * sizeof(*old_list->shared));
++
++	kfree(old_list);
++	obj->fence_shared = new_list;
++
++	return 0;
++}
++EXPORT_SYMBOL(dma_resv_reserve_shared);
++
++void dma_resv_add_shared_fence(struct dma_resv *obj, struct dma_fence *fence)
++{
++	struct dma_resv_list *fobj = obj->fence_shared;
++
++	BUG_ON(!fobj || fobj->shared_count >= fobj->shared_max);
++
++	dma_fence_get(fence);
++	fobj->shared[fobj->shared_count++] = fence;
++}
++EXPORT_SYMBOL(dma_resv_add_shared_fence);
++
++void dma_resv_add_excl_fence(struct dma_resv *obj, struct dma_fence *fence)
++{
++	struct dma_fence *old = obj->fence_excl;
++
++	dma_fence_get(fence);
++
++	/* An exclusive fence retires all older shared fences. */
++	if (obj->fence_shared) {
++		unsigned i;
++		for (i = 0; i < obj->fence_shared->shared_count; ++i)
++			dma_fence_put(obj->fence_shared->shared[i]);
++		obj->fence_shared->shared_count = 0;
++	}
++
++	obj->fence_excl = fence;
++	dma_fence_put(old);
++}
++EXPORT_SYMBOL(dma_resv_add_excl_fence);
++
++struct dma_fence *dma_resv_get_excl(struct dma_resv *obj)
++{
++	struct dma_fence *fence;
++
++	fence = obj->fence_excl;
++	dma_fence_get(fence);
++
++	return fence;
++}
++EXPORT_SYMBOL(dma_resv_get_excl);
++
++bool dma_resv_test_signaled(struct dma_resv *obj, bool test_all)
++{
++	struct dma_resv_list *fobj = obj->fence_shared;
++	unsigned i;
++	int ret;
++
++	ret = !obj->fence_excl || dma_fence_is_signaled(obj->fence_excl);
++	if (!ret || !test_all)
++		return ret;
++
++	if (!fobj)
++		return true;
++
++	for (i = 0; i < fobj->shared_count; ++i) {
++		if (!dma_fence_is_signaled(fobj->shared[i]))
++			return false;
++	}
++
++	return true;
++}
++EXPORT_SYMBOL(dma_resv_test_signaled);
++
++long dma_resv_wait_timeout(struct dma_resv *obj, bool wait_all, bool intr,
++			   long timeout)
++{
++	struct dma_fence *fence = obj->fence_excl;
++	struct dma_resv_list *fobj = obj->fence_shared;
++	unsigned i;
++	long ret = timeout;
++
++	if (fence) {
++		ret = dma_fence_wait_timeout(fence, intr, timeout);
++		if (ret <= 0 || !wait_all)
++			return ret;
++		timeout = ret;
++	}
++
++	if (!fobj)
++		return ret;
++
++	for (i = 0; i < fobj->shared_count && timeout > 0; ++i) {
++		timeout = dma_fence_wait_timeout(fobj->shared[i], intr,
++						 timeout);
++	}
++	ret = timeout;
++
++	return ret;
++}
++EXPORT_SYMBOL(dma_resv_wait_timeout);
++
++int dma_resv_copy_fences(struct dma_resv *dst, struct dma_resv *src)
++{
++	struct dma_resv_list *new_list = NULL;
++	struct dma_fence *new_excl;
++	unsigned count;
++	int ret;
++
++	if (src->fence_shared) {
++		count = src->fence_shared->shared_count;
++		new_list = kmalloc(sizeof(*new_list) +
++				   count * sizeof(*new_list->shared),
++				   GFP_KERNEL);
++		if (!new_list)
++			return -ENOMEM;
++		new_list->shared_count = count;
++		new_list->shared_max = count;
++		memcpy(new_list->shared, src->fence_shared->shared,
++		       count * sizeof(*new_list->shared));
++		for (count = 0; count < new_list->shared_count; ++count)
++			dma_fence_get(new_list->shared[count]);
++	}
++
++	new_excl = dma_resv_get_excl(src);
++
++	ret = 0;
++	dma_resv_fini(dst);
++	dst->fence_shared = new_list;
++	dst->fence_excl = new_excl;
++
++	return ret;
++}
++EXPORT_SYMBOL(dma_resv_copy_fences);
+diff --git a/include/linux/dma-resv.h b/include/linux/dma-resv.h
+new file mode 100644
+index 0000000..4388d73
+--- /dev/null
++++ b/include/linux/dma-resv.h
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * dma-resv minimal shim for Nura 3.10.108 panfrost backport.
++ *
++ * What this provides: the reservation object panfrost GEM needs --
++ * one shared fence slot (latest writer) + an exclusive-fence pointer +
++ * a shared-fence list, with the mainline add-shared/add-excl/test-signaled
++ * contract. Panfrost ioctl mapping: CREATE_BO creates an empty resv;
++ * SUBMIT reserves (lock), attaches in-fences via add_shared/add_excl,
++ * installs the job fence as exclusive on completion; BO_WAIT calls
++ * dma_resv_test_signaled() / dma_resv_wait_timeout().
++ *
++ * What this deliberately OMITs vs mainline dma-resv.c (818 LOC): the
++ * ww_mutex deadlock-avoidance dance (this tree has no ww_mutex.h --
++ * reservation uses resv->lock, a plain mutex, plus an init-once
++ * seqcount-free fast path), RCU-protected fence replacement, the
++ * fence-context/excl-fence iterator helpers, dma_resv_get_fences()
++ * full-copy API (only is_empty/copy-fences-needed-by-prime are kept),
++ * and the reservation-object slab cache (plain kzalloc/kfree).
++ *
++ * Builds on patch 01 (include/linux/dma-fence.h). Verified primitive
++ * usage: mutex_lock_interruptible (mutex.h:145), idr helpers (idr.h).
++ */
++#ifndef _LINUX_DMA_RESV_BACKPORT_H
++#define _LINUX_DMA_RESV_BACKPORT_H
++
++#include <linux/dma-fence.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++
++struct dma_resv_list {
++	unsigned shared_count;
++	unsigned shared_max;
++	struct dma_fence *shared[0];
++};
++
++/**
++ * struct dma_resv - reservation object: one writer slot + shared readers.
++ * @lock: serializes writers; replaces mainline's ww_mutex (absent in 3.10).
++ * @fence_excl: latest exclusive (write) fence, or NULL if idle.
++ * @fence_shared: list of shared (read) fences, may be NULL.
++ *
++ * Fence ownership: resv holds one reference per stored pointer; replaced
++ * pointers are put after the swap, same as mainline.
++ */
++struct dma_resv {
++	struct mutex lock;
++	struct dma_fence *fence_excl;
++	struct dma_resv_list *fence_shared;
++};
++
++static inline void dma_resv_init(struct dma_resv *obj)
++{
++	mutex_init(&obj->lock);
++	obj->fence_excl = NULL;
++	obj->fence_shared = NULL;
++}
++
++static inline void dma_resv_fini(struct dma_resv *obj)
++{
++	struct dma_resv_list *fobj = obj->fence_shared;
++	unsigned i;
++
++	dma_fence_put(obj->fence_excl);
++	if (fobj) {
++		for (i = 0; i < fobj->shared_count; ++i)
++			dma_fence_put(fobj->shared[i]);
++		kfree(fobj);
++	}
++	obj->fence_excl = NULL;
++	obj->fence_shared = NULL;
++}
++
++int dma_resv_reserve_shared(struct dma_resv *obj, unsigned int num_fences);
++void dma_resv_add_shared_fence(struct dma_resv *obj, struct dma_fence *fence);
++void dma_resv_add_excl_fence(struct dma_resv *obj, struct dma_fence *fence);
++struct dma_fence *dma_resv_get_excl(struct dma_resv *obj);
++
++static inline bool dma_resv_is_empty(struct dma_resv *obj)
++{
++	return obj->fence_excl == NULL && obj->fence_shared == NULL;
++}
++
++bool dma_resv_test_signaled(struct dma_resv *obj, bool test_all);
++long dma_resv_wait_timeout(struct dma_resv *obj, bool wait_all, bool intr,
++			   long timeout);
++int dma_resv_copy_fences(struct dma_resv *dst, struct dma_resv *src);
++
++#endif /* _LINUX_DMA_RESV_BACKPORT_H */
+-- 
+2.56.0
+

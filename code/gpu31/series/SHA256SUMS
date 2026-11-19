@@ -1,0 +1,7 @@
+ecd8b8623cd2bf2e244df2ebaf52f6167f81850f9db22a3b5b80ac43068ec6d5  /tmp/j7repo/code/gpu31/series/0001-dma-fence-minimal-subset.patch
+cfe3107679ca25963a85cb38352c8fa9a9164ac260076e0e2d8c0fade60fa092  /tmp/j7repo/code/gpu31/series/0001-drm-exynos7580-decon-dsim-kms.patch
+b8225d0e10161e1f60f2bc76d9369bb1e427e78968662e1e709f79dffbccb0f0  /tmp/j7repo/code/gpu31/series/0002-dma-resv-shim.patch
+63257e45c82aab4d9174737b16934f52caab7ddd0e4f4b2bae0656d1b905bb93  /tmp/j7repo/code/gpu31/series/0003-drm_syncobj-subset.patch
+1da9064e7d040bf4aea4f5edde06dafae253a6a1fd6233945a0dc9a26ae0022b  /tmp/j7repo/code/gpu31/series/0004-drm_sched-panfrost-job-only-shim.patch
+68a6756f15d3668a0a9c56fc10fad67eddbf53a3781fc6adc3035beafd6ce557  /tmp/j7repo/code/gpu31/series/0005-build-wiring-for-shims.patch
+7efae6ff2160b463df8cbf0c17640db491cd83b5283eaeec830de48ec3db9bd0  /tmp/j7repo/code/gpu31/series/m1-kconfig.fragment
