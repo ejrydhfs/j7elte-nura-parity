@@ -1,0 +1,51 @@
+# code/gpu31/power — panfrost7580 PM / clock / reset helper
+
+Two files, no build impact until a driver calls them:
+
+- `panfrost7580_power.h` — context, OPP table, register offsets, ordering contract.
+- `panfrost7580_power.c` — probe / runtime suspend+resume / system
+  suspend+resume / `set_rate` / `set_voltage` / remove.
+
+## Wiring (integrator)
+
+```c
+struct my_drv { struct pf7580_power *pwr; /* ... */ };
+
+static int my_probe(struct platform_device *pdev)
+{
+	void __iomem *regs = /* ioremap IORESOURCE_MEM,0 (0x11400000/0x5000) */;
+	return pf7580_power_probe(&pdev->dev, regs, &drv->pwr);
+}
+static int my_remove(struct platform_device *pdev)
+{
+	pf7580_power_remove(drv->pwr);
+	/* ... iounmap regs ... */
+	return 0;
+}
+static const struct dev_pm_ops my_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(pf7580_pm_suspend_wrap, pf7580_pm_resume_wrap)
+	SET_RUNTIME_PM_OPS(pf7580_rt_suspend_wrap, pf7580_rt_resume_wrap, NULL)
+};
+/* wrappers adapt (struct device *) to drv->pwr; this helper takes both so
+ * drvdata ownership never collides with it. */
+```
+
+Kconfig/Makefile: add `panfrost7580_power.o` to the panfrost obj list when
+`CONFIG_DRM_PANFROST_7580=y`. Nothing is auto-built from this directory.
+
+## Read-only syntax check (NOT a kernel build)
+
+```sh
+KT=/run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7k/android_kernel_samsung_universal7580-2a746c1bc1a41eae05988c153f527c8a5dc72d07
+gcc -fsyntax-only -Wall \
+  -I$KT/arch/arm64/include -I$KT/arch/arm64/include/generated \
+  -I$KT/include -I$KT/include/uapi -I$KT/include/generated/uapi \
+  -I$KT/drivers/gpu/arm/t7xx/r15p0 \
+  -D__KERNEL__ -DKBUILD_MODNAME='"panfrost7580_power"' \
+  code/gpu31/power/panfrost7580_power.c
+```
+
+No `make` in the shared tree (only `G31_Integrator` builds). No flashing
+(only `G31_M1Verify`, after explicit go). No DT change (stock dt.img is
+never rebuilt — code relies on stock clock-names + global `vdd_g3d` lookup
++ vendor pd-g3d attach).
