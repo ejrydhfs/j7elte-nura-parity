@@ -1,21 +1,21 @@
-From ee6bdc83206403355698a588769ee10a53db1377 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t <t@t>
-Date: Wed, 18 Nov 2026 23:34:21 -0500
-Subject: [PATCH 3/5] drm_syncobj subset
+Date: Thu, 19 Nov 2026 12:00:00 -0500
+Subject: [PATCH 0003/5] drm_syncobj subset
 
 ---
- drivers/gpu/drm/drm_syncobj.c | 154 ++++++++++++++++++++++++++++++++++
- drivers/gpu/drm/drm_syncobj.h |  79 +++++++++++++++++
- 2 files changed, 233 insertions(+)
+ drivers/gpu/drm/drm_syncobj.c  |  165 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_syncobj.h  |  79 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 244 insertions(+)
  create mode 100644 drivers/gpu/drm/drm_syncobj.c
  create mode 100644 drivers/gpu/drm/drm_syncobj.h
 
 diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
 new file mode 100644
-index 0000000..ef4b6f3
+index 0000000..0000000
 --- /dev/null
 +++ b/drivers/gpu/drm/drm_syncobj.c
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,165 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * drm_syncobj minimal subset implementation (Nura 3.10.108).
@@ -38,12 +38,23 @@ index 0000000..ef4b6f3
 +	struct drm_syncobj *syncobj;
 +	int id;
 +
-+	mutex_lock(&mgr->lock);
-+	idr_for_each_entry(&mgr->idr, syncobj, id) {
-+		idr_remove(&mgr->idr, id);
++	/*
++	 * Drain via idr_get_next (review F1): idr_for_each_entry is not
++	 * safe against removal of the current entry, so look up the
++	 * lowest remaining id, remove it, and repeat until empty.
++	 * Safe under mgr->lock; each removed entry drops its owner ref.
++	 */
++	for (;;) {
++		mutex_lock(&mgr->lock);
++		id = 0;
++		syncobj = idr_get_next(&mgr->idr, &id);
++		if (syncobj)
++			idr_remove(&mgr->idr, id);
++		mutex_unlock(&mgr->lock);
++		if (!syncobj)
++			break;
 +		drm_syncobj_put(syncobj);
 +	}
-+	mutex_unlock(&mgr->lock);
 +	idr_destroy(&mgr->idr);
 +}
 +EXPORT_SYMBOL(drm_syncobj_manager_fini);
@@ -172,7 +183,7 @@ index 0000000..ef4b6f3
 +EXPORT_SYMBOL(drm_syncobj_wait);
 diff --git a/drivers/gpu/drm/drm_syncobj.h b/drivers/gpu/drm/drm_syncobj.h
 new file mode 100644
-index 0000000..6682f2b
+index 0000000..0000000
 --- /dev/null
 +++ b/drivers/gpu/drm/drm_syncobj.h
 @@ -0,0 +1,79 @@
@@ -257,4 +268,3 @@ index 0000000..6682f2b
 +#endif /* _DRM_SYNCOBJ_BACKPORT_H */
 -- 
 2.56.0
-

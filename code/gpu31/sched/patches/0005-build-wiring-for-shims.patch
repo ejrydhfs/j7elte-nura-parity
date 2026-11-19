@@ -1,0 +1,38 @@
+From 3da1ef3eca03e6e38df768fa0836f84bf7bca38d Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Wed, 18 Nov 2026 23:34:31 -0500
+Subject: [PATCH 5/5] build wiring for shims
+
+---
+ drivers/base/Makefile    | 1 +
+ drivers/gpu/drm/Makefile | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/drivers/base/Makefile b/drivers/base/Makefile
+index 5d93bb5..8f19405 100644
+--- a/drivers/base/Makefile
++++ b/drivers/base/Makefile
+@@ -11,6 +11,7 @@ obj-y			+= power/
+ obj-$(CONFIG_HAS_DMA)	+= dma-mapping.o
+ obj-$(CONFIG_HAVE_GENERIC_DMA_COHERENT) += dma-coherent.o
+ obj-$(CONFIG_DMA_SHARED_BUFFER) += dma-buf.o
++obj-$(CONFIG_DMA_SHARED_BUFFER) += dma-fence.o dma-resv.o
+ obj-$(CONFIG_ISA)	+= isa.o
+ obj-$(CONFIG_FW_LOADER)	+= firmware_class.o
+ obj-$(CONFIG_NUMA)	+= node.o
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 1c9f243..99c0a7e 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -14,6 +14,8 @@ drm-y       :=	drm_auth.o drm_buffer.o drm_bufs.o drm_cache.o \
+ 		drm_info.o drm_debugfs.o drm_encoder_slave.o \
+ 		drm_trace_points.o drm_global.o drm_prime.o
+ 
++drm-y += drm_syncobj.o drm_sched.o
++
+ drm-$(CONFIG_COMPAT) += drm_ioc32.o
+ drm-$(CONFIG_DRM_GEM_CMA_HELPER) += drm_gem_cma_helper.o
+ drm-$(CONFIG_PCI) += ati_pcigart.o
+-- 
+2.56.0
+

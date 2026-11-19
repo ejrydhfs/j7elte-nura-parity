@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * drm_sched panfrost-job-only scheduler shim for Nura 3.10.108.
+ *
+ * What this provides: the exact drm_sched surface panfrost_job.c needs --
+ * entity (one runqueue per JM slot context), job (fence-backed unit of
+ * work with .run_job/.timedout_job callbacks), FIFO dispatch on an
+ * ordered workqueue, dependency tracking via dma-fence callbacks, job
+ * timeout via delayed work, and entity flush on release. Panfrost mapping:
+ * one sched per device, one entity per open-file submit context, one job
+ * per SUBMIT ioctl batch; run_job programs the JM slot registers and
+ * installs the returned job fence; hw completion (JOB_INT) signals it.
+ *
+ * What this deliberately OMITs vs mainline drm_sched (2684 LOC: scheduler
+ * + fence + entity): priority runqueues (single FIFO), credit-based load
+ * balancing (one queue = T720 JM slot set), GPU reset/recovery workers,
+ * guilty-job tracking, dynamic job-flow control, and free-job workqueue
+ * batching (synchronous put). This is a correctness shim, not a
+ * performance scheduler: jobs retire in submit order.
+ *
+ * Depends on patches 01+02 (dma-fence). Verified 3.10 primitives:
+ * alloc_ordered_workqueue (workqueue.h:434), INIT_DELAYED_WORK (260),
+ * queue_delayed_work / cancel_delayed_work_sync, complete_all
+ * (completion.h:95), mutex_lock_interruptible (mutex.h:145),
+ * msecs_to_jiffies (jiffies.h). No kthread usage (mainline uses a
+ * dedicated thread; this shim uses an ordered wq -- same FIFO order,
+ * no RT-priority inversion risk on this single-GPU part).
+ *
+ * Review fixes (gpu31-review §4): sched->entities is the membership
+ * list with its own link (F1); the pump skips jobs whose dep fence
+ * is still pending and re-queues itself behind the dep callback (F2);
+ * the dep waiter is a separate cb so -EBUSY completion races and
+ * dual-role overlap are gone -- one in-fence per job, rejected with
+ * -EOPNOTSUPP otherwise (F3, matches the one-in-fence Mesa contract);
+ * the run_job ERR_PTR path frees the job instead of dropping it (F4);
+ * the timeout comes from entity->timeout, seeded from sched->timeout
+ * at entity_init (F5); push_job is implemented (minor).
+ */
+#ifndef _DRM_SCHED_BACKPORT_H
+#define _DRM_SCHED_BACKPORT_H
+
+#include <linux/dma-fence.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
+#include <linux/list.h>
+#include <linux/completion.h>
+#include <linux/errno.h>
+
+struct drm_sched_entity;
+struct drm_sched_job;
+
+enum drm_sched_priority {
+	DRM_SCHED_PRIORITY_MIN,
+	DRM_SCHED_PRIORITY_NORMAL = DRM_SCHED_PRIORITY_MIN,
+	DRM_SCHED_PRIORITY_HIGH_HW,
+	DRM_SCHED_PRIORITY_HIGH_SW,
+	DRM_SCHED_PRIORITY_KERNEL,
+	DRM_SCHED_PRIORITY_COUNT
+};
+
+/**
+ * struct drm_sched_backend_ops - device callbacks, mirrors mainline subset.
+ * @run_job: execute @sched_job; must return the in-flight job fence, or
+ *           ERR_PTR on immediate failure. Called in FIFO submit order.
+ * @timedout_job: called from timeout work when the job fence has not
+ *           signaled in @timeout msecs; backend should reset the JM slot.
+ * @free_job: release backend resources for a retired job (may be NULL).
+ */
+struct drm_sched_backend_ops {
+	struct dma_fence *(*run_job)(struct drm_sched_job *sched_job);
+	void (*timedout_job)(struct drm_sched_job *sched_job);
+	void (*free_job)(struct drm_sched_job *sched_job);
+};
+
+struct drm_sched_job {
+	struct list_head node;
+	struct drm_sched_entity *entity;
+	const struct drm_sched_backend_ops *ops;
+	struct dma_fence *fence;	/* completion fence for this job */
+	struct dma_fence *dep_fence;	/* in-fence: must signal before dispatch */
+	struct dma_fence_cb dep_cb;	/* waits on dep_fence (dependency role) */
+	struct dma_fence_cb finish_cb;	/* waits on fence (completion role) */
+	struct delayed_work timeout_work;
+	struct work_struct finish_work;	/* retirement sweep */
+	int credits;
+	void *owner;			/* backend private (panfrost_job) */
+};
+
+/*
+ * struct drm_sched_entity - one submit context's FIFO against a scheduler.
+ * @sched_link: membership of sched->entities (never a job queue).
+ * @queue_list: pending jobs in submit order (never in sched->entities).
+ * @timeout: per-job dispatch budget (jiffies), copied from sched->timeout
+ *           at entity_init; 0 disables the timeout arm.
+ * @sched: back-pointer so the pump can honour sched->ready without
+ *         reaching through globals.
+ */
+struct drm_sched_entity {
+	struct list_head sched_link;	/* sched->entities membership */
+	struct list_head queue_list;	/* pending jobs, FIFO */
+	spinlock_t queue_lock;
+	struct drm_sched_job *in_flight;
+	struct drm_sched *sched;	/* owning scheduler */
+	long timeout;			/* per-job budget, jiffies */
+	struct workqueue_struct *wq;	/* shared ordered wq (borrowed) */
+	struct work_struct sched_work;	/* dispatch pump */
+	struct mutex lock;
+	struct completion entity_idle;
+	atomic_t job_count;
+	bool stopped;
+};
+
+struct drm_sched {
+	struct workqueue_struct *wq;	/* ordered dispatch queue */
+	struct list_head entities;
+	struct mutex lock;
+	const struct drm_sched_backend_ops *ops;
+	long timeout;			/* job timeout, jiffies */
+	const char *name;
+	bool ready;
+};
+
+int drm_sched_init(struct drm_sched *sched,
+		   const struct drm_sched_backend_ops *ops,
+		   long timeout, const char *name);
+void drm_sched_fini(struct drm_sched *sched);
+
+int drm_sched_entity_init(struct drm_sched_entity *entity,
+			  struct drm_sched *sched);
+void drm_sched_entity_fini(struct drm_sched *sched,
+			   struct drm_sched_entity *entity);
+int drm_sched_entity_push_job(struct drm_sched_job *sched_job);
+
+struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,
+					  const struct drm_sched_backend_ops *ops,
+					  void *owner);
+void drm_sched_job_cleanup(struct drm_sched_job *job);
+void drm_sched_job_arm(struct drm_sched_job *job);
+int drm_sched_job_add_dependency(struct drm_sched_job *job,
+				 struct dma_fence *fence);
+int drm_sched_job_submit(struct drm_sched_job *job);
+
+#endif /* _DRM_SCHED_BACKPORT_H */
