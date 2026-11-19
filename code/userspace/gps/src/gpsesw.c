@@ -124,6 +124,8 @@ static struct {
 	int prologue;                    /* -B 1: vendor autobaud+sync order */
 	int golden;                      /* --golden: vendor post-patch hand-off */
 	int glme_stream;                 /* --glme-stream: decode GLME after the switch */
+	int glme_replay;                 /* --glme-replay: 4x txn1 replay + decode */
+	const char *glme_check;          /* --glme-check DIR: offline image check */
 	int glme_ms_set;                 /* -L given on the command line */
 	unsigned char soff;
 } o = {
@@ -476,6 +478,29 @@ static const unsigned char glme_cfg1[225] = {
 	0x00, 0x00, 0x0b, 0x0b, 0x00, 0x02, 0x01, 0x38, 0x20, 0x00, 0x00, 0x00,
 	0x40, 0x00, 0x00, 0x00, 0xe0, 0x02, 0xac, 0xe0, 0x01 };
 
+/* Second frame of the first post-banner host transaction (id 0x01),
+ * captured complete from the stock daemon against the PTY emulator
+ * (gpsemu3, 2026-11-19): 46 raw bytes, sent immediately after the
+ * 225-byte frame above as one 271-byte transaction. Raw offset 2 is
+ * the retry sequence (01/03/05/07, always odd = even-seq + 1 of the
+ * preceding 225-byte frame); raw offset 43 is an opaque per-retry
+ * tail byte (f4/2e/85/5f, no sum/xor/crc8 relation to the body).
+ * Canonical bytes below are retry 00/01; --glme-replay patches both
+ * sequence bytes and both tails from the retry table. */
+static const unsigned char glme_cfg1b[46] = {
+	0xe0, 0x00, 0x01, 0x01, 0x01, 0x03, 0x03, 0x08, 0x01, 0x00, 0x05, 0x02,
+	0x00, 0x0a, 0x00, 0x06, 0x04, 0x03, 0x00, 0x02, 0x00, 0x01, 0x00, 0x03,
+	0x00, 0x0c, 0x01, 0x02, 0x01, 0x02, 0x00, 0x0a, 0x07, 0x01, 0x06, 0x00,
+	0x09, 0x07, 0x01, 0x00, 0x00, 0x00, 0x00, 0xf4, 0xe0, 0x01 };
+
+/* Per-retry opaque tail bytes for the 225-byte frame (raw offset 222)
+ * and the 46-byte companion (raw offset 43), by retry index 0..3
+ * (even seq 00/02/04/06, odd seq 01/03/05/07). No checksum relation
+ * to the body was found (sum/xor/crc8 over several slicings tried);
+ * replay the exact captured byte. */
+static const unsigned char glme_retry_tail[4] = { 0xac, 0x63, 0xf7, 0x38 };
+static const unsigned char glme_retry_tail_b[4] = { 0xf4, 0x2e, 0x85, 0x5f };
+
 /* Unescape one GLME payload in place.  Returns the decoded length. */
 static size_t glme_unescape(unsigned char *p, size_t n)
 {
@@ -637,6 +662,97 @@ static void nmea_void(void)
  * one more frame arrived, 7 (same cold-boot code as the banner wait)
  * when the chip stays silent.
  */
+static int glme_send_txn1(int fd, unsigned retry)
+{
+	unsigned char a[sizeof(glme_cfg1)], b[sizeof(glme_cfg1b)];
+	unsigned seq = (retry & 3) * 2;
+
+	memcpy(a, glme_cfg1, sizeof(a));
+	memcpy(b, glme_cfg1b, sizeof(b));
+	a[2] = (unsigned char)seq;
+	a[sizeof(a) - 3] = glme_retry_tail[retry & 3];
+	b[2] = (unsigned char)(seq + 1);
+	b[sizeof(b) - 3] = glme_retry_tail_b[retry & 3];
+	logmsg("glme-replay: sending txn1 retry %u (seq %02x/%02x, %zu+%zu bytes)",
+	       retry & 3, seq, seq + 1, sizeof(a), sizeof(b));
+	hexdump("        glme-tx", a, sizeof(a));
+	if (xwrite(fd, a, sizeof(a)) < 0)
+		return -1;
+	hexdump("        glme-tx", b, sizeof(b));
+	if (xwrite(fd, b, sizeof(b)) < 0)
+		return -1;
+	g_glme_seq = seq + 2;
+	return 0;
+}
+
+/* Offline check: verify the compiled-in retry-0 transaction against
+ * code/userspace/gps/glme/txn1_seq00_*.bin. Returns 0 on match. */
+static int glme_replay_selftest(const char *dir)
+{
+	static const char *names[2] = { "txn1_seq00_225.bin",
+					"txn1_seq00_46.bin" };
+	static const unsigned char *exp[2] = { glme_cfg1, glme_cfg1b };
+	static const size_t explen[2] = { sizeof(glme_cfg1),
+					  sizeof(glme_cfg1b) };
+	int i, rc = 0;
+
+	for (i = 0; i < 2; i++) {
+		char path[1024];
+		FILE *f;
+		long sz;
+		unsigned char *buf;
+
+		snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+		f = fopen(path, "rb");
+		if (!f) {
+			logmsg("glme-replay --check: missing %s: %s", path,
+			       strerror(errno));
+			return 1;
+		}
+		if (fseek(f, 0, SEEK_END) < 0 || (sz = ftell(f)) < 0 ||
+		    fseek(f, 0, SEEK_SET) < 0) {
+			logmsg("%s: seek failed", path);
+			fclose(f);
+			return 1;
+		}
+		if ((size_t)sz != explen[i]) {
+			logmsg("glme-replay --check: %s: size %ld, want %zu",
+			       path, sz, explen[i]);
+			fclose(f);
+			rc = 1;
+			continue;
+		}
+		buf = malloc((size_t)sz ? (size_t)sz : 1);
+		if (!buf) {
+			fclose(f);
+			return 1;
+		}
+		if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+			logmsg("%s: read failed", path);
+			free(buf);
+			fclose(f);
+			return 1;
+		}
+		fclose(f);
+		if (memcmp(buf, exp[i], explen[i]) != 0) {
+			size_t k;
+
+			for (k = 0; k < explen[i]; k++)
+				if (buf[k] != exp[i][k])
+					break;
+			logmsg("glme-replay --check: %s: byte %zu differs "
+			       "(file 0x%02x, image 0x%02x)", path, k,
+			       buf[k], exp[i][k]);
+			rc = 1;
+		} else {
+			logmsg("glme-replay --check: %s: %ld bytes match",
+			       path, sz);
+		}
+		free(buf);
+	}
+	return rc;
+}
+
 static int glme_stream_run(int fd)
 {
 	struct pollfd p = { fd, POLLIN, 0 };
@@ -645,17 +761,26 @@ static int glme_stream_run(int fd)
 	long elapsed;
 	int r;
 	unsigned char cfg[sizeof(glme_cfg1)];
-	size_t i, off = 0;
+	unsigned char cfg2[sizeof(glme_cfg1b)];
+	size_t off = 0;
 
-	logmsg("glme-stream: sending id-0x01 config (%zu bytes)",
-	       sizeof(glme_cfg1));
+	logmsg("glme-stream: sending id-0x01 config (%zu+%zu bytes)",
+	       sizeof(glme_cfg1), sizeof(glme_cfg1b));
 	memcpy(cfg, glme_cfg1, sizeof(cfg));
-	/* sequence byte: stock retries with 00/02/04/06; start at 00. */
-	for (i = 0; i + 47 < sizeof(cfg); i++)
-		;
-	cfg[47] = (unsigned char)(g_glme_seq & 0xff);
+	memcpy(cfg2, glme_cfg1b, sizeof(cfg2));
+	/* sequence bytes: stock retries with 00/02/04/06 on the 225-byte
+	 * frame and 01/03/05/07 on the 46-byte companion (raw offset 2
+	 * of each frame); tails at raw offsets 222/43 are opaque
+	 * per-retry bytes, patched from the retry table. */
+	cfg[2] = (unsigned char)(g_glme_seq & 0xff);
+	cfg[sizeof(cfg) - 3] = glme_retry_tail[(g_glme_seq / 2) & 3];
+	cfg2[2] = (unsigned char)((g_glme_seq + 1) & 0xff);
+	cfg2[sizeof(cfg2) - 3] = glme_retry_tail_b[(g_glme_seq / 2) & 3];
 	hexdump("        glme-tx", cfg, sizeof(cfg));
 	if (xwrite(fd, cfg, sizeof(cfg)) < 0)
+		return 5;
+	hexdump("        glme-tx", cfg2, sizeof(cfg2));
+	if (xwrite(fd, cfg2, sizeof(cfg2)) < 0)
 		return 5;
 	g_glme_seq += 2;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -691,6 +816,64 @@ static int glme_stream_run(int fd)
 		logmsg("glme-stream: chip silent after config; needs the "
 		       "chip reply (measurement stream) which no capture has "
 		       "produced yet");
+		nmea_void();
+		return 7;
+	}
+	nmea_void();
+	return 0;
+}
+
+/* --glme-replay: after the banner, send the recovered id-0x01
+ * transaction 4x (225+46 bytes per retry, exact captured bytes
+ * including per-retry tails) and decode the stream for -L ms.
+ * Same exit codes as --glme-stream (0 = >=1 frame, 7 = silent). */
+static int glme_replay_run(int fd)
+{
+	struct pollfd pl = { fd, POLLIN, 0 };
+	unsigned char buf[4096];
+	struct timespec rt0, rnow;
+	long relapsed;
+	int rr;
+	unsigned n;
+	size_t roff = 0;
+
+	for (n = 0; n < 4; n++) {
+		if (glme_send_txn1(fd, n) < 0)
+			return 5;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &rt0);
+	for (;;) {
+		clock_gettime(CLOCK_MONOTONIC, &rnow);
+		relapsed = (rnow.tv_sec - rt0.tv_sec) * 1000L +
+			  (rnow.tv_nsec - rt0.tv_nsec) / 1000000L;
+		if (relapsed >= o.glme_ms)
+			break;
+		rr = poll(&pl, 1, (int)(o.glme_ms - relapsed));
+		if (rr < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (rr == 0)
+			break;
+		{
+			ssize_t nread = read(fd, buf, sizeof(buf));
+
+			if (nread <= 0) {
+				if (nread < 0 && (errno == EAGAIN || errno == EINTR))
+					continue;
+				break;
+			}
+			hexdump("        glme-rx", buf, (size_t)nread);
+			roff += glme_feed(buf, (size_t)nread);
+			(void)roff;
+		}
+	}
+	logmsg("glme-replay: %u frames in %d ms", g_glme_frames, o.glme_ms);
+	if (!g_glme_frames) {
+		logmsg("glme-replay: peer silent after 4x txn1; the chip "
+		       "reply (measurement stream) is still the missing "
+		       "piece - a cold-boot silicon run is needed");
 		nmea_void();
 		return 7;
 	}
@@ -1096,6 +1279,8 @@ int main(int argc, char **argv)
 		{ "prologue",   required_argument, NULL, 'B' },
 		{ "golden",     no_argument,       NULL, 1001 },
 		{ "glme-stream", no_argument,      NULL, 1002 },
+		{ "glme-replay", no_argument,      NULL, 1003 },
+		{ "glme-check", required_argument, NULL, 1004 },
 		{ "handoff-delay", required_argument, NULL, 1000 },
 		{ "help",       no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -1151,6 +1336,14 @@ int main(int argc, char **argv)
 			if (!o.glme_ms_set)
 				o.glme_ms = 15000;
 			break;
+		case 1003:
+			o.glme_replay = 1;
+			o.golden = 1;
+			o.handoff = 1;
+			if (!o.glme_ms_set)
+				o.glme_ms = 15000;
+			break;
+		case 1004: o.glme_check = optarg; break;
 		case 1000: o.handoff_ms = atoi(optarg); break;
 		case 'h':
 		default:
@@ -1163,7 +1356,12 @@ int main(int argc, char **argv)
 				"       [-H 0..6] [--handoff-delay MS] [-B 1] [--golden]\n"
 				"       [--glme-stream]  (implies --golden; sends the\n"
 				"        recovered id-0x01 config after the banner and\n"
-				"        decodes the GLME stream, default -L 15000)\n", argv[0]);
+				"        decodes the GLME stream, default -L 15000)\n"
+		       "[--glme-replay]  (implies --golden; sends txn1\n"
+		       "        4x with exact per-retry bytes and decodes\n"
+		       "        the stream, default -L 15000)\n"
+		       "[--glme-check DIR]  (offline: verify the\n"
+		       "        compiled-in txn1 against glme/*.bin)\n", argv[0]);
 			return c == 'h' ? 0 : 2;
 		}
 	}
@@ -1196,6 +1394,9 @@ int main(int argc, char **argv)
 	 * 4752_B2: it lies inside block 0 and zeroing it breaks the patch. */
 	if (o.handoff == 1 || o.handoff == 2 || o.handoff == 5 || o.handoff == 6)
 		nblocks = 3;
+
+	if (o.glme_check)
+		return glme_replay_selftest(o.glme_check);
 
 	if (!o.query_only) {
 		for (i = 0; i < nblocks; i++) {
@@ -1319,7 +1520,9 @@ int main(int argc, char **argv)
 			rx_dump(fd, o.glme_ms, "        glme-rx");
 			if (g_banner) {
 				logmsg("GLME banner received: hand-off works");
-				if (o.glme_stream)
+				if (o.glme_replay)
+					rc = glme_replay_run(fd);
+				else if (o.glme_stream)
 					rc = glme_stream_run(fd);
 			} else {
 				logmsg("no GLME banner in %d ms: chip is mute for BRI; "
