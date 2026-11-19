@@ -132,3 +132,17 @@ CREATE/MMAP/close, `WAIT_BO` deadline, bad-CREATE/bad-SUBMIT injection):
   escalation), `mali_kbase_config_defaults.h` (300/350/400 ms + 3000 ms),
   `platform/exynos/gpu_integration_callbacks.c` (`KBASE_FENCE_TIMEOUT`
   1000 ms), `mali_base_kernel.h` (event codes incl. `0x4003 JOB_INVALID`).
+
+## 6. Review disposition (gpu31-review.md @ 625ed18)
+
+No finding touches this slice's files. The flagged items live in other
+slices: sched/resv/fence shims (§1–§4 → G31_Sched), the display driver/DT/
+fragment (§6–§8 → G31_DrmCore/G31_Integrator), the PRIME patch (§10 →
+G31_DmaBuf), the r7p0 compat header (§11 → G31_KbaseShim), and the Mesa
+kbase backend (§12 → G31_Mesa). Two stress-tool warts of my own, found on
+re-read, are fixed here: fault case (b) no longer issues a stray empty
+atom submit before draining the event, and case (c) submits a single-atom
+array (the second array entry was dead). No behaviour change — the (b)
+submit path is unchanged and the hardware result (CONFIG_FAULT 0x40 /
+JOB_INVALID 0x4003, 3/3 contained) stands. `gcc -fsyntax-only` clean
+after the edit.

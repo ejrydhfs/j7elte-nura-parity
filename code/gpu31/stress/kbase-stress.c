@@ -560,10 +560,7 @@ static int t_fault(struct kbase_dev *dev, struct kbase_bo *bo)
 	printf("fault-inject: bad-dep-type submit -> %d (expect nonzero or CANCELLED event)\n", ret);
 	if (ret == 0) {
 		/* Accepted at submit; the atom must then fail fast with a
-		 * fault/CANCELLED event, not hang. */
-		long rc = one_atom_wait(&fd, 0, 0, 0, 0, 0, 0, 0, 0, NULL);
-		(void)rc;
-		/* Drain the event for atom 31. */
+		 * fault/CANCELLED event, not hang. Drain the event for 31. */
 		uint64_t dl = now_ns() + 5000000000ull;
 		bool got = false;
 		while (now_ns() < dl) {
@@ -593,24 +590,17 @@ static int t_fault(struct kbase_dev *dev, struct kbase_bo *bo)
 	}
 
 	/* (c) dependency on an unused slot (never submitted) -> dependent
-	 * must fail fast, not hang. */
+	 * must fail fast, not hang. Submit atom 32 alone with a DATA dep on
+	 * slot 33, which is UNUSED with event_code 0 (not DONE): the kernel
+	 * fails 32 immediately (jd.c will_fail path). */
 	{
-		struct base_jd_atom_v2 atoms[2];
+		struct base_jd_atom_v2 atoms[1];
 		memset(atoms, 0, sizeof(atoms));
 		atoms[0].jc = bo->gpu_va;
 		atoms[0].core_req = BASE_JD_REQ_SOFT_DUMP_CPU_GPU_TIME;
 		atoms[0].atom_number = 32;
 		atoms[0].pre_dep[0].atom_id = 33; /* UNUSED, no event */
 		atoms[0].pre_dep[0].dependency_type = BASE_JD_DEP_TYPE_DATA;
-		atoms[1].jc = bo->gpu_va;
-		atoms[1].core_req = BASE_JD_REQ_SOFT_DUMP_CPU_GPU_TIME;
-		atoms[1].atom_number = 33;
-		/* Submit only atom 32 first would block on slot 33... instead
-		 * submit both with 33 depending on nothing: 33 runs, but 32's
-		 * dependency resolves against the COMPLETED-unused entry.
-		 * Simpler deterministic case: submit 32 alone with dep on 33
-		 * which is UNUSED with event_code 0 (not DONE) -> kernel
-		 * fails 32 immediately (jd.c:1095-1130 will_fail path). */
 		ret = SUBMIT_RAW(&atoms[0], 1, sizeof(atoms[0]));
 		if (ret != 0) {
 			printf("fault-inject: dep-on-unused submit -> %d (sync reject, good)\n", ret);
