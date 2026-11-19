@@ -108,3 +108,21 @@ Prior reports saying "device link down / unreachable" are **stale as of
 up), kernel `#35` (2026-11-18 23:36 EST) is running, `/dev/mali0` +
 `/dev/fb0` present, `/dev/dri` absent (expected pre-M1). The only outage
 seen this slice was a ~2 min DHCP flap, self-recovered.
+
+## 6. Review response (`gpu31-review.md` §§1–18, 2026-11-19)
+
+Full review read. **No finding applies to this slice; no fix required,
+none made:**
+
+- §§1–5 (dma-fence/resv/syncobj/sched shims) — G31_Sched scope; this
+  slice ships no kernel code.
+- §§6–9 (display driver/DT/config/M1) — G31_DrmCore/G31_Kms scope.
+- §10 (PRIME import-by-copy) — G31_DmaBuf scope.
+- §11 (r7p0 compat stride) — G31_KbaseShim scope.
+- §§12–15 (Mesa kbase backend incl. F1 `n_slots` short-by-one) —
+  G31_Mesa scope. This slice's demo is a *client* of EGL/GLES2, not a
+  submit path: `grep n_slots|trig_slot|stride|dma_fence|drm_sched`
+  over `code/gpu31/wsi/` = no matches.
+- §§16–17 (gpu-soft package, panfrost compatible) — PASS as-is; §16's
+  M3-cutover note (remove `LIBGL_ALWAYS_SOFTWARE=1` when HW GL lands)
+  is recorded in §4 above.
