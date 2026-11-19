@@ -1,0 +1,45 @@
+diff -u '--exclude=.git' -Naur a2/drivers/gpu/drm/Kconfig b2/drivers/gpu/drm/Kconfig
+--- a2/drivers/gpu/drm/Kconfig	2026-11-19 10:48:44.347304990 -0500
++++ b2/drivers/gpu/drm/Kconfig	2026-11-19 10:48:44.349560124 -0500
+@@ -220,3 +220,5 @@
+ source "drivers/gpu/drm/tilcdc/Kconfig"
+ 
+ source "drivers/gpu/drm/qxl/Kconfig"
++
++source "drivers/gpu/drm/panfrost/Kconfig"
+diff -u '--exclude=.git' -Naur a2/drivers/gpu/drm/Makefile b2/drivers/gpu/drm/Makefile
+--- a2/drivers/gpu/drm/Makefile	2026-11-19 10:48:44.346196454 -0500
++++ b2/drivers/gpu/drm/Makefile	2026-11-19 10:48:44.349560124 -0500
+@@ -53,3 +53,5 @@
+ obj-$(CONFIG_DRM_TILCDC)	+= tilcdc/
+ obj-$(CONFIG_DRM_QXL) += qxl/
+ obj-y			+= i2c/
++
++obj-$(CONFIG_DRM_PANFROST7580) += panfrost/
+diff -u '--exclude=.git' -Naur a2/drivers/gpu/drm/panfrost/Kconfig b2/drivers/gpu/drm/panfrost/Kconfig
+--- a2/drivers/gpu/drm/panfrost/Kconfig	1969-12-31 19:00:00.000000000 -0500
++++ b2/drivers/gpu/drm/panfrost/Kconfig	2026-11-19 10:48:44.350731657 -0500
+@@ -0,0 +1,12 @@
++# Mali-T720 render-only DRM driver for Exynos 7580 (j7elte).
++config DRM_PANFROST7580
++	tristate "Panfrost-7580 render-only DRM (Mali-T720, no modeset)"
++	depends on DRM && ARM64 && MMU
++	select DRM_GEM_CMA_HELPER if DRM
++	default n
++	help
++	  Render-minor-only DRM driver for the Exynos 7580 Mali-T720.
++	  Binds mali@0x11400000 (arm,mali) and exposes renderD128 with
++	  six v5.2 ioctls (SUBMIT/WAIT_BO/CREATE_BO/MMAP_BO/GET_PARAM/
++	  GET_BO_OFFSET). No modeset, no display takeover; vendor
++	  DECON fbdev keeps the panel.
+diff -u '--exclude=.git' -Naur a2/drivers/gpu/drm/panfrost/Makefile b2/drivers/gpu/drm/panfrost/Makefile
+--- a2/drivers/gpu/drm/panfrost/Makefile	1969-12-31 19:00:00.000000000 -0500
++++ b2/drivers/gpu/drm/panfrost/Makefile	2026-11-19 10:48:44.351696526 -0500
+@@ -0,0 +1,7 @@
++# Mali-T720 panfrost7580 driver objects.
++ccflags-y := -Iinclude/drm -Idrivers/gpu/drm/panfrost
++panfrost7580-y := panfrost7580_main.o panfrost7580_submit.o \
++		  panfrost7580_gem.o panfrost7580_ioctl.o \
++		  panfrost7580_job.o panfrost7580_mmu.o \
++		  panfrost7580_power.o pf7580_devfreq.o
++obj-$(CONFIG_DRM_PANFROST7580) += panfrost7580.o
