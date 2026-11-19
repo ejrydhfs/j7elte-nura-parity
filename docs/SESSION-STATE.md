@@ -122,6 +122,16 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## GPU M1 boot result (2026-11-19)
+- M1 image (DRM core built, sha256 cf25ed70…) flashed and booted as **#37**:
+  USB-net, fbdev X 720x1280, /dev/mali0 all fine; **no /dev/dri** — dmesg has zero
+  `drm` lines and /sys/class/drm holds only `version`, i.e. DRM core is present but
+  no driver bound (vendor 3.10 has no exynos-DRM match for this SoC).
+- Consequence: the render node must come from panfrost probing the stock
+  `mali@0x11400000` node, not from exynos KMS. Driver assembly is in progress
+  (code/gpu31/driver). Fallback image `/tmp/bindboot.img` verified.
+- Reboot from the shell works; the launcher tile now uses the sysrq helper.
+
 ## Modem / CP power (2026-11-19) — impossible without stock TrustZone
 Full evidence: `docs/reports/modem-tz.md`.
 - Userspace (`j7elte-cbd` + `j7elte-ril`) is deployed and replays the stock SIPC/ioctl
