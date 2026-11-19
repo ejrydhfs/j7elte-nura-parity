@@ -120,3 +120,24 @@ flash/reboot per slice rules; GPS/FM share the phone):
 - Slice rules honored: shared tree untouched (scratch copies only for
   `--dry-run`/`-c`); no build/flash; no reboot; short `flock` holds only;
   big files under `/tmp`+`/data`, none added here.
+
+## 8. Review disposition (gpu31-review.md @ 625ed18, 2026-11-19)
+
+The all-patch review (G31_Review, commit `625ed18`) does **not** name this
+slice's files: `code/gpu31/kms/0001-drm-3.10-render-node-mode-b.patch` and
+this report appear in **zero** `grep` hits across `gpu31-review.md`, and
+none of its NEEDS_FIXES / CONDITIONAL items (§§1-4 sched/fence/resv/
+syncobj; §6 display driver; §7 DT; §8 config fragment; §10 iommu-dma
+PRIME; §11 r7p0 stride; §12 Mesa `n_slots`) touch the Mode B hunks
+(`drmP.h` render holder, `drm_platform.c` render alloc, `drm_stub.c`
+release, `drm_fops.c` render-auth, `drm_drv.c` render-MASTER deny). The
+review's §18 (DESIGN.md PASS) is consistent with this patch: it notes
+the 3.10 platform path never allocates `DRM_MINOR_RENDER` — this patch
+is exactly that missing allocation plus its permission gating.
+
+Cross-slice check: `code/gpu31/drmcore/drm_compat_310.h` references the
+Mode B core changes by design (comments only: RENDER_ALLOW mapping,
+always-authenticated + MASTER-on-render deny live here, NOT in the
+header; no code dependency, no hunk overlap — sole-writer handshake with
+G31_DrmCore already recorded in §7). No patch change required by the
+review; no shared-tree file touched for this check (read-only greps).

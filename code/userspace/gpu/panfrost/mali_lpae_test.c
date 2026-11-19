@@ -16,6 +16,7 @@
 
 #include "mali_hw.h"
 #include "mali_lpae.h"
+#include "mali_mmu.h"
 
 static int failures;
 static int checks;
@@ -404,6 +405,163 @@ static void test_attr_indices(void)
 	CHECK_EQ(attrs & MALI_PTE_MEMATTR_MASK,
 		 MALI_PTE_ATTR_IDX(MALI_MAIR_IDX_DEV));
 }
+/* ------------------------------------------------------------------ */
+/* 8. AS count / selection: popcount(AS_PRESENT), slot gating          */
+/* ------------------------------------------------------------------ */
+static void test_as_select(void)
+{
+	/* T720 MP2: 8 address spaces (gpu-verify.md: AS_PRESENT 0xFF). */
+	CHECK_EQ(mali_as_count(0xFFu), 8);
+	CHECK_EQ(mali_as_count(0x07u), 3);
+	CHECK_EQ(mali_as_count(0x00u), 0);
+	CHECK_EQ(mali_as_count(0xFFFFu), 16);
+
+	/* Panfrost binds AS 0; any present slot passes the same gate. */
+	CHECK(mali_as_select_ok(0xFFu, 0));
+	CHECK(mali_as_select_ok(0xFFu, 7));
+	CHECK(!mali_as_select_ok(0xFFu, 8));
+	CHECK(!mali_as_select_ok(0xFFu, 16));
+	CHECK(!mali_as_select_ok(0x00u, 0));
+
+	/* Register math: AS15 TRANSCFG_HI stays inside the 0x5000 window. */
+	CHECK(MALI_MMU_AS_REG(15, MALI_AS_TRANSCFG_HI) < 0x5000);
+	CHECK_EQ(MALI_MMU_AS_REG(1, MALI_AS_COMMAND) -
+		 MALI_MMU_AS_REG(0, MALI_AS_COMMAND),
+		 MALI_MMU_AS_STRIDE);
+}
+
+/* ------------------------------------------------------------------ */
+/* 9. 33-bit VA window (measured mmu_features 0x2821: VA 33, PA 40)    */
+/* ------------------------------------------------------------------ */
+static void test_va_window(void)
+{
+	struct mali_pgtable pt;
+	uint64_t pa = 0;
+
+	/* 8 GiB window: last byte maps, first byte above does not. */
+	CHECK_EQ(mali_va_limit(33), 0x200000000ULL);
+	CHECK_EQ(mali_va_limit(32), 0x100000000ULL);
+	CHECK(mali_va_in_range(0x1FFFFFFFFULL, 33));
+	CHECK(!mali_va_in_range(0x200000000ULL, 33));
+	CHECK(!mali_va_in_range(0x100000000ULL, 32));
+
+	/* L0 decodes VA bits 39+: any VA below 2^40 lives in L0[0]; the
+	 * 33-bit space spans L1 entries 0..7 under it. */
+	CHECK_EQ(mali_l0_entries(32), 1);
+	CHECK_EQ(mali_l0_entries(33), 1);
+	CHECK_EQ(mali_l0_entries(40), 2);
+	CHECK_EQ(mali_l0_entries(48), 512);
+	CHECK_EQ(mali_pte_index(0x1FFFFFFFFULL, 0), 0);
+	CHECK_EQ(mali_pte_index(0x100000000ULL, 0), 0);
+	CHECK_EQ(mali_pte_index(0xFFFFFFFFULL, 0), 0);
+	CHECK_EQ(mali_pte_index(0x1FFFFFFFFULL, 1), 7);
+	CHECK_EQ(mali_pte_index(0x100000000ULL, 1), 4);
+
+	/* The page-table builder enforces the window end to end. */
+	fixture_init(&pt, 33);
+	CHECK_EQ(mali_pgtable_map(&pt, 0x1FFFFF000ULL, 0x90000000ULL,
+				  MALI_ATTR_GPU_RW), MALI_OK);
+	CHECK_EQ(mali_pgtable_walk(&pt, 0x1FFFFF000ULL, &pa, NULL), MALI_OK);
+	CHECK_EQ(pa, 0x90000000ULL);
+	CHECK_EQ(mali_pgtable_map(&pt, 0x200000000ULL, 0x90000000ULL,
+				  MALI_ATTR_GPU_RW), MALI_EINVAL);
+	CHECK_EQ(mali_pgtable_walk(&pt, 0x200000000ULL, &pa, NULL),
+		 MALI_EINVAL);
+}
+
+/* ------------------------------------------------------------------ */
+/* 10. LOCK region encoding (kbase lock_region / pf lock_region)       */
+/* ------------------------------------------------------------------ */
+static void test_lock_region(void)
+{
+	/* One page: width 11, base aligned down. */
+	CHECK_EQ(mali_lock_region(0x12345000ULL, 0x1000ULL), 0x1234500BULL);
+	/* Zero size means one page (kbase gracefully handles 0). */
+	CHECK_EQ(mali_lock_region(0x12345000ULL, 0ULL), 0x1234500BULL);
+	/* 8 pages (pow2): width 10 + fls(8)=4, exact pow2, no +1. */
+	CHECK_EQ(mali_lock_region(0xABCDE000ULL, 0x8000ULL), 0xABCDE00EULL);
+	/* 3 pages round up to 4: width 10 + fls(4) + 1 = 13. */
+	CHECK_EQ(mali_lock_region(0x1000ULL, 0x3000ULL), 0x100DULL);
+	/* 4 pages exact: width 10 + fls(4)=3, no round-up. */
+	CHECK_EQ(mali_lock_region(0x1000ULL, 0x4000ULL), 0x100DULL);
+	/* Unaligned IOVA aligns down to the page. */
+	CHECK_EQ(mali_lock_region(0x1234ULL, 0x1000ULL), 0x100BULL);
+	/* Full-TLB shape: LOCK(0, ~0UL) saturates at the 63 ceiling. */
+	CHECK_EQ(mali_lock_region(0ULL, ~0ULL) & 0x3FULL,
+		 MALI_LOCK_REGION_MAX_SIZE);
+}
+
+/* ------------------------------------------------------------------ */
+/* 11. AS config values: TRANSTAB / MEMATTR / TRANSCFG / disable       */
+/* ------------------------------------------------------------------ */
+static void test_as_values(void)
+{
+	/* Enable TRANSTAB: pgd base | TABLE(3) | READ_INNER(4), no
+	 * SHARE_OUTER on this COHERENCY_NONE SoC. */
+	CHECK_EQ(mali_as_transtab(0x40000000ULL), 0x40000007ULL);
+	CHECK_EQ(mali_as_transtab(0x40000000ULL) &
+		 MALI_AS_TRANSTAB_SHARE_OUTER, 0);
+	/* PGD base is page-aligned: low 12 bits never leak in. */
+	CHECK_EQ(mali_as_transtab(0x40000FFFULL), 0x40000007ULL);
+	/* Disable: TRANSTAB 0 (ADRMODE_UNMAPPED), then UPDATE. */
+	CHECK_EQ(mali_as_transtab_disabled(),
+		 MALI_AS_TRANSTAB_ADRMODE_UNMAPPED);
+	/* MEMATTR: kbase LPAE table, the value programmed on this unit. */
+	CHECK_EQ(mali_as_memattr_kbase(), MALI_MEMATTR_KBASE_LPAE);
+	CHECK_EQ(mali_as_memattr_kbase() & 0xFFULL, 0x48ULL);
+	/* TRANSCFG legacy: 0 on LPAE (no PTW_MEMATTR/PTW_SH bits set). */
+	CHECK_EQ(MALI_AS_TRANSCFG_ADRMODE_LEGACY, 0);
+	CHECK_EQ(MALI_AS_TRANSCFG_ADRMODE_MASK, 0xFu);
+	/* AS_ACTIVE poll ceiling is kbase's 100k-loop contract. */
+	CHECK_EQ(MALI_AS_INACTIVE_MAX_LOOPS, 100000);
+}
+
+/* ------------------------------------------------------------------ */
+/* 12. Fault decode: class / access / decoder / source / IRQ pairing   */
+/* ------------------------------------------------------------------ */
+static void test_fault_decode(void)
+{
+	/* Exception classes (low byte of AS_FAULTSTATUS). */
+	CHECK_EQ(mali_fault_exc_name(0xC0u)[0], 'T');	/* translation */
+	CHECK_EQ(mali_fault_exc_name(0xC4u)[0], 'T');	/* level 4 too */
+	CHECK_EQ(mali_fault_exc_name(0xC8u)[0], 'P');	/* permission */
+	CHECK_EQ(mali_fault_exc_name(0xD2u)[0], 'T');	/* transtab bus */
+	CHECK_EQ(mali_fault_exc_name(0xD8u)[0], 'A');	/* access flag */
+	CHECK_EQ(mali_fault_exc_name(0x00u)[0], 'U');	/* unknown */
+
+	/* Access types (bits 9:8). */
+	CHECK_EQ(mali_fault_access_name(0x200u)[0], 'R');	/* read */
+	CHECK_EQ(mali_fault_access_name(0x300u)[0], 'W');	/* write */
+	CHECK_EQ(mali_fault_access_name(0x100u)[0], 'E');	/* execute */
+	CHECK_EQ(mali_fault_access_name(0x000u)[0], 'U');	/* atomic->UNK */
+
+	/* Decoder (bit 10) vs slave fault. */
+	CHECK(mali_fault_is_decoder(1u << 10));
+	CHECK(!mali_fault_is_decoder(0u));
+
+	/* Source ID (bits 31:16). */
+	CHECK_EQ(mali_fault_source_id(0xABCD0000u), 0xABCDu);
+	CHECK_EQ(mali_fault_source_id(0x0000FFFFu), 0u);
+
+	/* 64-bit fault VA from the HI/LO pair. */
+	CHECK_EQ(mali_fault_addr(0x1u, 0xFFFFF000u), 0x1FFFFF000ULL);
+	CHECK_EQ(mali_fault_addr(0u, 0u), 0u);
+
+	/* IRQ pairing: low 16 = page fault, high 16 = bus error per AS;
+	 * a slot reporting both decodes as bus error. */
+	CHECK(mali_irq_is_page_fault(0x00000001u, 0));
+	CHECK(!mali_irq_is_page_fault(0x00010001u, 0));
+	CHECK(mali_irq_is_bus_error(0x00010001u, 0));
+	CHECK(!mali_irq_is_bus_error(0x00000001u, 0));
+	CHECK(mali_irq_is_page_fault(0x00000004u, 2));
+	CHECK(mali_irq_is_bus_error(0x00040000u, 2));
+	CHECK(!mali_irq_is_page_fault(0x00000000u, 0));
+
+	/* Old masks are the low-3-bit subset of the full exception byte. */
+	CHECK_EQ(MALI_AS_FAULTSTATUS_EXC_MASK, 0xFFu);
+	CHECK_EQ(MALI_AS_FAULTSTATUS_EXC_CODE_MASK, (0x7u << 3));
+}
+
 
 int main(void)
 {
@@ -418,6 +576,11 @@ int main(void)
 	test_map_walk();
 	test_unmap();
 	test_attr_indices();
+	test_as_select();
+	test_va_window();
+	test_lock_region();
+	test_as_values();
+	test_fault_decode();
 
 	printf("-------------------------------------------\n");
 	printf("%d checks, %d failure(s)\n", checks, failures);

@@ -1,0 +1,54 @@
+# code/gpu31/mmu — MMU model (userspace) + kernel AS-lifecycle helper (patch)
+
+Host model lives in `code/userspace/gpu/panfrost/` (M0 tree, owned by this
+slice for `mali_hw.h` / `mali_mmu.h` / `mali_lpae_test.c` / `Makefile`):
+
+- `mali_hw.h` — register map plus the MMU block completed here: FAULTEXTRA
+  LO/HI, MMU IRQ pairing (`PAGE_FAULT(n)` / `BUS_ERROR(n)`), TRANSCFG
+  identity/mask + AARCH64 PTW fields (named-but-zero on LPAE), LOCK width
+  limits, full fault-status field decode (exception byte / access / DEC /
+  source ID), LPAE exception classes, AS_ACTIVE poll ceiling.
+- `mali_mmu.h` — NEW: freestanding AS lifecycle + invalidate + fault model
+  (`mali_as_count/select_ok`, 33-bit VA window + L0 coverage, saturating
+  `mali_lock_region`, enable/disable TRANSTAB/MEMATTR values, fault
+  class/access/decoder/source/IRQ-pairing/VA decode). Every sequence cites
+  kbase r15p0 (LPAE, COHERENCY_NONE) and panfrost v5.2 file:line.
+- `mali_lpae_test.c` — 114 M0 checks + 71 new (sections 8–12: AS select,
+  33-bit window incl. builder end-to-end, LOCK vectors, AS values, fault
+  decode). `make check`: 185 checks, 0 failures, native + qemu-aarch64.
+- `Makefile` — test deps gain `mali_mmu.h`.
+
+Kernel helper in this directory:
+
+- `pf7580_as.h` — NEW data-free static-inline header for the 3.10 port:
+  `pf7580_as_enable/disable` (TRANSTAB/MEMATTR/TRANSCFG + wmb + UPDATE,
+  wait !ACTIVE both sides), `pf7580_as_invalidate` (LOCK + FLUSH_PT/MEM +
+  wait), `pf7580_as_wait_ready/write_cmd`, saturating `pf7580_lock_region`,
+  IRQ pairing + fault class/access names. No 9630 double-UNLOCK (absent on
+  T720 r1p0 errata list). Compiles as a `-c` object against the shared
+  3.10.108 tree headers (`CROSS_COMPILE=aarch64-linux-gnu-`, kbuild
+  `modules` stage-2 link OK); module-macro friction seen was gcc-16-vs-3.10
+  `cold`-attribute noise in the throwaway harness, not this header.
+- `0001-pf7580-as-helper.patch` — adds the header under
+  `drivers/gpu/drm/panfrost/` (new file only; integrator applies).
+
+Boundary: `G31_Iommu` owns `code/gpu31/iommu/panfrost7580_mmu.*`
+(`p7580_mmu_*` / `P7580_*`); this slice uses `mali_*` (host) and
+`pf7580_as_*` / `PF7580_*` (kernel). `G31_PanfrostTarget` confirmed no
+collision in `code/userspace/gpu/panfrost/`.
+
+## Wiring (integrator)
+
+```sh
+patch -p1 < code/gpu31/mmu/0001-pf7580-as-helper.patch
+# then #include "pf7580_as.h" from the panfrost port's MMU file and call
+# pf7580_as_enable(regs, 0, pgd_dma) after mapping the 0x11400000 window.
+```
+
+## Checks run
+
+```sh
+cd code/userspace/gpu/panfrost && make check   # 185/185 native + qemu
+# kernel header: kbuild M=/tmp/mmuck modules with CROSS_COMPILE=
+# aarch64-linux-gnu-, stage-2 link OK (scratch harness, removed)
+```

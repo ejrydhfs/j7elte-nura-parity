@@ -19,10 +19,10 @@ AARCH64 := mali_lpae_test.aarch64
 
 all: $(NATIVE) $(AARCH64)
 
-$(NATIVE): mali_lpae_test.c mali_lpae.h mali_hw.h
+$(NATIVE): mali_lpae_test.c mali_lpae.h mali_hw.h mali_mmu.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ mali_lpae_test.c
 
-$(AARCH64): mali_lpae_test.c mali_lpae.h mali_hw.h
+$(AARCH64): mali_lpae_test.c mali_lpae.h mali_hw.h mali_mmu.h
 	$(ARCH_CC) $(CPPFLAGS) $(CFLAGS) -static -o $@ mali_lpae_test.c
 
 check: all

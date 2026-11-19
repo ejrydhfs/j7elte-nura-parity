@@ -132,6 +132,17 @@
 #define MALI_AS_STATUS			0x28
 #define MALI_AS_TRANSCFG_LO		0x30
 #define MALI_AS_TRANSCFG_HI		0x34
+#define MALI_AS_FAULTEXTRA_LO		0x38
+#define MALI_AS_FAULTEXTRA_HI		0x3C
+/* MMU IRQ identification: low 16 bits are per-AS page faults, high 16 bits
+ * are per-AS bus errors.
+ * [kb] mali_midg_regmap.h:307-316 ; [pf] panfrost_mmu_irq_handler pairs
+ * BIT(i)|BIT(i+16) per AS (panfrost_mmu.c:308-340).
+ */
+#define MALI_MMU_PAGE_FAULT_FLAGS	16
+#define MALI_MMU_PAGE_FAULT(n)		(1u << (n))
+#define MALI_MMU_BUS_ERROR(n)		(1u << ((n) + MALI_MMU_PAGE_FAULT_FLAGS))
+
 
 #define MALI_AS_TRANSTAB_ADDR_MASK	0xFFFFF000u
 #define MALI_AS_TRANSTAB_ADRMODE_UNMAPPED (0u << 0)
@@ -142,6 +153,16 @@
 
 #define MALI_AS_TRANSCFG_ADRMODE_LEGACY		(0u << 0)
 #define MALI_AS_TRANSCFG_ADRMODE_UNMAPPED	(1u << 0)
+#define MALI_AS_TRANSCFG_ADRMODE_IDENTITY	(2u << 0)
+#define MALI_AS_TRANSCFG_ADRMODE_MASK		0xFu
+/* PTW memory/sharing fields, AARCH64-mode setup path. On the T720 LPAE
+ * build transcfg stays 0 ([kb] mali_kbase_mmu_mode_lpae.c:99-103); kept
+ * here so the model names the bits a port must not set.
+ * [kb] mali_midg_regmap.h:372-378. */
+#define MALI_AS_TRANSCFG_PTW_MEMATTR_MASK	(3u << 24)
+#define MALI_AS_TRANSCFG_PTW_MEMATTR_WB		(2u << 24)
+#define MALI_AS_TRANSCFG_PTW_SH_MASK		(3u << 28)
+#define MALI_AS_TRANSCFG_PTW_SH_OS		(2u << 28)
 
 #define MALI_AS_COMMAND_NOP		0x00
 #define MALI_AS_COMMAND_UPDATE		0x01
@@ -152,12 +173,47 @@
 
 #define MALI_AS_STATUS_AS_ACTIVE	0x01
 
-#define MALI_AS_FAULTSTATUS_EXC_MASK		(0x7u << 3)
+/* AS region lock: vpfn base with a pow2 size encoded as (10 + fls(pages)).
+ * Lock covers the IOVA range rounded up to the next pow2 page count; the
+ * MMU holds no entry outside the locked window while an UPDATE or FLUSH
+ * is in flight.
+ * [kb] mali_kbase_mmu_hw_direct.c:28-58 ; [pf] panfrost_mmu.c:57-83.
+ */
+#define MALI_LOCK_REGION_MIN_SIZE	11
+#define MALI_LOCK_REGION_MAX_SIZE	63
+
+/* Fault status: bits 7:0 mirror the GPU exception code, bit 10 selects
+ * decoder (1) vs slave (0) fault, bits 9:8 the access type, bits 31:16
+ * the source ID ([kb] mali_kbase_mmu.c:1715-1756 prints all four).
+ * [kb] mali_midg_regmap.h:341-354 ; [pf] panfrost_mmu.c:296-340.
+ */
+#define MALI_AS_FAULTSTATUS_EXC_MASK		(0xFFu << 0)
+#define MALI_AS_FAULTSTATUS_EXC_LO_MASK		(0x7u << 0)
+#define MALI_AS_FAULTSTATUS_EXC_CODE_MASK	(0x7u << 3)
+#define MALI_AS_FAULTSTATUS_DEC		(1u << 10)
 #define MALI_AS_FAULTSTATUS_ACCESS_MASK		(0x3u << 8)
 #define MALI_AS_FAULTSTATUS_ACCESS_ATOMIC	(0x0u << 8)
 #define MALI_AS_FAULTSTATUS_ACCESS_EXEC		(0x1u << 8)
 #define MALI_AS_FAULTSTATUS_ACCESS_READ		(0x2u << 8)
 #define MALI_AS_FAULTSTATUS_ACCESS_WRITE	(0x3u << 8)
+#define MALI_AS_FAULTSTATUS_SRC_MASK		(0xFFFFu << 16)
+
+/* Per-class exception codes in the low byte of AS_FAULTSTATUS.
+ * [kb] kbase_exception_name, mali_kbase_mmu.c:1529-1620 (LPAE build: only
+ * 0xC0-0xC7 / 0xC8 / 0xD0-0xD7 / 0xD8 carry a name; the AARCH64-only
+ * 0xC9+/0xD9+/0xE0+ ranges do not exist on this 3.10 LPAE build).
+ * [pf] panfrost_exception_name, panfrost_device.c:218-228.
+ */
+#define MALI_EXC_TRANSLATION_FAULT_BASE	0xC0u
+#define MALI_EXC_PERMISSION_FAULT	0xC8u
+#define MALI_EXC_TRANSTAB_BUS_FAULT_BASE	0xD0u
+#define MALI_EXC_ACCESS_FLAG		0xD8u
+
+/* Inactive-poll ceiling: kbase spins KBASE_AS_INACTIVE_MAX_LOOPS times on
+ * AS_STATUS_AS_ACTIVE ([kb] mali_kbase_defs.h:1682); panfrost polls 10 us
+ * x 100 ([pf] panfrost_mmu.c:29-43). Both mean "tens of ms, then stuck". */
+#define MALI_AS_INACTIVE_MAX_LOOPS	100000
+#define MALI_AS_POLL_STEP_US		10
 
 /* ------------------------------------------------------------------ */
 /* MMU_FEATURES decoding                                               */
