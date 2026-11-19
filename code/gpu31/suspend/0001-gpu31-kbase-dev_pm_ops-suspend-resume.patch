@@ -1,0 +1,195 @@
+From 217a95348b3e62cd3cf463437806a9d8dd3401fc Mon Sep 17 00:00:00 2001
+From: G31_Suspend <g31-suspend@j7elte>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] gpu31-suspend: wire kbase device suspend/resume through
+ dev_pm_ops, keep runtime PM intact
+
+The vendor r15p0 tree compiles its real suspend/resume bodies
+(kbase_device_suspend/kbase_device_resume -> kbase_pm_suspend/resume ->
+kbasep_js_suspend/js_resume, MMU reprogram, GPU reset on state loss) but
+never calls them from the driver model:
+
+  static const struct dev_pm_ops kbase_pm_ops = {
+      .suspend = kbase_device_suspend_dummy,   /* always returns 0 */
+      .resume  = kbase_device_resume_dummy,    /* always returns 0 */
+  };
+
+All system sleep instead funnels through the exynos PM notifier
+(gpu_pm_notifier: PM_SUSPEND_PREPARE -> kbase_device_suspend,
+PM_POST_SUSPEND -> kbase_device_resume).  That path has two defects:
+
+1. The dev_pm_ops dummy stubs mean the generic-power-domain and driver
+   suspend legs (drivers/base/power/main.c __device_suspend, genpd
+   pm_genpd_suspend -> GENPD_DEV_CALLBACK(suspend)) are no-ops for
+   11400000.mali: pd-g3d domain bookkeeping can tear the rail down while
+   kbase still believes it is powered (pm.backend.gpu_powered stays
+   true), and dpm ordering guarantees against pd-disp (DECON fbdev) are
+   lost.
+2. gpu_pm_notifier ignores its return value by construction
+   (blocking_notifier_call_chain folds all results; pm core logs but
+   never aborts on NOTIFY_OK).  A GPU suspend failure therefore cannot
+   veto the sleep transition the way a dev_pm_ops error return can.
+
+This patch keeps every runtime-PM and platform callback byte-identical
+and only replaces the two dummy legs with real ones:
+
+  static int kbase_device_suspend_pm(struct device *dev)
+  {
+      struct kbase_device *kbdev = to_kbase_device(dev);
+      if (!kbdev)
+          return -ENODEV;
+      return kbase_device_suspend(kbdev);
+  }
+
+dev_pm_ops becomes:
+
+  static const struct dev_pm_ops kbase_pm_ops = {
+      .suspend        = kbase_device_suspend_pm,   /* was dummy */
+      .resume         = kbase_device_resume_pm,    /* was dummy */
+      .freeze         = kbase_device_suspend_pm,   /* hibernation */
+      .thaw           = kbase_device_resume_pm,
+      .poweroff       = kbase_device_suspend_pm,
+      .restore        = kbase_device_resume_pm,
+      .runtime_suspend/resume/idle unchanged,
+  };
+
+Why this is safe on this tree:
+
+- kbase_device_suspend devfreq legs are NULL-safe
+  (drivers/devfreq/devfreq.c devfreq_suspend_device returns -EINVAL on
+  NULL devfreq; CONFIG_MALI_DEVFREQ is unset here so kbdev->devfreq is
+  NULL, legitimately skipped).
+- kbase_pm_suspend already handles the running-GPU case: it sets
+  pm.suspending, suspends the job scheduler (releasing PM refs),
+  waits for pm.active_count == 0, then forces the poweroff through
+  kbase_hwaccess_pm_suspend (kbase_pm_do_poweroff(is_suspend=true) ->
+  kbase_pm_clock_off -> gpu_power_suspend -> pm_runtime_suspend +
+  gpu_control_disable_clock).  Concurrent user syscalls race-free:
+  JD paths use kbase_pm_context_active_handle_suspend with explicit
+  suspend handlers.
+- Resume is lossless: kbase_hwaccess_pm_resume marks suspending=false,
+  kbase_pm_do_poweron(is_resume=true) -> kbase_pm_clock_on ->
+  power_resume/power_on callback chain, GPU reset when state was lost
+  (power_on return 1), MMU reprogram per bound address space, IRQ
+  re-enable, JS resume.  Context loss therefore degrades to a reset +
+  re-fault, never to stale mappings.
+- Runtime PM leg untouched: gpu_power_on/off, pm_callback_runtime_on/off
+  (clock gate + DVFS env + autosuspend 50 ms via pm_schedule_suspend),
+  runtime_idle veto (returns 1, kbase-owned sequencing) all unchanged.
+  No second PM notifier is added (gpu31-power.md F8): genpd owns the
+  domain, dev_pm_ops owns the device.
+- Notifier kept as-is (MALI_SEC hotplug/TMU ordering relies on
+  PM_SUSPEND_PREPARE/PM_POST_SUSPEND broadcast timing).  After this
+  patch it becomes a redundant second call, harmless because both
+  suspend and resume bodies are idempotent across the suspending flag
+  and the active_count drain (second suspend sees active_count already
+  0; second resume sees suspending already false).
+- fbdev path untouched: DECON keeps its own runtime-only dev_pm_ops
+  (decon_runtime_suspend/resume clock gating, no .suspend/.resume) and
+  its .fb_blank handler; pd_disp ordering unchanged.  Ordering vs
+  pd-g3d is parent/child-agnostic on the DPM list (separate domains),
+  same as the notifier path today.
+
+NOT in scope (honest gaps, integrator/M1Verify own):
+
+- No Kconfig change (CONFIG_PM_SLEEP/CONFIG_PM_RUNTIME already y,
+  MALI_RT_PM default y).  No DT change (stock dt.img untouched).
+- Context-loss userspace ABI: no new ioctl/event; Mesa re-faults on
+  next submit.  A lost-context generation counter is a follow-up slice.
+- Boot-time evidence only (no reboot/flash from this slice): live #35
+  shows runtime_status=suspended, control=auto, gpu_clock=0, gpu_busy
+  0%, i.e. runtime power-off already gates aclk_g3d.  System-sleep
+  cycle proof (mem sleep + job + resume) belongs to M1Verify after the
+  integrator wires and builds this patch.
+---
+ drivers/gpu/arm/t7xx/r15p0/mali_kbase_core_linux.c | 30 +++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/arm/t7xx/r15p0/mali_kbase_core_linux.c b/drivers/gpu/arm/t7xx/r15p0/mali_kbase_core_linux.c
+--- a/drivers/gpu/arm/t7xx/r15p0/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/t7xx/r15p0/mali_kbase_core_linux.c
+@@ -4059,12 +4059,6 @@ static int kbase_platform_device_probe(struct platform_device *pdev)
+  * @return A standard Linux error code
+  */
+ 
+-/* MALI_SEC_INTEGRATION */
+-static int kbase_device_suspend_dummy(struct device *dev)
+-{
+-	return 0;
+-}
+-
+ /* MALI_SEC_INTEGRATION */
+ int kbase_device_suspend(struct kbase_device *kbdev)
+ {
+@@ -4080,6 +4074,21 @@ int kbase_device_suspend(struct kbase_device *kbdev)
+ 	return 0;
+ }
+ 
++/* G31_SUSPEND: dev_pm_ops leg. Replaces the old always-zero dummy so the
++ * driver-model suspend path drains the scheduler (kbase_pm_suspend) and
++ * powers off the GPU. Runtime PM, platform callbacks and the exynos PM
++ * notifier are untouched; the notifier becomes a harmless redundant call
++ * because kbase_pm_suspend/resume are idempotent across suspending.
++ */
++static int kbase_device_suspend_pm(struct device *dev)
++{
++	struct kbase_device *kbdev = to_kbase_device(dev);
++
++	if (!kbdev)
++		return -ENODEV;
++	return kbase_device_suspend(kbdev);
++}
++
+ /** Resume callback from the OS.
+  *
+  * This is called by Linux when the device should resume from suspension.
+@@ -4089,12 +4098,6 @@ int kbase_device_suspend(struct kbase_device *kbdev)
+  * @return A standard Linux error code
+  */
+ 
+-/* MALI_SEC_INTEGRATION */
+-static int kbase_device_resume_dummy(struct device *dev)
+-{
+-	return 0;
+-}
+-
+ /* MALI_SEC_INTEGRATION */
+ int kbase_device_resume(struct kbase_device *kbdev)
+ {
+@@ -4110,6 +4113,16 @@ int kbase_device_resume(struct kbase_device *kbdev)
+ 	return 0;
+ }
+ 
++/* G31_SUSPEND: dev_pm_ops resume leg (see suspend leg above). */
++static int kbase_device_resume_pm(struct device *dev)
++{
++	struct kbase_device *kbdev = to_kbase_device(dev);
++
++	if (!kbdev)
++		return -ENODEV;
++	return kbase_device_resume(kbdev);
++}
++
+ /** Runtime suspend callback from the OS.
+  *
+  * This is called by Linux when the device should prepare for a condition in which it will
+@@ -4209,9 +4222,13 @@ static int kbase_device_runtime_idle(struct device *dev)
+ /** The power management operations for the platform driver.
+  */
+ static const struct dev_pm_ops kbase_pm_ops = {
+-	/* MALI_SEC_INTEGRATION */
+-	.suspend = kbase_device_suspend_dummy,
+-	.resume = kbase_device_resume_dummy,
++	/* G31_SUSPEND: was MALI_SEC_INTEGRATION dummies (always 0). */
++	.suspend = kbase_device_suspend_pm,
++	.resume = kbase_device_resume_pm,
++	.freeze = kbase_device_suspend_pm,
++	.thaw = kbase_device_resume_pm,
++	.poweroff = kbase_device_suspend_pm,
++	.restore = kbase_device_resume_pm,
+ #ifdef KBASE_PM_RUNTIME
+ 	.runtime_suspend = kbase_device_runtime_suspend,
+ 	.runtime_resume = kbase_device_runtime_resume,
+
+-- 
+2.43.0
