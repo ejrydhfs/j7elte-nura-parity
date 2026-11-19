@@ -1,0 +1,241 @@
+From 8d27fc94f2e6499d0e9b35e5bfd66b5167c8cf6 Mon Sep 17 00:00:00 2001
+From: G31_Kms <kms@gpu31>
+Date: Thu, 19 Nov 2026 06:40:00 +0000
+Subject: [PATCH] gpu31-kms: Mode B render-only minor on 3.10 DRM core
+
+Mode B gives a DRM render node (renderD128) for unprivileged GPU clients
+(Mali/kbase shim now, panfrost later) while the DECON fbdev keeps the
+panel.  No KMS takeover: no compatible change, no DT/dts edit, no vendor
+fbdev off-switch, no fbdev-conflicting CRTC/encoder/connector claim.
+The render node is allocated from the existing 3.10 idr carve-out
+(drm_stub.c drm_minor_get_id: base 128, limit base+255, i.e. minors
+128..383); only the allocation call was missing, and the /dev/dri
+renderD%d sysfs naming (drm_sysfs.c) is already wired.  Permission gating
+uses EXISTING 3.10 bits only: DRM_AUTH|DRM_UNLOCKED on buffer ioctls; no
+new DRM_RENDER_ALLOW bit, no dispatcher ABI change for card0/controlD64
+paths.
+
+Hunks (context verified byte-exact against shared-tree content via
+cat -A; tree itself untouched):
+
+1. include/drm/drmP.h: add `struct drm_minor *render` holder + comment.
+   3.10's struct drm_device has only `primary`/`control`, so the minor
+   pointer must live somewhere.  This patch stores it on the device next
+   to the other two, allocated/released by the same platform helpers.
+
+2. drivers/gpu/drm/drm_platform.c (drm_get_platform_dev):
+   allocate DRM_MINOR_RENDER after primary, BEFORE ->load() so a failed
+   display bring-up unwinds the node too (new err_g4 releases render,
+   err_g3 primary, err_g2 control).
+
+   Integrator note: drm_get_pci_dev (drm_pci.c) and drm_get_usb_dev
+   (drm_usb.c) have the same shape (control, primary, load).  Only the
+   platform path is patched here because M1/M2 run on the exynos platform
+   device (exynos_drm_platform_probe -> drm_platform_init); pci/usb never
+   bind on this phone.  Mirror the same alloc + unwind there only if a
+   future x86/qemu bring-up needs it.
+
+3. drivers/gpu/drm/drm_stub.c (drm_put_dev / drm_unplug_dev):
+   release/unplug ->render alongside primary/control (NULL-guarded; dev
+   is kzalloc'd so the field starts NULL and drm_get_minor NULLs it on
+   failure, so the guards only fire when a render minor exists).
+
+4. drivers/gpu/drm/drm_fops.c (drm_open_helper):
+   render opens are always authenticated, mirroring upstream render-node
+   semantics of that era (render client is authenticated, just never
+   master). Card0 behaviour is unchanged: non-root clients still
+   authenticate via the AUTH_MAGIC dance.
+
+5. drivers/gpu/drm/drm_drv.c (drm_ioctl dispatcher): explicit deny of any
+   DRM_MASTER-flagged ioctl arriving on a render node, even from the
+   render-minor master.  This clause is REQUIRED: mastership is per-minor
+   (drm_open_helper creates minor->master on first open of EACH node), so
+   the first render opener becomes master of the render minor and would
+   pass the plain `DRM_MASTER && !is_master` test.  With this clause,
+   SETCRTC/SETPLANE/CURSOR/ATTACH/DETACH/SETPROPERTY/PAGE_FLIP/DIRTYFB/
+   OBJ_SETPROPERTY (all DRM_MASTER) return -EACCES on renderD128: render
+   cannot modeset, without any new flag.  The existing
+   `!CONTROL_ALLOW && type == CONTROL -> -EACCES` control-node gate is
+   untouched, and buffer/GEM/PRIME/read-only-KMS ioctls keep working from
+   the render node under their existing DRM_AUTH/DRM_ROOT_ONLY bits.
+
+fbdev non-conflict statement:
+- No DT change: this patch matches no `samsung,exynos7580-decon-drm`,
+  `samsung,exynos7580-dsim`, `samsung,exynos5-decon_driver`,
+  `samsung,exynos5-dsim`, or `samsung,exynos5-mipi-dsi` compatible, binds
+  no DECON/DSIM registers, takes no clocks/regulators/power domains, and
+  installs no IRQ.  The vendor `decon_driver` (late_initcall) keeps its
+  nodes; /dev/fb0 + fbdev X are unaffected.
+- Not Mode A (M1-safe path already built): M1's card0+controlD64 via
+  exynos+G2D stands alone.  This patch only ADDS renderD128 next to it.
+- Not Mode C (full KMS later): Mode C still requires the separate
+  exynos7580 DECON/DSIM + panel patches (code/gpu31/series/0001-...-kms)
+  PLUS the DT compatible flip PLUS the vendor-fbdev Kconfig off-switches,
+  applied together.  None of that is in this patch.
+
+Verification (host-side only; no build/flash in shared tree per slice rules):
+- `patch -p1 --dry-run` clean on scratch copies of the 5 files (run
+  2026-11-19); integrator re-runs `git apply --check` at build time.
+- Per-file `gcc -fsyntax-only` AND real `-c` object compile with the
+  recorded kbuild flags vs actual 3.10.108 headers (run 2026-11-19;
+  results in docs/reports/gpu31-kms.md).
+- On-device (post-M1-flash, M1Verify-owned): `ls /dev/dri` shows
+  card0 controlD64 renderD128; unprivileged PRIME HANDLE_TO_FD + GEM map
+  works while a modeset client holds card0 master; SETCRTC from the render
+  fd returns -EACCES.  (Device UP on kernel #35, /dev/dri absent
+  pre-M1-flash, verified live 2026-11-19 via locked SSH.)
+
+---
+ drivers/gpu/drm/drm_drv.c      |  5 +++++
+ drivers/gpu/drm/drm_fops.c     |  9 +++++++++
+ drivers/gpu/drm/drm_platform.c | 17 +++++++++++++++--
+ drivers/gpu/drm/drm_stub.c     |  5 +++++
+ include/drm/drmP.h             |  3 +++
+ 5 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index 1111111..2222222 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -1205,8 +1205,11 @@ struct drm_device {
+ 	struct drm_driver *driver;
+ 	struct drm_local_map *agp_buffer_map;
+ 	unsigned int agp_buffer_token;
+ 	struct drm_minor *control;		/**< Control node for card */
+ 	struct drm_minor *primary;		/**< render type primary screen head */
++	struct drm_minor *render;		/**< Render node (Mode B): GEM/PRIME/
++						 * unprivileged GPU clients; no modeset,
++						 * never owns the display pipe. */
+ 
+         struct drm_mode_config mode_config;	/**< Current mode config */
+ 
+diff --git a/drivers/gpu/drm/drm_platform.c b/drivers/gpu/drm/drm_platform.c
+index 1111111..2222222 100644
+--- a/drivers/gpu/drm/drm_platform.c
++++ b/drivers/gpu/drm/drm_platform.c
+@@ -72,33 +72,46 @@ int drm_get_platform_dev(struct platform_device *platdev,
+ 	ret = drm_get_minor(dev, &dev->primary, DRM_MINOR_LEGACY);
+ 	if (ret)
+ 		goto err_g2;
++
++	/*
++	 * Mode B render node: allocate from the existing 3.10 render idr
++	 * carve-out (drm_minor_get_id: base 128, limit base+255, i.e.
++	 * minors 128..383 -> /dev/dri/renderD128). BEFORE ->load() so a
++	 * failed display bring-up unwinds the node too; err paths below
++	 * release exactly the minors already allocated.
++	 */
++	ret = drm_get_minor(dev, &dev->render, DRM_MINOR_RENDER);
++	if (ret)
++		goto err_g3;
+ 
+ 	if (dev->driver->load) {
+ 		ret = dev->driver->load(dev, 0);
+ 		if (ret)
+-			goto err_g3;
++			goto err_g4;
+ 	}
+ 
+ 	/* setup the grouping for the legacy output */
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
+ 		ret = drm_mode_group_init_legacy_group(dev,
+ 				&dev->primary->mode_group);
+ 		if (ret)
+-			goto err_g3;
++			goto err_g4;
+ 	}
+ 
+ 	list_add_tail(&dev->driver_item, &driver->device_list);
+ 
+ 	mutex_unlock(&drm_global_mutex);
+ 
+ 	DRM_INFO("Initialized %s %d.%d.%d %s on minor %d\n",
+ 		 driver->name, driver->major, driver->minor, driver->patchlevel,
+ 		 driver->date, dev->primary->index);
+ 
+ 	return 0;
++err_g4:
++	drm_put_minor(&dev->render);
+ 
+ err_g3:
+ 	drm_put_minor(&dev->primary);
+ err_g2:
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET))
+ 		drm_put_minor(&dev->control);
+diff --git a/drivers/gpu/drm/drm_stub.c b/drivers/gpu/drm/drm_stub.c
+index 1111111..2222222 100644
+--- a/drivers/gpu/drm/drm_stub.c
++++ b/drivers/gpu/drm/drm_stub.c
+@@ -479,21 +479,26 @@ void drm_put_dev(struct drm_device *dev)
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET))
+ 		drm_put_minor(&dev->control);
+ 
++	if (dev->render)
++		drm_put_minor(&dev->render);
++
+ 	if (driver->driver_features & DRIVER_GEM)
+ 		drm_gem_destroy(dev);
+ 
+ 	drm_put_minor(&dev->primary);
+ 
+ 	list_del(&dev->driver_item);
+ 	kfree(dev->devname);
+ 	kfree(dev);
+ }
+ EXPORT_SYMBOL(drm_put_dev);
+ 
+ void drm_unplug_dev(struct drm_device *dev)
+ {
+ 	/* for a USB device */
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET))
+ 		drm_unplug_minor(dev->control);
++	if (dev->render)
++		drm_unplug_minor(dev->render);
+ 	drm_unplug_minor(dev->primary);
+ 
+diff --git a/drivers/gpu/drm/drm_fops.c b/drivers/gpu/drm/drm_fops.c
+index 1111111..2222222 100644
+--- a/drivers/gpu/drm/drm_fops.c
++++ b/drivers/gpu/drm/drm_fops.c
+@@ -273,10 +273,19 @@ static int drm_open_helper(struct inode *inode, struct file *filp,
+ 	priv->minor = idr_find(&drm_minors_idr, minor_id);
+ 	priv->ioctl_count = 0;
+ 	/* for compatibility root is always authenticated */
+ 	priv->authenticated = capable(CAP_SYS_ADMIN);
++	/*
++	 * Mode B: a render node has no privileged modeset state behind it,
++	 * so the opener is authenticated from the start (upstream render
++	 * semantics of the era: authenticated, just never master). Card0
++	 * behaviour is unchanged: non-root clients still authenticate via
++	 * the AUTH_MAGIC dance.
++	 */
++	if (priv->minor && priv->minor->type == DRM_MINOR_RENDER)
++		priv->authenticated = 1;
+ 	priv->lock_count = 0;
+ 
+ 	INIT_LIST_HEAD(&priv->lhead);
+ 	INIT_LIST_HEAD(&priv->fbs);
+ 	mutex_init(&priv->fbs_lock);
+ 	INIT_LIST_HEAD(&priv->event_list);
+diff --git a/drivers/gpu/drm/drm_drv.c b/drivers/gpu/drm/drm_drv.c
+index 1111111..2222222 100644
+--- a/drivers/gpu/drm/drm_drv.c
++++ b/drivers/gpu/drm/drm_drv.c
+@@ -433,10 +433,15 @@ long drm_ioctl(struct file *filp,
+ 	if (!func) {
+ 		DRM_DEBUG("no function\n");
+ 		retcode = -EINVAL;
+ 	} else if (((ioctl->flags & DRM_ROOT_ONLY) && !capable(CAP_SYS_ADMIN)) ||
+ 		   ((ioctl->flags & DRM_AUTH) && !file_priv->authenticated) ||
+ 		   ((ioctl->flags & DRM_MASTER) && !file_priv->is_master) ||
++		   /* Mode B: a render node can never be modeset master, not
++		    * even the first opener (per-minor master would otherwise
++		    * pass the DRM_MASTER test above). */
++		   ((file_priv->minor->type == DRM_MINOR_RENDER) &&
++		    (ioctl->flags & DRM_MASTER)) ||
+ 		   (!(ioctl->flags & DRM_CONTROL_ALLOW) && (file_priv->minor->type == DRM_MINOR_CONTROL))) {
+ 		retcode = -EACCES;
+ 	} else {
+ 		if (cmd & (IOC_IN | IOC_OUT)) {
+-- 
+2.34.1
