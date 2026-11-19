@@ -161,5 +161,5 @@ Nothing stopped → nothing restarted.
 `install.sh` · `packaging-notes.txt` · `fm-mixer.sh` (route, not yet run to playback) ·
 `fm-audio-route.md` · `fc15-table.md` · `re-notes.txt` · `fm-bringup-seq.md` ·
 `probe-baseline.txt` · `live-fc15-log.txt` · `audio-evidence.txt` (partial) ·
-(`rds-coex.txt` PENDING — peer parked, pair unsent).
+`rds-coex.txt` (parked partial: pair held unsent, coex numbers + mitigation recipe).
 No kernel/DT/firmware changes. BT undisturbed.
