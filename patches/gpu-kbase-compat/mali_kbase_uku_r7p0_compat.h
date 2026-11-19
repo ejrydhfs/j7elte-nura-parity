@@ -122,36 +122,111 @@ static inline bool kbase_r7p0_soft_job_translatable(u16 core_req)
 
 /**
  * kbase_jd_atom_v2_from_r7p0 - translate one r7p0 atom into the r15p0 layout
- * @dst: destination 64-byte r15p0 atom
- * @src: source r7p0 atom (only @stride bytes are valid)
- * @stride: source stride, 48 or 56
+ * @dst: destination 64-byte r15p0 atom (fully written on success)
+ * @src: source r7p0 atom; only the first @stride bytes are valid
+ * @stride: source stride, 48 (no systrace) or 56 (systrace gles handle)
  * @submit_gles_ctx_handle: handle from the r7p0 submit header, used when the
  *                          atom itself has no systrace gles_ctx_handle
+ *
+ * Return: true if the atom can be translated safely, false if the core_req
+ * carries a soft job type with no r15p0 equivalent (r7p0 SOFT_DVFS, type 5,
+ * which collides with r15p0 SOFT_EVENT_WAIT).  The caller must translate the
+ * whole batch first and refuse the call when any atom fails; all atoms of a
+ * translated call run in one native call with stride 64.
  */
-static inline void kbase_jd_atom_v2_from_r7p0(struct base_jd_atom_v2 *dst,
+static inline bool kbase_jd_atom_v2_from_r7p0(struct base_jd_atom_v2 *dst,
 		const struct base_jd_atom_v2_r7p0 *src, u32 stride,
 		u32 submit_gles_ctx_handle)
 {
+	const unsigned char *raw = (const unsigned char *)src;
+	u16 core_req;
+
+	if (stride != KBASE_UK_R7P0_ATOM_V2_SIZE &&
+	    stride != KBASE_UK_R7P0_ATOM_V2_SIZE_SYSTRACE)
+		return false;
+
+	memcpy(&core_req, raw + offsetof(struct base_jd_atom_v2_r7p0,
+		core_req), sizeof(core_req));
+	if (!kbase_r7p0_soft_job_translatable(core_req))
+		return false;
+
 	memset(dst, 0, sizeof(*dst));
-	dst->jc = src->jc;
-	dst->udata = src->udata;
-	dst->extres_list = src->extres_list;
-	dst->nr_extres = src->nr_extres;
+	/* Raw-offset copies bounded by the validated stride: the 48-byte
+	 * (no-systrace) form has no bytes at 48..55, so nothing above offset
+	 * 48 may be read when stride == 48.  All fields below offset 48 exist
+	 * in both variants. */
+	memcpy(&dst->jc, raw + offsetof(struct base_jd_atom_v2_r7p0, jc),
+		sizeof(dst->jc));
+	memcpy(&dst->udata, raw + offsetof(struct base_jd_atom_v2_r7p0, udata),
+		sizeof(dst->udata));
+	memcpy(&dst->extres_list,
+		raw + offsetof(struct base_jd_atom_v2_r7p0, extres_list),
+		sizeof(dst->extres_list));
+	memcpy(&dst->nr_extres,
+		raw + offsetof(struct base_jd_atom_v2_r7p0, nr_extres),
+		sizeof(dst->nr_extres));
 	/* UK < 10.3 uses compat_core_req; kbase_jd_submit() copies it over. */
-	dst->compat_core_req = src->core_req;
-	dst->pre_dep[0] = src->pre_dep[0];
-	dst->pre_dep[1] = src->pre_dep[1];
-	dst->atom_number = src->atom_number;
-	dst->prio = src->prio;
-	dst->device_nr = src->device_nr;
-	dst->core_req = src->core_req;
+	dst->compat_core_req = core_req;
+	memcpy(&dst->pre_dep[0],
+		raw + offsetof(struct base_jd_atom_v2_r7p0, pre_dep),
+		sizeof(dst->pre_dep));
+	memcpy(&dst->atom_number,
+		raw + offsetof(struct base_jd_atom_v2_r7p0, atom_number),
+		sizeof(dst->atom_number));
+	memcpy(&dst->prio, raw + offsetof(struct base_jd_atom_v2_r7p0, prio),
+		sizeof(dst->prio));
+	memcpy(&dst->device_nr,
+		raw + offsetof(struct base_jd_atom_v2_r7p0, device_nr),
+		sizeof(dst->device_nr));
+	dst->core_req = core_req;
 
 	if (stride >= sizeof(*src))
-		dst->gles_ctx_handle = src->gles_ctx_handle;
+		memcpy(&dst->gles_ctx_handle,
+			raw + offsetof(struct base_jd_atom_v2_r7p0,
+				gles_ctx_handle),
+			sizeof(dst->gles_ctx_handle));
 	else
 		dst->gles_ctx_handle = submit_gles_ctx_handle;
 
 	/* r7p0 has no frame_number/surfacep; both stay zero. */
+	return true;
+}
+
+/**
+ * kbase_r7p0_atom_batch_translate - expand a whole r7p0 atom array to 64-byte
+ * @dst: caller-provided output array of at least @nr_atoms 64-byte atoms
+ * @src: source user bytes; @stride bytes per atom are valid
+ * @stride: 48 (no systrace) or 56 (systrace gles handle)
+ * @nr_atoms: atom count (must be <= BASE_JD_ATOM_COUNT)
+ * @submit_gles_ctx_handle: header-level gles handle for 48-byte atoms
+ *
+ * Translates every atom with kbase_jd_atom_v2_from_r7p0(), walking the source
+ * @stride bytes at a time and writing 64-byte atoms.  Returns true only when
+ * every atom translated; on the first failure the output is left partial and
+ * the caller must refuse the whole submit (never issue a half-translated
+ * batch).  nr_atoms == 0 is a no-op success.
+ */
+static inline bool kbase_r7p0_atom_batch_translate(
+		struct base_jd_atom_v2 *dst, const void *src, u32 stride,
+		u32 nr_atoms, u32 submit_gles_ctx_handle)
+{
+	u32 i;
+
+	if (stride != KBASE_UK_R7P0_ATOM_V2_SIZE &&
+	    stride != KBASE_UK_R7P0_ATOM_V2_SIZE_SYSTRACE)
+		return false;
+	if (nr_atoms > BASE_JD_ATOM_COUNT)
+		return false;
+
+	for (i = 0; i < nr_atoms; i++) {
+		const struct base_jd_atom_v2_r7p0 *s =
+			(const struct base_jd_atom_v2_r7p0 *)
+			((const unsigned char *)src + (size_t)i * stride);
+		if (!kbase_jd_atom_v2_from_r7p0(&dst[i], s, stride,
+				submit_gles_ctx_handle))
+			return false;
+	}
+	return true;
 }
 
 /**
@@ -160,6 +235,14 @@ static inline void kbase_jd_atom_v2_from_r7p0(struct base_jd_atom_v2 *dst,
  * @src: 32-byte r7p0 submit structure
  *
  * Return: true if the call can be translated safely.
+ *
+ * On success dst->stride is always sizeof(struct base_jd_atom_v2) = 64, never
+ * the 48/56 source stride: mali_kbase_jd.c:kbase_jd_submit() rejects any other
+ * stride (-EINVAL).  The caller MUST expand every source atom to a 64-byte
+ * base_jd_atom_v2 (kbase_r7p0_atom_batch_translate()) and point dst->addr at
+ * that array before issuing the native call.  Reusing src->addr with the old
+ * stride would misalign the kernel's stride-wise walk.  frame_number/surfacep
+ * are zero (r7p0 has no such fields).
  */
 static inline bool kbase_r7p0_job_submit_translate(
 		struct kbase_uk_job_submit *dst,
@@ -175,14 +258,20 @@ static inline bool kbase_r7p0_job_submit_translate(
 
 	memset(dst, 0, sizeof(*dst));
 	dst->header = src->header;
-	dst->addr = src->addr;
 	dst->nr_atoms = src->nr_atoms;
-	/* Keep the source stride: kbase_jd_submit() walks the user array. */
-	dst->stride = src->stride;
+	dst->stride = sizeof(struct base_jd_atom_v2);
 	dst->gles_ctx_handle = src->gles_ctx_handle;
 	dst->frame_number = 0;
 	dst->surfacep = NULL;
 
+	/* NOTE: dst->addr is deliberately left as the caller found it (zero).
+	 * The translation shim owns no kernel address space; it cannot repoint
+	 * the user array.  The dispatch-site glue (see docs/reports/gpu31-shim.md
+	 * section 2) allocates a 64-byte array, runs
+	 * kbase_r7p0_atom_batch_translate() into it, and sets dst->addr to the
+	 * translated array before calling kbase_jd_submit().  Copying src->addr
+	 * here would invite submitting the r7p0 array at stride 64, which the
+	 * kernel walks atom-by-atom and would read out of bounds. */
 	return true;
 }
 

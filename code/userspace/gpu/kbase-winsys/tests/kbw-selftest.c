@@ -25,7 +25,8 @@
 
 #include "kbase_winsys.h"
 
-#define DEFAULT_DEVICE "/dev/mali0"
+/* Default node; override with KBW_DEVICE=/dev/dri/renderD128 for the H2 shim. */
+#define DEFAULT_DEVICE KBW_DEFAULT_DEVICE
 
 static int print_abi(void)
 {

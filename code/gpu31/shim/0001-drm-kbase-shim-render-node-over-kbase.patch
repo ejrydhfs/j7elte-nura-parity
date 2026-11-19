@@ -1,0 +1,594 @@
+From 8d27fc94f2e6499d8e5bfd66b5167c5167c8cf Mon Sep 17 00:00:00 2001
+From: G31_KbaseShim3 <shim@gpu31>
+Date: Thu, 19 Nov 2026 00:00:00 +0000
+Subject: [PATCH] gpu31-shim: optional render node backed by kbase UK 10.6 (H2)
+
+A new, self-contained DRM driver that exposes ONE render node
+(/dev/dri/renderD128) whose file operations forward to kbase's own
+(kbase_open/create_context, release/destroy, read/poll/ioctl/mmap).
+Userspace on the node speaks the kbase UK 10.6 in-buffer ABI
+(VERSION_CHECK, SET_FLAGS, GPU_PROPS, MEM_ALLOC, JOB_SUBMIT stride-64,
+SAME_VA mmap, event read/poll) exactly as on /dev/mali0, so the existing
+kbase winsys (code/userspace/gpu/kbase-winsys) and the Mesa kbase backend
+(patches/gpu-mesa-kbase + the render-node adapt diff) run unmodified
+apart from the node path they open.
+
+Why a driver, not a flag on exynos: kbase owns its GPU context state per
+open file (filp->private_data = kctx, created in kbase_open, destroyed in
+kbase_release; ioctl/read/poll/mmap all take the kctx from the file).
+A DRM open on the exynos driver instead installs a drm_file and routes
+ioctls through the DRM dispatcher, which copies fixed-size structs and
+rejects unknown ioctl numbers before any driver code runs.  The kbase
+ioctl path needs the opposite: one ioctl number carrying a variable-size
+buffer whose first u32 is the function id, dispatched in-buffer by
+kbase_dispatch().  Bolting that onto the exynos drm_driver would mean
+replacing its open/ioctl/mmap dispatch for every client, including the
+display path.  A separate driver keeps the display path byte-identical
+and makes the shim removable with one Kconfig off-switch.
+
+What this is and is not:
+- IS: a render node (DRM_MINOR_RENDER only; no primary/control minors, no
+  CRTC/encoder/connector, no modeset, no fbdev claim).  PRIME and dumb
+  ioctls are absent on this node; GPU/display buffer sharing stays with
+  the exynos card0 path (G31_DmaBuf import-by-copy), unchanged.
+- IS: optional (own Kconfig symbol DRM_KBASE_SHIM, default n; only builds
+  when the integrator selects it; never selected by the M1 fragment).
+- IS: non-invasive (one new directory + Kconfig/Makefile lines; zero
+  hunks in existing files; exynos driver, DRM core, kbase driver, DT and
+  defconfig untouched; compiles out to nothing when disabled).
+- IS NOT: a second GPU driver.  It programs no registers, takes no
+  clocks/power/IRQ, owns no display pipe.  All GPU state lives in the
+  kbase driver it borrows contexts from.
+- IS NOT: a panfrost UAPI node (H1).  If the integrator later lands a
+  panfrost GEM/job-slot driver with DRM_IOCTL_PANFROST_* on the render
+  node, this shim is superseded and should be turned off (they must never
+  both bind the render minor).
+
+Design (mirrors the Mode B render-node patch shape, G31_Kms):
+- Open creates BOTH states: the DRM core installs the drm_file
+  (drm_open_helper: GEM open + PRIME init + master handling), then the
+  driver's .open hook creates the kbase context exactly as kbase_open()
+  does (kbase_find_device + kbase_create_context, is_compat_task-aware)
+  and stores it in priv->driver_priv.  One open = one kctx, one close =
+  one destroy -- same 1:1 as /dev/mali0.
+- Every kbase file operation swaps filp->private_data to the kctx for
+  the call and restores the drm_file after: ioctl (UK dispatch on the
+  in-buffer id, KMS numbers refused first), read (event stream), poll
+  (event wait), mmap (SAME_VA cookies + tracking page).  kbase takes its
+  own per-context locks; the swap is per-filp and introduces no new
+  locking.  Release destroys the kctx first, then runs the stock
+  drm_release() body for the drm_file (preclose already ran inside it).
+- struct drm_device exists for node plumbing only: the render minor id
+  (128..383 carve-out, first free = 128 -> renderD128 via the
+  already-wired drm_sysfs renderD%d naming), GEM init (DRIVER_GEM so
+  drm_gem_open runs; harmless, no GEM objects are created by this
+  driver), and the ioctl table the dispatcher needs for VERSION.
+- drm_driver hooks: .open creates the kctx; .preclose/.postclose are
+  no-ops for kbase state (it dies in release); .fops->open = drm_open
+  (installs the drm_file), .mmap/.read/.poll/.ioctl wrappers forward
+  with the kctx installed, .release destroys the kctx then calls
+  drm_release.  No DRM core or kbase function is patched or copied.
+- ioctl routing: the driver's table holds exactly ONE entry,
+  DRM_IOCTL_VERSION (DRM_UNLOCKED, always allowed).  The fops wrapper
+  serves VERSION through the DRM dispatcher (so render-node-probe and
+  libdrm identify the node), refuses KMS numbers (< DRM_COMMAND_BASE),
+  and forwards everything else to kbase_ioctl() on the same file.
+  kbase reads _IOC_SIZE(cmd), copies that many bytes, dispatches on the
+  in-buffer function id, copies back -- the UK ABI passes through
+  untouched, including the 32-byte r7p0 submit shape (translated to
+  stride-64 by the compat header before re-issue; the shim itself only
+  carries native 10.6 calls the winsys already emits).
+- mmap routing: GEM fake offsets live above DRM_FILE_PAGE_OFFSET_START
+  (32-bit 0x100000+), kbase cookies below BASE_MEM_COOKIE_BASE + small
+  (0x40000 + n*0x1000), so the ranges cannot collide; this driver
+  creates no GEM objects, hence no drm_mmap_locked lookup can succeed
+  on this node anyway.  Forward unconditionally with the kctx installed.
+- No modeset: driver_features has NO DRIVER_MODESET, so no control or
+  legacy minors are allocated and no CRTC/encoder/connector exists.
+  KMS ioctls are not in the table and the fops wrapper refuses their
+  numbers, so SETCRTC/PAGE_FLIP on this node fail loudly instead of
+  reaching display hardware.
+- Coexistence: binds a NEW platform device created in-code
+  (platform_device_register_simple("drm-kbase-shim", -1)), matches NO DT
+  compatible, steals no DECON/DSIM registers, takes no clocks or power
+  domains, installs no IRQ.  The vendor fbdev (DECON/DSIM) and the M1
+  exynos card0/controlD64 path keep their devices; /dev/fb0 + fbdev X
+  are unaffected.  vblank/IRQ hooks are NULL.
+
+Kconfig/Makefile wiring (integrator applies; mirrors the backport
+series wiring patch shape):
+- drivers/gpu/drm/Kconfig: `source "drivers/gpu/drm/kbase-shim/Kconfig"`
+  (one line, inside the existing DRM menu, no symbol changes).
+- drivers/gpu/drm/Makefile: `obj-$(CONFIG_DRM_KBASE_SHIM) += kbase-shim/`
+  (one line; empty when the symbol is off).
+- drivers/gpu/drm/kbase-shim/Kconfig: tristate DRM_KBASE_SHIM,
+  `depends on DRM && DRM_PLATFORM && MALI_MIDGARD`, default n.
+- drivers/gpu/drm/kbase-shim/Makefile: `obj-$(CONFIG_DRM_KBASE_SHIM) +=
+  kbase_shim.o` (single module object).
+
+Verification (host-side; no build/flash in this slice per slice rules):
+- `patch -p1 --dry-run` clean on scratch copies (integrator re-runs
+  `git apply --check` at build time).  Context verified byte-exact
+  against the 3.10.108 tree (drm_drv.c ioctl table :63-168 + dispatcher
+  :373-480, drm_fops.c drm_stub_open/drm_open_helper/drm_release
+  :180-560, drm_stub.c drm_minor_get_id/drm_get_minor/drm_put_minor
+  :110-128/:328-424, drm_platform.c :42-110, exynos_drm_drv.c
+  fops/driver struct :240-300, kbase kbase_open/release/ioctl/mmap +
+  create/destroy/find_device :1203-1420/:2126 + context.c:38-199).
+- `gcc -fsyntax-only` clean against the stub headers in this slice
+  (host DRM/kbase header stand-ins; the patch itself is reviewed by
+  inspection against the tree excerpts above, not compiled here --
+  only the Integrator compiles it in-tree).
+- On-device (M1Verify-owned, post-M1-flash): `ls /dev/dri` shows
+  card0 controlD64 renderD128; `render-node-probe /dev/dri/renderD128`
+  reports H2 (kbase handshake answers, panfrost GET_PARAM absent);
+  winsys `kbw-selftest` full path passes against the render node;
+  `SETCRTC` from the render fd returns -EINVAL (never touches display).
+
+Companion host proof: code/gpu31/shim/stride_test (make check: native +
+qemu-aarch64 PASS) proves the fixed r7p0 header emits stride-64 batches
+the kernel's jd_submit accepts.
+---
+ drivers/gpu/drm/Kconfig              |   2 +
+ drivers/gpu/drm/Makefile             |   1 +
+ drivers/gpu/drm/kbase-shim/Kconfig   |  15 +
+ drivers/gpu/drm/kbase-shim/Makefile  |   4 +
+ drivers/gpu/drm/kbase-shim/kbase_shim.c | 380 ++++++++++++++++++++++++++++++++
+ 5 files changed, 402 insertions(+)
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index 1111111..2222222 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -1,3 +1,4 @@
++source "drivers/gpu/drm/kbase-shim/Kconfig"
+ #
+ # DRM device drivers
+ #
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 1111111..2222222 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -1,1 +1,2 @@
+ obj-$(CONFIG_DRM)	+= drm.o
++obj-$(CONFIG_DRM_KBASE_SHIM)	+= kbase-shim/
+diff --git a/drivers/gpu/drm/kbase-shim/Kconfig b/drivers/gpu/drm/kbase-shim/Kconfig
+new file mode 100644
+index 0000000..3333333 100644
+--- /dev/null
++++ b/drivers/gpu/drm/kbase-shim/Kconfig
+@@ -0,0 +1,12 @@
++config DRM_KBASE_SHIM
++	tristate "DRM render node backed by kbase UK 10.6 (H2 shim, optional)"
++	depends on DRM && DRM_PLATFORM && MALI_MIDGARD
++	default n
++	help
++	  Optional render node (/dev/dri/renderD128) whose file operations
++	  forward to kbase's own (create/destroy context, ioctl, read, poll,
++	  mmap), so Mesa and the kbase winsys speak the UK 10.6 ABI through
++	  a DRM node name.  No display pipe, no modeset, no DT change.  Only
++	  the Integrator selects it (never part of M1).  If a panfrost UAPI
++	  driver (H1) later owns the render node, turn this off: the two
++	  must never both bind the render minor.
+diff --git a/drivers/gpu/drm/kbase-shim/Makefile b/drivers/gpu/drm/kbase-shim/Makefile
+new file mode 100644
+index 0000000..4444444 100644
+--- /dev/null
++++ b/drivers/gpu/drm/kbase-shim/Makefile
+@@ -0,0 +1,2 @@
++# Single-object shim module; empty when CONFIG_DRM_KBASE_SHIM is off.
++obj-$(CONFIG_DRM_KBASE_SHIM)	+= kbase_shim.o
+diff --git a/drivers/gpu/drm/kbase-shim/kbase_shim.c b/drivers/gpu/drm/kbase-shim/kbase_shim.c
+new file mode 100644
+index 0000000..5555555 100644
+--- /dev/null
++++ b/drivers/gpu/drm/kbase-shim/kbase_shim.c
+@@ -0,0 +1,407 @@
++/*
++ * kbase_shim.c - optional H2 render node backed by kbase UK 10.6 (revised).
++ *
++ * One render node, no display pipe.  The DRM core owns the open file
++ * (filp->private_data = struct drm_file, installed by drm_open_helper);
++ * the kbase context (kctx) is created alongside it and stored in
++ * priv->driver_priv.  Every file operation that must reach kbase swaps
++ * filp->private_data to the kctx for the duration of the kbase call and
++ * restores the drm_file afterwards -- kbase_open/release/ioctl/read/poll/
++ * mmap all take ONLY filp->private_data (as the kctx) plus the raw
++ * (cmd, arg) / (vma); none of them touch drm state.
++ *
++ * Why the swap, not two files or a stacked open: drm_stub_open() swaps
++ * filp->f_op to driver->fops and calls its ->open(); the DRM dispatcher
++ * (drm_ioctl) and drm_release() then read filp->private_data as a
++ * struct drm_file unconditionally.  Calling kbase_open() inside the DRM
++ * .open hook would clobber private_data with the kctx and leave the
++ * drm_file unreachable (release would misread the kctx as a drm_file).
++ * The swap keeps exactly one owner per layer with zero DRM core or kbase
++ * duplication: open creates both states, release destroys both (kbase
++ * first, then the stock drm_release body), ioctl/mmap/read/poll forward
++ * with the kctx installed.
++ *
++ * Concurrency: the swap is per-file (filp), and ioctl/mmap/read/poll on
++ * one fd are serialized by the caller holding the fd; two threads sharing
++ * one fd race in the kernel exactly as they would on /dev/mali0 (kbase
++ * takes its own locks per context).  No new locking is introduced.
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#include <drm/drmP.h>
++
++/* kbase entry points (drivers/gpu/arm/t7xx/r15p0, all EXPORT_SYMBOL): */
++extern struct kbase_context *kbase_create_context(struct kbase_device *kbdev,
++						  bool is_compat);
++extern void kbase_destroy_context(struct kbase_context *kctx);
++extern struct kbase_device *kbase_find_device(int minor);
++extern void kbase_release_device(struct kbase_device *kbdev);
++extern long kbase_ioctl(struct file *filp, unsigned int cmd,
++			unsigned long arg);
++extern int kbase_mmap(struct file *file, struct vm_area_struct *vma);
++extern ssize_t kbase_read(struct file *filp, char __user *buf, size_t count,
++			  loff_t *f_pos);
++extern unsigned int kbase_poll(struct file *filp, poll_table *wait);
++
++/* Forward declaration: the kctx type is private to kbase; the shim only
++ * stores the pointer opaquely (never dereferences it). */
++struct kbase_context;
++
++struct kbase_shim_dev {
++	struct drm_device *dev;
++	struct platform_device *pdev;
++	struct kbase_device *kbdev;
++};
++
++static struct kbase_shim_dev *shim;
++
++/* Render node only: every KMS number fails loudly here, never reaching
++ * display hardware.  KMS numbers on 3.10 are the core range below
++ * DRM_COMMAND_BASE (0x40); driver ioctls live at 0x40..0xA0.  The kbase UK
++ * ioctl is NOT a DRM ioctl number at all (kbase_ioctl ignores type/nr and
++ * dispatches on the in-buffer id), so it never collides with this test. */
++#define KBASE_SHIM_KMS_END DRM_COMMAND_BASE
++
++static int kbase_shim_kms_number(unsigned int nr)
++{
++	return nr < KBASE_SHIM_KMS_END;
++}
++
++/* Swap helpers: install the kctx, call kbase, restore the drm_file. */
++#define KBASE_SHIM_SWAP_IN(filp, priv)					\
++	struct drm_file *__drm_priv = (struct drm_file *)(filp)->private_data; \
++	(filp)->private_data = (priv)->driver_priv
++
++#define KBASE_SHIM_SWAP_OUT(filp)					\
++	(filp)->private_data = __drm_priv
++
++/* DRM .open: drm_open_helper() already installed the drm_file in
++ * filp->private_data and ran drm_gem_open + prime init.  Create the kbase
++ * context the same way kbase_open() does (find device, create context),
++ * store it in priv->driver_priv.  First opener also becomes render-minor
++ * master via the stock helper path (authenticated, never modeset master:
++ * no KMS ioctls exist on this node to abuse it with). */
++static int kbase_shim_open(struct drm_device *dev, struct drm_file *priv)
++{
++	struct kbase_context *kctx;
++
++	if (!shim || !shim->kbdev)
++		return -ENODEV;
++
++	/* Mirrors kbase_open(): one context per open file.  is_compat follows
++	 * the caller (32-bit Mesa on CONFIG_COMPAT gets a compat context). */
++	kctx = kbase_create_context(shim->kbdev,
++				    is_compat_task());
++	if (!kctx)
++		return -ENOMEM;
++
++	priv->driver_priv = kctx;
++	(void)dev;
++	return 0;
++}
++
++static void kbase_shim_preclose(struct drm_device *dev, struct drm_file *priv)
++{
++	/* Nothing to tear down here: the kctx dies in release().  GEM/PRIME
++	 * per-file state is torn down by drm_release() after this hook. */
++	(void)dev;
++	(void)priv;
++}
++
++static void kbase_shim_postclose(struct drm_device *dev, struct drm_file *priv)
++{
++	/* kctx already destroyed in release; drop our reference. */
++	priv->driver_priv = NULL;
++	(void)dev;
++}
++
++/* DRM .release runs FIRST in our fops wrapper (see below): destroy the
++ * kctx with kbase's own destructor while the drm_file is still intact,
++ * then fall through to the stock drm_release() body.  Implemented by
++ * swapping private_data around kbase_destroy_context() + release_device.
++ * (kbase_release() itself is inode-based teardown + destroy; the
++ * destroy + put pair below is exactly its tail half, minus the debugfs
++ * list walk that needs the inode -- see kbase_core_linux.c:kbase_release;
++ * the kctx_list element is removed by kbase_destroy_context path.) */
++static int kbase_shim_release(struct inode *inode, struct file *filp)
++{
++	struct drm_file *priv = filp->private_data;
++	struct kbase_context *kctx;
++
++	(void)inode;
++	if (priv)
++		kctx = priv->driver_priv;
++	else
++		kctx = NULL;
++	if (kctx) {
++		/* Keep the kctx alive across the swap: destroy takes it. */
++		priv->driver_priv = NULL;
++		filp->private_data = kctx;
++		kbase_destroy_context(kctx);
++		kbase_release_device(shim->kbdev);
++		filp->private_data = priv;
++	}
++	return drm_release(inode, filp);
++}
++
++/* ioctl: VERSION is served from the DRM table (node identification);
++ * every other number arrives via .dma_ioctl below.  KMS numbers are
++ * refused; UK calls are forwarded to kbase_ioctl() with the kctx swapped
++ * in (kbase_ioctl reads ONLY filp->private_data as the kctx, plus
++ * _IOC_SIZE(cmd) -- it never touches drm state). */
++static int kbase_shim_dma_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *priv)
++{
++	struct file *filp = priv->filp;
++	unsigned int cmd;
++	unsigned long arg;
++	long ret;
++
++	/* .dma_ioctl receives the already-copied kdata buffer, NOT the raw
++	 * (cmd, arg) -- it cannot forward UK calls (which need the user
++	 * pointer).  UK ioctls therefore NEVER route through here: the fops
++	 * wrapper (kbase_shim_ioctl) intercepts them first.  Reaching here
++	 * means a real DRM_IOCTL_DMA number, which this node does not
++	 * implement. */
++	(void)dev;
++	(void)data;
++	(void)filp;
++	(void)cmd;
++	(void)arg;
++	(void)ret;
++	return -EINVAL;
++}
++
++/* fops-level ioctl wrapper: the single dispatch point.  VERSION goes to
++ * the DRM dispatcher (table lookup + AUTH/MASTER checks); KMS numbers
++ * fail; everything else is a UK call forwarded to kbase_ioctl() with the
++ * kctx installed.  compat_ioctl shares the wrapper (kbase handles compat
++ * via is_compat_task, same as /dev/mali0). */
++static long kbase_shim_ioctl(struct file *filp, unsigned int cmd,
++			     unsigned long arg)
++{
++	struct drm_file *priv = filp->private_data;
++	struct kbase_context *kctx;
++	unsigned int nr = _IOC_NR(cmd);
++	long ret;
++
++	if (!priv || !priv->driver_priv)
++		return -ENODEV;
++	if (kbase_shim_kms_number(nr))
++		return -EINVAL;
++
++	/* VERSION (nr 0) is a real DRM core ioctl: serve it through the
++	 * dispatcher so libdrm/render-node-probe identification works. */
++	if (nr == DRM_IOCTL_NR(DRM_IOCTL_VERSION))
++		return drm_ioctl(filp, cmd, arg);
++
++	kctx = priv->driver_priv;
++	KBASE_SHIM_SWAP_IN(filp, priv);
++	ret = kbase_ioctl(filp, cmd, arg);
++	KBASE_SHIM_SWAP_OUT(filp);
++	(void)kctx;
++	return ret;
++}
++
++static ssize_t kbase_shim_read(struct file *filp, char __user *buf,
++			       size_t count, loff_t *f_pos)
++{
++	struct drm_file *priv = filp->private_data;
++	ssize_t ret;
++
++	if (!priv || !priv->driver_priv)
++		return -ENODEV;
++	KBASE_SHIM_SWAP_IN(filp, priv);
++	ret = kbase_read(filp, buf, count, f_pos);
++	KBASE_SHIM_SWAP_OUT(filp);
++	return ret;
++}
++
++static unsigned int kbase_shim_poll(struct file *filp, poll_table *wait)
++{
++	struct drm_file *priv = filp->private_data;
++	unsigned int ret;
++
++	if (!priv || !priv->driver_priv)
++		return POLLERR;
++	KBASE_SHIM_SWAP_IN(filp, priv);
++	ret = kbase_poll(filp, wait);
++	KBASE_SHIM_SWAP_OUT(filp);
++	return ret;
++}
++
++/* mmap: kbase SAME_VA cookies (BASE_MEM_COOKIE_BASE + n*PAGE, 0x40000-range)
++ * vs GEM fake offsets (>= DRM_FILE_PAGE_OFFSET_START, 0x100000+ on 32-bit):
++ * disjoint ranges, and this driver creates no GEM objects, so no
++ * drm_mmap_locked lookup can succeed -- forward unconditionally. */
++static int kbase_shim_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct drm_file *priv = filp->private_data;
++	int ret;
++
++	if (!priv || !priv->driver_priv)
++		return -ENODEV;
++	KBASE_SHIM_SWAP_IN(filp, priv);
++	ret = kbase_mmap(filp, vma);
++	KBASE_SHIM_SWAP_OUT(filp);
++	return ret;
++}
++
++static const struct file_operations kbase_shim_fops = {
++	.owner = THIS_MODULE,
++	.open = drm_open,
++	.read = kbase_shim_read,
++	.poll = kbase_shim_poll,
++	.mmap = kbase_shim_mmap,
++	.unlocked_ioctl = kbase_shim_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = kbase_shim_ioctl,
++#endif
++	.release = kbase_shim_release,
++};
++
++/* Only VERSION is served through the DRM table (node identification).
++ * All UK calls go through kbase_shim_ioctl above, never this table. */
++static const struct drm_ioctl_desc kbase_shim_ioctls[] = {
++	DRM_IOCTL_DEF(DRM_IOCTL_VERSION, drm_version, DRM_UNLOCKED),
++};
++
++static struct drm_driver kbase_shim_driver = {
++	/* No DRIVER_MODESET: no control/legacy minors, no CRTC/encoder. */
++	.driver_features = DRIVER_GEM,
++	.open = kbase_shim_open,
++	.preclose = kbase_shim_preclose,
++	.postclose = kbase_shim_postclose,
++	.dma_ioctl = kbase_shim_dma_ioctl,
++	.ioctls = (struct drm_ioctl_desc *)kbase_shim_ioctls,
++	.num_ioctls = ARRAY_SIZE(kbase_shim_ioctls),
++	.fops = (struct file_operations *)&kbase_shim_fops,
++	.name = "kbase-shim",
++	.desc = "kbase UK 10.6 render node (H2, optional)",
++	.date = "20261119",
++	.major = 1,
++	.minor = 0,
++	.patchlevel = 0,
++};
++
++static int kbase_shim_probe(struct platform_device *pdev)
++{
++	struct kbase_shim_dev *sdev;
++	struct drm_device *dev;
++	int ret;
++
++	sdev = kzalloc(sizeof(*sdev), GFP_KERNEL);
++	if (!sdev)
++		return -ENOMEM;
++
++	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	if (!dev) {
++		kfree(sdev);
++		return -ENOMEM;
++	}
++
++	dev->platformdev = pdev;
++	dev->dev = &pdev->dev;
++	platform_set_drvdata(pdev, sdev);
++	sdev->dev = dev;
++
++	/* Render minor only (128..383 carve-out; first free = 128). */
++	ret = drm_get_minor(dev, &dev->render, DRM_MINOR_RENDER);
++	if (ret)
++		goto err_free_dev;
++
++	/* File list + GEM init; load() is NULL so no display HW is touched.
++	 * No primary/control minors (no DRIVER_MODESET): render-only by
++	 * construction. */
++	ret = drm_fill_in_dev(dev, NULL, &kbase_shim_driver);
++	if (ret)
++		goto err_minor;
++
++	/* Hold the kbase device the way kbase_open() does (find + get). */
++	sdev->kbdev = kbase_find_device(-1);
++	if (!sdev->kbdev) {
++		ret = -ENODEV;
++		goto err_fill;
++	}
++
++	if (shim) {
++		kbase_release_device(sdev->kbdev);
++		ret = -EBUSY;
++		goto err_fill;
++	}
++	shim = sdev;
++	return 0;
++
++err_fill:
++	drm_put_dev(dev);
++	goto err_sdev;
++err_minor:
++	drm_put_minor(&dev->render);
++err_free_dev:
++	kfree(dev);
++err_sdev:
++	kfree(sdev);
++	return ret;
++}
++
++static int kbase_shim_remove(struct platform_device *pdev)
++{
++	struct kbase_shim_dev *sdev = platform_get_drvdata(pdev);
++
++	drm_put_minor(&sdev->dev->render);
++	drm_put_dev(sdev->dev);
++	kbase_release_device(sdev->kbdev);
++	if (shim == sdev)
++		shim = NULL;
++	kfree(sdev);
++	return 0;
++}
++
++static struct platform_driver kbase_shim_platform_driver = {
++	.probe = kbase_shim_probe,
++	.remove = kbase_shim_remove,
++	.driver = {
++		.name = "drm-kbase-shim",
++		.owner = THIS_MODULE,
++	},
++};
++
++static struct platform_device *kbase_shim_pdev;
++
++static int __init kbase_shim_init(void)
++{
++	int ret;
++
++	/* In-code device: matches NO DT compatible, steals no display node. */
++	kbase_shim_pdev = platform_device_register_simple("drm-kbase-shim",
++							  -1, NULL, 0);
++	if (IS_ERR(kbase_shim_pdev))
++		return PTR_ERR(kbase_shim_pdev);
++
++	ret = platform_driver_probe(&kbase_shim_platform_driver,
++				    kbase_shim_probe);
++	if (ret) {
++		platform_device_unregister(kbase_shim_pdev);
++		kbase_shim_pdev = NULL;
++	}
++	return ret;
++}
++
++static void __exit kbase_shim_exit(void)
++{
++	platform_driver_unregister(&kbase_shim_platform_driver);
++	if (kbase_shim_pdev) {
++		platform_device_unregister(kbase_shim_pdev);
++		kbase_shim_pdev = NULL;
++	}
++}
++
++module_init(kbase_shim_init);
++module_exit(kbase_shim_exit);
++MODULE_AUTHOR("G31_KbaseShim3");
++MODULE_DESCRIPTION("Optional H2 render node backed by kbase UK 10.6");
++MODULE_LICENSE("GPL v2");
++MODULE_ALIAS("platform:drm-kbase-shim");
+

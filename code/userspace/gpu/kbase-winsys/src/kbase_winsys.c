@@ -441,7 +441,7 @@ int kbw_device_open(const char *path, struct kbw_device **out, char *err,
    int fd;
 
    if (!path)
-      path = "/dev/mali0";
+      path = KBW_DEFAULT_DEVICE;
    errno = 0;
    fd = open(path, O_RDWR | O_CLOEXEC);
    if (fd < 0) {
@@ -605,7 +605,7 @@ int kbw_context_create(struct kbw_screen *screen, uint32_t flags,
    ctx->slot_timeout_ns = 5000000000ll; /* 5 s */
 
    if (flags == KBW_CONTEXT_NEW_FD) {
-      int fd = open(screen->dev->path[0] ? screen->dev->path : "/dev/mali0",
+      int fd = open(screen->dev->path[0] ? screen->dev->path : KBW_DEFAULT_DEVICE,
                     O_RDWR | O_CLOEXEC);
       if (fd < 0) {
          ret = -errno;

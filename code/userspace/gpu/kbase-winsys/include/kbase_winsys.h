@@ -89,7 +89,14 @@ struct kbw_caps {
 /* ------------------------------------------------------------------ */
 /* Device: exactly one kbase context (one open of /dev/maliN). */
 
-/* Open and handshake.  Returns 0 or -errno; on failure 'err' is filled. */
+/* Open and handshake.  Returns 0 or -errno; on failure 'err' is filled.
+ *
+ * 'path' is normally "/dev/mali0", but any fd speaking the kbase UK 10.6
+ * ABI is accepted -- including the H2 render node (/dev/dri/renderD128)
+ * from code/gpu31/shim (whose file operations forward to kbase's own).
+ * The handshake, not the node name, decides: a real DRM driver answers
+ * the UK version query with ENOTTY and is refused here. */
+#define KBW_DEFAULT_DEVICE "/dev/mali0"
 int kbw_device_open(const char *path, struct kbw_device **out, char *err,
                     size_t errlen);
 
