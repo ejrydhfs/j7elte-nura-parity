@@ -231,10 +231,12 @@ touches all four shims — fixes/callouts:
 
 ## 7. Verification (exercised, not claimed)
 
-- Host: `make check` → `job_test: all checks passed` (60 checks:
+- Host: `make check` → `job_test: all checks passed` (74 CHECKs:
   register offsets/IRQ bits, slot routing, JS_CONFIG construction +
   T720 exclusions, 6 fault names + fault-vs-benign split, timeouts,
-  32-B descriptor + SUBMIT layout sizes, caps).
+  32-B descriptor + SUBMIT layout sizes, caps, plus the §9
+  review-fix cover: 11 jc-polarity, 8 staged-pointer, 3 put-once,
+  4 signal-once, 4 fault-gating).
 - Kernel: `make stage-shims` stages 0001-0004 from
   `code/gpu31/series/` into a private dir (shared tree untouched);
   `aarch64-linux-gnu-gcc -fsyntax-only -std=gnu89` → **0 errors**;
@@ -254,6 +256,41 @@ touches all four shims — fixes/callouts:
   in-syncs → expect DONE(1) + `done_fence` signaled, HEAD/TAIL
   advance; then `ADDRESS_RANGE_FAULT` injection (unmapped jc) →
   expect ERR(1)+STATUS 0x5A → `p7580_job_recover` → slot IDLE.
+
+## 9. Review fixes (gpu31-driver-review, F-JOB1..F-JOB4)
+
+Source of truth: `docs/reports/gpu31-driver-review.md` (commit
+`ebfc1f5`). All four jobs blockers fixed in this slice; host test
+extended to lock each rule.
+
+- **F-JOB1 (inverted jc align test):** `p7580_job_submit_args` now
+  uses the shared `p7580_jc_valid(jc)` predicate (`jc != 0 &&
+  (jc & 7u) == 0`, new in `panfrost7580_jm_hw.h`) — identical to the
+  GEM ioctl stub, so the two can never disagree again. Test: 11
+  accept/reject checks incl. the old polarity (`0x1000` ok,
+  `0x1001` rejected).
+- **F-JOB2 (userspace pointer dereference):** the SUBMIT core no
+  longer pretends to touch userspace. The GEM ioctl layer stages
+  `in_syncs`/`bo_handles` with `copy_from_user` into stack buffers
+  and passes kernel pointers down; `p7580_job_submit_args` reads
+  them with plain `const u32` indexing, and the header contract
+  says so (`do not pass __user pointers here`). Test: staged-array
+  round-trip (8 checks) through the same `(u64)(uintptr_t)` shape.
+- **F-JOB3 (fence double-put UAF):** `done_fence` owns the single
+  `run_job` ref; `render_done_fence` is a documented non-owning
+  alias (consumers take their own ref — `syncobj_replace` does).
+  `p7580_job_free` puts `done_fence` once and clears the alias;
+  `p7580_job_run` drops a stale previous fence instead of leaking
+  it. Test: put-once model (3 checks; the old second put drives the
+  model negative).
+- **F-JOB4 (fault never signals):** `p7580_job_recover` latches the
+  faulting `in_flight` job under `hw_lock`, clears the slot (late
+  DONE cannot re-signal), resets + re-arms, then `dma_fence_signal`s
+  the fence exactly once (skipped if the IRQ already signaled).
+  Also fixed while here: the drain/reset polls sleep (`msleep(1)`)
+  instead of pinning the workqueue with `cpu_relax`.
+  Test: signal-once latch model (4 checks) + benign-vs-fault gating
+  (4 checks).
 
 ## 8. Integrator notes
 

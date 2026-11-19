@@ -232,4 +232,13 @@ struct p7580_submit {
 	uint32_t requirements;
 };
 
+/* SUBMIT jc rule (v5.2: nonzero, 8-byte aligned GPU address). Shared by */
+/* the GEM validate stub and p7580_job_submit_args so the two can never  */
+/* disagree (F-JOB1: the jobs copy had the align test inverted). Pure-C  */
+/* so the host unit test exercises the exact kernel predicate.           */
+static inline int p7580_jc_valid(uint64_t jc)
+{
+	return jc != 0 && (jc & 7u) == 0;
+}
+
 #endif /* PANFROST7580_JM_HW_H */

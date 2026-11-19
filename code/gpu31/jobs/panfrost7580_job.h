@@ -50,9 +50,11 @@ struct p7580_submit_job {
 	uint64_t affinity;		/* shader-present mask */
 	uint32_t flush_id;		/* recorded, unused (no FLUSH_REDUCTION) */
 
-	/* Fences. done_fence is signaled by the JOB_INT handler;
-	 * render_done_fence is the sched retirement fence returned by
-	 * run_job. in_fences are explicit SUBMIT deps (owned here). */
+	/* Fences. done_fence owns the run_job ref and is signaled by the
+	 * JOB_INT handler (or the fault-recovery path, F-JOB4);
+	 * render_done_fence is a non-owning alias of the same fence
+	 * handed to out_sync/sched (F-JOB3: never put twice).
+	 * in_fences are explicit SUBMIT deps (owned here). */
 	void *done_fence;
 	void *render_done_fence;
 	void **in_fences;
@@ -119,7 +121,10 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 void p7580_job_free(struct p7580_submit_job *job);
 
 /* SUBMIT ioctl body: validate -> resolve syncobj deps -> reserve BOs  */
-/* -> sched submit -> install out-sync fence. */
+/* -> sched submit -> install out-sync fence. args->in_syncs/bo_handles */
+/* must point at KERNEL-staged u32 arrays (the ioctl layer copies with  */
+/* copy_from_user first); this function never touches userspace         */
+/* (F-JOB2: do not pass __user pointers here). */
 int p7580_job_submit(struct p7580_job_dev *jd, struct p7580_file_ctx *fctx,
 		     const struct p7580_submit *args);
 

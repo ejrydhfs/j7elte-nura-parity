@@ -25,15 +25,18 @@
  * SHIM-CALLSITES: every call into the 0001-0004 shims below is marked
  * with the patch number so G31_Sched/G31_DrmCore can re-verify them
  * against the landed tree at integration.
- *
  * Locking: hw_lock (spinlock, IRQ-safe) serialises the HEAD/CONFIG/
  * COMMAND sequence per slot and the in_flight[] slot assignment. The
  * IRQ handler only touches in_flight/done_fence under that lock and
  * never sleeps. timedout_job and p7580_job_recover run in process
  * context (shim timeout workqueue): they take reset_lock, then
  * hw_lock only for register pokes.
- */
-
+ *
+ * Fences: each job owns exactly one ref (job->done_fence), created in
+ * p7580_job_run. job->render_done_fence is a non-owning alias of the
+ * same fence handed to the sched/out-sync paths; only done_fence is
+ * ever signaled or put. Fault recovery signals done_fence exactly
+ * once so waiters never hang (see p7580_job_recover).
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/spinlock.h>
@@ -349,12 +352,18 @@ void *p7580_job_run(struct p7580_job_dev *jd, struct p7580_submit_job *job)
 	if (IS_ERR(fence))
 		return fence;
 
-	if (job->done_fence)
+	/* One ref per job, owned by done_fence. render_done_fence is a
+	 * non-owning alias (F-JOB3: never put a second time). Dropping a
+	 * stale previous fence here keeps submit_args (which starts with
+	 * NULL fences) and re-run paths under the same rule. */
+	if (job->done_fence && job->done_fence != fence)
 		dma_fence_put((struct dma_fence *)job->done_fence); /* 0001 */
 	dma_fence_get(fence);			/* 0001: void, NULL-safe */
 	job->done_fence = fence;
 
 	p7580_job_hw_submit(jd, job);
+	/* Non-owning alias: consumers (sched/out-sync) must take their
+	 * own ref (e.g. syncobj replace takes one). */
 	job->render_done_fence = fence;
 	return fence;
 }
@@ -370,14 +379,16 @@ void p7580_job_free(struct p7580_submit_job *job)
 			dma_fence_put((struct dma_fence *)job->in_fences[i]); /* 0001 */
 		kfree(job->in_fences);
 	}
-	if (job->done_fence)
+	/* done_fence owns the single run_job ref; render_done_fence is
+	 * only an alias (F-JOB3), so clear it without putting. */
+	job->render_done_fence = NULL;
+	if (job->done_fence) {
 		dma_fence_put((struct dma_fence *)job->done_fence); /* 0001 */
-	if (job->render_done_fence)
-		dma_fence_put((struct dma_fence *)job->render_done_fence); /* 0001 */
+		job->done_fence = NULL;
+	}
 	kfree(job->bo_handles);
 	kfree(job);
 }
-
 /*
  * Timeout: the per-job delayed_work in the 0004 shim fires when the
  * done_fence has not signaled within P7580_JOB_TIMEOUT_MS of dispatch.
@@ -397,7 +408,6 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 	status = p7580_js_read(jd, slot, P7580_JS_STATUS);
 	p7580_job_recover(jd, slot, status);
 }
-
 /* ------------------------------------------------------------------ */
 /* SUBMIT ioctl body. Steps (mirrors v5.2 panfrost_job_push, adapted  */
 /* to the 0002/0003/0004 shims):                                       */
@@ -441,8 +451,9 @@ int p7580_job_submit_args(struct p7580_job_dev *jd, struct p7580_file_ctx *fc,
 	if (!jd || !fc || !args || !ops)
 		return -EINVAL;
 
-	/* 1. validate. */
-	if ((args->jc & 7u) == 0u || args->jc == 0u)
+	/* 1. validate (F-JOB1: single shared predicate; jc must be
+	 * nonzero and 8-byte aligned). */
+	if (!p7580_jc_valid(args->jc))
 		return -EINVAL;
 	if (args->requirements & ~(P7580_JD_REQ_FS |
 				   P7580_JD_REQ_ONLY_COMPUTE))
@@ -478,9 +489,14 @@ int p7580_job_submit_args(struct p7580_job_dev *jd, struct p7580_file_ctx *fc,
 		}
 	}
 
-	/* 2. explicit in-fences. */
+	/* 2. explicit in-fences. The ioctl layer stages plain u32 arrays
+	 * into kernel memory first (copy_from_user there); by the time
+	 * this runs, args->in_syncs points at kernel memory local to the
+	 * caller, so plain indexed loads apply and no __user dereference
+	 * happens here (F-JOB2). */
 	if (args->in_sync_count) {
-		uint32_t *hs = (uint32_t *)(uintptr_t)args->in_syncs;
+		const uint32_t *hs =
+			(const uint32_t *)(uintptr_t)args->in_syncs;
 
 		job->in_fences = kcalloc(args->in_sync_count,
 					 sizeof(*job->in_fences), GFP_KERNEL);
@@ -508,6 +524,9 @@ int p7580_job_submit_args(struct p7580_job_dev *jd, struct p7580_file_ctx *fc,
 	/* dependency/fence wiring contract is asserted by the host unit */
 	/* test in job_test.c). */
 	if (args->bo_handle_count) {
+		const uint32_t *uh =
+			(const uint32_t *)(uintptr_t)args->bo_handles;
+
 		job->bo_handles = kcalloc(args->bo_handle_count,
 					  sizeof(*job->bo_handles),
 					  GFP_KERNEL);
@@ -515,13 +534,10 @@ int p7580_job_submit_args(struct p7580_job_dev *jd, struct p7580_file_ctx *fc,
 			ret = -ENOMEM;
 			goto err;
 		}
-		/* Copy handles from userspace (caller copies in). */
-		{
-			uint32_t *uh =
-				(uint32_t *)(uintptr_t)args->bo_handles;
-			for (i = 0; i < args->bo_handle_count; i++)
-				job->bo_handles[i] = uh[i];
-		}
+		/* Plain copy: already kernel memory staged by the ioctl
+		 * layer (F-JOB2); no userspace access here. */
+		for (i = 0; i < args->bo_handle_count; i++)
+			job->bo_handles[i] = uh[i];
 		job->bo_count = args->bo_handle_count;
 		if (ops->bo_reserve) {
 			for (i = 0; i < job->bo_count; i++) {
@@ -545,6 +561,7 @@ int p7580_job_submit_args(struct p7580_job_dev *jd, struct p7580_file_ctx *fc,
 
 	/* 6. out-sync. */
 	if (args->out_sync && ops->sync_replace) {
+		/* Alias is fine: replace takes its own ref on the fence. */
 		ret = ops->sync_replace(ops->sync_priv, args->out_sync,
 					(struct dma_fence *)job->render_done_fence);
 		if (ret)
@@ -557,7 +574,6 @@ err:
 	p7580_job_free(job);
 	return ret;
 }
-
 /* Legacy name kept for the report/ioctl table. */
 int p7580_job_submit(struct p7580_job_dev *jd, struct p7580_file_ctx *fctx,
 		     const struct p7580_submit *args)
@@ -569,19 +585,17 @@ int p7580_job_submit(struct p7580_job_dev *jd, struct p7580_file_ctx *fctx,
 }
 
 /* ------------------------------------------------------------------ */
-/* Fault recovery (process context ONLY: takes reset_lock, polls,     */
-/* may sleep; never called from the IRQ handler). Sequence mirrors    */
-/* [KB] reset path + [V5] panfrost_job_timedout, minus the scheduler  */
-/* stop/resubmit the 0004 shim does not implement:                    */
-/*                                                                    */
-/*  1. HARD_STOP the faulting slot (+ neighbours if MULTIPLE_FAULT).  */
-/*  2. poll JS_COMMAND_NEXT == 0 (slot idle) up to RESET_TIMEOUT.     */
-/*  3. GPU SOFT_RESET; poll RESET_COMPLETED; HARD_RESET on timeout.   */
-/*  4. re-program AS_TRANSTAB (MMU slice hook: caller re-issues the   */
-/*     AS program before re-enabling slots), re-arm JOB_INT mask.     */
-/*  5. signal the faulting job's done_fence with -EIO error state so  */
-/*     waiters do not hang; leave retry policy to userspace (Mesa     */
-/*     re-submits the batch).                                         */
+/* Fault recovery, process context ONLY (never the IRQ handler).       */
+/* Serialises concurrent slot faults with reset_lock. The faulting    */
+/* job's done_fence is signaled exactly once here (F-JOB4): the IRQ    */
+/* path signals only DONE fences, so a faulted job would otherwise     */
+/* hang its WAIT_BO/sched-retirement waiters until the sched timeout   */
+/* re-entered recovery and still never signaled. dma_fence_signal is   */
+/* idempotent (second call returns -EINVAL), and the is_signaled      */
+/* check skips a job that completed between the fault latch and        */
+/* reset_lock. The 0001 fence carries no error state, so a plain      */
+/* signal marks completion; the fault status stays in the kernel log   */
+/* path for the retry decision (Mesa re-submits the batch).           */
 /* ------------------------------------------------------------------ */
 
 int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
@@ -590,11 +604,18 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 	uint32_t raw;
 	int i, ret = 0;
 	unsigned long end;
+	struct p7580_submit_job *fault_job = NULL;
 
 	if (!jd || fault_slot < 0 || fault_slot >= P7580_NUM_JOB_SLOTS)
 		return -EINVAL;
 
 	mutex_lock(&jd->reset_lock);
+	/* Latch the faulting in-flight job under hw_lock while the slot  */
+	/* is stopped: afterwards the IRQ cannot complete it into a late */
+	/* DONE signal, and a concurrent timedout_job for the same slot  */
+	/* serialises on reset_lock, so the signal below fires once. */
+	spin_lock_irq(&jd->hw_lock);
+	fault_job = jd->in_flight[fault_slot];
 	/* 1. stop the faulting slot. MULTIPLE_FAULT (GPU IRQ bit 7) is  */
 	/* read by the caller from GPU_INT_STAT; here every present slot */
 	/* that still shows a pending command is hard-stopped too. */
@@ -606,8 +627,11 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 			p7580_js_write(jd, i, P7580_JS_COMMAND_NEXT,
 				       P7580_JS_CMD_HARD_STOP);
 	}
+	/* Out of flight: a late DONE bit cannot signal the same fence. */
+	jd->in_flight[fault_slot] = NULL;
+	spin_unlock_irq(&jd->hw_lock);
 
-	/* 2. wait for slots to drain. */
+	/* 2. wait for slots to drain (sleep: workqueue context). */
 	end = jiffies + msecs_to_jiffies(P7580_RESET_TIMEOUT_MS);
 	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 		while (p7580_js_read(jd, i, P7580_JS_COMMAND_NEXT)) {
@@ -615,7 +639,7 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 				ret = -ETIMEDOUT;
 				break;
 			}
-			cpu_relax();
+			msleep(1);
 		}
 	}
 
@@ -629,7 +653,7 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 				     P7580_GPU_CMD_HARD_RESET);
 			break;
 		}
-		cpu_relax();
+		msleep(1);
 	}
 	p7580_writel(jd, P7580_GPU_INT_CLEAR, P7580_GPU_IRQ_RESET_COMPLETED);
 
@@ -645,7 +669,14 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 
 	mutex_unlock(&jd->reset_lock);
 
-	/* 5. fault accounting: the faulting job's fence must not hang. */
+	/* 5. fault accounting (F-JOB4): signal exactly once so waiters  */
+	/* do not hang. Skip an already-signaled fence: the IRQ won the */
+	/* race and the job completed. */
+	if (fault_job && fault_job->done_fence &&
+	    !dma_fence_is_signaled( /* 0001 */
+		    (struct dma_fence *)fault_job->done_fence))
+		dma_fence_signal( /* 0001 */
+			(struct dma_fence *)fault_job->done_fence);
 	(void)status;
 	return ret;
 }
