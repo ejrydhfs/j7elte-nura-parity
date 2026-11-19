@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Thu, 19 Nov 2026 00:00:00 -0500
+Subject: [PATCH 2/3] drm: wire panfrost7580 MMU helper into the build
+
+Adds drivers/gpu/drm/panfrost/{Kconfig,Makefile} behind a new
+CONFIG_DRM_PANFROST7580 symbol (default n; depends on DRM && ARM64 &&
+MMU) and sources it from drivers/gpu/drm/{Kconfig,Makefile}. The
+helper compiles to panfrost7580_mmu.o and is a prerequisite object
+for the future panfrost GEM/job-slot driver; it changes no existing
+driver (only additive obj-/source lines). No CONFIG_MALI_MIDGARD
+cutover here: kbase keeps owning mali@0x11400000 until the M2/M3
+driver + DeviceTree cutover lands.
+
+---
+ drivers/gpu/drm/Kconfig            | 2 ++
+ drivers/gpu/drm/Makefile           | 1 +
+ drivers/gpu/drm/panfrost/Kconfig   | 7 +++++++
+ drivers/gpu/drm/panfrost/Makefile  | 3 ++++
+ 4 files changed, 13 insertions(+)
+ create mode 100644 drivers/gpu/drm/panfrost/Kconfig
+ create mode 100644 drivers/gpu/drm/panfrost/Makefile
+
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 1c9f243..278f03e 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -52,4 +52,5 @@
+ obj-$(CONFIG_DRM_OMAP)	+= omapdrm/
+ obj-$(CONFIG_DRM_TILCDC)	+= tilcdc/
+ obj-$(CONFIG_DRM_QXL) += qxl/
++obj-$(CONFIG_DRM_PANFROST7580) += panfrost/
+ obj-y			+= i2c/
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index aaaabbb..ccccddd 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -218,5 +218,7 @@
+ source "drivers/gpu/drm/omapdrm/Kconfig"
+ 
+ source "drivers/gpu/drm/tilcdc/Kconfig"
+ 
+ source "drivers/gpu/drm/qxl/Kconfig"
++
++source "drivers/gpu/drm/panfrost/Kconfig"
+diff --git a/drivers/gpu/drm/panfrost/Kconfig b/drivers/gpu/drm/panfrost/Kconfig
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/drivers/gpu/drm/panfrost/Kconfig
+@@ -0,0 +1,9 @@
++# Mali-T720 GPU-MMU helper for Exynos 7580 (j7elte).
++config DRM_PANFROST7580
++	tristate "Panfrost-7580 GPU-MMU helper (Mali-T720, no sysmmu)"
++	depends on DRM && ARM64 && MMU
++	default n
++	help
++	  GPU-side MMU programming (AS_TRANSTAB/MEMATTR/COMMAND) with
++	  DMA-API direct mappings for the Exynos 7580 Mali-T720. No
++	  exynos-sysmmu / IOMMU-API use; the GPU MMU is the IOMMU.
+diff --git a/drivers/gpu/drm/panfrost/Makefile b/drivers/gpu/drm/panfrost/Makefile
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/drivers/gpu/drm/panfrost/Makefile
+@@ -0,0 +1,3 @@
++# Mali-T720 GPU-MMU helper objects (no sysmmu).
++panfrost7580-y := panfrost7580_mmu.o
++obj-$(CONFIG_DRM_PANFROST7580) += panfrost7580.o
+-- 
+2.56.0
