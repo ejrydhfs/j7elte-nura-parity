@@ -90,27 +90,32 @@ int p7580_mmu_alloc(struct device *dev, struct p7580_mmu *mmu)
 	/* Mark every entry invalid; 0x2 == ENTRY_IS_INVAL (lpae.c:186-189). */
 	for (i = 0; i < P7580_MMU_ENTRIES; i++)
 		tbl[i] = P7580_PTE_TYPE_INVAL;
-	mmu->root_cpu = tbl;
 	p7580_sync_pt(dev, mmu->root_dma);
 	p7580_kunmap_dma(tbl);
-	mmu->root_cpu = NULL;
 
 	return 0;
 }
 
-void p7580_mmu_free(struct p7580_mmu *mmu)
+void p7580_mmu_free_table(struct device *dev, dma_addr_t table_dma)
 {
 	struct page *p;
 
+	if (!dev || !table_dma)
+		return;
+	p = pfn_to_page(PFN_DOWN(table_dma));
+	dma_unmap_page(dev, table_dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	__free_page(p);
+}
+
+void p7580_mmu_free(struct p7580_mmu *mmu)
+{
+	/* Root only. Caller MUST have unmapped every mapping AND freed
+	 * every child table via p7580_mmu_free_table (no recursive walk
+	 * here: tables are a per-context resource freed at context
+	 * teardown, matching kbase's pool-free path). Leaks otherwise. */
 	if (!mmu || !mmu->dev || !mmu->root_dma)
 		return;
-
-	/* Caller must have unmapped all mappings (no recursive table walk
-	 * here: tables are a per-context resource freed at context
-	 * teardown, matching kbase's pool-free path). */
-	p = pfn_to_page(PFN_DOWN(mmu->root_dma));
-	dma_unmap_page(mmu->dev, mmu->root_dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
-	__free_page(p);
+	p7580_mmu_free_table(mmu->dev, mmu->root_dma);
 	mmu->dev = NULL;
 	mmu->root_dma = 0;
 }
@@ -262,6 +267,47 @@ void p7580_mmu_program_as(void __iomem *gpu_regs, unsigned int as_nr,
 	/* Ensure table/memattr writes are visible before UPDATE. */
 	wmb();
 	writel(P7580_AS_CMD_UPDATE, as + P7580_AS_COMMAND);
+}
+
+/* Poll AS_STATUS until no command is active (kbase wait_ready,
+ * mali_kbase_mmu_hw_direct.c:63-86; no kbdev here so the caller logs
+ * the -ETIMEDOUT and escalates to GPU reset). */
+static int p7580_as_wait_ready(void __iomem *as)
+{
+	unsigned int loops = P7580_AS_INACTIVE_MAX_LOOPS;
+	u32 val = readl(as + P7580_AS_STATUS);
+
+	while (--loops && (val & P7580_AS_STATUS_ACTIVE))
+		val = readl(as + P7580_AS_STATUS);
+	return loops ? 0 : -ETIMEDOUT;
+}
+
+int p7580_mmu_invalidate(void __iomem *gpu_regs, unsigned int as_nr,
+			 u64 vpfn, u32 nr, int sync)
+{
+	void __iomem *as;
+	u64 lock_addr;
+	int ret;
+
+	if (!gpu_regs || !nr)
+		return -EINVAL;
+	as = gpu_regs + P7580_MMU_AS_BASE + as_nr * P7580_MMU_AS_STRIDE;
+
+	/* Caller holds the MMU-HW lock (see header contract). Sequence is
+	 * kbase_mmu_hw_do_operation (mali_kbase_mmu_hw_direct.c:298-348):
+	 * LOCK region -> op -> wait-ready -> UNLOCK. */
+	lock_addr = (vpfn << PAGE_SHIFT) & ~((u64)0xFFF);
+	writel((u32)(lock_addr & 0xFFFFFFFFUL), as + P7580_AS_LOCKADDR_LO);
+	writel((u32)((lock_addr >> 32) & 0xFFFFFFFFUL),
+	       as + P7580_AS_LOCKADDR_HI);
+	writel(P7580_AS_CMD_LOCK, as + P7580_AS_COMMAND);
+	writel(sync ? P7580_AS_CMD_FLUSH_MEM : P7580_AS_CMD_FLUSH_PT,
+	       as + P7580_AS_COMMAND);
+	ret = p7580_as_wait_ready(as);
+	/* UNLOCK flushes the MMU/uTLB so updated entries are re-read
+	 * (kbase BASE_HW_ISSUE_9630 note at :326-344). */
+	writel(P7580_AS_CMD_UNLOCK, as + P7580_AS_COMMAND);
+	return ret;
 }
 
 const char *p7580_mmu_fault_code(u32 status)

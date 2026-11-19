@@ -1,9 +1,17 @@
 # GPU31 IOMMU path — decision and patch (Mali-T720, Exynos 7580, 3.10.108)
 
-Status: **decision made and compile-checked.** Device live state could not be
-re-read from this slice (the shared `gpsdev.lock` was held by the GPS/FM
-workstreams during this window; no reboot, no flash, no device command was
-issued — live bring-up state is owned by `G31_Report`/`gpu31-master.md`).
+Status: **decision made, self-review fixes applied, compile-checked
+(commit pending).** `docs/reports/gpu31-review.md` (625ed18) raises no
+finding against this slice's files (verified: no `gpu31/iommu`,
+`panfrost7580`, `p7580`, or `G31_Iommu` hit in the review); the §1–§4
+fence/resv/syncobj/sched, §6–§10 display/DT/PRIME, §11 r7p0-compat, and
+§12 Mesa findings belong to sibling slices and are explicitly NOT touched
+here. This slice's stated `fix` is therefore: none owed to the review —
+plus three self-found hardenings below (same review lens applied to my own
+helper). Device live state could not be re-read from this slice (the shared
+`gpsdev.lock` was held by the GPS/FM workstreams during this window; no
+reboot, no flash, no device command was issued — live bring-up state is
+owned by `G31_Report`/`gpu31-master.md`).
 All tree citations below are file:line in the shared Nura tree (KT);
 no kernel tree was modified — patches live under `code/gpu31/iommu/`.
 
@@ -64,10 +72,19 @@ no `CONFIG_*IOMMU*` change. Rationale, each point grounded:
 
 | File | Content |
 |---|---|
-| `panfrost7580_mmu.h` (116 lines) | AS register offsets/strides, TRANSTAB/MEMATTR/TRANSCCFG constants, both memattr tables (kbase `0x8D884D4F48` default + upstream `0x888D88` for A/B), fault-code decode, `struct p7580_mmu` + map/unmap/program API |
-| `panfrost7580_mmu.c` (301 lines) | `p7580_mmu_alloc/free` (identity-checked `dma_map_page`, `dma_mapping_error` handling), `p7580_mmu_map/unmap` (4-level walk, `dma_sync_single_for_device` after every parent/leaf write), `p7580_mmu_program_as` (TRANSTAB/MEMATTR/TRANSCCFG + `wmb()` + `UPDATE`), `p7580_mmu_fault_code/atype` |
+| `panfrost7580_mmu.h` (151 lines) | Locking contract (caller-held MMU/table + MMU-HW locks, mirrors kbase `mmu_lock`/`mmu_hw_mutex`); AS register offsets incl. `LOCKADDR_LO/HI`, `STATUS`, `CMD_{LOCK,UNLOCK,FLUSH_PT,FLUSH_MEM}`, wait bound (100000, `mali_kbase_defs.h:1682`); TRANSTAB/MEMATTR/TRANSCCFG constants, both memattr tables (kbase `0x8D884D4F48` default + upstream `0x888D88` for A/B), fault-code decode; `struct p7580_mmu` (dev + root_dma) + alloc/free/map/unmap/invalidate/program API |
+| `panfrost7580_mmu.c` (347 lines) | `p7580_mmu_alloc/free/free_table` (identity-checked `dma_map_page`, `dma_mapping_error` handling; root-only free + exported `free_table` for the M2/M3 teardown walker), `p7580_mmu_map/unmap` (4-level walk, `dma_sync_single_for_device` after every parent/leaf write; map may sleep allocating <=3 tables), `p7580_mmu_invalidate` (LOCK->op->wait-ready->UNLOCK mirroring `kbase_mmu_hw_do_operation` `mali_kbase_mmu_hw_direct.c:298-348`, `-ETIMEDOUT` on `AS_ACTIVE` stuck for GPU-reset escalation), `p7580_mmu_program_as` (TRANSTAB/MEMATTR/TRANSCCFG + `wmb()` + `UPDATE`), `p7580_mmu_fault_code/atype` |
 | `0001-panfrost7580-mmu-helper.patch` | New files → `drivers/gpu/drm/panfrost/panfrost7580_mmu.{c,h}` (byte-identical to staged sources, `cmp` clean) |
 | `0002-panfrost7580-build-wiring.patch` | `drivers/gpu/drm/{Makefile,Kconfig}` + new `drivers/gpu/drm/panfrost/{Kconfig,Makefile}` behind `CONFIG_DRM_PANFROST7580` (default n, `depends on DRM && ARM64 && MMU`) |
+
+Self-review hardenings this round (review lens, no reviewer finding owed):
+H1 locking contract documented in header (caller-held locks; helper takes
+none — same as kbase paths); H2 `p7580_mmu_invalidate()` added — map/unmap
+alone leave stale TLBs, which the first version never flushed (silent
+wrong-rendering risk; now LOCK->FLUSH_PT/MEM->wait->UNLOCK with the kbase
+`wait_ready` bound and 9630-UNLOCK note); H3 teardown made explicit
+(`free_table` export + root-only `free` contract; stale `root_cpu` struct
+member removed — it was write-only).
 
 Deliberately NOT in this slice: GEM object binding, dma-buf/sg import into
 GPU PTEs, MMU IRQ registration, fault-recovery policy, DVFS/OPP, any
@@ -81,11 +98,11 @@ lands — both drivers program `AS_TRANSTAB` and cannot coexist).
   `arch/arm64/include/generated`, `include`, `include/uapi`,
   `arch/arm64/include/uapi`, `__KERNEL__`, `linux/kconfig.h`): **both PASS,
   zero errors** (only pre-existing in-tree header warnings under `-Wall`).
-- Object `panfrost7580_mmu.o` 11840 B exports exactly
-  `p7580_mmu_{alloc,free,map,unmap,program_as,fault_code,fault_atype}`;
+- Object `panfrost7580_mmu.o` exports exactly
+  `p7580_mmu_{alloc,free,free_table,map,unmap,invalidate,program_as,fault_code,fault_atype}`;
   undefined refs are kernel-provided (`dma_ops`, `dev_warn`,
-  `alloc/free_pages`, `contig_page_data`, `memstart_addr`) — all resolved
-  at kernel link, same class as the `drm-backport` series objects.
+  `alloc/free_pages`) — all resolved at kernel link, same class as the
+  `drm-backport` series objects.
 - `git apply --check` PASS for 0001+0002 individually and as a series in a
   private tree seeded from the shared tree's `drivers/gpu/drm/{Makefile,
   Kconfig}`; post-apply files byte-identical to staged sources.

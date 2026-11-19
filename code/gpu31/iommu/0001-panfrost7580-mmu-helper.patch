@@ -18,16 +18,21 @@ Provenance: kbase_mmu_alloc_pgd (mali_kbase_mmu.c:386-428),
 kbase_mmu_sync_pgd (mali_kbase_mmu.c:78-87), kbase_mmu_hw_configure
 + mmu_get_as_setup (mali_kbase_mmu_hw_direct.c:242-288,
 mali_kbase_mmu_mode_lpae.c:76-103, ACE branch dropped),
-entry_set_ate/pte/invalidate (mali_kbase_mmu_mode_lpae.c:174-189).
+entry_set_ate/pte/invalidate (mali_kbase_mmu_mode_lpae.c:174-189),
+LOCK/UNLOCK/FLUSH + wait_ready (mali_kbase_mmu_hw_direct.c:63-86,
+298-348; BASE_HW_ISSUE_9630 double-UNLOCK note).
 Memattr default is the kbase LPAE table 0x8D884D4F48
 (mali_midg_regmap.h:506-514); upstream 0x888D88 defined for A/B
-comparison (risk R4). Slice contract: shared tree never edited;
+comparison (risk R4). Locking contract in header: caller holds the
+MMU/table lock for alloc/free/map/unmap and the MMU-HW lock for
+program_as/invalidate (mirrors kbase mmu_lock/mmu_hw_mutex).
+Slice contract: shared tree never edited;
 integrator applies this series; build/flash owned by integrator.
 
 ---
- drivers/gpu/drm/panfrost/panfrost7580_mmu.c | 254 ++++++++++++++++++++++++++++
- drivers/gpu/drm/panfrost/panfrost7580_mmu.h | 111 +++++++++++++++
- 2 files changed, 365 insertions(+)
+ drivers/gpu/drm/panfrost/panfrost7580_mmu.c | 347 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/panfrost/panfrost7580_mmu.h | 151 +++++++++++++++
+ 2 files changed, 498 insertions(+)
  create mode 100644 drivers/gpu/drm/panfrost/panfrost7580_mmu.c
  create mode 100644 drivers/gpu/drm/panfrost/panfrost7580_mmu.h
 
@@ -36,7 +41,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,347 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_mmu.c - Mali-T720 GPU-MMU programming, Exynos 7580 / 3.10.108.
@@ -129,27 +134,32 @@ index 0000000..1111111
 +	/* Mark every entry invalid; 0x2 == ENTRY_IS_INVAL (lpae.c:186-189). */
 +	for (i = 0; i < P7580_MMU_ENTRIES; i++)
 +		tbl[i] = P7580_PTE_TYPE_INVAL;
-+	mmu->root_cpu = tbl;
 +	p7580_sync_pt(dev, mmu->root_dma);
 +	p7580_kunmap_dma(tbl);
-+	mmu->root_cpu = NULL;
 +
 +	return 0;
 +}
 +
-+void p7580_mmu_free(struct p7580_mmu *mmu)
++void p7580_mmu_free_table(struct device *dev, dma_addr_t table_dma)
 +{
 +	struct page *p;
 +
++	if (!dev || !table_dma)
++		return;
++	p = pfn_to_page(PFN_DOWN(table_dma));
++	dma_unmap_page(dev, table_dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
++	__free_page(p);
++}
++
++void p7580_mmu_free(struct p7580_mmu *mmu)
++{
++	/* Root only. Caller MUST have unmapped every mapping AND freed
++	 * every child table via p7580_mmu_free_table (no recursive walk
++	 * here: tables are a per-context resource freed at context
++	 * teardown, matching kbase's pool-free path). Leaks otherwise. */
 +	if (!mmu || !mmu->dev || !mmu->root_dma)
 +		return;
-+
-+	/* Caller must have unmapped all mappings (no recursive table walk
-+	 * here: tables are a per-context resource freed at context
-+	 * teardown, matching kbase's pool-free path). */
-+	p = pfn_to_page(PFN_DOWN(mmu->root_dma));
-+	dma_unmap_page(mmu->dev, mmu->root_dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
-+	__free_page(p);
++	p7580_mmu_free_table(mmu->dev, mmu->root_dma);
 +	mmu->dev = NULL;
 +	mmu->root_dma = 0;
 +}
@@ -303,6 +313,47 @@ index 0000000..1111111
 +	writel(P7580_AS_CMD_UPDATE, as + P7580_AS_COMMAND);
 +}
 +
++/* Poll AS_STATUS until no command is active (kbase wait_ready,
++ * mali_kbase_mmu_hw_direct.c:63-86; no kbdev here so the caller logs
++ * the -ETIMEDOUT and escalates to GPU reset). */
++static int p7580_as_wait_ready(void __iomem *as)
++{
++	unsigned int loops = P7580_AS_INACTIVE_MAX_LOOPS;
++	u32 val = readl(as + P7580_AS_STATUS);
++
++	while (--loops && (val & P7580_AS_STATUS_ACTIVE))
++		val = readl(as + P7580_AS_STATUS);
++	return loops ? 0 : -ETIMEDOUT;
++}
++
++int p7580_mmu_invalidate(void __iomem *gpu_regs, unsigned int as_nr,
++			 u64 vpfn, u32 nr, int sync)
++{
++	void __iomem *as;
++	u64 lock_addr;
++	int ret;
++
++	if (!gpu_regs || !nr)
++		return -EINVAL;
++	as = gpu_regs + P7580_MMU_AS_BASE + as_nr * P7580_MMU_AS_STRIDE;
++
++	/* Caller holds the MMU-HW lock (see header contract). Sequence is
++	 * kbase_mmu_hw_do_operation (mali_kbase_mmu_hw_direct.c:298-348):
++	 * LOCK region -> op -> wait-ready -> UNLOCK. */
++	lock_addr = (vpfn << PAGE_SHIFT) & ~((u64)0xFFF);
++	writel((u32)(lock_addr & 0xFFFFFFFFUL), as + P7580_AS_LOCKADDR_LO);
++	writel((u32)((lock_addr >> 32) & 0xFFFFFFFFUL),
++	       as + P7580_AS_LOCKADDR_HI);
++	writel(P7580_AS_CMD_LOCK, as + P7580_AS_COMMAND);
++	writel(sync ? P7580_AS_CMD_FLUSH_MEM : P7580_AS_CMD_FLUSH_PT,
++	       as + P7580_AS_COMMAND);
++	ret = p7580_as_wait_ready(as);
++	/* UNLOCK flushes the MMU/uTLB so updated entries are re-read
++	 * (kbase BASE_HW_ISSUE_9630 note at :326-344). */
++	writel(P7580_AS_CMD_UNLOCK, as + P7580_AS_COMMAND);
++	return ret;
++}
++
 +const char *p7580_mmu_fault_code(u32 status)
 +{
 +	switch (status & P7580_FAULT_CODE_MASK) {
@@ -343,7 +394,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,151 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_mmu.h - Mali-T720 GPU-MMU programming for Exynos 7580 (j7elte).
@@ -394,13 +445,24 @@ index 0000000..1111111
 +#define P7580_AS_TRANSTAB_HI	0x04
 +#define P7580_AS_MEMATTR_LO	0x08
 +#define P7580_AS_MEMATTR_HI	0x0C
++#define P7580_AS_LOCKADDR_LO	0x10
++#define P7580_AS_LOCKADDR_HI	0x14
 +#define P7580_AS_COMMAND	0x18
 +#define P7580_AS_FAULTSTATUS	0x1C
 +#define P7580_AS_FAULTADDR_LO	0x20
 +#define P7580_AS_FAULTADDR_HI	0x24
++#define P7580_AS_STATUS		0x28
++#define P7580_AS_STATUS_ACTIVE	0x01
 +#define P7580_AS_TRANSCFG_LO	0x30
 +
 +#define P7580_AS_CMD_UPDATE	0x01
++#define P7580_AS_CMD_LOCK	0x02
++#define P7580_AS_CMD_UNLOCK	0x03
++#define P7580_AS_CMD_FLUSH_PT	0x04
++#define P7580_AS_CMD_FLUSH_MEM	0x05
++/* AS_ACTIVE poll bound (KT mali_kbase_defs.h:1682
++ * KBASE_AS_INACTIVE_MAX_LOOPS). */
++#define P7580_AS_INACTIVE_MAX_LOOPS 100000
 +
 +/* TRANSTAB value (KT mali_kbase_mmu_mode_lpae.c:89-97,
 + * mali_midg_regmap.h:321-326): pgd | TABLE(3) | READ_INNER(4).
@@ -430,13 +492,20 @@ index 0000000..1111111
 +#define P7580_FAULT_CODE_MASK	(0x7u << 3)
 +#define P7580_FAULT_ATYPE_MASK	(0x3u << 8)
 +
-+/* One GPU address space binding. Page tables come from the kernel page
++/* Locking contract (mirrors kbase: mmu_lock serialises table walks,
++ * mmu_hw_mutex serialises AS register programming):
++ * - alloc/free/map/unmap: caller MUST hold the driver's MMU/table lock.
++ *   No internal locking is provided (same as kbase_mmu_* paths, which
++ *   assert lockdep_assert_held on entry).
++ * - program_as/invalidate: caller MUST hold the driver's MMU-HW lock
++ *   (serialises AS_LOCKADDR/LOCK/UNLOCK/FLUSH sequences against
++ *   concurrent AS programming and IRQ-driven recovery).
++ * One GPU address space binding. Page tables come from the kernel page
 + * allocator via dma_map_page (identity on this arm64 tree: dma == phys);
 + * explicit dma_sync_single_for_device after every update because the
 + * system is COHERENCY_NONE (KT mali_kbase_mmu.c:78-87). */
 +struct p7580_mmu {
 +	struct device *dev;
-+	u64 *root_cpu;		/* kmap of the level-0 table */
 +	dma_addr_t root_dma;
 +};
 +
@@ -446,13 +515,30 @@ index 0000000..1111111
 +#define P7580_PROT_XN		(1u << 2)
 +
 +int p7580_mmu_alloc(struct device *dev, struct p7580_mmu *mmu);
++/* Free one child table page (dma_unmap + __free_page) after its parent
++ * entry has been cleared. Exported for the M2/M3 teardown walker; NOT
++ * for general use. */
++void p7580_mmu_free_table(struct device *dev, dma_addr_t table_dma);
++/* Free the root only; caller MUST have unmapped every mapping AND freed
++ * every child table via p7580_mmu_free_table (no recursive walk here,
++ * matching kbase's pool-free teardown). Leaks otherwise. */
 +void p7580_mmu_free(struct p7580_mmu *mmu);
-+/* Map one 4 KiB page (both addresses 4K-aligned). memattr_idx 0..7. */
++/* Map one 4 KiB page (both addresses 4K-aligned). memattr_idx 0..7.
++ * May allocate up to 3 child tables (GFP_KERNEL, may sleep). */
 +int p7580_mmu_map(struct p7580_mmu *mmu, u64 iova, phys_addr_t paddr,
 +		  unsigned int prot, unsigned int memattr_idx);
 +void p7580_mmu_unmap(struct p7580_mmu *mmu, u64 iova);
++/* Invalidate GPU TLBs for [vpfn, vpfn+nr) in address space as_nr.
++ * LOCK region -> op (FLUSH_PT async / FLUSH_MEM sync+drain) -> wait-ready
++ * -> UNLOCK, mirroring kbase_mmu_hw_do_operation
++ * (mali_kbase_mmu_hw_direct.c:298-348). sync != 0 drains prior accesses
++ * (kbase sync path); sync == 0 is the map/unmap fast path.
++ * Returns 0 on ready, -ETIMEDOUT if the AS fails to go ready (caller
++ * escalates to GPU reset, as kbase does at mali_kbase_mmu.c:873-886). */
++int p7580_mmu_invalidate(void __iomem *gpu_regs, unsigned int as_nr,
++			 u64 vpfn, u32 nr, int sync);
 +/* Program address space as_nr off a GPU register base (gpu regs + offsets
-+ * above); issues AS_COMMAND_UPDATE. Caller holds any required locks. */
++ * above); issues AS_COMMAND_UPDATE. Caller holds the MMU-HW lock. */
 +void p7580_mmu_program_as(void __iomem *gpu_regs, unsigned int as_nr,
 +			  dma_addr_t pgd_dma, u32 memattr_lo, u32 memattr_hi);
 +/* Human-readable fault status, for the MMU IRQ handler log path. */
