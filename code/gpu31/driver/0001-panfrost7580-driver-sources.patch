@@ -3016,6 +3016,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +				 ((u64)0 << 32) | shader_present);
 +	if (ret)
 +		goto err_mmu;
++	/* R1: warm up the shared sched workqueue at probe so the first
++	 * open never constructs kernel threads under the opener's
++	 * mutex. Failure here is non-fatal: the first open retries
++	 * via p7580_drv_sched_ensure inside file_init. */
++	ret = p7580_drv_sched_ensure();
++	if (ret)
++		goto err_mmu;
 +
 +	/* Power (clocks/regulator/runtime PM + first power-on). */
 +	ret = pf7580_power_probe(&pdev->dev, regs, &drv->power);
@@ -4663,6 +4670,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +	if (!df || !drv)
 +		return -EINVAL;
++	/* R1: the shared sched workqueue does not exist until the first
++	 * ensure. drm_sched_entity_init takes sched->lock, so running it
++	 * against a never-initialised (zeroed) sched wedges the opener.
++	 * Ensure here so open stays O(1) with no waits on the fast path
++	 * (ensure only inits once; later opens hit the live flag). */
++	ret = p7580_drv_sched_ensure();
++	if (ret)
++		return ret;
 +	df->drv = drv;
 +	df->next_seqno = 0;
 +	df->entities_live = 0;
