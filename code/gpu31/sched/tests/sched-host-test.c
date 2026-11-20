@@ -909,6 +909,77 @@ static void test_pumpfix_null_fence(void)
 	drm_sched_entity_fini(&sched, &e);
 	drm_sched_fini(&sched);
 }
+/* Opsfix: ops pointer round-trips alloc -> pump -> run_job.
+ * Silicon ST-OPS showed ops=NULL despite a correct store; this test
+ * pins the contract at host level: (1) alloc writes job->ops, (2) the
+ * pump calls the same ops' run_job (proves the pump reads the same
+ * offset the alloc store wrote), (3) run_job observes the ops pointer
+ * it was dispatched through. Hierarchy of the static asserts: header
+ * enum asserts pin offsetof==24 in every TU; the alloc BUG_ON fires
+ * if the store lands elsewhere; this test fires if the pump reads
+ * elsewhere. */
+static const struct drm_sched_backend_ops *ops_seen_in_run;
+static struct dma_fence *sched_run_record_ops(struct drm_sched_job *job)
+{
+	struct test_fence *tf;
+
+	run_count++;
+	ops_seen_in_run = job->ops;
+	tf = mkfence(9, (unsigned)run_count);
+	if (!tf)
+		return ERR_PTR(-ENOMEM);
+	return &tf->base;
+}
+
+static void test_opsfix_roundtrip(void)
+{
+	static const struct drm_sched_backend_ops ops_a = {
+		sched_run_record_ops, sched_timedout, sched_free,
+	};
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+	ops_seen_in_run = NULL;
+
+	/* (1) alloc stores the exact ops pointer the caller passed. */
+	j = drm_sched_job_alloc(&e, &ops_a, (void *)(long)42);
+	CHECK(j != NULL);
+	CHECK(j->ops == &ops_a);
+	/* Field address matches the compile-time offset both TUs
+	 * assert on (24): the probe the pump prints (&job->ops) is
+	 * the same word the alloc wrote. */
+	CHECK_EQ((long long)((char *)&j->ops - (char *)j), 24LL);
+	CHECK_EQ(j->slot, 0); /* kzalloc default: submit stamps it */
+	CHECK_EQ(j->ran, 0); /* unset until run_job returns */
+	j->slot = 1;
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+
+	/* (2) pump dispatches through the same ops (run fires once). */
+	e.sched_work.fn(&e.sched_work);
+	spin_lock(&e.queue_lock);
+	e.in_flight = NULL;
+	spin_unlock(&e.queue_lock);
+	CHECK_EQ(run_count, 1);
+	/* (3) run_job observed the dispatch ops pointer. */
+	CHECK(ops_seen_in_run == &ops_a);
+	CHECK_EQ(j->ran, 1);
+	CHECK(j->fence != NULL);
+
+	/* Retire: fence signal -> finish -> free. */
+	dma_fence_signal(j->fence);
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(free_count, 1);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
 
 
 int main(void)
@@ -931,6 +1002,7 @@ int main(void)
 	test_pumpfix_run_once_ordered();
 	test_pumpfix_null_run_job();
 	test_pumpfix_null_fence();
+	test_opsfix_roundtrip();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

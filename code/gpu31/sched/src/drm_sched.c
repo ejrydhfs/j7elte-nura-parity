@@ -27,6 +27,14 @@
  */
 
 #include "drm_sched.h"
+#include <stddef.h>
+#ifdef __KERNEL__
+#include <linux/bug.h>
+#define DRM_SCHED_BUILD_BUG_ON(e) BUILD_BUG_ON(e)
+#else
+/* Host emu has BUG_ON (kernel-emu.h, abort on fire); no bug.h needed. */
+#define DRM_SCHED_BUILD_BUG_ON(e) BUG_ON(e)
+#endif
 #include <linux/completion.h>
 #include <linux/slab.h>
 #include <linux/jiffies.h>
@@ -276,8 +284,15 @@ struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,
 	INIT_LIST_HEAD(&job->finish_cb.node);
 	job->entity = entity;
 	job->ops = ops;
+	/* Opsfix: fail LOUD if the store did not land where the pump
+	 * reads it (silicon ST-OPS showed ops=NULL despite a source
+	 * line that stores it). Header asserts offsetof==24 in both
+	 * TUs (enum-constant BUILD_BUG_ON_ZERO at file scope); a
+	 * mismatch means a duplicate struct definition or a stale .o,
+	 * never a silent "NULL ops" retire. */
+	DRM_SCHED_BUILD_BUG_ON(offsetof(struct drm_sched_job, ops) != 24);
+	BUG_ON(job->ops != ops);
 	job->owner = owner;
-	job->dep_fence = NULL;
 	INIT_DELAYED_WORK(&job->timeout_work, drm_sched_job_timeout);
 	INIT_WORK(&job->finish_work, drm_sched_job_finish);
 
@@ -490,11 +505,13 @@ static void drm_sched_pump(struct work_struct *work)
 	spin_unlock_irqrestore(&entity->queue_lock, flags);
 
 	/* ST-PUMP: worker dequeued (dep met or dep-less); run_job next.
-	 * The pumpfix probe prints the job's ops/run_job pointers plus the
-	 * carried slot, so a header/ABI skew (run_job at the wrong offset,
-	 * NULL-ops job) shows up in dmesg. job->ops is trusted only after
-	 * the NULL check below: a NULL-ops job retires through the F4
-	 * free path (no dispatch) instead of faulting. */
+	 * Opsfix probe prints the dequeued job address, the address of
+	 * its ->ops field, and the ops/run_job pointers plus the
+	 * carried slot, so a header/ABI skew (stale .o, duplicate
+	 * struct, link picking two shim copies) shows up in dmesg:
+	 * compare job->ops against the driver's &p7580_drv_sched_ops
+	 * (from /proc/kallsyms) and offsetof(ops)==24 in both TUs.
+	 * job->ops is trusted only after the NULL check below. */
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
 		pr_info("p7580_sched: pump job_count=%d\n",
@@ -502,7 +519,8 @@ static void drm_sched_pump(struct work_struct *work)
 	}
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
-		pr_info("p7580_sched: ops ops=%p run=%p slot=%d\n",
+		pr_info("p7580_sched: ops job=%p opsoff=%p ops=%p run=%p slot=%d\n",
+			job, (void *)&job->ops,
 			job->ops, job->ops ? job->ops->run_job : NULL,
 			job->slot);
 	}

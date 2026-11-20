@@ -5690,7 +5690,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,897 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -5738,6 +5738,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +#include <linux/dma-resv.h>		/* 0002 */
 +#include <drm_syncobj.h>		/* 0003 */
 +#include <drm_sched.h>			/* 0004 */
++#include <linux/bug.h>			/* opsfix: BUILD_BUG_ON */
 +
 +#include "panfrost_drm.h"
 +#include "panfrost7580_gem.h"
@@ -5997,6 +5998,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	.timedout_job = p7580_drv_timedout_job,
 +	.free_job = p7580_drv_free_job,
 +};
++
++/* Opsfix: the 0004 shim header is the single authoritative struct
++ * definition (both TUs include <drm_sched.h> via -Idrivers/gpu/drm).
++ * Silicon ST-OPS showed ops=NULL despite a correct store + correct call
++ * site; if either TU ever drifts, the build breaks here instead of
++ * retiring the job silently. Values (arm64 3.10): ops=24 slot=232 ran=236
++ * (see docs/reports/gpu31-opsfix). File-scope pin: a noinline probe
++ * the linker keeps, so /proc/kallsyms + ST-OPS dmesg can be compared
++ * against these exact numbers. */
++static void __maybe_unused p7580_drv_sched_layout_pin(void)
++{
++	BUILD_BUG_ON(offsetof(struct drm_sched_job, ops) != 24);
++	BUILD_BUG_ON(offsetof(struct drm_sched_job, slot) != 232);
++	BUILD_BUG_ON(offsetof(struct drm_sched_job, ran) != 236);
++}
 +
 +/* Power guard (F-SUB1). Every MMIO site in this file runs under a
 + * p7580_drv_pm_get/put pair; the get fails closed (caller must touch
@@ -6377,6 +6393,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	if (!sched_job) {
 +		p7580_job_free(job);
 +		ret = -ENOMEM;
++		goto err_objs;
++	}
++
++/* Opsfix call-site guard: the int13 silicon trace showed ST-OPS
++ * ops=0/run=0 despite this exact call passing
++ * &p7580_drv_sched_ops. A NULL entity or a store that does not
++ * round-trip means a stale .o / duplicate shim copy won the link,
++ * never a real NULL-ops job: fail the ioctl, do not queue. */
++BUILD_BUG_ON(offsetof(struct drm_sched_job, ops) != 24);
++if (!entity || sched_job->entity != entity ||
++    sched_job->ops != &p7580_drv_sched_ops || !sched_job->ops->run_job) {
++		drm_sched_job_cleanup(sched_job);
++		p7580_job_free(job);
++		kfree(sched_job);
++		ret = -EFAULT;
 +		goto err_objs;
 +	}
 +	drm_sched_job_arm(sched_job);

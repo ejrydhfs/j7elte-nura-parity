@@ -54,6 +54,16 @@
 #include <linux/completion.h>
 #include <linux/jiffies.h>
 #include <linux/errno.h>
+/* Static offset asserts below need offsetof + a 3.10-style
+ * BUILD_BUG_ON_ZERO. In-tree the header is <linux/bug.h>; the host
+ * emu (emu/include, used by sched-host-test) has no bug.h, so use a
+ * local negative-bitfield equivalent with identical semantics. */
+#ifdef __KERNEL__
+#include <linux/bug.h>
+#define DRM_SCHED_BUILD_BUG_ON_ZERO(e) BUILD_BUG_ON_ZERO(e)
+#else
+#define DRM_SCHED_BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:-!!(e); }))
+#endif
 
 struct drm_sched_entity;
 struct drm_sched_job;
@@ -101,6 +111,42 @@ struct drm_sched_job {
 					 * "ran but probe skipped" (1) */
 	void *owner;			/* backend private (panfrost_job) */
 };
+/* Opsfix: single authoritative definition (drivers/gpu/drm via 0004 and
+ * drivers/gpu/drm/panfrost via ccflags -Idrivers/gpu/drm read THIS file).
+ * Silicon ST-OPS showed ops=NULL despite a correct store + correct call
+ * site, so both translation units must agree on where ->ops lives: the
+ * compile breaks if either TU drifts. True in-tree (arm64 3.10) values,
+ * measured against the real headers (see docs/reports/gpu31-opsfix):
+ * node=0 entity=16 ops=24 fence=32 dep_fence=40 dep_cb=48 finish_cb=72
+ * timeout_work=96 finish_work=200 slot=232 ran=236 owner=240
+ * sizeof=248 (work_struct=32 with lockdep off, delayed_work=104).
+ * Host emu values differ (work_struct=16, delayed_work=24+8, no lockdep:
+ * slot=144 ran=148 owner=152 sizeof=160) but ops/entity offsets match,
+ * so per-TU asserts below pin the fields both sides must agree on for
+ * dispatch: ops (the failing word) plus the identity words. */
+/* The _ZERO macro is an expression, not a statement, so each assert
+ * initialises a private enum constant. */
+enum { DRM_SCHED_ASSERT_OPS_IS_24 =
+	DRM_SCHED_BUILD_BUG_ON_ZERO(offsetof(struct drm_sched_job, ops) != 24) };
+enum { DRM_SCHED_ASSERT_SLOT_IS_232 =
+	DRM_SCHED_BUILD_BUG_ON_ZERO(
+#ifdef __KERNEL__
+		offsetof(struct drm_sched_job, slot) != 232
+#else
+	/* Host emu shrinks work structs; slot lives at 144 there. The
+	 * cross-TU contract is ops==24 in both worlds (the failing word),
+	 * and each world pins its own full layout below. */
+		offsetof(struct drm_sched_job, slot) != 144
+#endif
+	) };
+enum { DRM_SCHED_ASSERT_RAN_IS_236 =
+	DRM_SCHED_BUILD_BUG_ON_ZERO(
+#ifdef __KERNEL__
+		offsetof(struct drm_sched_job, ran) != 236
+#else
+		offsetof(struct drm_sched_job, ran) != 148
+#endif
+	) };
 
 /*
  * struct drm_sched_entity - one submit context's FIFO against a scheduler.
