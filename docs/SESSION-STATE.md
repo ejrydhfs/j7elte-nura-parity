@@ -122,6 +122,15 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Panfrost dispatches to hardware; completion IRQ missing (2026-11-20, int15)
+- After fixing the scheduler (pump now calls run_job) and stamping file/drv at SUBMIT,
+  one NULL job reaches hardware:
+  `p7580_job: dispatch slot=1 jc=0x2000000 cfg=0x00083700 as=0 aff=0x3 seq=0`.
+- It does **not** complete by interrupt: `panfrost7580-job` IRQ count stays 0
+  (`panfrost7580-gpu` fired once), so the fence retires on the 5 s timeout.
+- Note: submit selected slot 1; panfrost normally uses slot 0 for fragment jobs, and
+  JOB_INT_MASK/RAWSTAT handling is unverified. Fix in progress (`gpu31-irq.md`).
+
 ## Why the GPU never ran (2026-11-20, int12 trace)
 On-silicon trace of one NULL-job submit:
 ```
