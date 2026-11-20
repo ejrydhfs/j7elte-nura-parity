@@ -521,22 +521,38 @@ const struct vm_operations_struct p7580_gem_vm_ops = {
  * -EINVAL without ever faulting; dmesg silent). The working shape on
  * this tree is exynos_drm_gem_mmap_buffer/drm_gem_cma_mmap:
  * pgprot_writecombine (WC, exynos update_vm_cache_attr shape), then
- * one dma_mmap_attrs() for the CMA page (arm64 backend honours plain
- * WRITE_COMBINE; NO_KERNEL_MAPPING/FORCE_CONTIGUOUS must NOT be set,
- * F-GEM3) or one remap_pfn_range() per SHMEM/imported page with the
- * same prot + size check. KMS dumb mmap keeps its own entry point. */
+ * one dma_mmap_attrs() for the CMA page (arm32 arm_dma_mmap backend
+ * treats vma->vm_pgoff as the page index into the buffer, so reset it
+ * to 0 -- the GEM fake key >> PAGE_SHIFT is NOT a buffer index;
+ * exynos mmap_buffer avoids this via a fresh vma at pgoff 0 and
+ * drm_gem_cma_mmap via remap_pfn_range which ignores pgoff) or one
+ * remap_pfn_range() per SHMEM/imported page with the same prot +
+ * size check. KMS dumb mmap keeps its own entry point.
+ *
+ * Temporary entry/exit pr_info (mmap2 ticket): prints the fake pgoff
+ * installed by drm_gem_mmap and the final return code, so silicon
+ * dmesg proves whether the handler ran and where it failed. */
 int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct drm_gem_object *obj;
 	struct p7580_bo *bo;
 	struct scatterlist *sgl;
-	unsigned long vm_size, pfn, off;
+	unsigned long vm_size, pfn, off, fake_pgoff;
 	unsigned int i, npages;
 	int ret;
 
+	fake_pgoff = vma->vm_pgoff;
+	pr_info("p7580_gem_mmap: enter pgoff=0x%lx len=0x%lx\n",
+		fake_pgoff, vma->vm_end - vma->vm_start);
 	ret = drm_gem_mmap(filp, vma);
-	if (ret)
+	if (ret) {
+		pr_info("p7580_gem_mmap: drm_gem_mmap failed rc=%d pgoff=0x%lx\n",
+			ret, fake_pgoff);
 		return ret;
+	}
+	/* The fake offset key served its purpose (BO lookup); from here
+	 * on vma describes a byte range inside THIS BO, starting at 0. */
+	vma->vm_pgoff = 0;
 
 	obj = vma->vm_private_data;
 	bo = to_p7580_bo(obj);
@@ -561,6 +577,8 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 		dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
 		ret = dma_mmap_attrs(obj->dev->dev, vma, bo->cma_vaddr,
 				     bo->cma_paddr, obj->size, &attrs);
+		pr_info("p7580_gem_mmap: dma_mmap_attrs rc=%d size=0x%zx paddr=0x%llx\n",
+			ret, obj->size, (unsigned long long)bo->cma_paddr);
 		if (ret)
 			goto err_close;
 		return 0;
@@ -597,9 +615,13 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 		if (ret)
 			goto err_close;
 	}
+	pr_info("p7580_gem_mmap: ok obj_size=0x%zx vm=0x%lx\n",
+		obj->size, vm_size);
 	return 0;
 
 err_close:
+	pr_info("p7580_gem_mmap: fail rc=%d vm=0x%lx obj=0x%zx\n",
+		ret, vm_size, obj->size);
 	drm_gem_vm_close(vma);
 	return ret;
 }

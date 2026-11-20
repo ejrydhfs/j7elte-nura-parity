@@ -93,7 +93,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-19 10:48:44.306186802 -0500
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,967 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -110,9 +110,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 + *    this attr; NO_KERNEL_MAPPING is ignored by the arm64 backend and
 + *    FORCE_CONTIGUOUS is a display-side mistaken carry-over, so neither
 + *    is set here).
-+ *  - fault handler mirrors exynos_drm_gem_fault/map_buf
-+ *    (vm_insert_mixed over the sg/phys walk; -EAGAIN stays VM_FAULT_NOPAGE)
-+ *    with WC/cached prot selection.
++ *  - CPU mmap is IMMEDIATE (exynos_drm_gem_mmap_buffer /
++ *    drm_gem_cma_mmap shape): pgprot_writecombine + dma_mmap_attrs
++ *    for CMA (plain WRITE_COMBINE only), remap_pfn_range per page
++ *    for SHMEM/imported. Fault-driven vm_insert_mixed cannot work:
++ *    drm_gem_mmap() sets VM_PFNMAP and installs driver->gem_vm_ops
++ *    itself (EINVAL when that table is NULL); clearing PFNMAP for
++ *    VM_MIXEDMAP + swapping in a second ops table breaks the core
++ *    contract (mmap -EINVAL, never faults). The fault helper stays
++ *    for reference only. WC/cached prot selection is exynos
++ *    update_vm_cache_attr shape.
 + *  - WAIT_BO mirrors v5.2 panfrost_wait_bo: dma_resv_wait_timeout on the
 + *    embedded 0002 resv (locked inside the shim; no outer lock needed).
 + *    Timeout arrives in jiffies (caller converts ns via nsecs_to_jiffies).
@@ -148,7 +155,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +#include <linux/mutex.h>
 +#include <linux/scatterlist.h>
 +#include <linux/shmem_fs.h>
-+#include <linux/slab.h>
 +#include <linux/vmalloc.h>
 +#include <linux/sched.h>
 +
@@ -165,9 +171,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	return container_of(obj, struct p7580_bo, base);
 +}
 +
-+/* ------------------------------------------------------------------ */
-+/* Per-device IOVA allocator (struct p7580_dev, header)               */
-+/* ------------------------------------------------------------------ */
++/* Per-device IOVA allocator (struct p7580_dev, header). Units: the
++ * drm_mm window is addressed in PAGES (init with the byte window
++ * shifted by PAGE_SHIFT; node .start is therefore a PFN and the byte
++ * GPU address is node.start << PAGE_SHIFT). Raw byte init would place
++ * every BO near 0x2000000000, past the 4 GiB window -- MMAP_BO via
++ * the GEM offset manager kept working, so open/CREATE/GET_BO all
++ * passed while only the GPU alias was wrong (gpu31-mmap.md).
++ * ------------------------------------------------------------------ */
 +
 +int p7580_dev_init(struct p7580_dev *gd, struct device *dev)
 +{
@@ -418,7 +429,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +/* per-context tables with this hook, then lets jobs SUBMIT pin each  */
 +/* referenced BO (dma_resv lock discipline per the 0002 plain-mutex)  */
 +/* before p7580_job_hw_submit reads the job descriptor. Unmap runs    */
-+/* before free (DriverAssemble teardown walk, F-MMU5).                */
++/* before free; the context teardown walker is p7580_mmu_teardown()   */
++/* (iommu/panfrost7580_mmu.h, F-MMU5), wired to file-close/remove.     */
 +/*                                                                    */
 +/* Contract (mirrors the review's `driver/` landing checklist):       */
 +/*  - map: for each page index 0..npages-1, p7580_mmu_map(mmu,        */
@@ -586,33 +598,57 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	return p7580_fault_err(ret);
 +}
 +
-+/* Published to the core as driver->gem_vm_ops in main.c (non-static:
-+ * referenced from another TU). */
++/* gem_vm_ops for this driver (exynos shape: fault/open/close from the
++ * core). Published to the core as driver->gem_vm_ops in main.c
++ * (non-static: referenced from another TU). */
 +const struct vm_operations_struct p7580_gem_vm_ops = {
++	.fault = p7580_gem_fault,
 +	.open = drm_gem_vm_open,
 +	.close = drm_gem_vm_close,
-+	.fault = p7580_gem_fault,
 +};
 +
 +/* Driver .fops mmap (GEM path): resolve the fake offset to the BO via
-+ * drm_gem_mmap, then map the pages IMMEDIATELY (exynos_drm_gem_mmap_buffer /
-+ * drm_gem_cma_mmap shape: WC prot + dma_mmap_attrs for CMA,
-+ * remap_pfn_range per SHMEM/imported page). Fault-driven MIXEDMAP cannot
-+ * work (drm_gem_mmap sets VM_PFNMAP + needs driver->gem_vm_ops; post-hoc
-+ * flag/ops swap -EINVALs without faulting). KMS dumb mmap keeps its own
-+ * entry point in the KMS slice. */
++ * drm_gem_mmap, then map the pages IMMEDIATELY (no fault round trip).
++ * Fault-driven vm_insert_mixed cannot work here: drm_gem_mmap() on
++ * 3.10 sets VM_PFNMAP|VM_DONTEXPAND, installs driver->gem_vm_ops
++ * itself, and rejects VM_MIXEDMAP vmas/-EINVALs when that table is
++ * NULL -- clearing PFNMAP/adding MIXEDMAP and swapping in a second
++ * ops table after the fact breaks the core's contract (mmap() returns
++ * -EINVAL without ever faulting; dmesg silent). The working shape on
++ * this tree is exynos_drm_gem_mmap_buffer/drm_gem_cma_mmap:
++ * pgprot_writecombine (WC, exynos update_vm_cache_attr shape), then
++ * one dma_mmap_attrs() for the CMA page (arm32 arm_dma_mmap backend
++ * treats vma->vm_pgoff as the page index into the buffer, so reset it
++ * to 0 -- the GEM fake key >> PAGE_SHIFT is NOT a buffer index;
++ * exynos mmap_buffer avoids this via a fresh vma at pgoff 0 and
++ * drm_gem_cma_mmap via remap_pfn_range which ignores pgoff) or one
++ * remap_pfn_range() per SHMEM/imported page with the same prot +
++ * size check. KMS dumb mmap keeps its own entry point.
++ *
++ * Temporary entry/exit pr_info (mmap2 ticket): prints the fake pgoff
++ * installed by drm_gem_mmap and the final return code, so silicon
++ * dmesg proves whether the handler ran and where it failed. */
 +int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 +{
 +	struct drm_gem_object *obj;
 +	struct p7580_bo *bo;
 +	struct scatterlist *sgl;
-+	unsigned long vm_size, pfn, off;
++	unsigned long vm_size, pfn, off, fake_pgoff;
 +	unsigned int i, npages;
 +	int ret;
 +
++	fake_pgoff = vma->vm_pgoff;
++	pr_info("p7580_gem_mmap: enter pgoff=0x%lx len=0x%lx\n",
++		fake_pgoff, vma->vm_end - vma->vm_start);
 +	ret = drm_gem_mmap(filp, vma);
-+	if (ret)
++	if (ret) {
++		pr_info("p7580_gem_mmap: drm_gem_mmap failed rc=%d pgoff=0x%lx\n",
++			ret, fake_pgoff);
 +		return ret;
++	}
++	/* The fake offset key served its purpose (BO lookup); from here
++	 * on vma describes a byte range inside THIS BO, starting at 0. */
++	vma->vm_pgoff = 0;
 +
 +	obj = vma->vm_private_data;
 +	bo = to_p7580_bo(obj);
@@ -624,6 +660,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		goto err_close;
 +	}
 +
++	/* WC default, cached opt-in (CMA BOs are created WC). */
 +	if (bo->cache_attr & P7580_GEM_CACHABLE)
 +		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 +	else if ((bo->cache_attr & P7580_GEM_WC) ||
@@ -636,6 +673,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
 +		ret = dma_mmap_attrs(obj->dev->dev, vma, bo->cma_vaddr,
 +				     bo->cma_paddr, obj->size, &attrs);
++		pr_info("p7580_gem_mmap: dma_mmap_attrs rc=%d size=0x%zx paddr=0x%llx\n",
++			ret, obj->size, (unsigned long long)bo->cma_paddr);
 +		if (ret)
 +			goto err_close;
 +		return 0;
@@ -672,9 +711,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		if (ret)
 +			goto err_close;
 +	}
++	pr_info("p7580_gem_mmap: ok obj_size=0x%zx vm=0x%lx\n",
++		obj->size, vm_size);
 +	return 0;
 +
 +err_close:
++	pr_info("p7580_gem_mmap: fail rc=%d vm=0x%lx obj=0x%zx\n",
++		ret, vm_size, obj->size);
 +	drm_gem_vm_close(vma);
 +	return ret;
 +}

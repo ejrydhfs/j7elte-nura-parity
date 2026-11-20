@@ -147,11 +147,14 @@ struct pf7580_submit_args {
 int pf7580_submit(struct pf7580_dev *dev,
 		  const struct pf7580_submit_args *args);
 
-/*
- * CPU mapping helpers. Real backend: mmap() on the DRM fd at the fake
+/* CPU mapping helpers. Real backend: mmap() on the DRM fd at the fake
  * offset returned by MMAP_BO. Mock backend: malloc-backed shadow memory
  * of the same size. Either way the caller must pf7580_cpu_unmap() it.
- */
+ * On real-backend failure the exact request (errno/offset/len) is left
+ * in pf7580_cpu_map_errno/_off/_len for the selftest to print. */
+extern int pf7580_cpu_map_errno;
+extern uint64_t pf7580_cpu_map_off;
+extern size_t pf7580_cpu_map_len;
 void *pf7580_cpu_map(struct pf7580_dev *dev, uint32_t handle,
 		     uint64_t map_offset, size_t size);
 int pf7580_cpu_unmap(struct pf7580_dev *dev, void *addr, size_t size);

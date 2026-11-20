@@ -409,7 +409,11 @@ int pf7580_submit(struct pf7580_dev *dev,
 	}
 }
 
-/* ------------------------------------------------------------------ */
+/* Last real-backend mmap request (diagnostics for the selftest). */
+int pf7580_cpu_map_errno;
+uint64_t pf7580_cpu_map_off;
+size_t pf7580_cpu_map_len;
+
 
 void *pf7580_cpu_map(struct pf7580_dev *dev, uint32_t handle,
 		     uint64_t map_offset, size_t size)
@@ -421,16 +425,32 @@ void *pf7580_cpu_map(struct pf7580_dev *dev, uint32_t handle,
 	if (dev->is_mock) {
 		struct pf7580_mock_bo *bo = mock_find(dev, handle);
 
-		if (!bo || size > bo->size)
+		if (!bo || size > bo->size) {
+			pf7580_cpu_map_errno = EINVAL;
+			pf7580_cpu_map_off = map_offset;
+			pf7580_cpu_map_len = size;
 			return NULL;
-		if (map_offset != bo->map_offset)
+		}
+		if (map_offset != bo->map_offset) {
+			pf7580_cpu_map_errno = EINVAL;
+			pf7580_cpu_map_off = map_offset;
+			pf7580_cpu_map_len = size;
 			return NULL;
+		}
+		pf7580_cpu_map_errno = 0;
 		return bo->shadow;
 	}
 	addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
 		    dev->fd, (off_t)map_offset);
-	if (addr == MAP_FAILED)
+	if (addr == MAP_FAILED) {
+		pf7580_cpu_map_errno = errno;
+		pf7580_cpu_map_off = map_offset;
+		pf7580_cpu_map_len = size;
 		return NULL;
+	}
+	pf7580_cpu_map_errno = 0;
+	pf7580_cpu_map_off = map_offset;
+	pf7580_cpu_map_len = size;
 	(void)handle;
 	return addr;
 }

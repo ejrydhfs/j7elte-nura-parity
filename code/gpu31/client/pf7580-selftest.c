@@ -410,7 +410,11 @@ static int run_device(const char *path)
 	if (!failures) {
 		p = pf7580_cpu_map(dev, h, map_off, 16384);
 		if (!p) {
-			printf("FAIL cpu map\n");
+			printf("FAIL cpu map: mmap(fd=%d, off=0x%" PRIx64
+			       ", len=%zu) errno=%d (%s)\n", pf7580_fd(dev),
+			       pf7580_cpu_map_off, pf7580_cpu_map_len,
+			       pf7580_cpu_map_errno,
+			       strerror(pf7580_cpu_map_errno));
 			failures++;
 		} else {
 			memset(p, 0x5a, 256);
