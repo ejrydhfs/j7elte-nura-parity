@@ -2571,7 +2571,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-19 10:48:44.321260351 -0500
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,581 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -2681,8 +2681,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +/* GPU_INT_RAWSTAT 0x020 / CLEAR 0x024 (jobs jm_hw.h P7580_JOB_INT_* is
 + * the JOB block at 0x1000; the GPU block is separate). MULTIPLE_FAULT
 + * is bit 7 (kbase); RESET_COMPLETED bit 8 (power slice). */
-+#define P7580_GPU_INT_RAWSTAT	0x020u
-+#define P7580_GPU_INT_CLEAR	0x024u
 +#define P7580_GPU_IRQ_MULTI_FAULT	(1u << 7)
 +
 +irqreturn_t p7580_drv_gpu_irq(int irq, void *arg)
@@ -4510,7 +4508,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,507 @@
+@@ -0,0 +1,515 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720

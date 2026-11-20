@@ -139,22 +139,39 @@ Lock order (global): `reset_lock` → `hw_lock` (recover) vs `hw_lock` alone
 syncobj/mgr locks are leaf-level, never held across waits or each other
 (S1 removed the one violation).
 
-## Changes (this commit)
+## Changes (this commit, plus R4-tail repair)
 
 - `code/gpu31/jobs/panfrost7580_job.c` — S3: `p7580_job_timedout`
   signals the timed-out job's own fence after recovery (bounded,
   idempotent).
 - `code/gpu31/driver/0001-*.patch` — regenerated hunks: `job.c` (S3),
   `mmu.c`/`mmu.h` verbatim re-snapshot from canonical `iommu/` (R5/S4);
-  `submit.c` S1 (drop outer `resv->lock`) + S2 (abort on resume error).
-  `git apply --check` passes; all 17 `@@` counts verified.
+  `submit.c` S1 (drop outer `resv->lock`) + S2 (abort on resume error);
+  `main.c` R1 hunk is G31_OpenFix's (left untouched here).
+- Patch-format repairs (same files, no logic change):
+  - `@@` counts corrected (`submit.c` 507→515, `main.c` 576→583 after
+    R1, then 583→581): the S2/R1 line edits added body lines without
+    updating the counts, so GNU `patch(1)` applied only the first N
+    lines and silently dropped the tail (missing
+    `p7580_drv_submit(&staged)` use → `-Wunused-but-set-variable` on
+    `staged` + `expected declaration at end of input` at the
+    `put_noidle` block). `git apply` tolerates the skew, `patch`
+    does not — counts are now byte-audited for all 17 sections.
+  - `main.c`: removed the two local `P7580_GPU_INT_RAWSTAT/CLEAR`
+    defines (they collide with the identical `jm_hw.h` pair;
+    `-Werror` failure under the slice `-fsyntax-only` recipe).
+- Verification actually run here (real 3.10.108 headers + staged
+  0001–0004 shims, `aarch64-linux-gnu-gcc -std=gnu89 -fsyntax-only
+  -Wall -Werror -Wno-unused-but-set-variable`): all 8 driver `.c`
+  files clean; `patch -p1` fresh-apply whole; `git apply --check`
+  passes.
 - `code/gpu31/driver/submit_fix_test.c` + `Makefile` (new) — host tests
   T1–T6 (resv discipline, resume abort, timeout-signal, bounded
   recovery, idempotence, spurious-timeout skip). `make check`: all pass;
   `jobs`/`gem` slice tests still pass.
-- Untouched by design: `p7580_drv_file_init` + probe (R1, G31_OpenFix);
-  0001–0004 shim patches (pool with shim owners); client selftest
-  (G31_NodeProbe2).
+- Untouched by design: `p7580_drv_file_init` + probe R1 logic
+  (G31_OpenFix); 0001–0004 shim patches (pool with shim owners); client
+  selftest (G31_NodeProbe2); kms/render-only (G31_RenderOnlyFix).
 
 ## Acceptance / follow-ups for Main
 
