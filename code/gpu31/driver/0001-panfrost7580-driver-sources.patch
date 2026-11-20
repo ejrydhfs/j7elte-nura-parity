@@ -5690,7 +5690,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,788 @@
+@@ -0,0 +1,842 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -5794,6 +5794,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +static int p7580_drv_sched_live;
 +static DEFINE_MUTEX(p7580_drv_sched_lock);
 +
++/* Bounded SUBMIT/run_job trace (schedtrace): ST-IOCTL/ST-QUEUE see
++ * the ioctl entry and the 0004 queue handoff; ST-RUN/ST-PMGET see
++ * the async worker entry and the run_job PM re-get verdict.
++ * Shared budget: first 8 SUBMITs print (0 = off). Plain static
++ * (NOT module_param_named): the integrator's object rule defines
++ * KBUILD_MODNAME at Image link time, but slice-level -fsyntax-only
++ * checks compile this file standalone (same reason job.c keeps
++ * p7580_job_trace a plain static). Racy dec under concurrent
++ * ioctls overshoots by at most a line or two; harmless. */
++static unsigned int p7580_sched_trace = 8;
++
 +static struct dma_fence *p7580_drv_run_job(struct drm_sched_job *sched_job)
 +{
 +	struct p7580_submit_job *job = sched_job->owner;
@@ -5819,8 +5830,28 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * resume. Re-get here so HEAD/AFFINITY/CONFIG/START writes
 +	 * below never hit a dark block; fail the job (ERR_PTR, freed
 +	 * by the 0004 F4 path) instead of hanging the bus. */
-+	if (p7580_drv_pm_get(drv))
++	/* ST-RUN: async worker entered (proves the 0004 pump dequeued
++	 * and dispatched; job->seqno assigned at SUBMIT order). */
++	if (p7580_sched_trace) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: run_job seq=%u slot=%d jc=0x%llx\n",
++			job->seqno, slot, (unsigned long long)job->jc);
++	}
++	if (p7580_drv_pm_get(drv)) {
++		/* ST-PMGET (fail): dark block, job failed closed. */
++		if (p7580_sched_trace) {
++			p7580_sched_trace--;
++			pr_info("p7580_sched: pm_get FAIL seq=%u slot=%d\n",
++				job->seqno, slot);
++		}
 +		return ERR_PTR(-EIO);
++	}
++	/* ST-PMGET (held): re-get succeeded, HEAD/START writes allowed. */
++	if (p7580_sched_trace) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: pm_get HELD seq=%u slot=%d\n",
++			job->seqno, slot);
++	}
 +	{
 +		void *fv = p7580_job_run(&drv->jd, job);
 +		struct dma_fence *fence = (struct dma_fence *)fv;
@@ -5914,6 +5945,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			drm_gem_object_unreference_unlocked(obj);
 +			job->bos[i] = NULL;
 +		}
++	}
++	/* ST-RETIRE: finish_work reached free_job (fence already
++	 * signalled by the 0004 retire path); proves the full
++	 * queue -> dispatch -> retire chain completed. */
++	if (p7580_sched_trace) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: retire seq=%u slot=%d\n",
++			job ? job->seqno : 0, job ? job->slot : -1);
 +	}
 +	p7580_job_free(job);
 +	/* Balances p7580_drv_job_pm_arm() at queue time: the async
@@ -6209,6 +6248,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	    args->bo_handle_count > P7580_MAX_SUBMIT_BOS)
 +		return -EINVAL;
 +
++	/* ST-IOCTL: ioctl reached the driver with a valid envelope. */
++	if (p7580_sched_trace) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: ioctl jc=0x%llx req=0x%x bo=%u in=%u out=%u\n",
++			(unsigned long long)args->jc, args->requirements,
++			args->bo_handle_count, args->in_sync_count,
++			args->out_sync);
++	}
++
 +	slot = p7580_job_slot(args->requirements);
 +	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS)
 +		return -EINVAL;
@@ -6355,6 +6403,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * publishes the job, so unwind the arm there. */
 +	p7580_drv_job_pm_arm(drv);
 +	ret = drm_sched_job_submit(sched_job);
++	/* ST-QUEUE: 0004 accepted (0) or refused (ret) the job. */
++	if (p7580_sched_trace) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: queued seq=%u slot=%d submit_rc=%d\n",
++			job->seqno, slot, ret);
++	}
 +	if (ret) {
 +		p7580_drv_job_pm_release(drv);
 +		drm_sched_job_cleanup(sched_job);

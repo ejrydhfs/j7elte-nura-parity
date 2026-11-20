@@ -31,10 +31,19 @@
 #include <linux/slab.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/printk.h>
 
 static void drm_sched_pump(struct work_struct *work);
 static void drm_sched_job_timeout(struct work_struct *work);
 static void drm_sched_job_finish(struct work_struct *work);
+
+/* Bounded dispatch trace (schedtrace): ST-PUSH/ST-PUMP/ST-FENCE see
+ * the 0004 FIFO handoff (queue, dequeue, retire). Shared budget:
+ * first 8 jobs print (0 = off). Plain static, same rationale as
+ * the p7580_sched_trace budget in panfrost7580_submit.c (NOT a
+ * module param; standalone -fsyntax-only compiles this file).
+ * Racy dec under concurrent entities overshoots trivially. */
+static unsigned int p7580_sched_trace = 8;
 
 static void drm_sched_dep_cb(struct dma_fence *fence,
 			     struct dma_fence_cb *cb)
@@ -362,6 +371,13 @@ int drm_sched_entity_push_job(struct drm_sched_job *sched_job)
 		INIT_COMPLETION(entity->entity_idle);
 	spin_unlock_irqrestore(&entity->queue_lock, flags);
 
+	/* ST-PUSH: job queued on the entity FIFO, pump kicked. */
+	if (p7580_sched_trace) {
+		p7580_sched_trace--;
+		pr_info("p7580_sched: push job_count=%d\n",
+			atomic_read(&entity->job_count));
+	}
+
 	queue_work(entity->wq, &entity->sched_work);
 	return 0;
 }
@@ -385,6 +401,14 @@ static void drm_sched_job_finish(struct work_struct *work)
 
 	if (atomic_dec_and_test(&entity->job_count))
 		complete_all(&entity->entity_idle);
+
+	/* ST-FENCE: fence signalled (finish queued by fence_cb),
+	 * retirement handed to the backend free_job. */
+	if (p7580_sched_trace) {
+		p7580_sched_trace--;
+		pr_info("p7580_sched: fence job_count=%d\n",
+			atomic_read(&entity->job_count));
+	}
 
 	if (job->ops->free_job)
 		job->ops->free_job(job);
@@ -456,6 +480,13 @@ static void drm_sched_pump(struct work_struct *work)
 	list_del_init(&job->node);
 	entity->in_flight = job;
 	spin_unlock_irqrestore(&entity->queue_lock, flags);
+
+	/* ST-PUMP: worker dequeued (dep met or dep-less); run_job next. */
+	if (p7580_sched_trace) {
+		p7580_sched_trace--;
+		pr_info("p7580_sched: pump job_count=%d\n",
+			atomic_read(&entity->job_count));
+	}
 
 	run_fence = job->ops->run_job(job);
 	if (IS_ERR(run_fence)) {
