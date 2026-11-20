@@ -1,6 +1,6 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-19 10:48:44.303866714 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-20 18:25:46.757374321 -0500
 @@ -0,0 +1,107 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -111,8 +111,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +#endif /* PANFROST7580_DRV_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,1028 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-20 18:25:46.759554917 -0500
+@@ -0,0 +1,1182 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -172,6 +172,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +#include <linux/dma-mapping.h>
 +#include <linux/dma-attrs.h>
 +#include <linux/dma-buf.h>
++#include <linux/highmem.h>
 +#include <linux/jiffies.h>
 +#include <linux/mm.h>
 +#include <linux/mutex.h>
@@ -179,7 +180,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +#include <linux/shmem_fs.h>
 +#include <linux/vmalloc.h>
 +#include <linux/sched.h>
-+#include <asm/cacheflush.h>	/* flush_dcache_page for HIGHMEM SHMEM */
++#include <asm/cacheflush.h>	/* __dma_{map,unmap}_area for COHERENCY_NONE */
++
 +
 +#include <drm/drmP.h>
 +#include <drm/drm.h>
@@ -195,40 +197,169 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +}
 +
 +/* ------------------------------------------------------------------ */
-+/* Job-completion CPU-cache invalidate (COHERENCY_NONE readback path). */
++/* COHERENCY_NONE data sync (the model: who maintains which alias).   */
 +/*                                                                     */
-+/* Why this exists: the CPU mmap is write-combined (MT_NORMAL_NC, no   */
-+/* CPU lines to flush) — but the SHMEM backing pages THEMSELVES may    */
-+/* live in HIGHMEM, where the CPU touches them through a kmap alias    */
-+/* (d-cacheable copy) and the GPU writes them through its own port.    */
-+/* After the GPU fence signals, copy the kmap-alias bytes the GPU may  */
-+/* have replaced back out of the dcache so the next kmap/kunmap        */
-+/* window (CPU writer), vmap readback (glReadPixels), or mmap fault    */
-+/* observes the GPU bytes instead of stale dcache lines. CMA (WC,      */
-+/* dma_alloc_attrs) never aliases and is skipped here; dma-direct      */
-+/* SHMEM is dcache-clean by construction (dma_map_page around the      */
-+/* access) and needs no city flush either — only HIGHMEM kmap pages    */
-+/* take the flush_dcache_page call. Bounded by the BO page count; no   */
-+/* MMIO, no sleeps, no locks: safe on the IRQ-adjacent completion path */
-+/* (in practice called from process-context retire, not hard-IRQ).     */
++/* This SoC is COHERENCY_NONE (kbase forces system_coherency NONE; no  */
++/* ACE; DT has no system-coherency property). The GPU reads/writes     */
++/* DRAM directly through its own MMU; the CPU reaches the same         */
++/* physical pages through two aliases the architecture does NOT keep   */
++/* coherent for us:                                                    */
++/*                                                                     */
++/*  (a) kernel linear map (page_address / kmap): d-cacheable. Every    */
++/*      CPU touch installs lines here.                                 */
++/*  (b) userspace WC mmap (MT_NORMAL_NC, pgprot_writecombine): never   */
++/*      cached, so no alias lines — but writes may sit in the store    */
++/*      buffer/combining buffer until drained.                         */
++/*  (c) the GPU port: reads/writes DRAM, bypassing the CPU caches.     */
++/*                                                                     */
++/* Correct discipline is the stock non-coherent DMA-API order, per     */
++/* page, with the device pointer carried so the backend can pick the   */
++/* swiotlb vs direct path (arm64 3.10: non-coherent swiotlb ops;       */
++/* dma_map == cache maintenance):                                     */
++/*                                                                     */
++/*  - SUBMIT (CPU -> GPU): CPU writes the descriptor/payloads into     */
++/*    (a)/(b), then dma_sync_single_for_device(dev, dma, PAGE_SIZE,    */
++/*    DMA_BIDIRECTIONAL) drains CPU lines to the point the GPU reads   */
++/*    (PoC/RAM). The GPU PTW tables already follow this                */
++/*    (p7580_sync_pt: sync after every table write).                   */
++/*  - COMPLETION (GPU -> CPU): after the job fence signals,           */
++/*    dma_sync_single_for_cpu(dev, dma, PAGE_SIZE,                     */
++/*    DMA_BIDIRECTIONAL) invalidates CPU lines for the range the GPU  */
++/*    wrote, so the next CPU read (kmap/vmap/mmap fault) misses to     */
++/*    DRAM and observes GPU bytes.                                     */
++/*                                                                     */
++/* Why not flush_dcache_page(): on arm64 it only clears PG_dcache_clean  */
++/* (flush.c: flush_dcache_page is a flag clear for the icache-alias    */
++/* case), i.e. a no-op for GPU-written data, and there is no HIGHMEM   */
++/* on arm64 to make the old PageHighMem gate meaningful. The correct   */
++/* primitive is the DMA sync (equivalently __dma_unmap_area, which is  */
++/* exactly what the arm64 sync_single_for_cpu backend calls before the */
++/* swiotlb sync: dma-mapping.c __swiotlb_sync_single_for_cpu ->        */
++/* __dma_unmap_area(phys_to_virt(dma_to_phys(dev, dma)), size, dir) +  */
++/* swiotlb_sync_single_for_cpu).                                       */
++/*                                                                     */
++/* Lifetime: pages are SHMEM-owned (shmem_read_mapping_page refs are   */
++/* the pin; the private filp is never exposed so ftruncate cannot drop */
++/* them). A BO additionally holds one bind-time DMA mapping covering   */
++/* its pages while GPU-bound (built at bind, torn down at unbind,      */
++/* DMA_BIDIRECTIONAL so the same mapping serves job upload and         */
++/* writeback; SKIP_CPU_SYNC is never set). sync_for_device runs at     */
++/* SUBMIT (before the job is queued) and sync_for_cpu at completion    */
++/* (after the fence signals, in free_job context: no MMIO, no sleeps,  */
++/* no locks — same constraints as the old hook). dma_addr per page is  */
++/* cached in the BO (identity on this tree is asserted, not assumed:   */
++/* a non-identity dma_addr is carried verbatim, so sync still hits the */
++/* right bus address; PTEs must come from p7580_bo_dma_addr, never     */
++/* from page_to_phys directly).                                        */
 +/* ------------------------------------------------------------------ */
 +void p7580_gem_job_done_sync(struct drm_gem_object *obj)
 +{
 +	struct p7580_bo *bo = to_p7580_bo(obj);
 +	unsigned int i;
 +
-+	/* WC/CMA has no CPU cache alias: nothing to invalidate. */
++	/* CMA (dma_alloc_attrs coherent) never needs CPU-side sync. */
 +	if (bo->backing != P7580_BO_SHMEM || !bo->pages)
 +		return;
++	if (!bo->sync_dev || !bo->dma_addrs)
++		return;
 +	for (i = 0; i < bo->nr_pages; i++) {
-+		struct page *p = bo->pages[i];
-+
-+		if (!p || !PageHighMem(p))
++		if (!bo->pages[i])
 +			continue;
-+		flush_dcache_page(p);
++		dma_sync_single_for_cpu(bo->sync_dev, bo->dma_addrs[i],
++					PAGE_SIZE, DMA_BIDIRECTIONAL);
 +	}
-+	bo->kmap_flushed = 1;
 +}
++
++/* Bind: dma_map the SHMEM pages for GPU access (before the AS0        */
++/* page-table walk). Idempotent: already-bound BOs return 0 without    */
++/* remapping. On non-identity trees the returned dma_addr is the bus   */
++/* address the GPU must use; callers MUST program PTEs from            */
++/* p7580_bo_dma_addr, never from page_to_phys. Maps                   */
++/* DMA_BIDIRECTIONAL (single mapping covers both directions; never     */
++/* SKIP_CPU_SYNC). Partial-failure unwind unmaps what was mapped. */
++int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++	unsigned int i;
++
++	if (!dev || bo->backing != P7580_BO_SHMEM || !bo->pages)
++		return 0;
++	if (bo->dma_addrs)
++		return 0;
++	bo->dma_addrs = kcalloc(bo->nr_pages, sizeof(*bo->dma_addrs),
++				GFP_KERNEL);
++	if (!bo->dma_addrs)
++		return -ENOMEM;
++	for (i = 0; i < bo->nr_pages; i++) {
++		dma_addr_t d = dma_map_page(dev, bo->pages[i], 0, PAGE_SIZE,
++					    DMA_BIDIRECTIONAL);
++
++		if (dma_mapping_error(dev, d)) {
++			while (i--)
++				dma_unmap_page(dev, bo->dma_addrs[i],
++					       PAGE_SIZE, DMA_BIDIRECTIONAL);
++			kfree(bo->dma_addrs);
++			bo->dma_addrs = NULL;
++			return -ENOMEM;
++		}
++		bo->dma_addrs[i] = d;
++	}
++	bo->sync_dev = dev;
++	return 0;
++}
++
++/* SUBMIT-side drain: push CPU-written bytes to the point the GPU      */
++/* reads. Runs after the CPU fills descriptors/payloads and before    */
++/* the job is queued (fence not yet armed). Unbound BOs are a no-op.  */
++void p7580_gem_submit_sync(struct drm_gem_object *obj)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++	unsigned int i;
++
++	if (bo->backing != P7580_BO_SHMEM || !bo->pages || !bo->sync_dev ||
++	    !bo->dma_addrs)
++		return;
++	for (i = 0; i < bo->nr_pages; i++) {
++		if (!bo->pages[i])
++			continue;
++		dma_sync_single_for_device(bo->sync_dev, bo->dma_addrs[i],
++					   PAGE_SIZE, DMA_BIDIRECTIONAL);
++	}
++}
++
++/* Unbind: tear down the bind-time DMA mapping (MMU-unmap/teardown     */
++/* path, file-close, free). Safe on unbound BOs. */
++void p7580_gem_dma_unbind(struct drm_gem_object *obj)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++	unsigned int i;
++
++	if (!bo->dma_addrs || !bo->sync_dev)
++		return;
++	for (i = 0; i < bo->nr_pages; i++)
++		dma_unmap_page(bo->sync_dev, bo->dma_addrs[i], PAGE_SIZE,
++			       DMA_BIDIRECTIONAL);
++	kfree(bo->dma_addrs);
++	bo->dma_addrs = NULL;
++	bo->sync_dev = NULL;
++}
++
++/* DMA address for one BO page (bind-time mapping when present,        */
++/* page_to_phys fallback for the never-bound path). Callers program    */
++/* GPU PTEs from this, never from page_to_phys directly. */
++phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++
++	if (idx >= bo->nr_pages)
++		return 0;
++	if (bo->dma_addrs && bo->sync_dev)
++		return (phys_addr_t)bo->dma_addrs[idx];
++	if (bo->pages && bo->pages[idx])
++		return (phys_addr_t)page_to_phys(bo->pages[idx]);
++	return 0;
++}
++
 +
 +/* Per-device IOVA allocator (struct p7580_dev, header). Units: the
 + * drm_mm window is addressed in PAGES (init with the byte window
@@ -508,20 +639,27 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +/* before free; the context teardown walker is p7580_mmu_teardown()   */
 +/* (iommu/panfrost7580_mmu.h, F-MMU5), wired to file-close/remove.     */
 +/*                                                                    */
-+/* Contract (mirrors the review's `driver/` landing checklist):       */
-+/*  - map: for each page index 0..npages-1, p7580_mmu_map(mmu,        */
-+/*    bo->iova + idx*PAGE_SIZE, phys, P7580_PROT_RD|WR, memattr),     */
-+/*    where phys is cma_paddr + idx*PAGE_SIZE (CMA), pages[idx]       */
-+/*    (SHMEM, via page_to_phys after dma_map_page), or the sg         */
-+/*    walk (imported, sg_phys + offset over bo->sgt); then            */
-+/*    p7580_mmu_invalidate(regs, as_nr, iova>>12, npages, sync=0)     */
-+/*    (FLUSH_PT via the fixed F-MMU1 LOCK-region encoding) and        */
-+/*    p7580_mmu_program_as(regs, as_nr, pgd_dma, memattr_lo/hi)       */
-+/*    once per context (code/gpu31/iommu/panfrost7580_mmu.h, pf7580   */
-+/*    lock/encode helpers in code/gpu31/mmu/pf7580_as.h).             */
-+/*  - unmap: p7580_mmu_unmap(mmu, bo->iova + idx*PAGE_SIZE) per page,  */
-+/*    then invalidate the same range; the caller frees child tables   */
-+/*    with p7580_mmu_free_table after the parent entry is cleared.    */
++/* Contract (mirrors the review's `driver/` landing checklist;            */
++/* gpu31-coherency adds bind/submit-sync/completion-sync):                */
++/*  - bind: p7580_gem_dma_bind(obj, dev->dev) once before the first     */
++/*    map (dma_map_page per page, BIDIRECTIONAL, never SKIP_CPU_SYNC).  */
++/*  - map: for each page index 0..npages-1, p7580_mmu_map(mmu,          */
++/*    bo->iova + idx*PAGE_SIZE, p7580_bo_dma_addr(obj, idx),            */
++/*    P7580_PROT_RD|WR, memattr), where the addr is the bind-time bus   */
++/*    address (cma_paddr + idx*PAGE_SIZE for CMA; the sg walk for        */
++/*    imported; the dma_addrs cache — never page_to_phys — for SHMEM);  */
++/*    then p7580_mmu_invalidate(regs, as_nr, iova>>12, npages, sync=0)  */
++/*    (FLUSH_PT via the fixed F-MMU1 LOCK-region encoding) and          */
++/*    p7580_mmu_program_as(regs, as_nr, pgd_dma, memattr_lo/hi)         */
++/*    once per context (code/gpu31/iommu/panfrost7580_mmu.h, pf7580     */
++/*    lock/encode helpers in code/gpu31/mmu/pf7580_as.h).               */
++/*  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills     */
++/*    descriptors/payloads, before queueing.                            */
++/*  - completion: p7580_gem_job_done_sync(obj) per BO in free_job.      */
++/*  - unmap: p7580_mmu_unmap(mmu, bo->iova + idx*PAGE_SIZE) per page,   */
++/*    then invalidate the same range; p7580_gem_dma_unbind(obj); the    */
++/*    caller frees child tables with p7580_mmu_free_table after the    */
++/*    parent entry is cleared.                                          */
 +/*  - locking: resv lock (0002) around pin/map, MMU-HW lock around    */
 +/*    program/invalidate (pf7580_as_* takes it), reset_lock ordering  */
 +/*    per job.c:28-34. Fault recovery signals done_fence (F-JOB4).    */
@@ -574,6 +712,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	if (gd)
 +		p7580_iova_free(gd, bo);
 +
++	if (bo->backing == P7580_BO_SHMEM && bo->dma_addrs && bo->sync_dev) {
++		/* Tear down the bind-time DMA mapping before the pages go
++		 * away. dev->dev is the platform device (never NULL on the
++		 * bound path; guard anyway: free must never crash). */
++		if (dev && dev->dev)
++			p7580_gem_dma_unbind(obj);
++		else {
++			kfree(bo->dma_addrs);
++			bo->dma_addrs = NULL;
++			bo->sync_dev = NULL;
++		}
++	}
 +	if (obj->import_attach) {
 +		/* Imported: sgt is the live exporter mapping; the core
 +		 * helper unmaps + detaches + drops our dma_buf ref
@@ -869,9 +1019,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		return 0;
 +	}
 +	if (bo->pages && bo->pages[idx]) {
++		/* gpu31-coherency: prefer the bind-time bus address (PTEs
++		 * must carry the dma_map result, not page_to_phys, so a
++		 * non-identity tree still programs the right address).
++		 * Never-bound BOs fall back to page_to_phys (identity). */
 +		if (ok)
 +			*ok = 1;
-+		return (phys_addr_t)page_to_phys(bo->pages[idx]);
++		return p7580_bo_dma_addr(obj, idx);
 +	}
 +	if (ok)
 +		*ok = 0;
@@ -1143,8 +1297,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,191 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-20 18:25:46.761191795 -0500
+@@ -0,0 +1,205 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
@@ -1258,14 +1412,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +	 * count mirrors them (p7580_gem_prime_vmap/vunmap). */
 +	void *vaddrs[P7580_VMAP_MAX];
 +	unsigned int vmap_count;
-+	/* Completion-side CPU-cache maintenance (jobtrace ticket). The
-+	 * SUBMIT path records one snapshot of sync state here when the
-+	 * SHMEM page array uses HIGHMEM: pages under a kmap_atomic
-+	 * window are flushed there via flush_dcache_page, so the job
-+	 * completion invalidate (p7580_gem_job_done_sync below) only
-+	 * re-flushes the pages this flag marks. Zero for dma-direct
-+	 * pages (dcache-clean by construction). */
-+	unsigned int kmap_flushed;
++	/* COHERENCY_NONE DMA sync state (gpu31-coherency): bind-time
++	 * dma_map of the SHMEM pages for GPU access. dma_addrs[i] is
++	 * the bus address programmed into the GPU PTE (identity on
++	 * this tree, carried verbatim otherwise); sync_dev is the
++	 * platform device the mapping belongs to. Both set by
++	 * p7580_gem_dma_bind, cleared by p7580_gem_dma_unbind/free.
++	 * NULL/NULL on never-bound and CMA/imported BOs. */
++	dma_addr_t *dma_addrs;
++	struct device *sync_dev;
 +};
 +/* Per-device GEM state: IOVA allocator + the lock that serialises it
 + * (the driver allocates this in probe and stores it in dev_private;
@@ -1308,23 +1463,36 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 + * before p7580_job_hw_submit reads the job descriptor. Unmap runs
 + * before free; the context teardown walker is p7580_mmu_teardown()
 + * (iommu/panfrost7580_mmu.h, F-MMU5), wired to file-close/remove.
-+ *  - map: for each page 0..npages-1, p7580_mmu_map(mmu,
-+ *    bo->iova + idx*PAGE_SIZE, phys, P7580_PROT_RD|WR, memattr), where
-+ *    phys comes from p7580_bo_page_phys; then p7580_mmu_invalidate(regs,
++ *  - bind (new, gpu31-coherency): p7580_gem_dma_bind(obj, dev) once
++ *    before the first map; then per page 0..npages-1, p7580_mmu_map(mmu,
++ *    bo->iova + idx*PAGE_SIZE, p7580_bo_dma_addr(obj, idx),
++ *    P7580_PROT_RD|WR, memattr); then p7580_mmu_invalidate(regs,
 + *    as_nr, iova>>12, npages, sync=0) and p7580_mmu_program_as once
 + *    per context (iommu/panfrost7580_mmu.h, lock/encode in
-+ *    mmu/pf7580_as.h). Unmap/invalidate per page before free. */
++ *    mmu/pf7580_as.h). PTEs MUST come from p7580_bo_dma_addr (the
++ *    bind-time bus address), never page_to_phys/sg_phys directly.
++ *  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills
++ *    descriptors/payloads, before queueing (drains CPU lines to the
++ *    point the GPU reads).
++ *  - completion: p7580_gem_job_done_sync(obj) per BO in free_job
++ *    (invalidates CPU lines so reads see GPU bytes).
++ *  - unbind/free: p7580_mmu_unmap per page + invalidate, then
++ *    p7580_gem_dma_unbind(obj) before pages are released. */
 +unsigned int p7580_bo_npages(struct drm_gem_object *obj);
 +phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
 +			       unsigned int idx, int *ok);
-+/* Job-completion CPU-cache invalidate (jobtrace ticket, COHERENCY_NONE).
-+ * Called on the fence-completion path with one BO the finished job
-+ * referenced: for SHMEM pages backed by HIGHMEM (kmap alias), issues
-+ * flush_dcache_page per page so CPU reads (glReadPixels, mmap) see
-+ * GPU-written bytes; for CMA (MT_NORMAL_NC, no CPU lines) and
-+ * dma-direct SHMEM (dcache-clean via dma_map_page) it is a no-op.
-+ * Safe in any process context; never sleeps for this BO layout. */
++/* COHERENCY_NONE data sync (gpu31-coherency): per-page DMA-API order.
++ * Bind maps the SHMEM pages (dma_map_page, BIDIRECTIONAL) and caches
++ * the bus addresses; SUBMIT drains CPU writes (sync_for_device);
++ * completion invalidates CPU lines (sync_for_cpu) so the next CPU
++ * read sees GPU bytes; unbind tears the mapping down. CMA/imported
++ * BOs are no-ops everywhere. job_done_sync runs in free_job context
++ * (no MMIO, no sleeps, no locks). PTEs must come from p7580_bo_dma_addr. */
 +void p7580_gem_job_done_sync(struct drm_gem_object *obj);
++int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev);
++void p7580_gem_submit_sync(struct drm_gem_object *obj);
++void p7580_gem_dma_unbind(struct drm_gem_object *obj);
++phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
 +struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
 +struct drm_gem_object *p7580_gem_prime_import_sg_table(
 +		struct drm_device *dev, size_t size, struct sg_table *sgt);
@@ -1338,7 +1506,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +#endif /* PANFROST7580_GEM_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-20 10:48:44.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-20 18:25:46.763979594 -0500
 @@ -0,0 +1,340 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -1682,7 +1850,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-20 10:48:44.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-20 18:25:46.766113814 -0500
 @@ -0,0 +1,45 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -1729,899 +1897,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 +void p7580_file_priv_fini(struct drm_device *dev, struct drm_file *file_priv);
 +
 +#endif /* PANFROST7580_IOCTL_H */
-diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
---- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,70 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+/*
-+ * panfrost7580_syncobj.h - generic DRM syncobj ioctl handlers for the
-+ * T720 port (Exynos 7580, Nura 3.10.108, j7elte).
-+ *
-+ * Why this file exists: Mesa 20.3.5 panfrost hard-asserts on
-+ * drmSyncobjCreate at context creation (pan_context.c:1632-1633:
-+ * "assert(!ret && ctx->syncobj)"). The stock 3.10 core has NO generic
-+ * syncobj ioctls (drm.h ends at 0xBA;drm_drv.c dispatches only its own
-+ * core table), so SYNCOBJ_CREATE arrived as -EINVAL. The shim backport
-+ * (0003) provides the per-file handle table; this file wires the
-+ * UAPI surface Mesa actually calls.
-+ *
-+ * UAPI source of truth: v5.2-era drm.h (Mesa 20.3.5 bundles it at
-+ * include/drm-uapi/drm.h): SYNCOBJ_CREATE 0xBF, DESTROY 0xC0,
-+ * HANDLE_TO_FD 0xC1, FD_TO_HANDLE 0xC2, WAIT 0xC3, RESET 0xC4,
-+ * SIGNAL 0xC5. The 20.x libdrm wrappers emit exactly these numbers
-+ * (disassembled, aarch64): CREATE 0xc00864bf, DESTROY 0xc00864c0,
-+ * HANDLE_TO_FD 0xc01864c1, FD_TO_HANDLE 0xc01864c2, WAIT 0xc02864c3,
-+ * RESET/SIGNAL 0xc01064c4/5. Payload structs are the 3.10-era
-+ * (40-byte WAIT, no deadline_nsec; handle struct has fd+pad, no
-+ * point field, 16 bytes).
-+ *
-+ * Scope (binary syncobj only, same omissions as the 0003 shim):
-+ * no timeline payloads, no eventfd, no WAIT_FOR_SUBMIT/WAIT_AVAILABLE
-+ * (rejected -EINVAL), no sync_file fd passing (3.10 has no
-+ * sync_file.c). HANDLE_TO_FD/FD_TO_HANDLE support ONLY plain
-+ * dma-fence export/import via anon_inode fd (flags==0); any
-+ * *_SYNC_FILE flag is -EINVAL, unknown flags -EINVAL.
-+ *
-+ * File state: file_priv->driver_priv leads with struct
-+ * drm_syncobj_manager (same layout contract as GEM's p7580_file_priv
-+ * and the driver's p7580_drv_file: mgr first). Handlers take the
-+ * manager via driver_priv + 0, so GEM's and the driver's own file
-+ * states both work unchanged.
-+ */
-+
-+#ifndef PANFROST7580_SYNCOBJ_H
-+#define PANFROST7580_SYNCOBJ_H
-+
-+struct drm_device;
-+struct drm_file;
-+
-+int panfrost_syncobj_create(struct drm_device *dev, void *data,
-+			    struct drm_file *file_priv);
-+int panfrost_syncobj_destroy(struct drm_device *dev, void *data,
-+			     struct drm_file *file_priv);
-+int panfrost_syncobj_handle_to_fd(struct drm_device *dev, void *data,
-+				  struct drm_file *file_priv);
-+int panfrost_syncobj_fd_to_handle(struct drm_device *dev, void *data,
-+				  struct drm_file *file_priv);
-+int panfrost_syncobj_wait(struct drm_device *dev, void *data,
-+			  struct drm_file *file_priv);
-+int panfrost_syncobj_reset(struct drm_device *dev, void *data,
-+			   struct drm_file *file_priv);
-+int panfrost_syncobj_signal(struct drm_device *dev, void *data,
-+			    struct drm_file *file_priv);
-+
-+/* fops-level dispatcher: routes 3.10-unknown ioctl numbers (core has
-+ * no SYNCOBJ rows) to the handlers above; everything else falls
-+ * through to drm_ioctl. compat32 maps to the same handlers (payload
-+ * structs are u32/__u64/__s32-width-clean, no pointer fields). */
-+long panfrost_syncobj_ioctl(struct file *filp, unsigned int cmd,
-+			    unsigned long arg);
-+#ifdef CONFIG_COMPAT
-+long panfrost_syncobj_compat_ioctl(struct file *filp, unsigned int cmd,
-+				   unsigned long arg);
-+#endif
-+
-+#endif /* PANFROST7580_SYNCOBJ_H */
-diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
---- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,812 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+/*
-+ * panfrost7580_syncobj.c - generic DRM syncobj ioctl bodies for the
-+ * T720 port (Exynos 7580, Nura 3.10.108, j7elte).
-+ *
-+ * Context (see the header): Mesa 20.3.5 panfrost asserts on
-+ * drmSyncobjCreate (pan_context.c:1632-1633). The 3.10 core exposes
-+ * no core SYNCOBJ rows, and the driver-private table only serves
-+ * nr < DRM_COMMAND_END (0xA0); the generic syncobj numbers
-+ * (0xBF-0xC5) always fall through to the core table, where a NULL
-+ * func returns -EINVAL (drm_drv.c:401-435). So this file registers
-+ * NOTHING in the driver's ioctl table. Instead the driver's fops
-+ * .unlocked_ioctl/.compat_ioctl point at panfrost_syncobj_ioctl,
-+ * which routes the seven syncobj numbers here and forwards
-+ * everything else to drm_ioctl() unchanged.
-+ *
-+ * errno contract (what Mesa/libdrm expect; same as mainline):
-+ *  - CREATE: unknown flags bits -> -EINVAL (mainline rejects
-+ *    anything but CREATE_SIGNALED at once: the check is
-+ *    flags & ~DRM_SYNCOBJ_CREATE_SIGNALED).
-+ *  - CREATE_SIGNALED: installs a signaled fence so a first WAIT
-+ *    returns 0 instead of blocking forever. 3.10 has no pre-signaled
-+ *    fence type, so an already-signaled private fence is used
-+ *    (dma_fence_init + dma_fence_signal, released on replace).
-+ *  - DESTROY of an unknown handle -> -ENOENT (0003 shim contract;
-+ *    matches mainline ENOENT-on-stale-handle).
-+ *  - WAIT: unknown flag bits -> -EINVAL; timeout is ABSOLUTE
-+ *    CLOCK_MONOTONIC ns (drm_syncobj_wait in the 20.x libdrm wrapper
-+ *    passes the absolute stamp straight through). Past/zero stamp is
-+ *    non-blocking (0 jiffies). count==0 or NULL handles -> -EINVAL.
-+ *    WAIT_ALL(all fences signaled -> 0) and WAIT_ANY(first signaled
-+ *    index in first_signaled, still 0; none signaled in budget ->
-+ *    -ETIME, matching the shim's dma_fence_wait_timeout -ETIME).
-+ *    WAIT_FOR_SUBMIT/WAIT_AVAILABLE need the timeline/eventfd code
-+ *    the 0003 shim deliberately omits -> -EINVAL (never silently
-+ *    ignored: Mesa would hang on an un-waited submit fence).
-+ *  - RESET of an unknown handle -> -ENOENT; NULL fence is already
-+ *    the signaled state, so reset keeps fence NULL and returns 0.
-+ *  - SIGNAL: unknown handle -> -ENOENT; the installed fence is a
-+ *    private already-signaled fence (see CREATE_SIGNALED). Signaling
-+ *    an already-signaled (or empty) syncobj is a no-op 0 -- Mesa
-+ *    re-signals without checking.
-+ *  - HANDLE_TO_FD/FD_TO_HANDLE tolerate bit 0 (libdrm 2.4.134 sets
-+ *    EXPORT/IMPORT_SYNC_FILE unconditionally; no sync_file.c on 3.10
-+ *    but the plain-fence anon-inode fd satisfies Mesa's snapshot use)
-+ *    and reject all other unknown bits (TIMELINE bit 1 included).
-+ *  - copy_from_user/copy_to_user faults -> -EFAULT (the 3.10 core
-+ *    copies the fixed struct, NOT the pointed-to handle array; the
-+ *    array is copied here).
-+ *  - no driver_priv (open did not run) -> -ENODEV.
-+ *
-+ * Locking: the 0003 manager serialises the idr; each syncobj
-+ * serialises its own fence pointer. WAIT snapshots fence refs under
-+ * the manager then sleeps unlocked. The anon-inode export holds a
-+ * fence ref for the file's lifetime (released in syncobj_file_release).
-+ *
-+ * SHIM-CALLSITES: 0003 (manager create/destroy/find, replace_fence,
-+ * find_fence). 0001 (dma_fence_init/signal/wait_timeout/get/put via
-+ * the 0003 wrappers). No 0002/0004 use.
-+ */
-+
-+#include <linux/anon_inodes.h>
-+#include <linux/device.h>
-+#include <linux/dma-mapping.h>
-+#include <linux/file.h>
-+#include <linux/jiffies.h>
-+#include <linux/ktime.h>
-+#include <linux/mutex.h>
-+#include <linux/slab.h>
-+#include <linux/time.h>
-+#include <linux/uaccess.h>
-+
-+#include <drm/drmP.h>
-+#include <drm/drm.h>
-+
-+#include <linux/dma-fence.h>		/* 0001 (staged by Makefile) */
-+#include "drm_syncobj.h"		/* 0003 (staged by Makefile) */
-+#include "panfrost7580_syncobj.h"
-+
-+/* ---- UAPI payload mirrors (3.10-era sizes, byte-identical wire) ---- */
-+/* v5.2/20.x drm.h: SYNCOBJ ioctls are core numbers, NOT driver-private:
-+ * CREATE 0xBF, DESTROY 0xC0, HANDLE_TO_FD 0xC1, FD_TO_HANDLE 0xC2,
-+ * WAIT 0xC3, RESET 0xC4, SIGNAL 0xC5 (DRM_IOWR). The _IOC_NR (low 8
-+ * bits) is what drm_ioctl dispatches on; the core table has no rows
-+ * there, so our fops dispatcher catches them first. */
-+#define P7580_SYNCOBJ_NR_CREATE		0xBFu
-+#define P7580_SYNCOBJ_NR_DESTROY	0xC0u
-+#define P7580_SYNCOBJ_NR_HANDLE_TO_FD	0xC1u
-+#define P7580_SYNCOBJ_NR_FD_TO_HANDLE	0xC2u
-+#define P7580_SYNCOBJ_NR_WAIT		0xC3u
-+#define P7580_SYNCOBJ_NR_RESET		0xC4u
-+#define P7580_SYNCOBJ_NR_SIGNAL		0xC5u
-+
-+#define P7580_SYNCOBJ_CREATE_SIGNALED	(1u << 0)
-+
-+#define P7580_SYNCOBJ_WAIT_ALL		(1u << 0)
-+#define P7580_SYNCOBJ_WAIT_FOR_SUBMIT	(1u << 1)
-+#define P7580_SYNCOBJ_WAIT_AVAILABLE	(1u << 2)
-+/* Bits the 20.x WAIT struct defines but this binary subset cannot
-+ * honour: deadline hint (needs fence deadlines, absent in 0001). */
-+#define P7580_SYNCOBJ_WAIT_DEADLINE	(1u << 3)
-+
-+struct p7580_syncobj_create {
-+	__u32 handle;
-+	__u32 flags;
-+};
-+
-+struct p7580_syncobj_destroy {
-+	__u32 handle;
-+	__u32 pad;
-+};
-+
-+struct p7580_syncobj_handle {
-+	__u32 handle;
-+	__u32 flags;
-+	__s32 fd;
-+	__u32 pad;
-+};
-+
-+struct p7580_syncobj_wait {
-+	__u64 handles;
-+	__s64 timeout_nsec;	/* absolute CLOCK_MONOTONIC */
-+	__u32 count_handles;
-+	__u32 flags;
-+	__u32 first_signaled;
-+	__u32 pad;
-+};
-+
-+struct p7580_syncobj_array {
-+	__u64 handles;
-+	__u32 count_handles;
-+	__u32 pad;
-+};
-+
-+/* ABI gate (gpu31-abialign, both TUs): Mesa 20.3 bundles the 20.x
-+ * drm.h syncobj shapes (verified on-device 2026-11-20 from
-+ * /data/mesabuild/mesa20/include/drm-uapi/drm.h + disassembled
-+ * libdrm.so.2.134.0 wrappers):
-+ *   CREATE 8 B  IOWR(0xBF), DESTROY 8 B (v5.2-era: IOWR, current is
-+ *   IOWR too -- the old IOW comment in pf7580.c predates the check),
-+ *   HANDLE 16 B IOWR(0xC1/0xC2, NO point field),
-+ *   WAIT   32 B IOWR(0xC3, NO deadline_nsec tail),
-+ *   ARRAY  16 B IOWR(0xC4/0xC5).
-+ * The 3.10 core keys copy_from/to_user on OUR asize (the dispatcher's
-+ * asize table below), so the struct MUST stay 16/32 B: a 24/40 B
-+ * current-header struct would over-copy into the stack buffer. The
-+ * dispatcher ALSO keys on _IOC_NR only (not _IOC_SIZE), so a 24 B
-+ * HANDLE_TO_FD from libdrm 2.4.134 lands here with usize=24; the
-+ * handler reads only the first 16 B and ignores the point tail.
-+ * ioctl direction (client pf7580.c asserts the same): CREATE+WAIT are
-+ * IOWR, DESTROY is IOWR on the wire the kernel serves (20.x drm.h says
-+ * DRM_IOWR for all three; the legacy IOW DESTROY encoding aliases the
-+ * same _IOC_NR so dispatch is unaffected, but new code MUST use IOWR).
-+ * Flag contract: SYNC_FILE bits (HTOF/FTOH bit 0) need sync_file.c
-+ * (absent on 3.10) and are the ONLY rejected HTOF/FTOH bits; WAIT
-+ * rejects FOR_SUBMIT/AVAILABLE/DEADLINE. See the handle_to_fd body for
-+ * why SYNC_FILE is silently tolerated on plain-fence exports. */
-+#include <linux/bug.h>
-+/* Bit 0 doubles as the only valid HTOF/FTOH flag on BOTH the 20.x
-+ * header (EXPORT/IMPORT_SYNC_FILE) and mainline (TIMELINE is bit 1). */
-+#define P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE	(1u << 0)
-+#define P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE	(1u << 0)
-+static inline void p7580_syncobj_abi_check(void)
-+{
-+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_create) != 8);
-+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_destroy) != 8);
-+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_handle) != 16);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
-+					handle) != 0);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
-+					flags) != 4);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
-+					fd) != 8);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
-+					pad) != 12);
-+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_wait) != 32);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
-+					handles) != 0);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
-+					timeout_nsec) != 8);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
-+					count_handles) != 16);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
-+					flags) != 20);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
-+					first_signaled) != 24);
-+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
-+					pad) != 28);
-+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_array) != 16);
-+	BUILD_BUG_ON(P7580_SYNCOBJ_CREATE_SIGNALED !=
-+		     (1u << 0));
-+	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_ALL != (1u << 0));
-+	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_FOR_SUBMIT != (1u << 1));
-+	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_AVAILABLE != (1u << 2));
-+	BUILD_BUG_ON(P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE != (1u << 0));
-+	BUILD_BUG_ON(P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE != (1u << 0));
-+}
-+
-+/* The manager lives first in driver_priv (GEM p7580_file_priv and the
-+ * driver's p7580_drv_file share the layout: mgr, ...). */
-+static struct drm_syncobj_manager *p7580_sync_mgr(struct drm_file *fp)
-+{
-+	struct drm_syncobj_manager *mgr;
-+
-+	if (!fp)
-+		return NULL;
-+	mgr = (struct drm_syncobj_manager *)fp->driver_priv;
-+	return mgr;
-+}
-+
-+/* A pre-signaled fence: 0001 has no timeline/signaled constructor, so
-+ * init a private fence and signal it once. Ops mirror the submit-job
-+ * fence backend contract (release via release_base). */
-+static const struct dma_fence_ops p7580_sync_signaled_ops = {
-+	.get_driver_name = NULL,
-+	.get_timeline_name = NULL,
-+	.enable_signaling = NULL,
-+	.signaled = NULL,
-+	.wait = NULL,
-+	.release = NULL,	/* filled at first use (no static fn) */
-+};
-+
-+static void p7580_sync_signaled_release(struct dma_fence *fence)
-+{
-+	dma_fence_release_base(fence);
-+	kfree(fence);
-+}
-+
-+static struct dma_fence *p7580_sync_signaled_fence(void)
-+{
-+	struct dma_fence *f;
-+
-+	f = kzalloc(sizeof(*f), GFP_KERNEL);
-+	if (!f)
-+		return NULL;
-+	/* release hook is per-instance (static ops has no .release
-+	 * until set here; init BUGs on NULL release). */
-+	((struct dma_fence_ops *)&p7580_sync_signaled_ops)->release =
-+		p7580_sync_signaled_release;
-+	dma_fence_init(f, &p7580_sync_signaled_ops,
-+		       dma_fence_context_alloc(1), 1);
-+	dma_fence_signal(f);
-+	return f;
-+}
-+
-+int panfrost_syncobj_create(struct drm_device *dev, void *data,
-+			    struct drm_file *file_priv)
-+{
-+	struct p7580_syncobj_create *args = data;
-+	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
-+	struct drm_syncobj *s;
-+	u32 handle;
-+	int ret;
-+
-+	(void)dev;
-+	p7580_syncobj_abi_check();
-+	if (!mgr)
-+		return -ENODEV;
-+	/* Mainline rejects any unknown bit at once (flags & ~SIGNALED). */
-+	if (args->flags & ~P7580_SYNCOBJ_CREATE_SIGNALED)
-+		return -EINVAL;
-+	ret = drm_syncobj_create(mgr, &handle);
-+	if (ret)
-+		return ret;
-+	if (args->flags & P7580_SYNCOBJ_CREATE_SIGNALED) {
-+		struct dma_fence *f = p7580_sync_signaled_fence();
-+
-+		if (!f) {
-+			drm_syncobj_destroy(mgr, handle);
-+			return -ENOMEM;
-+		}
-+		s = drm_syncobj_find(mgr, handle);
-+		if (!s) {
-+			dma_fence_put(f);
-+			drm_syncobj_destroy(mgr, handle);
-+			return -ENOENT;
-+		}
-+		ret = drm_syncobj_replace_fence(s, f);
-+		drm_syncobj_put(s);
-+		/* replace takes its own ref. */
-+		dma_fence_put(f);
-+		if (ret) {
-+			drm_syncobj_destroy(mgr, handle);
-+			return ret;
-+		}
-+	}
-+	args->handle = handle;
-+	return 0;
-+}
-+
-+int panfrost_syncobj_destroy(struct drm_device *dev, void *data,
-+			     struct drm_file *file_priv)
-+{
-+	struct p7580_syncobj_destroy *args = data;
-+	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
-+
-+	(void)dev;
-+	if (!mgr)
-+		return -ENODEV;
-+	if (args->pad)
-+		return -EINVAL;
-+	/* Unknown handle -> -ENOENT (0003 contract, mainline parity). */
-+	return drm_syncobj_destroy(mgr, args->handle);
-+}
-+
-+/* ---- FD export/import: plain-fence anon_inode transport ---- */
-+/* 3.10 has no sync_file.c, so HANDLE_TO_FD exports the CURRENT fence
-+ * (snapshot ref at export time; later replaces do not follow the fd).
-+ * Bit 0 (EXPORT/IMPORT_SYNC_FILE) is tolerated (see handler bodies);
-+ * all other flag bits are -EINVAL. */
-+
-+struct p7580_syncobj_export {
-+	struct dma_fence *fence;	/* ref held for the file */
-+};
-+
-+static int p7580_syncobj_file_release(struct inode *inode, struct file *filp)
-+{
-+	struct p7580_syncobj_export *ex = filp->private_data;
-+
-+	(void)inode;
-+	if (ex) {
-+		dma_fence_put(ex->fence);
-+		kfree(ex);
-+	}
-+	return 0;
-+}
-+
-+static const struct file_operations p7580_syncobj_file_fops = {
-+	.owner = THIS_MODULE,
-+	.release = p7580_syncobj_file_release,
-+};
-+
-+int panfrost_syncobj_handle_to_fd(struct drm_device *dev, void *data,
-+				  struct drm_file *file_priv)
-+{
-+	struct p7580_syncobj_handle *args = data;
-+	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
-+	struct drm_syncobj *s;
-+	struct dma_fence *f;
-+	struct p7580_syncobj_export *ex;
-+	int fd;
-+
-+	(void)dev;
-+	p7580_syncobj_abi_check();
-+	if (!mgr)
-+		return -ENODEV;
-+	if (args->pad)
-+		return -EINVAL;
-+	/* Mesa 20.3 libdrm 2.4.134 unconditionally sets bit 0
-+	 * (EXPORT_SYNC_FILE) in drmSyncobjExportSyncFile/HandleToFD
-+	 * (disassembled: stp w1=handle,w2=-1 + mov w1=#1 for the flag
-+	 * word; pan_screen.c panfrost_fence_create calls ExportSyncFile
-+	 * so EVERY fence snapshot -- and therefore every glFinish/
-+	 * ReadPixels flush -- goes through here). There is no sync_file
-+	 * layer on 3.10, but the plain-fence anon-inode fd we install
-+	 * satisfies the only thing Mesa does with it: import the fence
-+	 * into a fresh syncobj. Rejecting bit 0 broke all draws (3x
-+	 * EINVAL per flush, SUBMIT never reached). So: tolerate bit 0,
-+	 * reject every OTHER unknown bit (TIMELINE bit 1 included --
-+	 * the 0003 shim has no timeline points, and silently dropping
-+	 * them would hang Mesa on a fence we never signalled). */
-+	if (args->flags & ~P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE)
-+		return -EINVAL;
-+	s = drm_syncobj_find(mgr, args->handle);
-+	if (!s)
-+		return -ENOENT;
-+	f = drm_syncobj_find_fence(s);
-+	drm_syncobj_put(s);
-+	if (!f)
-+		return -EINVAL;	/* NULL fence: nothing to export */
-+	ex = kzalloc(sizeof(*ex), GFP_KERNEL);
-+	if (!ex) {
-+		dma_fence_put(f);
-+		return -ENOMEM;
-+	}
-+	ex->fence = f;	/* fd owns this ref now */
-+	fd = anon_inode_getfd("syncobj", &p7580_syncobj_file_fops, ex,
-+			      O_CLOEXEC);
-+	if (fd < 0) {
-+		dma_fence_put(f);
-+		kfree(ex);
-+		return fd;
-+	}
-+	args->fd = fd;
-+	return 0;
-+}
-+
-+int panfrost_syncobj_fd_to_handle(struct drm_device *dev, void *data,
-+				  struct drm_file *file_priv)
-+{
-+	struct p7580_syncobj_handle *args = data;
-+	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
-+	struct file *filp;
-+	struct p7580_syncobj_export *ex;
-+	struct drm_syncobj *s;
-+	u32 handle;
-+	int ret;
-+
-+	(void)dev;
-+	if (!mgr)
-+		return -ENODEV;
-+	if (args->pad)
-+		return -EINVAL;
-+	/* Mirror HANDLE_TO_FD: libdrm drmSyncobjImportSyncFile sets bit 0
-+	 * (IMPORT_SYNC_FILE); tolerate it, reject the rest (TIMELINE bit 1
-+	 * included). A foreign sync_file fd (real sync_file.c file) still
-+	 * fails the f_op check below -- we only snapshot fences from fds
-+	 * this driver exported. */
-+	if (args->flags & ~P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE)
-+		return -EINVAL;
-+	if (args->fd < 0)
-+		return -EINVAL;
-+	filp = fget((unsigned int)args->fd);
-+	if (!filp)
-+		return -EINVAL;
-+	/* Only fds this driver exported carry a fence; anything else
-+	 * (eventfd, pipe, foreign sync_file) is -EINVAL, never a
-+	 * blind pointer dereference. */
-+	if (filp->f_op != &p7580_syncobj_file_fops) {
-+		fput(filp);
-+		return -EINVAL;
-+	}
-+	ex = filp->private_data;
-+	if (!ex || !ex->fence) {
-+		fput(filp);
-+		return -EINVAL;
-+	}
-+	ret = drm_syncobj_create(mgr, &handle);
-+	if (ret) {
-+		fput(filp);
-+		return ret;
-+	}
-+	s = drm_syncobj_find(mgr, handle);
-+	if (!s) {
-+		fput(filp);
-+		drm_syncobj_destroy(mgr, handle);
-+		return -ENOENT;
-+	}
-+	/* Import snapshots the CURRENT fence of the fd (same non-sync_file
-+	 * limit as export: later fence replaces on the source syncobj do
-+	 * not propagate through the fd). */
-+	ret = drm_syncobj_replace_fence(s, ex->fence);
-+	drm_syncobj_put(s);
-+	fput(filp);
-+	if (ret) {
-+		drm_syncobj_destroy(mgr, handle);
-+		return ret;
-+	}
-+	args->handle = handle;
-+	return 0;
-+}
-+
-+int panfrost_syncobj_wait(struct drm_device *dev, void *data,
-+			  struct drm_file *file_priv)
-+{
-+	struct p7580_syncobj_wait *args = data;
-+	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
-+	struct drm_syncobj **syncs = NULL;
-+	struct dma_fence **fences = NULL;
-+	uint32_t count, i;
-+	struct timespec now;
-+	int64_t remain_ns;
-+	long timeout;
-+	int ret = 0;
-+
-+	(void)dev;
-+	if (!mgr)
-+		return -ENODEV;
-+	count = args->count_handles;
-+	if (!count || !args->handles)
-+		return -EINVAL;
-+	/* WAIT_FOR_SUBMIT/WAIT_AVAILABLE need the timeline/eventfd code
-+	 * the 0003 shim omits; deadline needs 0001 fence deadlines.
-+	 * Reject (never ignore): Mesa would hang on a fence we never
-+	 * waited for. WAIT_ALL vs ANY is honoured below. */
-+	if (args->flags & ~(P7580_SYNCOBJ_WAIT_ALL))
-+		return -EINVAL;
-+	/* Absolute -> relative: same shape as WAIT_BO (ktime_get_ts is
-+	 * the 3.10 spelling). Past stamp stays non-blocking. */
-+	ktime_get_ts(&now);
-+	remain_ns = (int64_t)args->timeout_nsec -
-+		    ((int64_t)now.tv_sec * 1000000000LL + now.tv_nsec);
-+	if (remain_ns <= 0)
-+		timeout = 0;
-+	else if ((uint64_t)remain_ns > (uint64_t)LONG_MAX)
-+		timeout = LONG_MAX;
-+	else
-+		timeout = nsecs_to_jiffies((uint64_t)remain_ns);
-+
-+	/* Snapshot syncobj + fence refs under the manager, sleep after.
-+	 * Caps mirror SUBMIT (64 BOs / 16 in-syncs): 64 handles max. */
-+	if (count > 64)
-+		return -EINVAL;
-+	syncs = kcalloc(count, sizeof(*syncs), GFP_KERNEL);
-+	if (!syncs)
-+		return -ENOMEM;
-+	fences = kcalloc(count, sizeof(*fences), GFP_KERNEL);
-+	if (!fences) {
-+		kfree(syncs);
-+		return -ENOMEM;
-+	}
-+	for (i = 0; i < count; i++) {
-+		uint32_t h;
-+
-+		if (copy_from_user(&h,
-+				   (void __user *)(uintptr_t)args->handles +
-+				   i * sizeof(h), sizeof(h))) {
-+			ret = -EFAULT;
-+			count = i;
-+			goto out_put_syncs;
-+		}
-+		syncs[i] = drm_syncobj_find(mgr, h);
-+		if (!syncs[i]) {
-+			ret = -ENOENT;
-+			count = i;
-+			goto out_put_syncs;
-+		}
-+		/* NULL fence == already signaled (0003 contract): no
-+		 * fence ref, counted as signaled below. */
-+		fences[i] = drm_syncobj_find_fence(syncs[i]);
-+	}
-+	if (args->flags & P7580_SYNCOBJ_WAIT_ALL) {
-+		for (i = 0; i < args->count_handles; i++) {
-+			long r;
-+
-+			if (!fences[i])
-+				continue;
-+			r = dma_fence_wait_timeout(fences[i], true,
-+						   timeout);
-+			if (r < 0) {
-+				ret = (int)r;
-+				goto out_put_all;
-+			}
-+			/* Chained budget: each fence consumes from what
-+			 * the previous one left (0001 returns remaining;
-+			 * 0 with budget left means signaled now). */
-+			timeout = r;
-+		}
-+		args->first_signaled = 0;
-+	} else {
-+		/* ANY: poll without consuming the whole budget on the
-+		 * first unsignaled fence. Zero-timeout test first, then
-+		 * bounded wait on each in turn with the remaining
-+		 * budget split evenly (binary-subset approximation). */
-+		uint32_t n = args->count_handles;
-+
-+		for (i = 0; i < n; i++) {
-+			if (!fences[i] ||
-+			    dma_fence_is_signaled(fences[i])) {
-+				args->first_signaled = i;
-+				goto out_put_all;
-+			}
-+		}
-+		if (timeout == 0) {
-+			ret = -ETIME;
-+			goto out_put_all;
-+		}
-+		for (i = 0; i < n; i++) {
-+			long r = dma_fence_wait_timeout(fences[i], true,
-+							timeout / (n - i));
-+
-+			if (r < 0 && r != -ETIME) {
-+				ret = (int)r;
-+				goto out_put_all;
-+			}
-+			if (r >= 0 || !r) {
-+				/* signaled (r>=0 remaining) or 0-budget
-+				 * hit exactly at signal: re-test. */
-+				if (!fences[i] ||
-+				    dma_fence_is_signaled(fences[i])) {
-+					args->first_signaled = i;
-+					ret = 0;
-+					goto out_put_all;
-+				}
-+			}
-+		}
-+		ret = -ETIME;
-+	}
-+out_put_all:
-+	count = args->count_handles;
-+out_put_syncs:
-+	for (i = 0; i < count; i++) {
-+		dma_fence_put(fences[i]);
-+		if (syncs[i])
-+			drm_syncobj_put(syncs[i]);
-+	}
-+	kfree(fences);
-+	kfree(syncs);
-+	return ret;
-+}
-+
-+int panfrost_syncobj_reset(struct drm_device *dev, void *data,
-+			   struct drm_file *file_priv)
-+{
-+	struct p7580_syncobj_array *args = data;
-+	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
-+	uint32_t i, count = args->count_handles;
-+
-+	(void)dev;
-+	if (!mgr)
-+		return -ENODEV;
-+	if (!count || !args->handles)
-+		return -EINVAL;
-+	if (count > 64)
-+		return -EINVAL;
-+	for (i = 0; i < count; i++) {
-+		uint32_t h;
-+		struct drm_syncobj *s;
-+
-+		if (copy_from_user(&h,
-+				   (void __user *)(uintptr_t)args->handles +
-+				   i * sizeof(h), sizeof(h)))
-+			return -EFAULT;
-+		s = drm_syncobj_find(mgr, h);
-+		if (!s)
-+			return -ENOENT;
-+		/* Binary reset: drop the fence (NULL == signaled in the
-+		 * 0003 contract, but Mesa only resets after WAIT, so the
-+		 * next SUBMIT re-installs via replace_fence anyway). */
-+		drm_syncobj_replace_fence(s, NULL);
-+		drm_syncobj_put(s);
-+	}
-+	return 0;
-+}
-+
-+int panfrost_syncobj_signal(struct drm_device *dev, void *data,
-+			    struct drm_file *file_priv)
-+{
-+	struct p7580_syncobj_array *args = data;
-+	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
-+	uint32_t i, count = args->count_handles;
-+
-+	(void)dev;
-+	if (!mgr)
-+		return -ENODEV;
-+	if (!count || !args->handles)
-+		return -EINVAL;
-+	if (count > 64)
-+		return -EINVAL;
-+	for (i = 0; i < count; i++) {
-+		uint32_t h;
-+		struct drm_syncobj *s;
-+		struct dma_fence *f;
-+		int ret;
-+
-+		if (copy_from_user(&h,
-+				   (void __user *)(uintptr_t)args->handles +
-+				   i * sizeof(h), sizeof(h)))
-+			return -EFAULT;
-+		s = drm_syncobj_find(mgr, h);
-+		if (!s)
-+			return -ENOENT;
-+		/* Already-signaled (or empty) is a no-op 0. */
-+		f = drm_syncobj_find_fence(s);
-+		if (!f || dma_fence_is_signaled(f)) {
-+			dma_fence_put(f);
-+			drm_syncobj_put(s);
-+			continue;
-+		}
-+		dma_fence_put(f);
-+		f = p7580_sync_signaled_fence();
-+		if (!f) {
-+			drm_syncobj_put(s);
-+			return -ENOMEM;
-+		}
-+		ret = drm_syncobj_replace_fence(s, f);
-+		dma_fence_put(f);
-+		drm_syncobj_put(s);
-+		if (ret)
-+			return ret;
-+	}
-+	return 0;
-+}
-+
-+/* ---- fops dispatcher (main.c wires .unlocked_ioctl here) ---- */
-+
-+static long p7580_syncobj_dispatch(struct drm_device *dev, void *kdata,
-+				   struct drm_file *file_priv,
-+				   unsigned int nr)
-+{
-+	switch (nr) {
-+	case P7580_SYNCOBJ_NR_CREATE:
-+		return panfrost_syncobj_create(dev, kdata, file_priv);
-+	case P7580_SYNCOBJ_NR_DESTROY:
-+		return panfrost_syncobj_destroy(dev, kdata, file_priv);
-+	case P7580_SYNCOBJ_NR_HANDLE_TO_FD:
-+		return panfrost_syncobj_handle_to_fd(dev, kdata, file_priv);
-+	case P7580_SYNCOBJ_NR_FD_TO_HANDLE:
-+		return panfrost_syncobj_fd_to_handle(dev, kdata, file_priv);
-+	case P7580_SYNCOBJ_NR_WAIT:
-+		return panfrost_syncobj_wait(dev, kdata, file_priv);
-+	case P7580_SYNCOBJ_NR_RESET:
-+		return panfrost_syncobj_reset(dev, kdata, file_priv);
-+	case P7580_SYNCOBJ_NR_SIGNAL:
-+		return panfrost_syncobj_signal(dev, kdata, file_priv);
-+	default:
-+		return -ENOENT;	/* not a syncobj number: caller forwards */
-+	}
-+}
-+
-+/* Same copy discipline as drm_ioctl (drm_drv.c:444-490): fixed-size
-+ * struct is kernel-copied; only the pointed-to handle arrays are
-+ * copied in the handlers. asize>usize zero-pads (older libdrm with a
-+ * shorter WAIT struct keeps working); usize>asize truncates (newer
-+ * libdrm with a LONGER struct: 24 B HANDLE with point tail, 40 B WAIT
-+ * with deadline_nsec -- the extra tail bytes are NOT copied in, so
-+ * the handler never sees them, and the copy_to_user writes back only
-+ * usize... see below). Copy-back is capped at asize (never usize):
-+ * with a 24 B userspace HANDLE, blindly writing 24 B back would leak
-+ * 8 B of stack past our 16 B struct into userspace. */
-+static long p7580_syncobj_do(struct file *filp, unsigned int cmd,
-+			     unsigned long arg)
-+{
-+	struct drm_file *file_priv = filp->private_data;
-+	struct drm_device *dev;
-+	unsigned int nr = _IOC_NR(cmd);
-+	unsigned int usize = _IOC_SIZE(cmd);
-+	char stack_kdata[128];
-+	char *kdata = stack_kdata;
-+	unsigned int asize;
-+	long ret;
-+
-+	if (!file_priv)
-+		return -EINVAL;
-+	dev = file_priv->minor->dev;
-+	if (!dev)
-+		return -ENODEV;
-+	if (drm_device_is_unplugged(dev))
-+		return -ENODEV;
-+	switch (nr) {
-+	case P7580_SYNCOBJ_NR_CREATE:
-+		asize = sizeof(struct p7580_syncobj_create);
-+		break;
-+	case P7580_SYNCOBJ_NR_DESTROY:
-+		asize = sizeof(struct p7580_syncobj_destroy);
-+		break;
-+	case P7580_SYNCOBJ_NR_HANDLE_TO_FD:
-+	case P7580_SYNCOBJ_NR_FD_TO_HANDLE:
-+		asize = sizeof(struct p7580_syncobj_handle);
-+		break;
-+	case P7580_SYNCOBJ_NR_WAIT:
-+		asize = sizeof(struct p7580_syncobj_wait);
-+		break;
-+	case P7580_SYNCOBJ_NR_RESET:
-+	case P7580_SYNCOBJ_NR_SIGNAL:
-+		asize = sizeof(struct p7580_syncobj_array);
-+		break;
-+	default:
-+		return drm_ioctl(filp, cmd, arg);
-+	}
-+	if (asize > sizeof(stack_kdata)) {
-+		kdata = kmalloc(asize, GFP_KERNEL);
-+		if (!kdata)
-+			return -ENOMEM;
-+	}
-+	if (asize > usize)
-+		memset(kdata + usize, 0, asize - usize);
-+	if (cmd & IOC_IN) {
-+		/* Truncate: copy at most asize (our struct); a longer
-+		 * userspace struct (24 B HANDLE, 40 B WAIT) leaves its
-+		 * tail in userspace, untouched. */
-+		unsigned int cpin = usize < asize ? usize : asize;
-+
-+		if (copy_from_user(kdata, (void __user __force *)arg,
-+				   cpin) != 0) {
-+			ret = -EFAULT;
-+			goto out;
-+		}
-+		if (cpin < asize)
-+			memset(kdata + cpin, 0, asize - cpin);
-+	} else {
-+		memset(kdata, 0, asize);
-+	}
-+	ret = p7580_syncobj_dispatch(dev, kdata, file_priv, nr);
-+	if (ret == -ENOENT)
-+		ret = drm_ioctl(filp, cmd, arg);
-+	else if ((cmd & IOC_OUT) && ret == 0) {
-+		/* Cap the write-back at asize: never leak stack past our
-+		 * struct into a longer userspace struct's tail. */
-+		unsigned int cpout = usize < asize ? usize : asize;
-+
-+		if (copy_to_user((void __user __force *)arg, kdata,
-+				 cpout) != 0)
-+			ret = -EFAULT;
-+	}
-+out:
-+	if (kdata != stack_kdata)
-+		kfree(kdata);
-+	return ret;
-+}
-+
-+long panfrost_syncobj_ioctl(struct file *filp, unsigned int cmd,
-+			    unsigned long arg)
-+{
-+	unsigned int nr = _IOC_NR(cmd);
-+
-+	/* Fast path: driver-private numbers never reach us with extra
-+	 * work -- straight to the core. */
-+	if ((nr >= DRM_COMMAND_BASE) && (nr < DRM_COMMAND_END))
-+		return drm_ioctl(filp, cmd, arg);
-+	return p7580_syncobj_do(filp, cmd, arg);
-+}
-+
-+#ifdef CONFIG_COMPAT
-+long panfrost_syncobj_compat_ioctl(struct file *filp, unsigned int cmd,
-+				   unsigned long arg)
-+{
-+	/* Payload structs are width-clean (no pointers, only u32/__u64/
-+	 * __s32); compat32 handling is identical. */
-+	return panfrost_syncobj_ioctl(filp, cmd, arg);
-+}
-+#endif
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-20 18:25:46.768196981 -0500
 @@ -0,0 +1,254 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -2879,7 +2157,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#endif /* PANFROST7580_JM_HW_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 18:25:46.770310109 -0500
 @@ -0,0 +1,851 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -3734,8 +3012,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
-@@ -0,0 +1,177 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 18:25:46.772530375 -0500
+@@ -0,0 +1,179 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3877,9 +3155,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +		       uint32_t js_present, uint64_t shader_present,
 +		       dma_addr_t pgd_dma);
 +#else
++#include <stdint.h>
++typedef uint64_t p7580_dma_addr_t;
 +int p7580_job_dev_init(struct p7580_job_dev *jd, void *regs,
 +		       uint32_t js_present, uint64_t shader_present,
-+		       dma_addr_t pgd_dma);
++		       p7580_dma_addr_t pgd_dma);
 +#endif
 +void p7580_job_dev_fini(struct p7580_job_dev *jd);
 +/* CLEAR + unmask after reset/resume (power held by caller). */
@@ -3915,7 +3195,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +#endif /* PANFROST7580_JOB_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-20 18:25:46.774689598 -0500
 @@ -0,0 +1,682 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -4601,7 +3881,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +MODULE_ALIAS("platform:panfrost7580");
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-19 10:48:44.323461008 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-20 18:25:46.776733584 -0500
 @@ -0,0 +1,447 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -4968,7 +4248,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/d
 +	/* Stepped poll (mmu/pf7580_as.h twin, F-MMU3): 10 us between
 +	 * reads. The old tight loop held the caller in a hot readl
 +	 * spin for ~10^5 iterations; on a wedged slot that is a
-+	 * seconds-long stall on the caller CPU. */
++	 * seconds-long atomic-context-style stall on the caller CPU. */
 +	unsigned int i;
 +
 +	for (i = 0; i < P7580_AS_INACTIVE_MAX_LOOPS; i++) {
@@ -5052,7 +4332,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-19 10:48:44.325852125 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-20 18:25:46.778726305 -0500
 @@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -5227,7 +4507,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/d
 +#endif /* PANFROST7580_MMU_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b/drivers/gpu/drm/panfrost/panfrost7580_power.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-19 10:48:44.328121717 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-20 18:25:46.780767497 -0500
 @@ -0,0 +1,524 @@
 +/*
 + * panfrost7580_power.c - PM / clock / reset sequencing for Mali-T720
@@ -5755,7 +5035,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b/drivers/gpu/drm/panfrost/panfrost7580_power.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-19 10:48:44.330216005 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-20 18:25:46.783015349 -0500
 @@ -0,0 +1,201 @@
 +/*
 + * panfrost7580_power.h - PM / clock / reset sequencing for Mali-T720
@@ -5960,8 +5240,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 +#endif /* PANFROST7580_POWER_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,976 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-20 18:25:46.784962045 -0500
+@@ -0,0 +1,995 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6274,15 +5554,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +	if (!drv && df)
 +		drv = df->drv;
-+	/* F-JT2: completion-side CPU-cache invalidate. free_job runs
-+	 * on finish_work strictly after the fence signal (0004: cancel
-+	 * timeout, put fence, THEN free_job), so every referenced BO
-+	 * is post-GPU-write here. Walk the job's owned BO pointers
-+	 * (referenced at SUBMIT, stored on job->bos) and retire each
-+	 * HIGHMEM SHMEM page via p7580_gem_job_done_sync
-+	 * (flush_dcache_page; CMA/dma-direct pages no-op inside),
-+	 * then drop the job's refs. No MMIO, never sleeps, no
-+	 * locks: safe beside the PM release below. */
++	/* F-JT2 + gpu31-coherency: completion-side DMA sync. free_job
++	 * runs on finish_work strictly after the fence signal (0004:
++	 * cancel timeout, put fence, THEN free_job), so every
++	 * referenced BO is post-GPU-write here. Walk the job's owned
++	 * BO pointers (referenced at SUBMIT, stored on job->bos) and
++	 * retire each via p7580_gem_job_done_sync
++	 * (dma_sync_single_for_cpu per bound SHMEM page; CMA/imported
++	 * and never-bound BOs no-op inside), then drop the job's refs.
++	 * No MMIO, never sleeps, no locks: safe beside the PM release
++	 * below. */
 +	if (job && job->bo_count && job->bos) {
 +		for (i = 0; i < job->bo_count; i++) {
 +			struct drm_gem_object *obj =
@@ -6442,6 +5723,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	if (invalidate)
 +		p7580_mmu_invalidate(drv->regs, P7580_DRV_AS_NR,
 +				     bo->iova >> PAGE_SHIFT, npages, 1);
++	/* gpu31-coherency: tear down the bind-time DMA mapping now the
++	 * PTEs no longer reference the pages. CPU-side only, safe dark. */
++	p7580_gem_dma_unbind(obj);
 +	return 0;
 +}
 +
@@ -6571,6 +5855,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	}
 +	mutex_unlock(&drv->bo_lock);
 +
++	/* gpu31-coherency: bind-time dma_map before the AS0 walk so PTEs
++	 * carry bus addresses (p7580_bo_page_phys routes SHMEM through
++	 * the dma_addrs cache) and completion sync has a mapping. */
++	{
++		int bret = p7580_gem_dma_bind(obj, drv->dev);
++
++		if (bret)
++			return bret;
++	}
++
 +	for (i = 0; i < npages; i++) {
 +		int ok = 0;
 +		phys_addr_t phys = p7580_bo_page_phys(obj, i, &ok);
@@ -6688,6 +5982,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			ret = p7580_drv_map_bo(drv, obj);
 +			if (ret)
 +				goto err_objs;
++			/* gpu31-coherency: CPU fills descriptors/payloads
++			 * before SUBMIT (ioctl copy / mmap writes); drain
++			 * those lines to the point the GPU reads now that
++			 * the BO is bound. Before the job is queued. */
++			p7580_gem_submit_sync(obj);
 +		}
 +	}
 +
@@ -6938,9 +6237,899 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		return ret;
 +	}
 +}
+diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
+--- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	1969-12-31 19:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-20 18:25:46.787158774 -0500
+@@ -0,0 +1,812 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * panfrost7580_syncobj.c - generic DRM syncobj ioctl bodies for the
++ * T720 port (Exynos 7580, Nura 3.10.108, j7elte).
++ *
++ * Context (see the header): Mesa 20.3.5 panfrost asserts on
++ * drmSyncobjCreate (pan_context.c:1632-1633). The 3.10 core exposes
++ * no core SYNCOBJ rows, and the driver-private table only serves
++ * nr < DRM_COMMAND_END (0xA0); the generic syncobj numbers
++ * (0xBF-0xC5) always fall through to the core table, where a NULL
++ * func returns -EINVAL (drm_drv.c:401-435). So this file registers
++ * NOTHING in the driver's ioctl table. Instead the driver's fops
++ * .unlocked_ioctl/.compat_ioctl point at panfrost_syncobj_ioctl,
++ * which routes the seven syncobj numbers here and forwards
++ * everything else to drm_ioctl() unchanged.
++ *
++ * errno contract (what Mesa/libdrm expect; same as mainline):
++ *  - CREATE: unknown flags bits -> -EINVAL (mainline rejects
++ *    anything but CREATE_SIGNALED at once: the check is
++ *    flags & ~DRM_SYNCOBJ_CREATE_SIGNALED).
++ *  - CREATE_SIGNALED: installs a signaled fence so a first WAIT
++ *    returns 0 instead of blocking forever. 3.10 has no pre-signaled
++ *    fence type, so an already-signaled private fence is used
++ *    (dma_fence_init + dma_fence_signal, released on replace).
++ *  - DESTROY of an unknown handle -> -ENOENT (0003 shim contract;
++ *    matches mainline ENOENT-on-stale-handle).
++ *  - WAIT: unknown flag bits -> -EINVAL; timeout is ABSOLUTE
++ *    CLOCK_MONOTONIC ns (drm_syncobj_wait in the 20.x libdrm wrapper
++ *    passes the absolute stamp straight through). Past/zero stamp is
++ *    non-blocking (0 jiffies). count==0 or NULL handles -> -EINVAL.
++ *    WAIT_ALL(all fences signaled -> 0) and WAIT_ANY(first signaled
++ *    index in first_signaled, still 0; none signaled in budget ->
++ *    -ETIME, matching the shim's dma_fence_wait_timeout -ETIME).
++ *    WAIT_FOR_SUBMIT/WAIT_AVAILABLE need the timeline/eventfd code
++ *    the 0003 shim deliberately omits -> -EINVAL (never silently
++ *    ignored: Mesa would hang on an un-waited submit fence).
++ *  - RESET of an unknown handle -> -ENOENT; NULL fence is already
++ *    the signaled state, so reset keeps fence NULL and returns 0.
++ *  - SIGNAL: unknown handle -> -ENOENT; the installed fence is a
++ *    private already-signaled fence (see CREATE_SIGNALED). Signaling
++ *    an already-signaled (or empty) syncobj is a no-op 0 -- Mesa
++ *    re-signals without checking.
++ *  - HANDLE_TO_FD/FD_TO_HANDLE tolerate bit 0 (libdrm 2.4.134 sets
++ *    EXPORT/IMPORT_SYNC_FILE unconditionally; no sync_file.c on 3.10
++ *    but the plain-fence anon-inode fd satisfies Mesa's snapshot use)
++ *    and reject all other unknown bits (TIMELINE bit 1 included).
++ *  - copy_from_user/copy_to_user faults -> -EFAULT (the 3.10 core
++ *    copies the fixed struct, NOT the pointed-to handle array; the
++ *    array is copied here).
++ *  - no driver_priv (open did not run) -> -ENODEV.
++ *
++ * Locking: the 0003 manager serialises the idr; each syncobj
++ * serialises its own fence pointer. WAIT snapshots fence refs under
++ * the manager then sleeps unlocked. The anon-inode export holds a
++ * fence ref for the file's lifetime (released in syncobj_file_release).
++ *
++ * SHIM-CALLSITES: 0003 (manager create/destroy/find, replace_fence,
++ * find_fence). 0001 (dma_fence_init/signal/wait_timeout/get/put via
++ * the 0003 wrappers). No 0002/0004 use.
++ */
++
++#include <linux/anon_inodes.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/file.h>
++#include <linux/jiffies.h>
++#include <linux/ktime.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/time.h>
++#include <linux/uaccess.h>
++
++#include <drm/drmP.h>
++#include <drm/drm.h>
++
++#include <linux/dma-fence.h>		/* 0001 (staged by Makefile) */
++#include "drm_syncobj.h"		/* 0003 (staged by Makefile) */
++#include "panfrost7580_syncobj.h"
++
++/* ---- UAPI payload mirrors (3.10-era sizes, byte-identical wire) ---- */
++/* v5.2/20.x drm.h: SYNCOBJ ioctls are core numbers, NOT driver-private:
++ * CREATE 0xBF, DESTROY 0xC0, HANDLE_TO_FD 0xC1, FD_TO_HANDLE 0xC2,
++ * WAIT 0xC3, RESET 0xC4, SIGNAL 0xC5 (DRM_IOWR). The _IOC_NR (low 8
++ * bits) is what drm_ioctl dispatches on; the core table has no rows
++ * there, so our fops dispatcher catches them first. */
++#define P7580_SYNCOBJ_NR_CREATE		0xBFu
++#define P7580_SYNCOBJ_NR_DESTROY	0xC0u
++#define P7580_SYNCOBJ_NR_HANDLE_TO_FD	0xC1u
++#define P7580_SYNCOBJ_NR_FD_TO_HANDLE	0xC2u
++#define P7580_SYNCOBJ_NR_WAIT		0xC3u
++#define P7580_SYNCOBJ_NR_RESET		0xC4u
++#define P7580_SYNCOBJ_NR_SIGNAL		0xC5u
++
++#define P7580_SYNCOBJ_CREATE_SIGNALED	(1u << 0)
++
++#define P7580_SYNCOBJ_WAIT_ALL		(1u << 0)
++#define P7580_SYNCOBJ_WAIT_FOR_SUBMIT	(1u << 1)
++#define P7580_SYNCOBJ_WAIT_AVAILABLE	(1u << 2)
++/* Bits the 20.x WAIT struct defines but this binary subset cannot
++ * honour: deadline hint (needs fence deadlines, absent in 0001). */
++#define P7580_SYNCOBJ_WAIT_DEADLINE	(1u << 3)
++
++struct p7580_syncobj_create {
++	__u32 handle;
++	__u32 flags;
++};
++
++struct p7580_syncobj_destroy {
++	__u32 handle;
++	__u32 pad;
++};
++
++struct p7580_syncobj_handle {
++	__u32 handle;
++	__u32 flags;
++	__s32 fd;
++	__u32 pad;
++};
++
++struct p7580_syncobj_wait {
++	__u64 handles;
++	__s64 timeout_nsec;	/* absolute CLOCK_MONOTONIC */
++	__u32 count_handles;
++	__u32 flags;
++	__u32 first_signaled;
++	__u32 pad;
++};
++
++struct p7580_syncobj_array {
++	__u64 handles;
++	__u32 count_handles;
++	__u32 pad;
++};
++
++/* ABI gate (gpu31-abialign, both TUs): Mesa 20.3 bundles the 20.x
++ * drm.h syncobj shapes (verified on-device 2026-11-20 from
++ * /data/mesabuild/mesa20/include/drm-uapi/drm.h + disassembled
++ * libdrm.so.2.134.0 wrappers):
++ *   CREATE 8 B  IOWR(0xBF), DESTROY 8 B (v5.2-era: IOWR, current is
++ *   IOWR too -- the old IOW comment in pf7580.c predates the check),
++ *   HANDLE 16 B IOWR(0xC1/0xC2, NO point field),
++ *   WAIT   32 B IOWR(0xC3, NO deadline_nsec tail),
++ *   ARRAY  16 B IOWR(0xC4/0xC5).
++ * The 3.10 core keys copy_from/to_user on OUR asize (the dispatcher's
++ * asize table below), so the struct MUST stay 16/32 B: a 24/40 B
++ * current-header struct would over-copy into the stack buffer. The
++ * dispatcher ALSO keys on _IOC_NR only (not _IOC_SIZE), so a 24 B
++ * HANDLE_TO_FD from libdrm 2.4.134 lands here with usize=24; the
++ * handler reads only the first 16 B and ignores the point tail.
++ * ioctl direction (client pf7580.c asserts the same): CREATE+WAIT are
++ * IOWR, DESTROY is IOWR on the wire the kernel serves (20.x drm.h says
++ * DRM_IOWR for all three; the legacy IOW DESTROY encoding aliases the
++ * same _IOC_NR so dispatch is unaffected, but new code MUST use IOWR).
++ * Flag contract: SYNC_FILE bits (HTOF/FTOH bit 0) need sync_file.c
++ * (absent on 3.10) and are the ONLY rejected HTOF/FTOH bits; WAIT
++ * rejects FOR_SUBMIT/AVAILABLE/DEADLINE. See the handle_to_fd body for
++ * why SYNC_FILE is silently tolerated on plain-fence exports. */
++#include <linux/bug.h>
++/* Bit 0 doubles as the only valid HTOF/FTOH flag on BOTH the 20.x
++ * header (EXPORT/IMPORT_SYNC_FILE) and mainline (TIMELINE is bit 1). */
++#define P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE	(1u << 0)
++#define P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE	(1u << 0)
++static inline void p7580_syncobj_abi_check(void)
++{
++	BUILD_BUG_ON(sizeof(struct p7580_syncobj_create) != 8);
++	BUILD_BUG_ON(sizeof(struct p7580_syncobj_destroy) != 8);
++	BUILD_BUG_ON(sizeof(struct p7580_syncobj_handle) != 16);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
++					handle) != 0);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
++					flags) != 4);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
++					fd) != 8);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
++					pad) != 12);
++	BUILD_BUG_ON(sizeof(struct p7580_syncobj_wait) != 32);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
++					handles) != 0);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
++					timeout_nsec) != 8);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
++					count_handles) != 16);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
++					flags) != 20);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
++					first_signaled) != 24);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
++					pad) != 28);
++	BUILD_BUG_ON(sizeof(struct p7580_syncobj_array) != 16);
++	BUILD_BUG_ON(P7580_SYNCOBJ_CREATE_SIGNALED !=
++		     (1u << 0));
++	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_ALL != (1u << 0));
++	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_FOR_SUBMIT != (1u << 1));
++	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_AVAILABLE != (1u << 2));
++	BUILD_BUG_ON(P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE != (1u << 0));
++	BUILD_BUG_ON(P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE != (1u << 0));
++}
++
++/* The manager lives first in driver_priv (GEM p7580_file_priv and the
++ * driver's p7580_drv_file share the layout: mgr, ...). */
++static struct drm_syncobj_manager *p7580_sync_mgr(struct drm_file *fp)
++{
++	struct drm_syncobj_manager *mgr;
++
++	if (!fp)
++		return NULL;
++	mgr = (struct drm_syncobj_manager *)fp->driver_priv;
++	return mgr;
++}
++
++/* A pre-signaled fence: 0001 has no timeline/signaled constructor, so
++ * init a private fence and signal it once. Ops mirror the submit-job
++ * fence backend contract (release via release_base). */
++static const struct dma_fence_ops p7580_sync_signaled_ops = {
++	.get_driver_name = NULL,
++	.get_timeline_name = NULL,
++	.enable_signaling = NULL,
++	.signaled = NULL,
++	.wait = NULL,
++	.release = NULL,	/* filled at first use (no static fn) */
++};
++
++static void p7580_sync_signaled_release(struct dma_fence *fence)
++{
++	dma_fence_release_base(fence);
++	kfree(fence);
++}
++
++static struct dma_fence *p7580_sync_signaled_fence(void)
++{
++	struct dma_fence *f;
++
++	f = kzalloc(sizeof(*f), GFP_KERNEL);
++	if (!f)
++		return NULL;
++	/* release hook is per-instance (static ops has no .release
++	 * until set here; init BUGs on NULL release). */
++	((struct dma_fence_ops *)&p7580_sync_signaled_ops)->release =
++		p7580_sync_signaled_release;
++	dma_fence_init(f, &p7580_sync_signaled_ops,
++		       dma_fence_context_alloc(1), 1);
++	dma_fence_signal(f);
++	return f;
++}
++
++int panfrost_syncobj_create(struct drm_device *dev, void *data,
++			    struct drm_file *file_priv)
++{
++	struct p7580_syncobj_create *args = data;
++	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
++	struct drm_syncobj *s;
++	u32 handle;
++	int ret;
++
++	(void)dev;
++	p7580_syncobj_abi_check();
++	if (!mgr)
++		return -ENODEV;
++	/* Mainline rejects any unknown bit at once (flags & ~SIGNALED). */
++	if (args->flags & ~P7580_SYNCOBJ_CREATE_SIGNALED)
++		return -EINVAL;
++	ret = drm_syncobj_create(mgr, &handle);
++	if (ret)
++		return ret;
++	if (args->flags & P7580_SYNCOBJ_CREATE_SIGNALED) {
++		struct dma_fence *f = p7580_sync_signaled_fence();
++
++		if (!f) {
++			drm_syncobj_destroy(mgr, handle);
++			return -ENOMEM;
++		}
++		s = drm_syncobj_find(mgr, handle);
++		if (!s) {
++			dma_fence_put(f);
++			drm_syncobj_destroy(mgr, handle);
++			return -ENOENT;
++		}
++		ret = drm_syncobj_replace_fence(s, f);
++		drm_syncobj_put(s);
++		/* replace takes its own ref. */
++		dma_fence_put(f);
++		if (ret) {
++			drm_syncobj_destroy(mgr, handle);
++			return ret;
++		}
++	}
++	args->handle = handle;
++	return 0;
++}
++
++int panfrost_syncobj_destroy(struct drm_device *dev, void *data,
++			     struct drm_file *file_priv)
++{
++	struct p7580_syncobj_destroy *args = data;
++	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
++
++	(void)dev;
++	if (!mgr)
++		return -ENODEV;
++	if (args->pad)
++		return -EINVAL;
++	/* Unknown handle -> -ENOENT (0003 contract, mainline parity). */
++	return drm_syncobj_destroy(mgr, args->handle);
++}
++
++/* ---- FD export/import: plain-fence anon_inode transport ---- */
++/* 3.10 has no sync_file.c, so HANDLE_TO_FD exports the CURRENT fence
++ * (snapshot ref at export time; later replaces do not follow the fd).
++ * Bit 0 (EXPORT/IMPORT_SYNC_FILE) is tolerated (see handler bodies);
++ * all other flag bits are -EINVAL. */
++
++struct p7580_syncobj_export {
++	struct dma_fence *fence;	/* ref held for the file */
++};
++
++static int p7580_syncobj_file_release(struct inode *inode, struct file *filp)
++{
++	struct p7580_syncobj_export *ex = filp->private_data;
++
++	(void)inode;
++	if (ex) {
++		dma_fence_put(ex->fence);
++		kfree(ex);
++	}
++	return 0;
++}
++
++static const struct file_operations p7580_syncobj_file_fops = {
++	.owner = THIS_MODULE,
++	.release = p7580_syncobj_file_release,
++};
++
++int panfrost_syncobj_handle_to_fd(struct drm_device *dev, void *data,
++				  struct drm_file *file_priv)
++{
++	struct p7580_syncobj_handle *args = data;
++	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
++	struct drm_syncobj *s;
++	struct dma_fence *f;
++	struct p7580_syncobj_export *ex;
++	int fd;
++
++	(void)dev;
++	p7580_syncobj_abi_check();
++	if (!mgr)
++		return -ENODEV;
++	if (args->pad)
++		return -EINVAL;
++	/* Mesa 20.3 libdrm 2.4.134 unconditionally sets bit 0
++	 * (EXPORT_SYNC_FILE) in drmSyncobjExportSyncFile/HandleToFD
++	 * (disassembled: stp w1=handle,w2=-1 + mov w1=#1 for the flag
++	 * word; pan_screen.c panfrost_fence_create calls ExportSyncFile
++	 * so EVERY fence snapshot -- and therefore every glFinish/
++	 * ReadPixels flush -- goes through here). There is no sync_file
++	 * layer on 3.10, but the plain-fence anon-inode fd we install
++	 * satisfies the only thing Mesa does with it: import the fence
++	 * into a fresh syncobj. Rejecting bit 0 broke all draws (3x
++	 * EINVAL per flush, SUBMIT never reached). So: tolerate bit 0,
++	 * reject every OTHER unknown bit (TIMELINE bit 1 included --
++	 * the 0003 shim has no timeline points, and silently dropping
++	 * them would hang Mesa on a fence we never signalled). */
++	if (args->flags & ~P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE)
++		return -EINVAL;
++	s = drm_syncobj_find(mgr, args->handle);
++	if (!s)
++		return -ENOENT;
++	f = drm_syncobj_find_fence(s);
++	drm_syncobj_put(s);
++	if (!f)
++		return -EINVAL;	/* NULL fence: nothing to export */
++	ex = kzalloc(sizeof(*ex), GFP_KERNEL);
++	if (!ex) {
++		dma_fence_put(f);
++		return -ENOMEM;
++	}
++	ex->fence = f;	/* fd owns this ref now */
++	fd = anon_inode_getfd("syncobj", &p7580_syncobj_file_fops, ex,
++			      O_CLOEXEC);
++	if (fd < 0) {
++		dma_fence_put(f);
++		kfree(ex);
++		return fd;
++	}
++	args->fd = fd;
++	return 0;
++}
++
++int panfrost_syncobj_fd_to_handle(struct drm_device *dev, void *data,
++				  struct drm_file *file_priv)
++{
++	struct p7580_syncobj_handle *args = data;
++	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
++	struct file *filp;
++	struct p7580_syncobj_export *ex;
++	struct drm_syncobj *s;
++	u32 handle;
++	int ret;
++
++	(void)dev;
++	if (!mgr)
++		return -ENODEV;
++	if (args->pad)
++		return -EINVAL;
++	/* Mirror HANDLE_TO_FD: libdrm drmSyncobjImportSyncFile sets bit 0
++	 * (IMPORT_SYNC_FILE); tolerate it, reject the rest (TIMELINE bit 1
++	 * included). A foreign sync_file fd (real sync_file.c file) still
++	 * fails the f_op check below -- we only snapshot fences from fds
++	 * this driver exported. */
++	if (args->flags & ~P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE)
++		return -EINVAL;
++	if (args->fd < 0)
++		return -EINVAL;
++	filp = fget((unsigned int)args->fd);
++	if (!filp)
++		return -EINVAL;
++	/* Only fds this driver exported carry a fence; anything else
++	 * (eventfd, pipe, foreign sync_file) is -EINVAL, never a
++	 * blind pointer dereference. */
++	if (filp->f_op != &p7580_syncobj_file_fops) {
++		fput(filp);
++		return -EINVAL;
++	}
++	ex = filp->private_data;
++	if (!ex || !ex->fence) {
++		fput(filp);
++		return -EINVAL;
++	}
++	ret = drm_syncobj_create(mgr, &handle);
++	if (ret) {
++		fput(filp);
++		return ret;
++	}
++	s = drm_syncobj_find(mgr, handle);
++	if (!s) {
++		fput(filp);
++		drm_syncobj_destroy(mgr, handle);
++		return -ENOENT;
++	}
++	/* Import snapshots the CURRENT fence of the fd (same non-sync_file
++	 * limit as export: later fence replaces on the source syncobj do
++	 * not propagate through the fd). */
++	ret = drm_syncobj_replace_fence(s, ex->fence);
++	drm_syncobj_put(s);
++	fput(filp);
++	if (ret) {
++		drm_syncobj_destroy(mgr, handle);
++		return ret;
++	}
++	args->handle = handle;
++	return 0;
++}
++
++int panfrost_syncobj_wait(struct drm_device *dev, void *data,
++			  struct drm_file *file_priv)
++{
++	struct p7580_syncobj_wait *args = data;
++	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
++	struct drm_syncobj **syncs = NULL;
++	struct dma_fence **fences = NULL;
++	uint32_t count, i;
++	struct timespec now;
++	int64_t remain_ns;
++	long timeout;
++	int ret = 0;
++
++	(void)dev;
++	if (!mgr)
++		return -ENODEV;
++	count = args->count_handles;
++	if (!count || !args->handles)
++		return -EINVAL;
++	/* WAIT_FOR_SUBMIT/WAIT_AVAILABLE need the timeline/eventfd code
++	 * the 0003 shim omits; deadline needs 0001 fence deadlines.
++	 * Reject (never ignore): Mesa would hang on a fence we never
++	 * waited for. WAIT_ALL vs ANY is honoured below. */
++	if (args->flags & ~(P7580_SYNCOBJ_WAIT_ALL))
++		return -EINVAL;
++	/* Absolute -> relative: same shape as WAIT_BO (ktime_get_ts is
++	 * the 3.10 spelling). Past stamp stays non-blocking. */
++	ktime_get_ts(&now);
++	remain_ns = (int64_t)args->timeout_nsec -
++		    ((int64_t)now.tv_sec * 1000000000LL + now.tv_nsec);
++	if (remain_ns <= 0)
++		timeout = 0;
++	else if ((uint64_t)remain_ns > (uint64_t)LONG_MAX)
++		timeout = LONG_MAX;
++	else
++		timeout = nsecs_to_jiffies((uint64_t)remain_ns);
++
++	/* Snapshot syncobj + fence refs under the manager, sleep after.
++	 * Caps mirror SUBMIT (64 BOs / 16 in-syncs): 64 handles max. */
++	if (count > 64)
++		return -EINVAL;
++	syncs = kcalloc(count, sizeof(*syncs), GFP_KERNEL);
++	if (!syncs)
++		return -ENOMEM;
++	fences = kcalloc(count, sizeof(*fences), GFP_KERNEL);
++	if (!fences) {
++		kfree(syncs);
++		return -ENOMEM;
++	}
++	for (i = 0; i < count; i++) {
++		uint32_t h;
++
++		if (copy_from_user(&h,
++				   (void __user *)(uintptr_t)args->handles +
++				   i * sizeof(h), sizeof(h))) {
++			ret = -EFAULT;
++			count = i;
++			goto out_put_syncs;
++		}
++		syncs[i] = drm_syncobj_find(mgr, h);
++		if (!syncs[i]) {
++			ret = -ENOENT;
++			count = i;
++			goto out_put_syncs;
++		}
++		/* NULL fence == already signaled (0003 contract): no
++		 * fence ref, counted as signaled below. */
++		fences[i] = drm_syncobj_find_fence(syncs[i]);
++	}
++	if (args->flags & P7580_SYNCOBJ_WAIT_ALL) {
++		for (i = 0; i < args->count_handles; i++) {
++			long r;
++
++			if (!fences[i])
++				continue;
++			r = dma_fence_wait_timeout(fences[i], true,
++						   timeout);
++			if (r < 0) {
++				ret = (int)r;
++				goto out_put_all;
++			}
++			/* Chained budget: each fence consumes from what
++			 * the previous one left (0001 returns remaining;
++			 * 0 with budget left means signaled now). */
++			timeout = r;
++		}
++		args->first_signaled = 0;
++	} else {
++		/* ANY: poll without consuming the whole budget on the
++		 * first unsignaled fence. Zero-timeout test first, then
++		 * bounded wait on each in turn with the remaining
++		 * budget split evenly (binary-subset approximation). */
++		uint32_t n = args->count_handles;
++
++		for (i = 0; i < n; i++) {
++			if (!fences[i] ||
++			    dma_fence_is_signaled(fences[i])) {
++				args->first_signaled = i;
++				goto out_put_all;
++			}
++		}
++		if (timeout == 0) {
++			ret = -ETIME;
++			goto out_put_all;
++		}
++		for (i = 0; i < n; i++) {
++			long r = dma_fence_wait_timeout(fences[i], true,
++							timeout / (n - i));
++
++			if (r < 0 && r != -ETIME) {
++				ret = (int)r;
++				goto out_put_all;
++			}
++			if (r >= 0 || !r) {
++				/* signaled (r>=0 remaining) or 0-budget
++				 * hit exactly at signal: re-test. */
++				if (!fences[i] ||
++				    dma_fence_is_signaled(fences[i])) {
++					args->first_signaled = i;
++					ret = 0;
++					goto out_put_all;
++				}
++			}
++		}
++		ret = -ETIME;
++	}
++out_put_all:
++	count = args->count_handles;
++out_put_syncs:
++	for (i = 0; i < count; i++) {
++		dma_fence_put(fences[i]);
++		if (syncs[i])
++			drm_syncobj_put(syncs[i]);
++	}
++	kfree(fences);
++	kfree(syncs);
++	return ret;
++}
++
++int panfrost_syncobj_reset(struct drm_device *dev, void *data,
++			   struct drm_file *file_priv)
++{
++	struct p7580_syncobj_array *args = data;
++	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
++	uint32_t i, count = args->count_handles;
++
++	(void)dev;
++	if (!mgr)
++		return -ENODEV;
++	if (!count || !args->handles)
++		return -EINVAL;
++	if (count > 64)
++		return -EINVAL;
++	for (i = 0; i < count; i++) {
++		uint32_t h;
++		struct drm_syncobj *s;
++
++		if (copy_from_user(&h,
++				   (void __user *)(uintptr_t)args->handles +
++				   i * sizeof(h), sizeof(h)))
++			return -EFAULT;
++		s = drm_syncobj_find(mgr, h);
++		if (!s)
++			return -ENOENT;
++		/* Binary reset: drop the fence (NULL == signaled in the
++		 * 0003 contract, but Mesa only resets after WAIT, so the
++		 * next SUBMIT re-installs via replace_fence anyway). */
++		drm_syncobj_replace_fence(s, NULL);
++		drm_syncobj_put(s);
++	}
++	return 0;
++}
++
++int panfrost_syncobj_signal(struct drm_device *dev, void *data,
++			    struct drm_file *file_priv)
++{
++	struct p7580_syncobj_array *args = data;
++	struct drm_syncobj_manager *mgr = p7580_sync_mgr(file_priv);
++	uint32_t i, count = args->count_handles;
++
++	(void)dev;
++	if (!mgr)
++		return -ENODEV;
++	if (!count || !args->handles)
++		return -EINVAL;
++	if (count > 64)
++		return -EINVAL;
++	for (i = 0; i < count; i++) {
++		uint32_t h;
++		struct drm_syncobj *s;
++		struct dma_fence *f;
++		int ret;
++
++		if (copy_from_user(&h,
++				   (void __user *)(uintptr_t)args->handles +
++				   i * sizeof(h), sizeof(h)))
++			return -EFAULT;
++		s = drm_syncobj_find(mgr, h);
++		if (!s)
++			return -ENOENT;
++		/* Already-signaled (or empty) is a no-op 0. */
++		f = drm_syncobj_find_fence(s);
++		if (!f || dma_fence_is_signaled(f)) {
++			dma_fence_put(f);
++			drm_syncobj_put(s);
++			continue;
++		}
++		dma_fence_put(f);
++		f = p7580_sync_signaled_fence();
++		if (!f) {
++			drm_syncobj_put(s);
++			return -ENOMEM;
++		}
++		ret = drm_syncobj_replace_fence(s, f);
++		dma_fence_put(f);
++		drm_syncobj_put(s);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++/* ---- fops dispatcher (main.c wires .unlocked_ioctl here) ---- */
++
++static long p7580_syncobj_dispatch(struct drm_device *dev, void *kdata,
++				   struct drm_file *file_priv,
++				   unsigned int nr)
++{
++	switch (nr) {
++	case P7580_SYNCOBJ_NR_CREATE:
++		return panfrost_syncobj_create(dev, kdata, file_priv);
++	case P7580_SYNCOBJ_NR_DESTROY:
++		return panfrost_syncobj_destroy(dev, kdata, file_priv);
++	case P7580_SYNCOBJ_NR_HANDLE_TO_FD:
++		return panfrost_syncobj_handle_to_fd(dev, kdata, file_priv);
++	case P7580_SYNCOBJ_NR_FD_TO_HANDLE:
++		return panfrost_syncobj_fd_to_handle(dev, kdata, file_priv);
++	case P7580_SYNCOBJ_NR_WAIT:
++		return panfrost_syncobj_wait(dev, kdata, file_priv);
++	case P7580_SYNCOBJ_NR_RESET:
++		return panfrost_syncobj_reset(dev, kdata, file_priv);
++	case P7580_SYNCOBJ_NR_SIGNAL:
++		return panfrost_syncobj_signal(dev, kdata, file_priv);
++	default:
++		return -ENOENT;	/* not a syncobj number: caller forwards */
++	}
++}
++
++/* Same copy discipline as drm_ioctl (drm_drv.c:444-490): fixed-size
++ * struct is kernel-copied; only the pointed-to handle arrays are
++ * copied in the handlers. asize>usize zero-pads (older libdrm with a
++ * shorter WAIT struct keeps working); usize>asize truncates (newer
++ * libdrm with a LONGER struct: 24 B HANDLE with point tail, 40 B WAIT
++ * with deadline_nsec -- the extra tail bytes are NOT copied in, so
++ * the handler never sees them, and the copy_to_user writes back only
++ * usize... see below). Copy-back is capped at asize (never usize):
++ * with a 24 B userspace HANDLE, blindly writing 24 B back would leak
++ * 8 B of stack past our 16 B struct into userspace. */
++static long p7580_syncobj_do(struct file *filp, unsigned int cmd,
++			     unsigned long arg)
++{
++	struct drm_file *file_priv = filp->private_data;
++	struct drm_device *dev;
++	unsigned int nr = _IOC_NR(cmd);
++	unsigned int usize = _IOC_SIZE(cmd);
++	char stack_kdata[128];
++	char *kdata = stack_kdata;
++	unsigned int asize;
++	long ret;
++
++	if (!file_priv)
++		return -EINVAL;
++	dev = file_priv->minor->dev;
++	if (!dev)
++		return -ENODEV;
++	if (drm_device_is_unplugged(dev))
++		return -ENODEV;
++	switch (nr) {
++	case P7580_SYNCOBJ_NR_CREATE:
++		asize = sizeof(struct p7580_syncobj_create);
++		break;
++	case P7580_SYNCOBJ_NR_DESTROY:
++		asize = sizeof(struct p7580_syncobj_destroy);
++		break;
++	case P7580_SYNCOBJ_NR_HANDLE_TO_FD:
++	case P7580_SYNCOBJ_NR_FD_TO_HANDLE:
++		asize = sizeof(struct p7580_syncobj_handle);
++		break;
++	case P7580_SYNCOBJ_NR_WAIT:
++		asize = sizeof(struct p7580_syncobj_wait);
++		break;
++	case P7580_SYNCOBJ_NR_RESET:
++	case P7580_SYNCOBJ_NR_SIGNAL:
++		asize = sizeof(struct p7580_syncobj_array);
++		break;
++	default:
++		return drm_ioctl(filp, cmd, arg);
++	}
++	if (asize > sizeof(stack_kdata)) {
++		kdata = kmalloc(asize, GFP_KERNEL);
++		if (!kdata)
++			return -ENOMEM;
++	}
++	if (asize > usize)
++		memset(kdata + usize, 0, asize - usize);
++	if (cmd & IOC_IN) {
++		/* Truncate: copy at most asize (our struct); a longer
++		 * userspace struct (24 B HANDLE, 40 B WAIT) leaves its
++		 * tail in userspace, untouched. */
++		unsigned int cpin = usize < asize ? usize : asize;
++
++		if (copy_from_user(kdata, (void __user __force *)arg,
++				   cpin) != 0) {
++			ret = -EFAULT;
++			goto out;
++		}
++		if (cpin < asize)
++			memset(kdata + cpin, 0, asize - cpin);
++	} else {
++		memset(kdata, 0, asize);
++	}
++	ret = p7580_syncobj_dispatch(dev, kdata, file_priv, nr);
++	if (ret == -ENOENT)
++		ret = drm_ioctl(filp, cmd, arg);
++	else if ((cmd & IOC_OUT) && ret == 0) {
++		/* Cap the write-back at asize: never leak stack past our
++		 * struct into a longer userspace struct's tail. */
++		unsigned int cpout = usize < asize ? usize : asize;
++
++		if (copy_to_user((void __user __force *)arg, kdata,
++				 cpout) != 0)
++			ret = -EFAULT;
++	}
++out:
++	if (kdata != stack_kdata)
++		kfree(kdata);
++	return ret;
++}
++
++long panfrost_syncobj_ioctl(struct file *filp, unsigned int cmd,
++			    unsigned long arg)
++{
++	unsigned int nr = _IOC_NR(cmd);
++
++	/* Fast path: driver-private numbers never reach us with extra
++	 * work -- straight to the core. */
++	if ((nr >= DRM_COMMAND_BASE) && (nr < DRM_COMMAND_END))
++		return drm_ioctl(filp, cmd, arg);
++	return p7580_syncobj_do(filp, cmd, arg);
++}
++
++#ifdef CONFIG_COMPAT
++long panfrost_syncobj_compat_ioctl(struct file *filp, unsigned int cmd,
++				   unsigned long arg)
++{
++	/* Payload structs are width-clean (no pointers, only u32/__u64/
++	 * __s32); compat32 handling is identical. */
++	return panfrost_syncobj_ioctl(filp, cmd, arg);
++}
++#endif
+diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
+--- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	1969-12-31 19:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-20 18:25:46.789383998 -0500
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * panfrost7580_syncobj.h - generic DRM syncobj ioctl handlers for the
++ * T720 port (Exynos 7580, Nura 3.10.108, j7elte).
++ *
++ * Why this file exists: Mesa 20.3.5 panfrost hard-asserts on
++ * drmSyncobjCreate at context creation (pan_context.c:1632-1633:
++ * "assert(!ret && ctx->syncobj)"). The stock 3.10 core has NO generic
++ * syncobj ioctls (drm.h ends at 0xBA;drm_drv.c dispatches only its own
++ * core table), so SYNCOBJ_CREATE arrived as -EINVAL. The shim backport
++ * (0003) provides the per-file handle table; this file wires the
++ * UAPI surface Mesa actually calls.
++ *
++ * UAPI source of truth: v5.2-era drm.h (Mesa 20.3.5 bundles it at
++ * include/drm-uapi/drm.h): SYNCOBJ_CREATE 0xBF, DESTROY 0xC0,
++ * HANDLE_TO_FD 0xC1, FD_TO_HANDLE 0xC2, WAIT 0xC3, RESET 0xC4,
++ * SIGNAL 0xC5. The 20.x libdrm wrappers emit exactly these numbers
++ * (disassembled, aarch64): CREATE 0xc00864bf, DESTROY 0xc00864c0,
++ * HANDLE_TO_FD 0xc01864c1, FD_TO_HANDLE 0xc01864c2, WAIT 0xc02864c3,
++ * RESET/SIGNAL 0xc01064c4/5. Payload structs are the 3.10-era
++ * (40-byte WAIT, no deadline_nsec; handle struct has fd+pad, no
++ * point field, 16 bytes).
++ *
++ * Scope (binary syncobj only, same omissions as the 0003 shim):
++ * no timeline payloads, no eventfd, no WAIT_FOR_SUBMIT/WAIT_AVAILABLE
++ * (rejected -EINVAL), no sync_file fd passing (3.10 has no
++ * sync_file.c). HANDLE_TO_FD/FD_TO_HANDLE support ONLY plain
++ * dma-fence export/import via anon_inode fd (flags==0); any
++ * *_SYNC_FILE flag is -EINVAL, unknown flags -EINVAL.
++ *
++ * File state: file_priv->driver_priv leads with struct
++ * drm_syncobj_manager (same layout contract as GEM's p7580_file_priv
++ * and the driver's p7580_drv_file: mgr first). Handlers take the
++ * manager via driver_priv + 0, so GEM's and the driver's own file
++ * states both work unchanged.
++ */
++
++#ifndef PANFROST7580_SYNCOBJ_H
++#define PANFROST7580_SYNCOBJ_H
++
++struct drm_device;
++struct drm_file;
++
++int panfrost_syncobj_create(struct drm_device *dev, void *data,
++			    struct drm_file *file_priv);
++int panfrost_syncobj_destroy(struct drm_device *dev, void *data,
++			     struct drm_file *file_priv);
++int panfrost_syncobj_handle_to_fd(struct drm_device *dev, void *data,
++				  struct drm_file *file_priv);
++int panfrost_syncobj_fd_to_handle(struct drm_device *dev, void *data,
++				  struct drm_file *file_priv);
++int panfrost_syncobj_wait(struct drm_device *dev, void *data,
++			  struct drm_file *file_priv);
++int panfrost_syncobj_reset(struct drm_device *dev, void *data,
++			   struct drm_file *file_priv);
++int panfrost_syncobj_signal(struct drm_device *dev, void *data,
++			    struct drm_file *file_priv);
++
++/* fops-level dispatcher: routes 3.10-unknown ioctl numbers (core has
++ * no SYNCOBJ rows) to the handlers above; everything else falls
++ * through to drm_ioctl. compat32 maps to the same handlers (payload
++ * structs are u32/__u64/__s32-width-clean, no pointer fields). */
++long panfrost_syncobj_ioctl(struct file *filp, unsigned int cmd,
++			    unsigned long arg);
++#ifdef CONFIG_COMPAT
++long panfrost_syncobj_compat_ioctl(struct file *filp, unsigned int cmd,
++				   unsigned long arg);
++#endif
++
++#endif /* PANFROST7580_SYNCOBJ_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drivers/gpu/drm/panfrost/panfrost_drm.h
 --- a/drivers/gpu/drm/panfrost/panfrost_drm.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-20 10:48:44.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-20 18:25:46.791695686 -0500
 @@ -0,0 +1,155 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
@@ -7099,7 +7288,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drive
 +#endif /* _PANFROST_DRM_H_ */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/drivers/gpu/drm/panfrost/pf7580_devfreq.c
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-19 10:48:44.337348079 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-20 18:25:46.793867831 -0500
 @@ -0,0 +1,355 @@
 +/*
 + * pf7580_devfreq.c - panfrost devfreq/DVFS for Mali-T720 on 3.10.108.
@@ -7458,7 +7647,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/dri
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.h b/drivers/gpu/drm/panfrost/pf7580_devfreq.h
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-19 10:48:44.339539307 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-20 18:25:46.796100249 -0500
 @@ -0,0 +1,251 @@
 +/*
 + * pf7580_devfreq.h - panfrost devfreq/DVFS for Mali-T720 (Exynos 7580,

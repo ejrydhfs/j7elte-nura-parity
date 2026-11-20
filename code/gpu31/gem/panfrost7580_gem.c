@@ -57,6 +57,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dma-attrs.h>
 #include <linux/dma-buf.h>
+#include <linux/highmem.h>
 #include <linux/jiffies.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
@@ -64,7 +65,8 @@
 #include <linux/shmem_fs.h>
 #include <linux/vmalloc.h>
 #include <linux/sched.h>
-#include <asm/cacheflush.h>	/* flush_dcache_page for HIGHMEM SHMEM */
+#include <asm/cacheflush.h>	/* __dma_{map,unmap}_area for COHERENCY_NONE */
+
 
 #include <drm/drmP.h>
 #include <drm/drm.h>
@@ -80,40 +82,169 @@ struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj)
 }
 
 /* ------------------------------------------------------------------ */
-/* Job-completion CPU-cache invalidate (COHERENCY_NONE readback path). */
+/* COHERENCY_NONE data sync (the model: who maintains which alias).   */
 /*                                                                     */
-/* Why this exists: the CPU mmap is write-combined (MT_NORMAL_NC, no   */
-/* CPU lines to flush) — but the SHMEM backing pages THEMSELVES may    */
-/* live in HIGHMEM, where the CPU touches them through a kmap alias    */
-/* (d-cacheable copy) and the GPU writes them through its own port.    */
-/* After the GPU fence signals, copy the kmap-alias bytes the GPU may  */
-/* have replaced back out of the dcache so the next kmap/kunmap        */
-/* window (CPU writer), vmap readback (glReadPixels), or mmap fault    */
-/* observes the GPU bytes instead of stale dcache lines. CMA (WC,      */
-/* dma_alloc_attrs) never aliases and is skipped here; dma-direct      */
-/* SHMEM is dcache-clean by construction (dma_map_page around the      */
-/* access) and needs no city flush either — only HIGHMEM kmap pages    */
-/* take the flush_dcache_page call. Bounded by the BO page count; no   */
-/* MMIO, no sleeps, no locks: safe on the IRQ-adjacent completion path */
-/* (in practice called from process-context retire, not hard-IRQ).     */
+/* This SoC is COHERENCY_NONE (kbase forces system_coherency NONE; no  */
+/* ACE; DT has no system-coherency property). The GPU reads/writes     */
+/* DRAM directly through its own MMU; the CPU reaches the same         */
+/* physical pages through two aliases the architecture does NOT keep   */
+/* coherent for us:                                                    */
+/*                                                                     */
+/*  (a) kernel linear map (page_address / kmap): d-cacheable. Every    */
+/*      CPU touch installs lines here.                                 */
+/*  (b) userspace WC mmap (MT_NORMAL_NC, pgprot_writecombine): never   */
+/*      cached, so no alias lines — but writes may sit in the store    */
+/*      buffer/combining buffer until drained.                         */
+/*  (c) the GPU port: reads/writes DRAM, bypassing the CPU caches.     */
+/*                                                                     */
+/* Correct discipline is the stock non-coherent DMA-API order, per     */
+/* page, with the device pointer carried so the backend can pick the   */
+/* swiotlb vs direct path (arm64 3.10: non-coherent swiotlb ops;       */
+/* dma_map == cache maintenance):                                     */
+/*                                                                     */
+/*  - SUBMIT (CPU -> GPU): CPU writes the descriptor/payloads into     */
+/*    (a)/(b), then dma_sync_single_for_device(dev, dma, PAGE_SIZE,    */
+/*    DMA_BIDIRECTIONAL) drains CPU lines to the point the GPU reads   */
+/*    (PoC/RAM). The GPU PTW tables already follow this                */
+/*    (p7580_sync_pt: sync after every table write).                   */
+/*  - COMPLETION (GPU -> CPU): after the job fence signals,           */
+/*    dma_sync_single_for_cpu(dev, dma, PAGE_SIZE,                     */
+/*    DMA_BIDIRECTIONAL) invalidates CPU lines for the range the GPU  */
+/*    wrote, so the next CPU read (kmap/vmap/mmap fault) misses to     */
+/*    DRAM and observes GPU bytes.                                     */
+/*                                                                     */
+/* Why not flush_dcache_page(): on arm64 it only clears PG_dcache_clean  */
+/* (flush.c: flush_dcache_page is a flag clear for the icache-alias    */
+/* case), i.e. a no-op for GPU-written data, and there is no HIGHMEM   */
+/* on arm64 to make the old PageHighMem gate meaningful. The correct   */
+/* primitive is the DMA sync (equivalently __dma_unmap_area, which is  */
+/* exactly what the arm64 sync_single_for_cpu backend calls before the */
+/* swiotlb sync: dma-mapping.c __swiotlb_sync_single_for_cpu ->        */
+/* __dma_unmap_area(phys_to_virt(dma_to_phys(dev, dma)), size, dir) +  */
+/* swiotlb_sync_single_for_cpu).                                       */
+/*                                                                     */
+/* Lifetime: pages are SHMEM-owned (shmem_read_mapping_page refs are   */
+/* the pin; the private filp is never exposed so ftruncate cannot drop */
+/* them). A BO additionally holds one bind-time DMA mapping covering   */
+/* its pages while GPU-bound (built at bind, torn down at unbind,      */
+/* DMA_BIDIRECTIONAL so the same mapping serves job upload and         */
+/* writeback; SKIP_CPU_SYNC is never set). sync_for_device runs at     */
+/* SUBMIT (before the job is queued) and sync_for_cpu at completion    */
+/* (after the fence signals, in free_job context: no MMIO, no sleeps,  */
+/* no locks — same constraints as the old hook). dma_addr per page is  */
+/* cached in the BO (identity on this tree is asserted, not assumed:   */
+/* a non-identity dma_addr is carried verbatim, so sync still hits the */
+/* right bus address; PTEs must come from p7580_bo_dma_addr, never     */
+/* from page_to_phys directly).                                        */
 /* ------------------------------------------------------------------ */
 void p7580_gem_job_done_sync(struct drm_gem_object *obj)
 {
 	struct p7580_bo *bo = to_p7580_bo(obj);
 	unsigned int i;
 
-	/* WC/CMA has no CPU cache alias: nothing to invalidate. */
+	/* CMA (dma_alloc_attrs coherent) never needs CPU-side sync. */
 	if (bo->backing != P7580_BO_SHMEM || !bo->pages)
 		return;
+	if (!bo->sync_dev || !bo->dma_addrs)
+		return;
 	for (i = 0; i < bo->nr_pages; i++) {
-		struct page *p = bo->pages[i];
-
-		if (!p || !PageHighMem(p))
+		if (!bo->pages[i])
 			continue;
-		flush_dcache_page(p);
+		dma_sync_single_for_cpu(bo->sync_dev, bo->dma_addrs[i],
+					PAGE_SIZE, DMA_BIDIRECTIONAL);
 	}
-	bo->kmap_flushed = 1;
 }
+
+/* Bind: dma_map the SHMEM pages for GPU access (before the AS0        */
+/* page-table walk). Idempotent: already-bound BOs return 0 without    */
+/* remapping. On non-identity trees the returned dma_addr is the bus   */
+/* address the GPU must use; callers MUST program PTEs from            */
+/* p7580_bo_dma_addr, never from page_to_phys. Maps                   */
+/* DMA_BIDIRECTIONAL (single mapping covers both directions; never     */
+/* SKIP_CPU_SYNC). Partial-failure unwind unmaps what was mapped. */
+int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev)
+{
+	struct p7580_bo *bo = to_p7580_bo(obj);
+	unsigned int i;
+
+	if (!dev || bo->backing != P7580_BO_SHMEM || !bo->pages)
+		return 0;
+	if (bo->dma_addrs)
+		return 0;
+	bo->dma_addrs = kcalloc(bo->nr_pages, sizeof(*bo->dma_addrs),
+				GFP_KERNEL);
+	if (!bo->dma_addrs)
+		return -ENOMEM;
+	for (i = 0; i < bo->nr_pages; i++) {
+		dma_addr_t d = dma_map_page(dev, bo->pages[i], 0, PAGE_SIZE,
+					    DMA_BIDIRECTIONAL);
+
+		if (dma_mapping_error(dev, d)) {
+			while (i--)
+				dma_unmap_page(dev, bo->dma_addrs[i],
+					       PAGE_SIZE, DMA_BIDIRECTIONAL);
+			kfree(bo->dma_addrs);
+			bo->dma_addrs = NULL;
+			return -ENOMEM;
+		}
+		bo->dma_addrs[i] = d;
+	}
+	bo->sync_dev = dev;
+	return 0;
+}
+
+/* SUBMIT-side drain: push CPU-written bytes to the point the GPU      */
+/* reads. Runs after the CPU fills descriptors/payloads and before    */
+/* the job is queued (fence not yet armed). Unbound BOs are a no-op.  */
+void p7580_gem_submit_sync(struct drm_gem_object *obj)
+{
+	struct p7580_bo *bo = to_p7580_bo(obj);
+	unsigned int i;
+
+	if (bo->backing != P7580_BO_SHMEM || !bo->pages || !bo->sync_dev ||
+	    !bo->dma_addrs)
+		return;
+	for (i = 0; i < bo->nr_pages; i++) {
+		if (!bo->pages[i])
+			continue;
+		dma_sync_single_for_device(bo->sync_dev, bo->dma_addrs[i],
+					   PAGE_SIZE, DMA_BIDIRECTIONAL);
+	}
+}
+
+/* Unbind: tear down the bind-time DMA mapping (MMU-unmap/teardown     */
+/* path, file-close, free). Safe on unbound BOs. */
+void p7580_gem_dma_unbind(struct drm_gem_object *obj)
+{
+	struct p7580_bo *bo = to_p7580_bo(obj);
+	unsigned int i;
+
+	if (!bo->dma_addrs || !bo->sync_dev)
+		return;
+	for (i = 0; i < bo->nr_pages; i++)
+		dma_unmap_page(bo->sync_dev, bo->dma_addrs[i], PAGE_SIZE,
+			       DMA_BIDIRECTIONAL);
+	kfree(bo->dma_addrs);
+	bo->dma_addrs = NULL;
+	bo->sync_dev = NULL;
+}
+
+/* DMA address for one BO page (bind-time mapping when present,        */
+/* page_to_phys fallback for the never-bound path). Callers program    */
+/* GPU PTEs from this, never from page_to_phys directly. */
+phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx)
+{
+	struct p7580_bo *bo = to_p7580_bo(obj);
+
+	if (idx >= bo->nr_pages)
+		return 0;
+	if (bo->dma_addrs && bo->sync_dev)
+		return (phys_addr_t)bo->dma_addrs[idx];
+	if (bo->pages && bo->pages[idx])
+		return (phys_addr_t)page_to_phys(bo->pages[idx]);
+	return 0;
+}
+
 
 /* Per-device IOVA allocator (struct p7580_dev, header). Units: the
  * drm_mm window is addressed in PAGES (init with the byte window
@@ -393,20 +524,27 @@ err_bo:
 /* before free; the context teardown walker is p7580_mmu_teardown()   */
 /* (iommu/panfrost7580_mmu.h, F-MMU5), wired to file-close/remove.     */
 /*                                                                    */
-/* Contract (mirrors the review's `driver/` landing checklist):       */
-/*  - map: for each page index 0..npages-1, p7580_mmu_map(mmu,        */
-/*    bo->iova + idx*PAGE_SIZE, phys, P7580_PROT_RD|WR, memattr),     */
-/*    where phys is cma_paddr + idx*PAGE_SIZE (CMA), pages[idx]       */
-/*    (SHMEM, via page_to_phys after dma_map_page), or the sg         */
-/*    walk (imported, sg_phys + offset over bo->sgt); then            */
-/*    p7580_mmu_invalidate(regs, as_nr, iova>>12, npages, sync=0)     */
-/*    (FLUSH_PT via the fixed F-MMU1 LOCK-region encoding) and        */
-/*    p7580_mmu_program_as(regs, as_nr, pgd_dma, memattr_lo/hi)       */
-/*    once per context (code/gpu31/iommu/panfrost7580_mmu.h, pf7580   */
-/*    lock/encode helpers in code/gpu31/mmu/pf7580_as.h).             */
-/*  - unmap: p7580_mmu_unmap(mmu, bo->iova + idx*PAGE_SIZE) per page,  */
-/*    then invalidate the same range; the caller frees child tables   */
-/*    with p7580_mmu_free_table after the parent entry is cleared.    */
+/* Contract (mirrors the review's `driver/` landing checklist;            */
+/* gpu31-coherency adds bind/submit-sync/completion-sync):                */
+/*  - bind: p7580_gem_dma_bind(obj, dev->dev) once before the first     */
+/*    map (dma_map_page per page, BIDIRECTIONAL, never SKIP_CPU_SYNC).  */
+/*  - map: for each page index 0..npages-1, p7580_mmu_map(mmu,          */
+/*    bo->iova + idx*PAGE_SIZE, p7580_bo_dma_addr(obj, idx),            */
+/*    P7580_PROT_RD|WR, memattr), where the addr is the bind-time bus   */
+/*    address (cma_paddr + idx*PAGE_SIZE for CMA; the sg walk for        */
+/*    imported; the dma_addrs cache — never page_to_phys — for SHMEM);  */
+/*    then p7580_mmu_invalidate(regs, as_nr, iova>>12, npages, sync=0)  */
+/*    (FLUSH_PT via the fixed F-MMU1 LOCK-region encoding) and          */
+/*    p7580_mmu_program_as(regs, as_nr, pgd_dma, memattr_lo/hi)         */
+/*    once per context (code/gpu31/iommu/panfrost7580_mmu.h, pf7580     */
+/*    lock/encode helpers in code/gpu31/mmu/pf7580_as.h).               */
+/*  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills     */
+/*    descriptors/payloads, before queueing.                            */
+/*  - completion: p7580_gem_job_done_sync(obj) per BO in free_job.      */
+/*  - unmap: p7580_mmu_unmap(mmu, bo->iova + idx*PAGE_SIZE) per page,   */
+/*    then invalidate the same range; p7580_gem_dma_unbind(obj); the    */
+/*    caller frees child tables with p7580_mmu_free_table after the    */
+/*    parent entry is cleared.                                          */
 /*  - locking: resv lock (0002) around pin/map, MMU-HW lock around    */
 /*    program/invalidate (pf7580_as_* takes it), reset_lock ordering  */
 /*    per job.c:28-34. Fault recovery signals done_fence (F-JOB4).    */
@@ -459,6 +597,18 @@ void p7580_gem_free_object(struct drm_gem_object *obj)
 	if (gd)
 		p7580_iova_free(gd, bo);
 
+	if (bo->backing == P7580_BO_SHMEM && bo->dma_addrs && bo->sync_dev) {
+		/* Tear down the bind-time DMA mapping before the pages go
+		 * away. dev->dev is the platform device (never NULL on the
+		 * bound path; guard anyway: free must never crash). */
+		if (dev && dev->dev)
+			p7580_gem_dma_unbind(obj);
+		else {
+			kfree(bo->dma_addrs);
+			bo->dma_addrs = NULL;
+			bo->sync_dev = NULL;
+		}
+	}
 	if (obj->import_attach) {
 		/* Imported: sgt is the live exporter mapping; the core
 		 * helper unmaps + detaches + drops our dma_buf ref
@@ -754,9 +904,13 @@ phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
 		return 0;
 	}
 	if (bo->pages && bo->pages[idx]) {
+		/* gpu31-coherency: prefer the bind-time bus address (PTEs
+		 * must carry the dma_map result, not page_to_phys, so a
+		 * non-identity tree still programs the right address).
+		 * Never-bound BOs fall back to page_to_phys (identity). */
 		if (ok)
 			*ok = 1;
-		return (phys_addr_t)page_to_phys(bo->pages[idx]);
+		return p7580_bo_dma_addr(obj, idx);
 	}
 	if (ok)
 		*ok = 0;

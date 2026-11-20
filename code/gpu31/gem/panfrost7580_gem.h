@@ -111,14 +111,15 @@ struct p7580_bo {
 	 * count mirrors them (p7580_gem_prime_vmap/vunmap). */
 	void *vaddrs[P7580_VMAP_MAX];
 	unsigned int vmap_count;
-	/* Completion-side CPU-cache maintenance (jobtrace ticket). The
-	 * SUBMIT path records one snapshot of sync state here when the
-	 * SHMEM page array uses HIGHMEM: pages under a kmap_atomic
-	 * window are flushed there via flush_dcache_page, so the job
-	 * completion invalidate (p7580_gem_job_done_sync below) only
-	 * re-flushes the pages this flag marks. Zero for dma-direct
-	 * pages (dcache-clean by construction). */
-	unsigned int kmap_flushed;
+	/* COHERENCY_NONE DMA sync state (gpu31-coherency): bind-time
+	 * dma_map of the SHMEM pages for GPU access. dma_addrs[i] is
+	 * the bus address programmed into the GPU PTE (identity on
+	 * this tree, carried verbatim otherwise); sync_dev is the
+	 * platform device the mapping belongs to. Both set by
+	 * p7580_gem_dma_bind, cleared by p7580_gem_dma_unbind/free.
+	 * NULL/NULL on never-bound and CMA/imported BOs. */
+	dma_addr_t *dma_addrs;
+	struct device *sync_dev;
 };
 /* Per-device GEM state: IOVA allocator + the lock that serialises it
  * (the driver allocates this in probe and stores it in dev_private;
@@ -161,23 +162,36 @@ long p7580_gem_wait(struct drm_device *dev, struct drm_file *file_priv,
  * before p7580_job_hw_submit reads the job descriptor. Unmap runs
  * before free; the context teardown walker is p7580_mmu_teardown()
  * (iommu/panfrost7580_mmu.h, F-MMU5), wired to file-close/remove.
- *  - map: for each page 0..npages-1, p7580_mmu_map(mmu,
- *    bo->iova + idx*PAGE_SIZE, phys, P7580_PROT_RD|WR, memattr), where
- *    phys comes from p7580_bo_page_phys; then p7580_mmu_invalidate(regs,
+ *  - bind (new, gpu31-coherency): p7580_gem_dma_bind(obj, dev) once
+ *    before the first map; then per page 0..npages-1, p7580_mmu_map(mmu,
+ *    bo->iova + idx*PAGE_SIZE, p7580_bo_dma_addr(obj, idx),
+ *    P7580_PROT_RD|WR, memattr); then p7580_mmu_invalidate(regs,
  *    as_nr, iova>>12, npages, sync=0) and p7580_mmu_program_as once
  *    per context (iommu/panfrost7580_mmu.h, lock/encode in
- *    mmu/pf7580_as.h). Unmap/invalidate per page before free. */
+ *    mmu/pf7580_as.h). PTEs MUST come from p7580_bo_dma_addr (the
+ *    bind-time bus address), never page_to_phys/sg_phys directly.
+ *  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills
+ *    descriptors/payloads, before queueing (drains CPU lines to the
+ *    point the GPU reads).
+ *  - completion: p7580_gem_job_done_sync(obj) per BO in free_job
+ *    (invalidates CPU lines so reads see GPU bytes).
+ *  - unbind/free: p7580_mmu_unmap per page + invalidate, then
+ *    p7580_gem_dma_unbind(obj) before pages are released. */
 unsigned int p7580_bo_npages(struct drm_gem_object *obj);
 phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
 			       unsigned int idx, int *ok);
-/* Job-completion CPU-cache invalidate (jobtrace ticket, COHERENCY_NONE).
- * Called on the fence-completion path with one BO the finished job
- * referenced: for SHMEM pages backed by HIGHMEM (kmap alias), issues
- * flush_dcache_page per page so CPU reads (glReadPixels, mmap) see
- * GPU-written bytes; for CMA (MT_NORMAL_NC, no CPU lines) and
- * dma-direct SHMEM (dcache-clean via dma_map_page) it is a no-op.
- * Safe in any process context; never sleeps for this BO layout. */
+/* COHERENCY_NONE data sync (gpu31-coherency): per-page DMA-API order.
+ * Bind maps the SHMEM pages (dma_map_page, BIDIRECTIONAL) and caches
+ * the bus addresses; SUBMIT drains CPU writes (sync_for_device);
+ * completion invalidates CPU lines (sync_for_cpu) so the next CPU
+ * read sees GPU bytes; unbind tears the mapping down. CMA/imported
+ * BOs are no-ops everywhere. job_done_sync runs in free_job context
+ * (no MMIO, no sleeps, no locks). PTEs must come from p7580_bo_dma_addr. */
 void p7580_gem_job_done_sync(struct drm_gem_object *obj);
+int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev);
+void p7580_gem_submit_sync(struct drm_gem_object *obj);
+void p7580_gem_dma_unbind(struct drm_gem_object *obj);
+phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
 struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
 struct drm_gem_object *p7580_gem_prime_import_sg_table(
 		struct drm_device *dev, size_t size, struct sg_table *sgt);

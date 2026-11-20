@@ -12,6 +12,20 @@
  *   --probe-only PATH run the SUBMIT-free node probe (GET_PARAM/CREATE_BO
  *                 4K/MMAP_BO/GET_BO_OFFSET only). Safe on live hardware:
  *                 never issues SUBMIT, WAIT_BO, or a CPU mapping.
+ *   --submit-test PATH issue exactly one NULL job (32 B, type 1) at the
+ *                 BO's own gpu_offset + fence-wait it. Proves dispatch +
+ *                 retire; does NOT prove GPU writes are visible (a NULL
+ *                 job writes nothing).
+ *   --pattern-test PATH ("coherency proof", gpu31-coherency): write one
+ *                 56-byte WRITE_VALUE job (Mesa midgard.xml: type 2,
+ *                 Immediate-32) whose payload targets a second 4 KiB
+ *                 result BO at a known GPU VA with a known u32 pattern
+ *                 (0xC0C3E8E1). SUBMIT it (req=0 -> JS1), fence-wait the
+ *                 out_sync, re-mmap the result BO, and compare the word.
+ *                 PASS (pattern word == expected) proves the full
+ *                 COHERENCY_NONE chain: CPU write -> sync_for_device ->
+ *                 GPU DMA write -> IRQ retire -> sync_for_cpu -> CPU read.
+ *                 FAIL prints expected-vs-actual + JS_STATUS hint.
  *
  * Exit codes: 0 success, 2 device absent, 1 failure. The mock suite runs
  * on any build host; the real-node path is skipped (exit 2) when the
@@ -766,12 +780,237 @@ static int run_submit_test(const char *path)
 	fflush(stdout);
 	return 0;
 }
+/* WRITE_VALUE pattern test ("coherency proof", gpu31-coherency).
+ * Layout (two 4 KiB BOs, both mapped through the driver's AS0):
+ *   job BO:    56-byte job at offset 0: 32-byte header (type 2 =
+ *              WRITE_VALUE, 64-bit next=NULL) + 24-byte payload
+ *              (u64 address = result gpu_offset, u32 type = 6 =
+ *              Immediate-32, u64 immediate = PATTERN). Byte layout
+ *              follows Mesa 20.3's midgard.xml pack order exactly:
+ *              header words [0..7] = {exc=0, first=0, fault=0,0,
+ *              w4 = is64b|type<<1, deps=0, next=0,0},
+ *              payload words [8..13] = {addr_lo, addr_hi, type32,
+ *              0, imm_lo, imm_hi}.
+ *   result BO: zeroed; word 0 is the GPU write target.
+ *
+ * Sequence: SUBMIT(jc=job gpu_offset, both BOs, req=0 -> JS1) +
+ * out_sync fence-wait (+8 s abs) + munmap + re-mmap result + compare.
+ * Expected: result[0] == PATTERN. Before the coherency fix the CPU
+ * read back 0 (stale cache lines: flush_dcache_page is a flag-clear
+ * no-op on arm64, no HIGHMEM); after the fix (dma_map at bind,
+ * sync_for_device at SUBMIT, sync_for_cpu at completion) it reads
+ * the GPU-written pattern. A faulting job (bad address/type) shows
+ * result[0] == 0 AND a nonzero JS_STATUS — distinguishable in dmesg
+ * from a coherency miss (IRQ DONE + clean status, word still 0).
+ * Exit: 0 pattern matched, 1 mismatch/failure, 2 node unavailable. */
+#define PF7580_PATTERN_EXPECTED		0xC0C3E8E1u
+static int run_pattern_test(const char *path)
+{
+	struct pf7580_dev *dev;
+	char err[256] = "";
+	uint64_t prod = 0, job_map = 0, res_map = 0;
+	uint64_t job_gpu = 0, res_gpu = 0;
+	uint32_t jh = 0, rh = 0;
+	uint32_t out_sync = 0;
+	uint32_t bos[2];
+	unsigned char *jp = NULL, *rp = NULL;
+	uint32_t *w;
+	struct pf7580_submit_args sa;
+	struct timespec now, t0, t1;
+	int64_t deadline_ns;
+	long elapsed_ms;
+	uint32_t got = 0;
+	int rc;
+
+	printf("-- pf7580 pattern-test (WRITE_VALUE coherency) on %s --\n",
+	       path);
+	rc = pf7580_open(path, &dev, err, sizeof(err));
+	if (rc) {
+		printf("pattern-test %s unavailable: %s\n", path, err);
+		return 2;
+	}
+	printf("open: OK (fd=%d mock=%d)\n", pf7580_fd(dev),
+	       pf7580_is_mock(dev));
+	rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &prod);
+	if (rc || prod != PF7580_T720_PROD_ID) {
+		printf("GET_PARAM: FAIL rc=%d (%s) prod=0x%" PRIx64 "\n",
+		       rc, pf7580_strerror(rc), prod);
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("GET_PARAM: OK GPU_PROD_ID 0x%" PRIx64 " (T720)\n", prod);
+	rc = pf7580_create_bo(dev, 4096, &jh, &job_gpu);
+	if (rc || !jh || !job_gpu || (job_gpu & 7u)) {
+		printf("CREATE_BO(job): FAIL rc=%d (%s) h=%u off=0x%" PRIx64
+		       "\n", rc, pf7580_strerror(rc), jh, job_gpu);
+		pf7580_close(dev);
+		return 1;
+	}
+	rc = pf7580_create_bo(dev, 4096, &rh, &res_gpu);
+	if (rc || !rh || !res_gpu || (res_gpu & 7u)) {
+		printf("CREATE_BO(result): FAIL rc=%d (%s) h=%u off=0x%" PRIx64
+		       "\n", rc, pf7580_strerror(rc), rh, res_gpu);
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("CREATE_BO: job h=%u gpu=0x%" PRIx64 " result h=%u gpu=0x%" PRIx64
+	       "\n", jh, job_gpu, rh, res_gpu);
+	rc = pf7580_mmap_bo(dev, jh, &job_map);
+	if (rc) {
+		printf("MMAP_BO(job): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_close(dev);
+		return 1;
+	}
+	rc = pf7580_mmap_bo(dev, rh, &res_map);
+	if (rc) {
+		printf("MMAP_BO(result): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_close(dev);
+		return 1;
+	}
+	jp = pf7580_cpu_map(dev, jh, job_map, 4096);
+	if (!jp) {
+		printf("FAIL cpu map job: mmap(fd=%d, off=0x%" PRIx64
+		       ", len=%zu) errno=%d (%s)\n", pf7580_fd(dev),
+		       pf7580_cpu_map_off, pf7580_cpu_map_len,
+		       pf7580_cpu_map_errno,
+		       strerror(pf7580_cpu_map_errno));
+		pf7580_close(dev);
+		return 1;
+	}
+	rp = pf7580_cpu_map(dev, rh, res_map, 4096);
+	if (!rp) {
+		printf("FAIL cpu map result: mmap(fd=%d, off=0x%" PRIx64
+		       ", len=%zu) errno=%d (%s)\n", pf7580_fd(dev),
+		       pf7580_cpu_map_off, pf7580_cpu_map_len,
+		       pf7580_cpu_map_errno,
+		       strerror(pf7580_cpu_map_errno));
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	memset(jp, 0, 4096);
+	memset(rp, 0, 4096);
+	w = (uint32_t *)jp;
+	w[4] = (1u << 0) | (2u << 1);
+	w[8] = (uint32_t)(res_gpu & 0xffffffffu);
+	w[9] = (uint32_t)(res_gpu >> 32);
+	w[10] = 6u;
+	w[11] = 0u;
+	w[12] = (uint32_t)PF7580_PATTERN_EXPECTED;
+	w[13] = 0u;
+	__builtin___clear_cache((char *)jp, (char *)jp + 4096);
+	__builtin___clear_cache((char *)rp, (char *)rp + 4096);
+	if (((uint32_t *)rp)[0] != 0) {
+		printf("PATTERN: FAIL result not zero before submit (0x%08x)\n",
+		       ((uint32_t *)rp)[0]);
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_cpu_unmap(dev, rp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("DESC: OK WRITE_VALUE type=2 imm32=0x%08x -> [0x%" PRIx64
+	       "] at jc=0x%" PRIx64 "\n", PF7580_PATTERN_EXPECTED, res_gpu,
+	       job_gpu);
+	rc = pf7580_syncobj_create(dev, 0, &out_sync);
+	if (rc || !out_sync) {
+		printf("SYNCOBJ-CREATE: FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_cpu_unmap(dev, rp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	bos[0] = jh;
+	bos[1] = rh;
+	memset(&sa, 0, sizeof(sa));
+	sa.jc = job_gpu;
+	sa.bo_handles = bos;
+	sa.bo_handle_count = 2;
+	sa.requirements = 0;
+	sa.out_sync = out_sync;
+	printf("SUBMIT: WRITE_VALUE jc=0x%" PRIx64 " bos=[%u,%u] out_sync=%u...\n",
+	       job_gpu, jh, rh, out_sync);
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_submit(dev, &sa);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("SUBMIT: rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (rc) {
+		printf("PATTERN-TEST: FAILED (submit rejected; see dmesg)\n");
+		pf7580_syncobj_destroy(dev, out_sync);
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_cpu_unmap(dev, rp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
+		now.tv_nsec + 8000000000LL;
+	printf("SYNCOBJ-WAIT: waiting out_sync=%u (+8s abs)...\n", out_sync);
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_syncobj_wait(dev, &out_sync, 1, deadline_ns, 0, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("SYNCOBJ-WAIT(+8s abs): rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (rc) {
+		printf("PATTERN-TEST: FAILED (fence wait failed; dark-GPU timeout, see dmesg)\n");
+		pf7580_syncobj_destroy(dev, out_sync);
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_cpu_unmap(dev, rp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	pf7580_syncobj_destroy(dev, out_sync);
+	out_sync = 0;
+	pf7580_cpu_unmap(dev, rp, 4096);
+	rp = NULL;
+	rc = pf7580_mmap_bo(dev, rh, &res_map);
+	if (rc) {
+		printf("RE-MMAP(result): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	rp = pf7580_cpu_map(dev, rh, res_map, 4096);
+	if (!rp) {
+		printf("FAIL cpu remap result: errno=%d (%s)\n",
+		       pf7580_cpu_map_errno,
+		       strerror(pf7580_cpu_map_errno));
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	got = ((uint32_t *)rp)[0];
+	printf("PATTERN: expected=0x%08x actual=0x%08x %s\n",
+	       PF7580_PATTERN_EXPECTED, got,
+	       got == PF7580_PATTERN_EXPECTED ? "MATCH" : "MISMATCH");
+	if (got != PF7580_PATTERN_EXPECTED)
+		printf("HINT: MISMATCH with fence signalled = stale CPU lines (coherency); "
+		       "MISMATCH with JS_STATUS fault in dmesg = bad job/VA.\n");
+	pf7580_cpu_unmap(dev, jp, 4096);
+	pf7580_cpu_unmap(dev, rp, 4096);
+	pf7580_close(dev);
+	printf(got == PF7580_PATTERN_EXPECTED ?
+	       "PATTERN-TEST: PASS (GPU write visible to CPU)\n" :
+	       "PATTERN-TEST: FAILED (GPU write NOT visible)\n");
+	return got == PF7580_PATTERN_EXPECTED ? 0 : 1;
+}
 
 int main(int argc, char **argv)
 {
 	const char *devpath = getenv("PF7580_DEVICE");
 	const char *probeonly = NULL;
 	const char *submittest = NULL;
+	const char *patterntest = NULL;
 	int i;
 
 	/* Unbuffered: on HW a hang must leave partial output behind. */
@@ -789,12 +1028,16 @@ int main(int argc, char **argv)
 			submittest = argv[++i];
 		} else if (!strncmp(argv[i], "--submit-test=", 14)) {
 			submittest = argv[i] + 14;
+		} else if (!strcmp(argv[i], "--pattern-test") && i + 1 < argc) {
+			patterntest = argv[++i];
+		} else if (!strncmp(argv[i], "--pattern-test=", 15)) {
+			patterntest = argv[i] + 15;
 		} else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			devpath = argv[++i];
 		} else if (!strncmp(argv[i], "--device=", 9)) {
 			devpath = argv[i] + 9;
 		} else {
-			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH] [--submit-test PATH]\n",
+			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH] [--submit-test PATH] [--pattern-test PATH]\n",
 				argv[0]);
 			return 1;
 		}
@@ -803,6 +1046,8 @@ int main(int argc, char **argv)
 		return run_probe_only(probeonly);
 	if (submittest)
 		return run_submit_test(submittest);
+	if (patterntest)
+		return run_pattern_test(patterntest);
 	if (devpath)
 		return run_device(devpath);
 	return run_mock_suite();
