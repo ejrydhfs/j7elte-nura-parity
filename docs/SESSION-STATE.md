@@ -122,6 +122,15 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Panfrost on silicon — int5 (2026-11-20)
+- int5 (`dc892874…`) boots with **renderD128 only** (no `card0`), Xorg healthy, shell up;
+  the earlier blank-screen/X-hang is gone by construction.
+- Real-node ioctls PASS with `code/gpu31/client` selftest:
+  open OK, `GET_PARAM` -> GPU_PROD_ID `0x720`, `CREATE_BO(4K)` -> handle 1 / gpu_offset
+  `0x2000000000`, `MMAP_BO` -> `0x100000000`, `GET_BO_OFFSET` OK.
+- Next failure is CPU map of the BO ("FAIL cpu map", no kernel trace, no hang); submit not
+  reached yet. Fixed deadlocks: scheduler init at open, resv self-deadlock, bounded waits.
+
 ## Panfrost driver — first silicon boot (2026-11-19)
 - int4 image (sha256 5678dca4…, `p7580_drv_probe`) **boots**: `/dev/dri/card0` + `renderD128`
   appear, fbdev stays intact, kbase `/dev/mali0` is gone (d4 cutover).
