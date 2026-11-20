@@ -67,6 +67,19 @@ struct p7580_submit_job {
 	/* BO reservation set (file-private handles + resv pointers). */
 	uint32_t *bo_handles;
 	uint32_t bo_count;
+	/* Dispatch context stamped at SUBMIT (probenumeric): the async
+	 * run_job/timedout_job/free_job workers must NOT re-derive the
+	 * file state from the entity pointer (container_of(ent, ...,
+	 * entity[0]) breaks under container layouts -- int14 retired
+	 * without run_job because df came back wrong). Opaque void* so
+	 * this header stays drm-free; submit.c casts to struct
+	 * p7580_drv_file / struct p7580_drv. */
+	void *file_priv;
+	void *drv_priv;
+	/* Monotonic run_job entry count (probenumeric): incremented as
+	 * the first statement of p7580_drv_run_job, printed by free_job
+	 * as ran=N. Proves call order even if a print is lost. */
+	unsigned int run_seq;
 	/* Owned BO object pointers for the completion retire path
 	 * (F-JT2): SUBMIT stores one referenced pointer per handle
 	 * here (opaque void* so this header stays drm-free); the

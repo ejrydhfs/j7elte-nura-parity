@@ -3504,7 +3504,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,168 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3574,6 +3574,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	/* BO reservation set (file-private handles + resv pointers). */
 +	uint32_t *bo_handles;
 +	uint32_t bo_count;
++	/* Dispatch context stamped at SUBMIT (probenumeric): the async
++	 * run_job/timedout_job/free_job workers must NOT re-derive the
++	 * file state from the entity pointer (container_of(ent, ...,
++	 * entity[0]) breaks under container layouts -- int14 retired
++	 * without run_job because df came back wrong). Opaque void* so
++	 * this header stays drm-free; submit.c casts to struct
++	 * p7580_drv_file / struct p7580_drv. */
++	void *file_priv;
++	void *drv_priv;
++	/* Monotonic run_job entry count (probenumeric): incremented as
++	 * the first statement of p7580_drv_run_job, printed by free_job
++	 * as ran=N. Proves call order even if a print is lost. */
++	unsigned int run_seq;
 +	/* Owned BO object pointers for the completion retire path
 +	 * (F-JT2): SUBMIT stores one referenced pointer per handle
 +	 * here (opaque void* so this header stays drm-free); the
@@ -5690,7 +5703,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,897 @@
+@@ -0,0 +1,976 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -5806,51 +5819,112 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * ioctls overshoots by at most a line or two; harmless. */
 +static unsigned int p7580_sched_trace = 8;
 +
++static unsigned int p7580_drv_run_seq = 0;
++
 +static struct dma_fence *p7580_drv_run_job(struct drm_sched_job *sched_job)
 +{
-+	struct p7580_submit_job *job = sched_job->owner;
-+	struct drm_sched_entity *ent = sched_job->entity;
++	struct p7580_submit_job *job = sched_job ? sched_job->owner : NULL;
++	struct drm_sched_entity *ent = sched_job ? sched_job->entity : NULL;
 +	struct p7580_drv_file *df;
 +	struct p7580_drv *drv;
 +	int slot;
 +
-+	/* Pumpfix: trust the submit-chosen slot carried on the sched job.
-+	 * The old entity-pointer derivation (container_of(ent, ...,
-+	 * entity[0]) + index math) is kept only as a dark fallback: under
-+	 * the real container layout it recomputes index 0 for every slot,
-+	 * which is exactly the int12 signature (submit slot 1, retire
-+	 * slot 0, ST-RUN never reached because -EINVAL bailed first). */
-+	slot = sched_job->slot;
-+	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS) {
-+		df = container_of(ent, struct p7580_drv_file, entity[0]);
-+		if (ent >= &df->entity[0] &&
-+		    ent < &df->entity[P7580_NUM_JOB_SLOTS])
-+			slot = (int)(ent - &df->entity[0]);
++	/* ST-RUN (entry): first statement -- before any deref/derivation.
++	 * Numeric (%lu) so kptr_restrict cannot censor it. Proves the
++	 * 0004 pump called OUR run_job; per-guard bail prints below name
++	 * the exact reject. runexp= is our own address (no symbol lookup
++	 * needed); ST-OPS run= must equal it. */
++	if (p7580_sched_trace) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: run job=%lu ent=%lu owner=%lu ops=%lu runexp=%lu\n",
++			(unsigned long)sched_job, (unsigned long)ent,
++			(unsigned long)(sched_job ? sched_job->owner : NULL),
++			(unsigned long)(sched_job ? sched_job->ops : NULL),
++			(unsigned long)&p7580_drv_run_job);
 +	}
-+	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS)
++	if (!sched_job || !job) {
++		if (p7580_sched_trace) {
++			p7580_sched_trace--;
++			pr_info("p7580_sched: run_bail NULLJOB job=%lu\n",
++				(unsigned long)sched_job);
++		}
 +		return ERR_PTR(-EINVAL);
++	}
++	/* Monotonic entry stamp: free_job prints ran=N so the
++	 * dispatch->retire order is provable even if a print is lost. */
++	job->run_seq = ++p7580_drv_run_seq;
++
++	/* Probenumeric: trust the SUBMIT-stamped file/driver pointers on
++	 * the job (stamped next to slot at queue time); the entity-pointer
++	 * container_of math is fallback-only (range-checked) for jobs
++	 * queued before this Stamp existed. ent itself is used only for
++	 * the fallback -- never trusted blindly. */
++	df = (struct p7580_drv_file *)job->file_priv;
++	drv = (struct p7580_drv *)job->drv_priv;
++	slot = job->slot;
++	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS || !df || !drv) {
++		struct p7580_drv_file *edf;
++		if (p7580_sched_trace) {
++			p7580_sched_trace--;
++			pr_info("p7580_sched: run_fallback seq=%u slot=%d sslot=%d\n",
++				job->seqno, slot, sched_job->slot);
++		}
++		edf = ent ? container_of(ent, struct p7580_drv_file, entity[0]) : NULL;
++		if (edf && ent >= &edf->entity[0] &&
++		    ent < &edf->entity[P7580_NUM_JOB_SLOTS]) {
++			if (!df)
++				df = edf;
++			if (!drv)
++				drv = df->drv;
++			if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS)
++				slot = (int)(ent - &edf->entity[0]);
++		}
++	}
++	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS) {
++		if (p7580_sched_trace) {
++			p7580_sched_trace--;
++			pr_info("p7580_sched: run_bail BADSLOT seq=%u slot=%d\n",
++				job->seqno, slot);
++		}
++		return ERR_PTR(-EINVAL);
++	}
 +	job->slot = slot;
-+	df = container_of(ent, struct p7580_drv_file, entity[0]);
-+	if (ent < &df->entity[0] || ent >= &df->entity[P7580_NUM_JOB_SLOTS])
-+		df = NULL;
-+	drv = (df && df->drv) ? df->drv : NULL;
++	if (!df || (ent && (ent < &df->entity[0] ||
++			    ent >= &df->entity[P7580_NUM_JOB_SLOTS]))) {
++		/* ent outside the stamped df: trust the stamp, distrust ent. */
++		if (p7580_sched_trace) {
++			p7580_sched_trace--;
++			pr_info("p7580_sched: run_bail BADENT seq=%u ent=%lu df=%lu\n",
++				job->seqno, (unsigned long)ent,
++				(unsigned long)df);
++		}
++		if (!df)
++			return ERR_PTR(-ENODEV);
++	}
 +	if (!drv)
++		drv = df->drv;
++	if (!drv) {
++		if (p7580_sched_trace) {
++			p7580_sched_trace--;
++			pr_info("p7580_sched: run_bail NODRV seq=%u slot=%d df=%lu\n",
++				job->seqno, slot, (unsigned long)df);
++		}
 +		return ERR_PTR(-ENODEV);
++	}
 +	/* Async worker context (0004 wq): the ioctl's synchronous PM
 +	 * ref is long gone (returned) and the live-job ref only
 +	 * guarantees the block was continuously powered since queue
-+	 * time — it cannot resurrect a block that suspended despite
++	 * time -- it cannot resurrect a block that suspended despite
 +	 * that (get/put counting bug elsewhere) or that failed
 +	 * resume. Re-get here so HEAD/AFFINITY/CONFIG/START writes
 +	 * below never hit a dark block; fail the job (ERR_PTR, freed
 +	 * by the 0004 F4 path) instead of hanging the bus. */
-+	/* ST-RUN: async worker entered (proves the 0004 pump dequeued
-+	 * and dispatched; job->seqno assigned at SUBMIT order). */
++	/* ST-RUN (dispatched): slot + jc the job will program. */
 +	if (p7580_sched_trace) {
 +		p7580_sched_trace--;
-+		pr_info("p7580_sched: run_job seq=%u slot=%d sslot=%d jc=0x%llx owner=%p\n",
++		pr_info("p7580_sched: run_job seq=%u slot=%d sslot=%d jc=0x%llx owner=%lu\n",
 +			job->seqno, slot, sched_job->slot,
-+			(unsigned long long)job->jc, job);
++			(unsigned long long)job->jc, (unsigned long)job);
 +	}
 +	if (p7580_drv_pm_get(drv)) {
 +		/* ST-PMGET (fail): dark block, job failed closed. */
@@ -5877,7 +5951,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		 * here on the async worker: install it on the stashed
 +		 * out_sync handle so SYNCOBJ-WAIT blocks until retire.
 +		 * replace_fence takes its own ref; closed handles (or
-+		 * no out_sync) skip silently — the job still runs. */
++		 * no out_sync) skip silently -- the job still runs. */
 +		if (!IS_ERR(fence) && fence && job->out_sync) {
 +			struct drm_syncobj *s =
 +				drm_syncobj_find(&df->mgr, job->out_sync);
@@ -5894,16 +5968,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +static void p7580_drv_timedout_job(struct drm_sched_job *sched_job)
 +{
-+	struct p7580_submit_job *job = sched_job->owner;
-+	struct drm_sched_entity *ent = sched_job->entity;
-+	struct p7580_drv_file *df;
-+	struct p7580_drv *drv;
++	struct p7580_submit_job *job = sched_job ? sched_job->owner : NULL;
++	struct p7580_drv_file *df = job ?
++		(struct p7580_drv_file *)job->file_priv : NULL;
++	struct p7580_drv *drv = job ?
++		(struct p7580_drv *)job->drv_priv : NULL;
 +	void *f;
 +
-+	df = container_of(ent, struct p7580_drv_file, entity[0]);
-+	if (ent < &df->entity[0] || ent >= &df->entity[P7580_NUM_JOB_SLOTS])
-+		df = NULL;
-+	drv = (df && df->drv) ? df->drv : NULL;
++	if (!drv && df)
++		drv = df->drv;
 +	if (!drv)
 +		return;
 +	/* Timeout workqueue (process context): the recover path below
@@ -5934,16 +6007,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +static void p7580_drv_free_job(struct drm_sched_job *sched_job)
 +{
-+	struct p7580_submit_job *job = sched_job->owner;
-+	struct drm_sched_entity *ent = sched_job->entity;
-+	struct p7580_drv_file *df;
-+	struct p7580_drv *drv;
++	struct p7580_submit_job *job = sched_job ? sched_job->owner : NULL;
++	struct p7580_drv_file *df = job ?
++		(struct p7580_drv_file *)job->file_priv : NULL;
++	struct p7580_drv *drv = job ?
++		(struct p7580_drv *)job->drv_priv : NULL;
 +	uint32_t i;
 +
-+	df = container_of(ent, struct p7580_drv_file, entity[0]);
-+	if (ent < &df->entity[0] || ent >= &df->entity[P7580_NUM_JOB_SLOTS])
-+		df = NULL;
-+	drv = df ? df->drv : NULL;
++	if (!drv && df)
++		drv = df->drv;
 +	/* F-JT2: completion-side CPU-cache invalidate. free_job runs
 +	 * on finish_work strictly after the fence signal (0004: cancel
 +	 * timeout, put fence, THEN free_job), so every referenced BO
@@ -5967,12 +6039,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	}
 +	/* ST-RETIRE: finish_work reached free_job (fence already
 +	 * signalled by the 0004 retire path); proves the full
-+	 * queue -> dispatch -> retire chain completed. */
++	 * queue -> dispatch -> retire chain completed. Numeric (%lu)
++	 * so kptr_restrict cannot censor it. ran=N is the run_job
++	 * entry count stamped on the job (order provable even if the
++	 * ST-RUN print was lost); sslot= is the carried sched slot. */
 +	if (p7580_sched_trace) {
 +		p7580_sched_trace--;
-+		pr_info("p7580_sched: retire seq=%u slot=%d sslot=%d\n",
++		pr_info("p7580_sched: retire seq=%u slot=%d sslot=%d ran=%u owner=%lu\n",
 +			job ? job->seqno : 0, job ? job->slot : -1,
-+			sched_job ? sched_job->slot : -1);
++			sched_job ? sched_job->slot : -1,
++			job ? job->run_seq : 0, (unsigned long)job);
 +	}
 +	p7580_job_free(job);
 +	/* Balances p7580_drv_job_pm_arm() at queue time: the async
@@ -5998,6 +6074,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	.timedout_job = p7580_drv_timedout_job,
 +	.free_job = p7580_drv_free_job,
 +};
++
++/* Probenumeric: strong run_job address for the shim ST-OPS cross-check.
++ * The 0004 TU declares p7580_drv_run_job_addr() (weak default -> NULL);
++ * this strong definition wins the link and returns our run_job, so
++ * silicon compares ST-OPS run= against runexp= with no symbol lookup. */
++drm_sched_run_fn p7580_drv_run_job_addr(void)
++{
++	return p7580_drv_run_job;
++}
 +
 +/* Opsfix: the 0004 shim header is the single authoritative struct
 + * definition (both TUs include <drm_sched.h> via -Idrivers/gpu/drm).
@@ -6356,6 +6441,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	}
 +	job->seqno = df->next_seqno++;
 +	job->slot = slot;
++	/* Probenumeric: stamp the dispatch context on the job so the async
++	 * workers never re-derive it from the entity pointer (int14: df
++	 * came back wrong -> ENODEV before ST-RUN). Entity math survives
++	 * in run_job only as a range-checked fallback. */
++	job->file_priv = df;
++	job->drv_priv = drv;
++	job->run_seq = 0;
 +	job->jc = args->jc;
 +	job->requirements = args->requirements;
 +	job->as_nr = P7580_DRV_AS_NR;

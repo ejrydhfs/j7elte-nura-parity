@@ -50,8 +50,19 @@ static void drm_sched_job_finish(struct work_struct *work);
  * first 8 jobs print (0 = off). Plain static, same rationale as
  * the p7580_sched_trace budget in panfrost7580_submit.c (NOT a
  * module param; standalone -fsyntax-only compiles this file).
- * Racy dec under concurrent entities overshoots trivially. */
+ * Racy dec under concurrent entities overshoots trivially.
+ * Numeric probes (gpu31-probenumeric): kptr_restrict=4 censors %p to
+ * zero here, so addresses print as (unsigned long) with %lu (no %px
+ * on 3.10) -- readable censored or not. */
 static unsigned int p7580_sched_trace = 8;
+
+/* Probenumeric weak default (see drm_sched.h): NULL when the backend TU
+ * is not linked (host emu); the driver's strong definition wins in the
+ * Image link. __weak (not __weak_alias): plain C, same as module.h. */
+drm_sched_run_fn __attribute__((weak)) p7580_drv_run_job_addr(void)
+{
+	return NULL;
+}
 
 static void drm_sched_dep_cb(struct dma_fence *fence,
 			     struct dma_fence_cb *cb)
@@ -419,9 +430,9 @@ static void drm_sched_job_finish(struct work_struct *work)
 
 	/* ST-FENCE: fence signalled (finish queued by fence_cb),
 	 * retirement handed to the backend free_job. ST-FINISH adds
-	 * the ran stamp + slot so dmesg tells "retire without ever
-	 * running" (ran=0) from "run_job returned but its probe was
-	 * skipped" (ran=1). */
+	 * the ran stamp + slot + owner so dmesg tells "retire without
+	 * ever running" (ran=0) from "run_job returned but its probe
+	 * was skipped" (ran=1); owner links back to the ST-RUN line. */
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
 		pr_info("p7580_sched: fence job_count=%d\n",
@@ -429,8 +440,8 @@ static void drm_sched_job_finish(struct work_struct *work)
 	}
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
-		pr_info("p7580_sched: finish ran=%d slot=%d\n",
-			job->ran, job->slot);
+		pr_info("p7580_sched: finish ran=%d slot=%d owner=%lu\n",
+			job->ran, job->slot, (unsigned long)job->owner);
 	}
 
 	if (job->ops->free_job)
@@ -505,12 +516,13 @@ static void drm_sched_pump(struct work_struct *work)
 	spin_unlock_irqrestore(&entity->queue_lock, flags);
 
 	/* ST-PUMP: worker dequeued (dep met or dep-less); run_job next.
-	 * Opsfix probe prints the dequeued job address, the address of
-	 * its ->ops field, and the ops/run_job pointers plus the
-	 * carried slot, so a header/ABI skew (stale .o, duplicate
-	 * struct, link picking two shim copies) shows up in dmesg:
-	 * compare job->ops against the driver's &p7580_drv_sched_ops
-	 * (from /proc/kallsyms) and offsetof(ops)==24 in both TUs.
+	 * Numeric ST-OPS prints the dequeued job address, the address of
+	 * its ->ops field, and the ops/run_job pointers plus owner and the
+	 * carried slot, so a header/ABI skew (stale .o, duplicate struct,
+	 * link picking two shim copies) shows up in dmesg: compare job->ops
+	 * against the driver's &p7580_drv_sched_ops (from /proc/kallsyms)
+	 * and offsetof(ops)==24 in both TUs. runexp= is the backend's own
+	 * run_job address (no symbol lookup needed): run= must equal it.
 	 * job->ops is trusted only after the NULL check below. */
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
@@ -519,10 +531,12 @@ static void drm_sched_pump(struct work_struct *work)
 	}
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
-		pr_info("p7580_sched: ops job=%p opsoff=%p ops=%p run=%p slot=%d\n",
-			job, (void *)&job->ops,
-			job->ops, job->ops ? job->ops->run_job : NULL,
-			job->slot);
+		pr_info("p7580_sched: ops job=%lu opsoff=%lu ops=%lu run=%lu runexp=%lu owner=%lu slot=%d\n",
+			(unsigned long)job, (unsigned long)&job->ops,
+			(unsigned long)job->ops,
+			(unsigned long)(job->ops ? job->ops->run_job : NULL),
+			(unsigned long)p7580_drv_run_job_addr(),
+			(unsigned long)job->owner, job->slot);
 	}
 
 	if (!job->ops || !job->ops->run_job) {

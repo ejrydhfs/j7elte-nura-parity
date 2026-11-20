@@ -212,6 +212,16 @@ int drm_sched_entity_push_job(struct drm_sched_job *sched_job);
 struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,
 					  const struct drm_sched_backend_ops *ops,
 					  void *owner);
+/* Probenumeric hook (gpu31-probenumeric): the backend run_job address
+ * for the numeric ST-OPS cross-check (ST-OPS run= must equal runexp=;
+ * both printed as (unsigned long)+%lu, readable under kptr_restrict).
+ * The backend (panfrost7580_submit.c) defines the strong version
+ * returning its run_job; drm_sched.c carries a weak default returning
+ * NULL so shim-only builds (host emu) still link. Plain declaration
+ * here: the weak attribute lives only on the shim default definition,
+ * so the backend definition stays strong and always wins the link. */
+typedef struct dma_fence *(*drm_sched_run_fn)(struct drm_sched_job *);
+drm_sched_run_fn p7580_drv_run_job_addr(void);
 void drm_sched_job_cleanup(struct drm_sched_job *job);
 void drm_sched_job_arm(struct drm_sched_job *job);
 int drm_sched_job_add_dependency(struct drm_sched_job *job,
