@@ -185,7 +185,7 @@ process/session wedged and the hardware watchdog reset the SoC (uptime
 teardown** (fd close → GEM free / MMU unmap / entity fini MMIO while
 suspended) — handed to the PM slice by Main.
 
-## 8. Test refinements for the next run (committed f929726)
+## 8. Test refinements for the next run (f929726; superseded by §9)
 
 Per Main's two asks (teardown isolation + fence proof):
 
@@ -213,3 +213,45 @@ Next-run command (after PM-slice teardown fix + Main's go):
 `rootshell sh -c '/data/wdarm 60 /tmp/pf7580-submit --submit-test
 /dev/dri/renderD128'` with the rebuilt static binary (fence-probe +
 markers included).
+
+## 9. Job-completion proof via the job's OWN fence (out_sync, int9)
+
+Close-fix 476b75d showed the previous WAIT_BO legs were vacuous: the job
+fence is never attached to the BO resv, so WAIT_BO on a fresh BO returns
+from an empty resv instantly — rc=0 proved nothing about the GPU, and
+the old FENCE-PROBE (also WAIT_BO-based) inherited the vacuity.
+
+Committed dd0a908 rewrites the submit test around the out_sync syncobj:
+
+- New client wrappers (`pf7580.c`/`pf7580.h`): `pf7580_syncobj_create`
+  / `destroy` / `wait`, with `static_assert` wire checks. WAIT encodes
+  a fixed 32 B payload matching the driver's `p7580_syncobj_wait`
+  (the host `drm.h` added a `u64 deadline_nsec` tail → 40 B — that
+  tail is NOT sent, since the 3.10 fops dispatcher keys on `_IOC_NR`
+  and copies `_IOC_SIZE` bytes). Mock backend: signalled/pending table
+  mirroring the 0003 shim (submit retires → signalled).
+- Test flow: `SYNCOBJ-CREATE` → `SUBMIT(out_sync=handle)` →
+  `FENCE-PROBE` (0-timeout `SYNCOBJ-WAIT` on the job's own fence:
+  `-ETIME` = live fence = real dispatch; `0` = fast retire,
+  NULL-install leg, or skip — dmesg run_job/IRQ trail decides) →
+  `SYNCOBJ-WAIT(+8s abs)` (the completion proof; a bounded `-ETIME`
+  here means the new dark-timeout leg fired) → `SYNCOBJ-DESTROY` →
+  legacy `WAIT_BO` kept but labelled informational/vacuous →
+  unmap/post-check/`CLOSE:` markers (kept from §8; int9 expects
+  `CLOSE: returned` + exit 0 with bounded close).
+
+Caveat (stated, not solved): the driver cannot yet expose JS_STATUS or
+a job counter to userspace — no register-mapped counter exists in the
+UAPI. So the fence proof is: (a) out_sync fence waited via
+`SYNCOBJ-WAIT` (a signal only the sched-job completion path, or the new
+bounded dark-timeout leg, can produce — `-EINVAL`/`-ENOENT` rejections
+vs `-ETIME`/0 distinguish the cases), plus (b) dmesg run_job/IRQ lines
+on the device. If int9's wait returns 0 with a mid-range elapsed and no
+dark-timeout dmesg, the job ran on hardware.
+
+Host checks: `make check` MOCK SUITE PASS (host + qemu-aarch64 cross);
+cross static binary rebuilt (`build-aarch64/pf7580-selftest`).
+
+Next-run command (int9, after PM close guards + Main's go):
+`rootshell sh -c '/data/wdarm 15 /tmp/pf7580-submit --submit-test
+/dev/dri/renderD128'` with the rebuilt binary uploaded first.
