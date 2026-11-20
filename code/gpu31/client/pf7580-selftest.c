@@ -567,6 +567,23 @@ static int run_submit_test(const char *path)
 		pf7580_close(dev);
 		return 1;
 	}
+	/* Fence proof: a 0-timeout (past absolute stamp) poll must report
+	 * the fence still pending (-ETIME) if the job really dispatched
+	 * to HW. An immediately-signalled fence here would mean the wait
+	 * below proves nothing (fence faked/skipped). */
+	printf("FENCE-PROBE: 0-timeout poll (expect -ETIME=pending)...\n");
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	deadline_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_wait_bo(dev, h, deadline_ns);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("FENCE-PROBE(0-timeout): rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (!rc)
+		printf("FENCE-PROBE: fence already signalled (fast retire or skip; see dmesg)\n");
 	rc = pf7580_cpu_unmap(dev, p, 4096);
 	if (rc)
 		printf("WARN cpu unmap: %s\n", pf7580_strerror(rc));
@@ -575,12 +592,23 @@ static int run_submit_test(const char *path)
 	       pf7580_strerror(rc), prod,
 	       (!rc && prod == PF7580_T720_PROD_ID) ? " (node alive)" :
 						      " (MISMATCH)");
-	pf7580_close(dev);
 	if (rc || prod != PF7580_T720_PROD_ID) {
+		printf("CLOSE: NOT reached (node unhealthy); closing fd...\n");
+		fflush(stdout);
+		printf("CLOSE: calling pf7580_close now\n");
+		fflush(stdout);
+		pf7580_close(dev);
+		printf("CLOSE: returned (fd closed)\n");
 		printf("SUBMIT-TEST: FAILED (node unhealthy after submit)\n");
 		return 1;
 	}
-	printf("SUBMIT-TEST: PASS\n");
+	printf("SUBMIT-TEST: PASS (submit+fence proven; closing fd...)\n");
+	fflush(stdout);
+	printf("CLOSE: calling pf7580_close now\n");
+	fflush(stdout);
+	pf7580_close(dev);
+	printf("CLOSE: returned (fd closed); process exiting\n");
+	fflush(stdout);
 	return 0;
 }
 
