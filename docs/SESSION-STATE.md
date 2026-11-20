@@ -122,6 +122,18 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Panfrost submit hard-hang (2026-11-20)
+- A single NULL-job submit **hard-hung the SoC** and took the USB gadget with it (no device on
+  the bus). Safe ioctls are unaffected: after reset, `--probe-only` still PASSes
+  (open, GET_PARAM 0x720, CREATE_BO gpu_offset 0x2000000, MMAP_BO, GET_BO_OFFSET).
+- Prime suspect `F-SUB1`: `p7580_drv_submit -> p7580_drv_map_bo -> p7580_mmu_invalidate`
+  issues MMIO before runtime-PM is guaranteed -> bus-level hang. Fix in progress
+  (`docs/reports/gpu31-pm-order.md`).
+- Safety net prepared: `code/gpu31/client/wdarm` (arms `/dev/watchdog`, 30 s) so a hang
+  self-resets. No pstore backend on this kernel (no ramoops node).
+- Mesa: installed 26.3 cannot bind a v5.2 UAPI node; a Mesa 20.3.5 build on device
+  (`/data/mesabuild`) is the pairing candidate.
+
 ## Panfrost on silicon — int5 (2026-11-20)
 - int5 (`dc892874…`) boots with **renderD128 only** (no `card0`), Xorg healthy, shell up;
   the earlier blank-screen/X-hang is gone by construction.
