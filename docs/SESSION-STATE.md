@@ -122,6 +122,15 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Hardware GL via panfrost (2026-11-20, int9)
+- Full ioctl lifecycle PASS on silicon, including clean close: GET_PARAM 0x720, CREATE_BO,
+  MMAP, SUBMIT rc=0, syncobj create/wait, `CLOSE: returned`, exit 0, watchdog disarmed.
+- Mesa 20.3.5 (on-device build) + `MESA_LOADER_DRIVER_OVERRIDE=panfrost`:
+  `GL vendor=Panfrost`, `renderer=Mali T720 (Panfrost)`, `GLES 3.0 Mesa 20.3.5`.
+- egltest offscreen: 60 draws in 0.021 s (2889 FPS) **but readback all-zero** (RENDER_MISMATCH):
+  either jobs retire without GPU execution, or GPU writes are invisible under COHERENCY_NONE
+  (needs explicit dma_sync on completion). Tracing patch in progress (`gpu31-jobtrace.md`).
+
 ## Panfrost submit works on silicon (2026-11-20, int7)
 - int7 (render-only + shmem BOs + job-lifetime PM + syncobj) boots with `renderD128`, X healthy.
 - `--submit-test` on the real node: NULL job DESC written, **SUBMIT rc=0**, **WAIT_BO rc=0**
