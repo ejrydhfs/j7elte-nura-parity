@@ -37,7 +37,8 @@ LIB      := build/libpf7580.a
 SELFTEST := build/pf7580-selftest
 
 AARCH64_LIB := build-aarch64/libpf7580.a
-AARCH64_SELFTEST := build-aarch64/pf7580-selftest
+AARCH64_WDARM := build-aarch64/wdarm
+
 
 .PHONY: all lib check check-aarch64 clean
 
@@ -73,6 +74,10 @@ $(AARCH64_LIB): pf7580.c pf7580.h
 $(AARCH64_SELFTEST): pf7580-selftest.c $(AARCH64_LIB)
 	@mkdir -p $(dir $@)
 	$(AARCH64_CC) $(CFLAGS) $(INCLUDES) $< $(AARCH64_LIB) $(LDFLAGS_aarch64) $(LDLIBS) -o $@
+
+$(AARCH64_WDARM): wdarm.c
+	@mkdir -p $(dir $@)
+	$(AARCH64_CC) $(CFLAGS) $(INCLUDES) $< -static -o $@
 
 clean:
 	rm -rf build build-aarch64

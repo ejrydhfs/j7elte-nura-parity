@@ -3624,12 +3624,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/d
 + * the -ETIMEDOUT and escalates to GPU reset). */
 +static int p7580_as_wait_ready(void __iomem *as)
 +{
-+	unsigned int loops = P7580_AS_INACTIVE_MAX_LOOPS;
-+	u32 val = readl(as + P7580_AS_STATUS);
++	/* Stepped poll (mmu/pf7580_as.h twin, F-MMU3): 10 us between
++	 * reads. The old tight loop held the caller in a hot readl
++	 * spin for ~10^5 iterations; on a wedged slot that is a
++	 * seconds-long stall on the caller CPU. */
++	unsigned int i;
 +
-+	while (--loops && (val & P7580_AS_STATUS_ACTIVE))
-+		val = readl(as + P7580_AS_STATUS);
-+	return loops ? 0 : -ETIMEDOUT;
++	for (i = 0; i < P7580_AS_INACTIVE_MAX_LOOPS; i++) {
++		if (!(readl(as + P7580_AS_STATUS) & P7580_AS_STATUS_ACTIVE))
++			return 0;
++		udelay(P7580_AS_WAIT_STEP_US);
++	}
++	return -ETIMEDOUT;
 +}
 +
 +int p7580_mmu_invalidate(void __iomem *gpu_regs, unsigned int as_nr,

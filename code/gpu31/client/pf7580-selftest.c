@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "pf7580.h"
 
@@ -447,12 +448,152 @@ static int run_device(const char *path)
 	return failures ? 1 : 0;
 }
 
+/* Real-submit test: exactly one NULL job after a BO is mapped.
+ * Sequence: GET_PARAM + CREATE_BO(4K) + MMAP_BO + GET_BO_OFFSET (via
+ * CREATE_BO offset) + CPU map + write a 32-byte NULL job descriptor
+ * (type 1, 32-bit next=NULL, jobabi section 1) at BO offset 0 +
+ * SUBMIT(jc=gpu_offset, 1 BO, req=0 -> JS1) + WAIT_BO(handle,
+ * absolute CLOCK_MONOTONIC now+8s). One submit only, never looped:
+ * on any fault the driver state is left for dmesg, not retried.
+ * Exit: 0 submitted+waited, 1 failed, 2 node unavailable. */
+static int run_submit_test(const char *path)
+{
+	struct pf7580_dev *dev;
+	char err[256] = "";
+	uint64_t prod = 0, map_off = 0, gpu_off = 0;
+	uint32_t h = 0;
+	unsigned char *p;
+	struct pf7580_submit_args sa;
+	struct timespec now, t0, t1;
+	int64_t deadline_ns;
+	long elapsed_ms;
+	int rc;
+
+	printf("-- pf7580 submit-test on %s --\n", path);
+	rc = pf7580_open(path, &dev, err, sizeof(err));
+	if (rc) {
+		printf("submit-test %s unavailable: %s\n", path, err);
+		return 2;
+	}
+	printf("open: OK (fd=%d mock=%d)\n", pf7580_fd(dev),
+	       pf7580_is_mock(dev));
+	rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &prod);
+	if (rc || prod != PF7580_T720_PROD_ID) {
+		printf("GET_PARAM: FAIL rc=%d (%s) prod=0x%" PRIx64 "\n",
+		       rc, pf7580_strerror(rc), prod);
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("GET_PARAM: OK GPU_PROD_ID 0x%" PRIx64 " (T720)\n", prod);
+	rc = pf7580_create_bo(dev, 4096, &h, &gpu_off);
+	if (rc || !h || !gpu_off || (gpu_off & 7u)) {
+		printf("CREATE_BO(4K): FAIL rc=%d (%s) h=%u off=0x%" PRIx64
+		       "\n", rc, pf7580_strerror(rc), h, gpu_off);
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("CREATE_BO(4K): OK handle=%u gpu_offset=0x%" PRIx64 "\n",
+	       h, gpu_off);
+	rc = pf7580_mmap_bo(dev, h, &map_off);
+	if (rc) {
+		printf("MMAP_BO: FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("MMAP_BO: OK map_offset=0x%" PRIx64 "\n", map_off);
+	p = pf7580_cpu_map(dev, h, map_off, 4096);
+	if (!p) {
+		printf("FAIL cpu map: mmap(fd=%d, off=0x%" PRIx64
+		       ", len=%zu) errno=%d (%s)\n", pf7580_fd(dev),
+		       pf7580_cpu_map_off, pf7580_cpu_map_len,
+		       pf7580_cpu_map_errno,
+		       strerror(pf7580_cpu_map_errno));
+		pf7580_close(dev);
+		return 1;
+	}
+	/* 32-byte NULL job (jobabi section 1): type 1, 32-bit next=NULL. */
+	printf("DESC: writing NULL job at gpu_offset=0x%" PRIx64 "...\n",
+	       gpu_off);
+	fflush(stdout);
+	memset(p, 0, 4096);
+	p[16] = (unsigned char)((1u << 1) | 0u);
+	__builtin___clear_cache((char *)p, (char *)p + 4096);
+	if (p[16] != 0x02 || p[0] != 0) {
+		printf("DESC: FAIL read-back mismatch\n");
+		pf7580_cpu_unmap(dev, p, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("DESC: OK NULL job (type=1, 32 B) at gpu_offset=0x%" PRIx64
+	       "\n", gpu_off);
+	memset(&sa, 0, sizeof(sa));
+	sa.jc = gpu_off;
+	sa.bo_handles = &h;
+	sa.bo_handle_count = 1;
+	sa.requirements = 0;
+	printf("SUBMIT: issuing one NULL job (jc=0x%" PRIx64
+	       " req=0 slot=JS1)...\n", gpu_off);
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_submit(dev, &sa);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("SUBMIT: rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (rc) {
+		printf("SUBMIT-TEST: FAILED (submit rejected; see dmesg)\n");
+		pf7580_cpu_unmap(dev, p, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
+		now.tv_nsec + 8000000000LL;
+	printf("WAIT_BO: waiting (+8s abs deadline %lld ns)...\n",
+	       (long long)deadline_ns);
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_wait_bo(dev, h, deadline_ns);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("WAIT_BO(+8s abs): rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (rc) {
+		printf("SUBMIT-TEST: FAILED (wait failed; see dmesg)\n");
+		pf7580_cpu_unmap(dev, p, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	rc = pf7580_cpu_unmap(dev, p, 4096);
+	if (rc)
+		printf("WARN cpu unmap: %s\n", pf7580_strerror(rc));
+	rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &prod);
+	printf("POST GET_PARAM: rc=%d (%s) prod=0x%" PRIx64 "%s\n", rc,
+	       pf7580_strerror(rc), prod,
+	       (!rc && prod == PF7580_T720_PROD_ID) ? " (node alive)" :
+						      " (MISMATCH)");
+	pf7580_close(dev);
+	if (rc || prod != PF7580_T720_PROD_ID) {
+		printf("SUBMIT-TEST: FAILED (node unhealthy after submit)\n");
+		return 1;
+	}
+	printf("SUBMIT-TEST: PASS\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const char *devpath = getenv("PF7580_DEVICE");
 	const char *probeonly = NULL;
+	const char *submittest = NULL;
 	int i;
 
+	/* Unbuffered: on HW a hang must leave partial output behind. */
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
 	print_abi();
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--print-abi"))
@@ -461,18 +602,24 @@ int main(int argc, char **argv)
 			probeonly = argv[++i];
 		} else if (!strncmp(argv[i], "--probe-only=", 13)) {
 			probeonly = argv[i] + 13;
+		} else if (!strcmp(argv[i], "--submit-test") && i + 1 < argc) {
+			submittest = argv[++i];
+		} else if (!strncmp(argv[i], "--submit-test=", 14)) {
+			submittest = argv[i] + 14;
 		} else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			devpath = argv[++i];
 		} else if (!strncmp(argv[i], "--device=", 9)) {
 			devpath = argv[i] + 9;
 		} else {
-			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH]\n",
+			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH] [--submit-test PATH]\n",
 				argv[0]);
 			return 1;
 		}
 	}
 	if (probeonly)
 		return run_probe_only(probeonly);
+	if (submittest)
+		return run_submit_test(submittest);
 	if (devpath)
 		return run_device(devpath);
 	return run_mock_suite();
