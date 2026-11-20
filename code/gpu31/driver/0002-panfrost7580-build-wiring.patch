@@ -35,11 +35,12 @@ diff -u '--exclude=.git' -Naur a2/drivers/gpu/drm/panfrost/Kconfig b2/drivers/gp
 diff -u '--exclude=.git' -Naur a2/drivers/gpu/drm/panfrost/Makefile b2/drivers/gpu/drm/panfrost/Makefile
 --- a2/drivers/gpu/drm/panfrost/Makefile	1969-12-31 19:00:00.000000000 -0500
 +++ b2/drivers/gpu/drm/panfrost/Makefile	2026-11-19 10:48:44.351696526 -0500
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +# Mali-T720 panfrost7580 driver objects.
 +ccflags-y := -Iinclude/drm -Idrivers/gpu/drm -Idrivers/gpu/drm/panfrost
 +panfrost7580-y := panfrost7580_main.o panfrost7580_submit.o \
 +		  panfrost7580_gem.o panfrost7580_ioctl.o \
 +		  panfrost7580_job.o panfrost7580_mmu.o \
-+		  panfrost7580_power.o pf7580_devfreq.o
++		  panfrost7580_power.o pf7580_devfreq.o \
++		  panfrost7580_syncobj.o
 +obj-$(CONFIG_DRM_PANFROST7580) += panfrost7580.o

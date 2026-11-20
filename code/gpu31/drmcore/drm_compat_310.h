@@ -88,7 +88,12 @@ static const struct file_operations name = {				\
 	.llseek		= noop_llseek,					\
 }
 
-/* Same, with 32-bit compat ioctl entry (cf. exynos #ifdef CONFIG_COMPAT). */
+/* Same, with 32-bit compat ioctl entry (cf. exynos #ifdef CONFIG_COMPAT).
+ * F-DRM1 (gpu31-driver-review): the _COMPAT variant carries the guarded
+ * .compat_ioctl entry; 32-bit Mesa on this 64-bit kernel would otherwise
+ * get ENOTTY on every ioctl. The panfrost7580 driver wires its own fops
+ * (syncobj-routed unlocked_ioctl + compat_ioctl) rather than this macro;
+ * the macro stays for other/exynos-style consumers. */
 #define DEFINE_DRM_GEM_FOPS_COMPAT(name, mmap_fn)			\
 static const struct file_operations name = {				\
 	.owner		= THIS_MODULE,					\
@@ -99,6 +104,7 @@ static const struct file_operations name = {				\
 	.poll		= drm_poll,					\
 	.read		= drm_read,					\
 	.llseek		= noop_llseek,					\
+	.compat_ioctl	= drm_compat_ioctl,				\
 }
 
 /*
