@@ -3504,7 +3504,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-19 10:48:44.321260351 -0500
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,656 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -5523,7 +5523,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,625 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -5617,6 +5617,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * p7580_drv_pm_put is only ever called for a ref this file took via
 + * p7580_drv_pm_get (never balances someone else's get).
 + */
++/* Live-job helpers (defined after the backend ops; free_job calls release). */
++static void p7580_drv_job_pm_arm(struct p7580_drv *drv);
++static void p7580_drv_job_pm_release(struct p7580_drv *drv);
 +
 +/* Scheduler backend ops for the 0004 shim. The sched job owner IS
 + * the submit job; the file state is recovered from the entity. */
@@ -5738,10 +5741,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	pm_runtime_mark_last_busy(drv->dev);
 +	pm_runtime_put_autosuspend(drv->dev);
 +}
-+/* Forward declarations: free_job (above) runs before these defs. */
-+static void p7580_drv_job_pm_arm(struct p7580_drv *drv);
-+static void p7580_drv_job_pm_release(struct p7580_drv *drv);
-+
 +/* Live-job ref: armed at queue time, released in free_job. Paired
 + * get/put around the whole async job lifetime (queue -> run ->
 + * retire, including the timeout/recover path which re-touches
