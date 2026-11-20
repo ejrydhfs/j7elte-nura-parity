@@ -9,6 +9,9 @@
  *                 GET_BO_OFFSET/WAIT + CPU map/write/read). SUBMIT is
  *                 mock-only: a test jc would fault real hardware.
  *                 PF7580_DEVICE also selects the node.
+ *   --probe-only PATH run the SUBMIT-free node probe (GET_PARAM/CREATE_BO
+ *                 4K/MMAP_BO/GET_BO_OFFSET only). Safe on live hardware:
+ *                 never issues SUBMIT, WAIT_BO, or a CPU mapping.
  *
  * Exit codes: 0 success, 2 device absent, 1 failure. The mock suite runs
  * on any build host; the real-node path is skipped (exit 2) when the
@@ -75,6 +78,82 @@ static void print_abi(void)
 	printf("get_param         %zu\n", sizeof(struct pf7580_get_param));
 	printf("get_bo_offset     %zu\n", sizeof(struct pf7580_get_bo_offset));
 	printf("T720 prod id       0x%04x\n", PF7580_T720_PROD_ID);
+}
+
+/* SUBMIT-free node probe: GET_PARAM + CREATE_BO(4K) + MMAP_BO +
+ * GET_BO_OFFSET only. No SUBMIT (a test jc would fault HW), no WAIT_BO,
+ * no CPU mapping — the ioctl sequence mutates nothing beyond one
+ * throwaway 4 KiB BO on the probed fd, which dies with close(). */
+static int run_probe_only(const char *path)
+{
+	struct pf7580_dev *dev;
+	char err[256] = "";
+	uint64_t prod = 0, map_off = 0, gpu_off = 0, gpu_off2 = 0;
+	uint32_t h = 0;
+	int rc, bad = 0;
+
+	printf("-- pf7580 probe-only on %s --\n", path);
+	rc = pf7580_open(path, &dev, err, sizeof(err));
+	if (rc) {
+		printf("probe-only %s unavailable: %s\n", path, err);
+		return 2;
+	}
+	printf("open: OK (fd=%d mock=%d)\n", pf7580_fd(dev),
+	       pf7580_is_mock(dev));
+	rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &prod);
+	if (rc) {
+		printf("GET_PARAM: FAIL %d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		bad = 1;
+	} else {
+		printf("GET_PARAM: OK GPU_PROD_ID 0x%" PRIx64 "%s\n", prod,
+		       prod == PF7580_T720_PROD_ID ? " (T720)" : " (mismatch)");
+		if (prod != PF7580_T720_PROD_ID)
+			bad = 1;
+	}
+	rc = pf7580_create_bo(dev, 4096, &h, &gpu_off);
+	if (rc) {
+		printf("CREATE_BO(4K): FAIL %d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		bad = 1;
+	} else {
+		printf("CREATE_BO(4K): OK handle=%u gpu_offset=0x%" PRIx64
+		       "\n", h, gpu_off);
+		if (!h || !gpu_off) {
+			printf("CREATE_BO(4K): FAIL null handle/offset\n");
+			bad = 1;
+		}
+	}
+	if (!bad) {
+		rc = pf7580_mmap_bo(dev, h, &map_off);
+		if (rc) {
+			printf("MMAP_BO: FAIL %d (%s)\n", rc,
+			       pf7580_strerror(rc));
+			bad = 1;
+		} else {
+			printf("MMAP_BO: OK map_offset=0x%" PRIx64 "\n",
+			       map_off);
+		}
+	}
+	if (!bad) {
+		rc = pf7580_get_bo_offset(dev, h, &gpu_off2);
+		if (rc) {
+			printf("GET_BO_OFFSET: FAIL %d (%s)\n", rc,
+			       pf7580_strerror(rc));
+			bad = 1;
+		} else {
+			printf("GET_BO_OFFSET: OK offset=0x%" PRIx64 "%s\n",
+			       gpu_off2,
+			       gpu_off2 == gpu_off ? " (matches CREATE_BO)"
+						   : " (MISMATCH vs CREATE_BO)");
+			if (gpu_off2 != gpu_off)
+				bad = 1;
+		}
+	}
+	printf("SUBMIT: skipped (probe-only)\n");
+	pf7580_close(dev);
+	printf(bad ? "PROBE-ONLY: FAILED\n" : "PROBE-ONLY: PASS\n");
+	return bad ? 1 : 0;
 }
 
 /* T2: GET_PARAM. */
@@ -367,22 +446,29 @@ static int run_device(const char *path)
 int main(int argc, char **argv)
 {
 	const char *devpath = getenv("PF7580_DEVICE");
+	const char *probeonly = NULL;
 	int i;
 
 	print_abi();
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--print-abi"))
 			return 0;
-		if (!strcmp(argv[i], "--device") && i + 1 < argc) {
+		if (!strcmp(argv[i], "--probe-only") && i + 1 < argc) {
+			probeonly = argv[++i];
+		} else if (!strncmp(argv[i], "--probe-only=", 13)) {
+			probeonly = argv[i] + 13;
+		} else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			devpath = argv[++i];
 		} else if (!strncmp(argv[i], "--device=", 9)) {
 			devpath = argv[i] + 9;
 		} else {
-			fprintf(stderr, "usage: %s [--print-abi] [--device PATH]\n",
+			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH]\n",
 				argv[0]);
 			return 1;
 		}
 	}
+	if (probeonly)
+		return run_probe_only(probeonly);
 	if (devpath)
 		return run_device(devpath);
 	return run_mock_suite();
