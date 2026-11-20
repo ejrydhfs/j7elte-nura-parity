@@ -115,8 +115,12 @@ to ever arm.
 
 ## 3. Host-side proof
 
-- `patch -p1 --dry-run` / `git apply --check`: `0001` applies clean
-  with both hunks (`17 files, 5718 insertions`; `APPLY_CHECK_OK`).
+- `patch -p1` fresh-apply (GNU patch, strict) + `git apply --check`:
+  `0001` applies clean with both hunks (`17 files, 5718 insertions`).
+  (Post-commit note: peer commit `e4edb3a` repaired the `@@ -0,0 +1,N`
+  counts — submit.c 507→515, main.c 576→583 — after R1/R2–R5 added body
+  lines; `git apply` tolerates that skew but GNU `patch` truncated the
+  submit tail. Counts now byte-audited across all 17 sections.)
 - Mock open-path test (new throwaway in `/tmp`, NOT committed — peer
   `code/gpu31/driver/submit_fix_test.c` owns the driver test slot):
   compiles the REAL 0004 `drm_sched` + `drm_syncobj` shim bodies
@@ -127,14 +131,10 @@ to ever arm.
     hang cause; fixed init returns 0, `entities_live=1`, 3 entities on
     `sched->entities`; fini unregisters all; `offsetof` layout aliasing
     holds for `mgr/job_fctx/job_dev`).
-- `-fsyntax-only` of the extracted `panfrost7580_main.c` (with probe
-  hunk) against the real 3.10.108 headers + staged 0001–0004 shims:
-  clean (only pre-existing `P7580_GPU_INT_*` redefinition notes shared
-  with `jm_hw.h`). `panfrost7580_submit.c` does not yet reach syntax
-  clean because of the peer's in-flight R4 tail (`-Wunused-but-set-variable`
-  on `staged` + `expected declaration or statement at end of input` at
-  the override tail) — pre-existing in commit `c553b8e`, NOT from this
-  hunk; flagged to G31_SubmitFix2, Main to gate on their repair.
+- `-fsyntax-only` of all 8 extracted driver `.c` files (with both R1
+  hunks) against the real 3.10.108 headers + staged 0001–0004 shims:
+  **8/8 clean** (verified after peer `e4edb3a`, which also removed the
+  local `P7580_GPU_INT_RAWSTAT/CLEAR` duplicates of `jm_hw.h`).
 - Peer's `code/gpu31/driver/submit_fix_test` (T1–T6): still passes
   (`make check` → `all checks passed`), so R2–R5 are unaffected by the
   two R1 hunks.
@@ -146,8 +146,8 @@ to ever arm.
 - This report: `docs/reports/gpu31-open-fix.md` (call graph, offending
   lines, fix, host-side proof).
 - Not done here (explicit non-goals): live-device boot/open test (no
-  `/dev/dri` on current M1 image; Main's gate), peer's submit-tail
-  syntax repair (theirs), render-only flag (G31_RenderOnlyFix).
+  `/dev/dri` on current M1 image; Main's gate), render-only flag
+  (G31_RenderOnlyFix).
 - Suggested Main verification: rebuild int4 image, boot, run
   `pf7580-selftest --probe-only` (GET_PARAM/CREATE_BO-4K/MMAP_BO/
   GET_BO_OFFSET, no SUBMIT) — previously hung with zero output; with
