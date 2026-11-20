@@ -1,6 +1,6 @@
 # gpu31-submit-hw — first real SUBMIT on silicon (NULL job, JS1)
 
-Date: 2026-11-20. Owner: G31_SubmitHW.
+Date: 2026-11-20 (updated post-int7). Owner: G31_SubmitHW.
 Ticket: `code/gpu31/client` (+`--submit-test`), `code/gpu31/jobs` + driver
 submit path. "If it faults/hangs, capture dmesg and stop (no loop)."
 
@@ -157,12 +157,59 @@ into a bounded, preemptible one.
 - Client: rebuilt `--submit-test` flushes every stage line before its
   ioctl; the surviving line names the death stage.
 
-## 6. Result
+## 6. Result (int5: hang) — superseded by §7
 
-**No signalled fence.** One NULL-job SUBMIT hung the SoC hard (USB gone,
-no reboot within ~10 min); per the ticket, the run was stopped after the
-single attempt — no loop, no retry. The precise driver line cannot be
-named from silicon evidence (no dmesg); the static prime suspect is
-**F-SUB1: MMIO (`p7580_drv_map_bo` → `p7580_mmu_invalidate`) issued while
-the GPU block may be dark**, with the hot-spin F-SUB2 fixed in this
-ticket. Commit: pending Main's go (device still down).
+**No signalled fence (int5 `e6c0bf19`).** One NULL-job SUBMIT hung the
+SoC hard (USB gone, no reboot within ~10 min); per the ticket, the run
+was stopped after the single attempt — no loop, no retry. The precise
+driver line could not be named from silicon evidence (no dmesg); the
+static prime suspect was **F-SUB1: MMIO (`p7580_drv_map_bo` →
+`p7580_mmu_invalidate`) issued while the GPU block may be dark**
+(G31_PmOrderFix's c81e8a7 lifetime fix has since landed for exactly
+this), with the hot-spin F-SUB2 fixed in this ticket.
+
+## 7. Silicon result (int7, PM lifetime fix) — SUBMIT-TEST PASS
+
+Ground truth from Main (device run, int7 image with G31_PmOrderFix):
+
+```
+SUBMIT rc=0
+WAIT_BO rc=0 (0 ms, well inside the 8 s deadline)
+POST GET_PARAM rc=0 prod=0x720 (node alive)
+```
+
+i.e. the fence signalled: the NULL job completed on hardware
+(JS1 path: map → HEAD/START → IRQ DONE → `dma_fence_signal`). Then the
+process/session wedged and the hardware watchdog reset the SoC (uptime
+1 min). Verdict: **submit + fence are fine; the remaining hang is
+teardown** (fd close → GEM free / MMU unmap / entity fini MMIO while
+suspended) — handed to the PM slice by Main.
+
+## 8. Test refinements for the next run (committed f929726)
+
+Per Main's two asks (teardown isolation + fence proof):
+
+1. **Close/exit markers**: after the post-submit `GET_PARAM`, the test
+   prints `SUBMIT-TEST: PASS (submit+fence proven; closing fd...)`,
+   then `CLOSE: calling pf7580_close now` before `pf7580_close()`, and
+   `CLOSE: returned (fd closed); process exiting` after. The unhealthy
+   branch prints `CLOSE: NOT reached...` + the same before/after pair.
+   Next run distinguishes "hang at close" (after `calling`, no
+   `returned`) from "hang after process exit" (both lines present).
+2. **Fence proof**: a 0-timeout (past absolute stamp) `WAIT_BO` poll
+   runs right after the 8 s wait and prints
+   `FENCE-PROBE(0-timeout): rc=... elapsed=...`. Expectation on a real
+   HW run: the 8 s wait returns `rc=0` after the job completes; the
+   probe then also returns `0` (already signalled). The proof value is
+   the *elapsed time of the 8 s wait vs the probe*: if the 8 s wait
+   returns in ~0 ms with the fence already signalled at probe time,
+   dmesg decides between fast-retire and skip — but a mid-range
+   elapsed (IRQ round-trip) plus a signalled probe proves the job ran
+   on hardware rather than being faked/skipped. Mock backend note:
+   the stub has no fences, so both return `0`; the probe line is
+   informational there.
+
+Next-run command (after PM-slice teardown fix + Main's go):
+`rootshell sh -c '/data/wdarm 60 /tmp/pf7580-submit --submit-test
+/dev/dri/renderD128'` with the rebuilt static binary (fence-probe +
+markers included).
