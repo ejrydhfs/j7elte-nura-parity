@@ -35,6 +35,14 @@
  * the run_job ERR_PTR path frees the job instead of dropping it (F4);
  * the timeout comes from entity->timeout, seeded from sched->timeout
  * at entity_init (F5); push_job is implemented (minor).
+ *
+ * Close path (gpu31-close-fix): entity_fini cancels queued jobs, detaches
+ * from the scheduler, then waits BOUNDED for dispatched-but-unretired
+ * jobs (budget = entity->timeout + recovery margin). Mainline waits
+ * unbounded here; on this SoC an unbounded close wedges the release
+ * (watchdog reset ~14 s after CLOSE on the int7 node). entity_fini is
+ * idempotent (second call is a no-op). drm_sched_fini stops workers
+ * (ready=false, evict entities) before draining the workqueue.
  */
 #ifndef _DRM_SCHED_BACKPORT_H
 #define _DRM_SCHED_BACKPORT_H
@@ -44,6 +52,7 @@
 #include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/completion.h>
+#include <linux/jiffies.h>
 #include <linux/errno.h>
 
 struct drm_sched_entity;
@@ -94,6 +103,14 @@ struct drm_sched_job {
  *           at entity_init; 0 disables the timeout arm.
  * @sched: back-pointer so the pump can honour sched->ready without
  *         reaching through globals.
+ * @entity_idle: signaled while job_count == 0 (see job_count).
+ * @job_count: queued + dispatched-but-unretired jobs. Push re-arms
+ *           (INIT_COMPLETION on the 0->1 transition); retirement
+ *           completes (complete_all on dec-to-zero). fini waits on
+ *           this with a bounded budget; the wait terminates because
+ *           the timeout path always retires the job (even dark: the
+ *           backend skips MMIO but the fence still signals).
+ * @stopped: set by fini under entity->lock; the pump exits early.
  */
 struct drm_sched_entity {
 	struct list_head sched_link;	/* sched->entities membership */
@@ -124,11 +141,19 @@ int drm_sched_init(struct drm_sched *sched,
 		   const struct drm_sched_backend_ops *ops,
 		   long timeout, const char *name);
 void drm_sched_fini(struct drm_sched *sched);
+/* Close budget margin past one job timeout + one recovery (jiffies). */
+#define DRM_SCHED_CLOSE_MARGIN_JIFFIES	(HZ * 8)
 
 int drm_sched_entity_init(struct drm_sched_entity *entity,
 			  struct drm_sched *sched);
 void drm_sched_entity_fini(struct drm_sched *sched,
 			   struct drm_sched_entity *entity);
+/* Bounded idle wait for close (0 idle, -ETIME on budget expiry, -EINVAL
+ * on NULL entity). Budget <= 0 selects the default close budget. */
+long drm_sched_entity_wait_idle(struct drm_sched_entity *entity,
+				long budget);
+/* Default close budget for an entity (jiffies). */
+long drm_sched_close_budget(struct drm_sched_entity *entity);
 int drm_sched_entity_push_job(struct drm_sched_job *sched_job);
 
 struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,

@@ -200,12 +200,23 @@ static int model_recover(struct fake_dev *d, unsigned budget_ms)
 }
 
 /* Timedout model (fixed p7580_job_timedout): early-out if signaled,
- * else recover, then signal OUR fence if still pending. */
+ * else recover, then signal OUR fence if still pending.
+ * Dark-skip leg (gpu31-close-fix): when power is unavailable the driver
+ * skips recovery BUT STILL signals the fence (CPU-only, always safe),
+ * so the sched close wait always terminates. */
 static void model_timedout(struct fake_dev *d, struct fake_fence *ours)
 {
 	if (ours && fence_is_signaled(ours))
 		return;
 	model_recover(d, RESET_TIMEOUT_MS);
+	if (ours && !fence_is_signaled(ours))
+		fence_signal(ours);
+}
+
+/* Dark-skip model (fixed p7580_drv_timedout_job): pm_get fails (GPU
+ * suspended at timeout) -> no MMIO recovery, fence still signals. */
+static void model_timedout_dark(struct fake_fence *ours)
+{
 	if (ours && !fence_is_signaled(ours))
 		fence_signal(ours);
 }
@@ -259,6 +270,20 @@ static void run_t5(void)
 	CHECK(f.signals == 1);
 }
 
+static void run_t7(void)
+{
+	/* Dark timeout: recovery skipped (no MMIO while suspended) but
+	 * the fence still signals exactly once -> close wait terminates. */
+	struct fake_fence ours;
+
+	memset(&ours, 0, sizeof(ours));
+	model_timedout_dark(&ours);
+	CHECK(fence_is_signaled(&ours));
+	CHECK(ours.signals == 1);
+	model_timedout_dark(&ours);	/* idempotent */
+	CHECK(ours.signals == 1);
+}
+
 static void run_t6(void)
 {
 	/* IRQ-won race: fence already signaled when timeout fires ->
@@ -283,6 +308,7 @@ int main(void)
 	run_t4();
 	run_t5();
 	run_t6();
+	run_t7();
 
 	if (fails == 0)
 		printf("submit_fix_test: all checks passed\n");

@@ -28,6 +28,20 @@
  *  0004 minor drm_sched_entity_push_job is defined and queues work.
  *  sched->ready is honoured by the pump (fini stops dispatch).
  *
+ *  close-fix (gpu31-close-fix, mock-GPU ordering repro):
+ *  C1 wait_idle on an idle entity returns 0 immediately (no wait).
+ *  C2 wait_idle on a dispatched-but-unretired job returns 0 once the
+ *     timeout path retires it (bounded: no infinite flush).
+ *  C3 entity_fini with a queued (never-dispatched) job frees it
+ *     synchronously and detaches the dep callback (late dep signal
+ *     cannot re-queue the dead pump); fini is idempotent.
+ *  C4 entity_fini with a dispatched-but-unretired job retires it via
+ *     the timeout path and returns (bounded); double fini is a no-op.
+ *  C5 push re-arms entity_idle on 0->1 (no stale completion).
+ *  C6 syncobj_manager_fini with a pending fence drops the handle
+ *     without waiting; double fini is safe.
+ *  C7 fence remove_callback(NULL, cb) is a no-op (dep-less close).
+ *
  * Build: cc -Wall -Wextra -std=gnu99 -o sched-host-test sched-host-test.c
  *        ./sched-host-test   (native PASS; also built/run aarch64 under qemu)
  */
@@ -342,7 +356,10 @@ static struct dma_fence *sched_run_fail(struct drm_sched_job *job)
 
 static void sched_timedout(struct drm_sched_job *job)
 {
-	(void)job;
+	/* Mirror the fixed driver leg (p7580_drv_timedout_job): retire
+	 * unconditionally, even "dark". The fence signal is CPU-only. */
+	if (job && job->fence && !dma_fence_is_signaled(job->fence))
+		dma_fence_signal(job->fence);
 }
 
 static void sched_free(struct drm_sched_job *job)
@@ -574,6 +591,176 @@ static void test_timeout_push_ready(void)
 	(void)drain_wq;
 }
 
+/* ------------------------------------------------------------------ */
+/* close-fix tests: mock-GPU ordering repro (no HW, single-threaded).    */
+/* The int7 node hung in CLOSE with a dispatched-but-unretired job:      */
+/* WAIT_BO proved nothing (empty resv returns instantly), the job's      */
+/* fence stayed pending, and the old fini had no bounded retirement —   */
+/* the file state could be freed under a pending timeout/IRQ callback.   */
+/* These tests pin the new contract: bounded waits, sync cancel,         */
+/* idempotent fini, no waits inside syncobj fini.                        */
+/* ------------------------------------------------------------------ */
+
+/* C1: idle entity waits zero time. */
+static void test_close_idle(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+
+	memset(&sched, 0, sizeof(sched));
+	CHECK_EQ(drm_sched_init(&sched, &sched_ops_ok, 50, "t"), 0);
+	CHECK_EQ(drm_sched_entity_init(&e, &sched), 0);
+	CHECK_EQ(drm_sched_entity_wait_idle(&e, 0), 0);
+	CHECK_EQ(drm_sched_entity_wait_idle(&e, -1), 0);
+	CHECK_EQ(drm_sched_entity_wait_idle(NULL, 0), -EINVAL);
+	CHECK(drm_sched_close_budget(&e) == (long)(e.timeout + DRM_SCHED_CLOSE_MARGIN_JIFFIES));
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
+/* C5: push re-arms the idle completion on 0->1. */
+static void test_close_rearm(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	/* Fresh entity starts idle (completed). A push must re-arm so a
+	 * later wait observes the new job, not the stale completion. */
+	CHECK_EQ(drm_sched_entity_wait_idle(&e, 0), 0);
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	CHECK_EQ(drm_sched_entity_push_job(j), 0);
+	CHECK_EQ(completion_done(&e.entity_idle), 0);
+	/* Retire it: dispatch then signal then finish. */
+	e.sched_work.fn(&e.sched_work);
+	dma_fence_signal(j->fence);
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(drm_sched_entity_wait_idle(&e, 0), 0);
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
+/* C3: queued job freed synchronously; dep detach; idempotent fini. */
+static void test_close_queued(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+	struct test_fence *dep = mkfence(4, 11);
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &dep->base), 0);
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	/* Pump sees the unsignaled dep and leaves the job queued. */
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 0);
+
+	/* Close with the job still queued: freed synchronously. */
+	drm_sched_entity_fini(&sched, &e);
+	CHECK_EQ(free_count, 1);
+	CHECK(list_empty(&e.queue_list));
+	CHECK_EQ(atomic_load_explicit(&e.job_count.counter, memory_order_relaxed), 0LL);
+	/* Late dep signal must not re-queue the dead pump. */
+	e.sched_work.pending = 0;
+	dma_fence_signal(&dep->base);
+	CHECK_EQ(e.sched_work.pending, 0);
+	/* Idempotent: second fini is a no-op (no double free). */
+	drm_sched_entity_fini(&sched, &e);
+	CHECK_EQ(free_count, 1);
+	drm_sched_fini(&sched);
+	kfree(dep);
+}
+
+/* C4: dispatched-but-unretired job retires via the timeout path;
+ * fini stays bounded and idempotent. */
+static void test_close_inflight(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	/* Dispatch one job; fence stays pending (mock GPU never IRQs). */
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_entity_push_job(j);
+	e.sched_work.pending = 0;
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+	CHECK(j->fence != NULL);
+	CHECK(!dma_fence_is_signaled(j->fence));
+	CHECK_EQ(j->timeout_work.armed, 1);
+
+	/* Not idle while the job is outstanding. wait_idle with budget
+	 * must report -ETIME without retiring anything itself. */
+	CHECK_EQ(drm_sched_entity_wait_idle(&e, 1), -ETIME);
+	CHECK_EQ(free_count, 0);
+
+	/* Timeout work calls the backend hook, which now guarantees the
+	 * fence signal (the driver dark-skip leg); finish retires it. */
+	j->timeout_work.work.fn(&j->timeout_work.work);
+	CHECK(dma_fence_is_signaled(j->fence));
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(free_count, 1);
+	CHECK_EQ(drm_sched_entity_wait_idle(&e, 0), 0);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_entity_fini(&sched, &e); /* idempotent */
+	CHECK_EQ(free_count, 1);
+	drm_sched_fini(&sched);
+	drm_sched_fini(&sched); /* idempotent */
+	CHECK(sched.wq == NULL);
+}
+
+/* C6: syncobj fini never waits; double fini safe. */
+static void test_close_syncobj_pending(void)
+{
+	struct drm_syncobj_manager mgr;
+	struct drm_syncobj *s;
+	struct test_fence *tf = mkfence(8, 77);
+	u32 h;
+
+	drm_syncobj_manager_init(&mgr);
+	CHECK_EQ(drm_syncobj_create(&mgr, &h), 0);
+	s = drm_syncobj_find(&mgr, h);
+	CHECK(s != NULL);
+	CHECK_EQ(drm_syncobj_replace_fence(s, &tf->base), 0);
+	drm_syncobj_put(s);
+	/* Fence still pending; fini must drop the handle WITHOUT waiting
+	 * (no wait call exists on this path by construction). */
+	CHECK(!dma_fence_is_signaled(&tf->base));
+	drm_syncobj_manager_fini(&mgr);
+	drm_syncobj_manager_fini(&mgr); /* idempotent */
+	/* The job side still owns its ref; release it here. */
+	dma_fence_put(&tf->base);
+	kfree(tf);
+}
+
+/* C7: dep-less close never touches fence callbacks with NULL. */
+static void test_close_null_dep(void)
+{
+	CHECK_EQ(dma_fence_remove_callback(NULL, NULL), false);
+	{
+		struct dma_fence_cb cb;
+
+		INIT_LIST_HEAD(&cb.node);
+		CHECK_EQ(dma_fence_remove_callback(NULL, &cb), false);
+	}
+}
+
 int main(void)
 {
 	test_fence_init();
@@ -585,6 +772,12 @@ int main(void)
 	test_dep_gating();
 	test_errptr_frees_job();
 	test_timeout_push_ready();
+	test_close_idle();
+	test_close_rearm();
+	test_close_queued();
+	test_close_inflight();
+	test_close_syncobj_pending();
+	test_close_null_dep();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

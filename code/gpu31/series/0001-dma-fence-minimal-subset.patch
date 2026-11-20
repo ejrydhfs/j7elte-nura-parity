@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/drivers/base/dma-fence.c
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,235 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * dma-fence minimal subset implementation for Nura 3.10.108.
@@ -223,6 +223,12 @@ index 0000000..0000000
 +	unsigned long flags;
 +	bool ret = false;
 +
++	/* NULL fence (no dependency attached) detaches nothing. The
++	 * close path calls this for every queued job, most of which
++	 * carry no dep; without the guard the first dep-less close
++	 * would dereference NULL. */
++	if (!fence || !cb)
++		return false;
 +	spin_lock_irqsave(&fence->cb_lock, flags);
 +	if (!list_empty(&cb->node)) {
 +		list_del_init(&cb->node);

@@ -205,6 +205,12 @@ bool dma_fence_remove_callback(struct dma_fence *fence,
 	unsigned long flags;
 	bool ret = false;
 
+	/* NULL fence (no dependency attached) detaches nothing. The
+	 * close path calls this for every queued job, most of which
+	 * carry no dep; without the guard the first dep-less close
+	 * would dereference NULL. */
+	if (!fence || !cb)
+		return false;
 	spin_lock_irqsave(&fence->cb_lock, flags);
 	if (!list_empty(&cb->node)) {
 		list_del_init(&cb->node);

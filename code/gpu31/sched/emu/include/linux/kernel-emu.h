@@ -57,6 +57,7 @@ typedef struct { atomic_int counter; } atomic_t;
 #define atomic_set(v, i) atomic_store(&(v)->counter, (i))
 #define atomic_read(v) atomic_load(&(v)->counter)
 #define atomic_inc(v) (void)atomic_fetch_add(&(v)->counter, 1)
+#define atomic_inc_return(v) (atomic_fetch_add(&(v)->counter, 1) + 1)
 #define atomic_dec_and_test(v) (atomic_fetch_sub(&(v)->counter, 1) == 1)
 
 static inline int test_bit(int nr, const volatile unsigned long *addr)
@@ -114,7 +115,10 @@ static inline int mutex_lock_interruptible(struct mutex *m)
 /* ---- completion (manual: test drives signaling) ---- */
 struct completion { int done; };
 static inline void init_completion(struct completion *c) { c->done = 0; }
+#define INIT_COMPLETION(c) ((c).done = 0)
+static inline void complete(struct completion *c) { c->done = 1; }
 static inline void complete_all(struct completion *c) { c->done = 1; }
+static inline int completion_done(struct completion *c) { return c->done; }
 static inline unsigned long wait_for_completion_timeout(struct completion *c,
 							unsigned long t)
 {

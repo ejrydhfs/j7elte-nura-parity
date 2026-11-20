@@ -15,10 +15,20 @@ void drm_syncobj_manager_init(struct drm_syncobj_manager *mgr)
 }
 EXPORT_SYMBOL(drm_syncobj_manager_init);
 
+/* Close semantics (gpu31-close-fix): fini drops every manager reference
+ * without ever waiting on a fence. A syncobj whose fence is still pending
+ * (in-flight job at close) simply loses the manager's owner ref here; the
+ * fence itself is owned by the job/sched retirement path and signals (or
+ * is freed) independently. Any concurrent WAIT snapshots its own fence ref
+ * under mgr->lock before sleeping, so dropping the idr entry cannot free
+ * a fence out from under a waiter. Double fini is safe (empty drain). */
 void drm_syncobj_manager_fini(struct drm_syncobj_manager *mgr)
 {
 	struct drm_syncobj *syncobj;
 	int id;
+
+	if (!mgr)
+		return;
 
 	/*
 	 * Drain via idr_get_next (review F1): idr_for_each_entry is not
