@@ -48,6 +48,34 @@
 #define PF7580_IOCTL_GET_BO_OFFSET \
 	DRM_IOWR(DRM_COMMAND_BASE + PF7580_CMD_GET_BO_OFFSET, struct pf7580_get_bo_offset)
 
+/* Generic syncobj ioctls (core numbers 0xBF-0xC5, NOT driver-private;
+ * the driver's fops dispatcher routes them — G31_SyncobjIoctl. Wire types
+ * are the stock drm.h structs (verified below against <drm/drm.h>). */
+struct pf7580_syncobj_create {
+	uint32_t handle;
+	uint32_t flags;
+};
+struct pf7580_syncobj_destroy {
+	uint32_t handle;
+	uint32_t pad;
+};
+struct pf7580_syncobj_wait {
+	uint64_t handles;
+	int64_t timeout_nsec;	/* absolute CLOCK_MONOTONIC */
+	uint32_t count_handles;
+	uint32_t flags;
+	uint32_t first_signaled;
+	uint32_t pad;
+};
+#define PF7580_IOCTL_SYNCOBJ_CREATE \
+	DRM_IOWR(0xBF, struct pf7580_syncobj_create)
+#define PF7580_IOCTL_SYNCOBJ_DESTROY \
+	DRM_IOW(0xC0, struct pf7580_syncobj_destroy)
+#define PF7580_IOCTL_SYNCOBJ_WAIT_SZ 32
+#define PF7580_IOCTL_SYNCOBJ_WAIT \
+	DRM_IOWR(0xC3, char[PF7580_IOCTL_SYNCOBJ_WAIT_SZ])
+#define PF7580_SYNCOBJ_WAIT_ALL		(1u << 0)
+
 /* Compile-time wire check: our mirrors must encode exactly like the
  * v5.2 directions above (a direction flip changes the ioctl number). */
 _Static_assert(PF7580_IOCTL_SUBMIT ==
@@ -68,11 +96,33 @@ _Static_assert(PF7580_IOCTL_GET_PARAM ==
 _Static_assert(PF7580_IOCTL_GET_BO_OFFSET ==
 	DRM_IOWR(DRM_COMMAND_BASE + 0x05, struct pf7580_get_bo_offset),
 	"get_bo_offset encoding");
+/* CREATE/DESTROY match stock drm.h (8 B); WAIT matches the DRIVER's
+ * p7580_syncobj_wait (32 B, no deadline tail — the host drm.h added a
+ * u64 deadline_nsec the 3.10 driver does not know). The driver's fops
+ * dispatcher keys on _IOC_NR and copies _IOC_SIZE bytes, so WAIT must
+ * encode a 32 B payload: fixed-size macro below, NOT sizeof(struct
+ * drm_syncobj_wait) (40 B on this host). */
+_Static_assert(sizeof(struct pf7580_syncobj_create) ==
+	sizeof(struct drm_syncobj_create), "syncobj_create wire size");
+_Static_assert(sizeof(struct pf7580_syncobj_destroy) ==
+	sizeof(struct drm_syncobj_destroy), "syncobj_destroy wire size");
+_Static_assert(sizeof(struct pf7580_syncobj_wait) == 32,
+	"syncobj_wait driver wire size");
+#define PF7580_SYNCOBJ_WAIT_SIZE 32
+_Static_assert(PF7580_IOCTL_SYNCOBJ_CREATE ==
+	DRM_IOWR(0xBF, struct drm_syncobj_create), "syncobj_create enc");
+_Static_assert(PF7580_IOCTL_SYNCOBJ_DESTROY ==
+	DRM_IOW(0xC0, struct drm_syncobj_destroy), "syncobj_destroy enc");
 
 /* ------------------------------------------------------------------ */
 /* Device handle. */
 
+/* Only CREATE_SIGNALED is valid on create (mainline contract). */
+#define PF7580_SYNCOBJ_CREATE_SIGNALED	(1u << 0)
+#define PF7580_SYNCOBJ_MAX_HANDLES	64u
+
 #define PF7580_MOCK_MAX_BOS 64
+#define PF7580_MOCK_MAX_SYNCOBJS 64
 /* Mock IOVA window: nonzero, 2 MiB-spaced, inside the driver's
  * 32 MiB .. 4 GiB window (P7580_IOVA_START/SIZE). */
 #define PF7580_MOCK_IOVA_BASE 0x10000000ull
@@ -90,6 +140,12 @@ struct pf7580_mock_bo {
 	void *shadow;	/* malloc(size), persistent until close */
 };
 
+struct pf7580_mock_syncobj {
+	int used;
+	uint32_t handle;
+	int signaled;	/* 0 pending, 1 signaled (binary payload) */
+};
+
 struct pf7580_dev {
 	int fd;		/* real backend DRM fd, -1 for mock */
 	int is_mock;
@@ -97,6 +153,8 @@ struct pf7580_dev {
 	/* Mock state. */
 	uint32_t next_handle;
 	struct pf7580_mock_bo bos[PF7580_MOCK_MAX_BOS];
+	uint32_t next_syncobj;
+	struct pf7580_mock_syncobj syncobjs[PF7580_MOCK_MAX_SYNCOBJS];
 };
 
 static struct pf7580_mock_bo *mock_find(struct pf7580_dev *dev,
@@ -161,6 +219,7 @@ int pf7580_open_mock(struct pf7580_dev **out)
 	dev->fd = -1;
 	dev->is_mock = 1;
 	dev->next_handle = 1;
+	dev->next_syncobj = 1;
 	*out = dev;
 	return 0;
 }
@@ -405,6 +464,135 @@ int pf7580_submit(struct pf7580_dev *dev,
 		s.requirements = args->requirements;
 		if (ioctl(dev->fd, PF7580_IOCTL_SUBMIT, &s))
 			return -errno;
+		return 0;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Generic syncobj ioctls (out_sync job-fence proof). */
+
+static struct pf7580_mock_syncobj *mock_syncobj_find(struct pf7580_dev *dev,
+						     uint32_t handle)
+{
+	unsigned i;
+
+	for (i = 0; i < PF7580_MOCK_MAX_SYNCOBJS; i++)
+		if (dev->syncobjs[i].used && dev->syncobjs[i].handle == handle)
+			return &dev->syncobjs[i];
+	return NULL;
+}
+
+int pf7580_syncobj_create(struct pf7580_dev *dev, uint32_t flags,
+			  uint32_t *handle)
+{
+	if (!dev || !handle)
+		return -EINVAL;
+	if (flags & ~PF7580_SYNCOBJ_CREATE_SIGNALED)
+		return -EINVAL;
+	if (dev->is_mock) {
+		unsigned i;
+		int rc = mock_inject(dev);
+
+		if (rc)
+			return rc;
+		for (i = 0; i < PF7580_MOCK_MAX_SYNCOBJS; i++) {
+			if (!dev->syncobjs[i].used) {
+				dev->syncobjs[i].used = 1;
+				dev->syncobjs[i].handle = dev->next_syncobj++;
+				if (dev->next_syncobj == 0)
+					dev->next_syncobj = 1;
+				dev->syncobjs[i].signaled =
+					(flags & PF7580_SYNCOBJ_CREATE_SIGNALED)
+					? 1 : 0;
+				*handle = dev->syncobjs[i].handle;
+				return 0;
+			}
+		}
+		return -ENOSPC;
+	}
+	{
+		struct pf7580_syncobj_create c;
+
+		memset(&c, 0, sizeof(c));
+		c.flags = flags;
+		if (ioctl(dev->fd, PF7580_IOCTL_SYNCOBJ_CREATE, &c))
+			return -errno;
+		*handle = c.handle;
+		return 0;
+	}
+}
+
+int pf7580_syncobj_destroy(struct pf7580_dev *dev, uint32_t handle)
+{
+	if (!dev || !handle)
+		return -EINVAL;
+	if (dev->is_mock) {
+		struct pf7580_mock_syncobj *o;
+		int rc = mock_inject(dev);
+
+		if (rc)
+			return rc;
+		o = mock_syncobj_find(dev, handle);
+		if (!o)
+			return -ENOENT;
+		o->used = 0;
+		return 0;
+	}
+	{
+		struct pf7580_syncobj_destroy d;
+
+		memset(&d, 0, sizeof(d));
+		d.handle = handle;
+		if (ioctl(dev->fd, PF7580_IOCTL_SYNCOBJ_DESTROY, &d))
+			return -errno;
+		return 0;
+	}
+}
+
+int pf7580_syncobj_wait(struct pf7580_dev *dev, const uint32_t *handles,
+			uint32_t count, int64_t timeout_ns, uint32_t flags,
+			uint32_t *first_signaled)
+{
+	if (!dev || !handles || !count ||
+	    count > PF7580_SYNCOBJ_MAX_HANDLES)
+		return -EINVAL;
+	if (flags & ~PF7580_SYNCOBJ_WAIT_ALL)
+		return -EINVAL;
+	if (dev->is_mock) {
+		uint32_t i;
+		int rc = mock_inject(dev);
+
+		if (rc)
+			return rc;
+		/* Mock has no fences: every known syncobj reads
+		 * signalled (mirrors the stub's known-BO-is-idle rule),
+		 * unknown handles fail like the 0003 shim. */
+		for (i = 0; i < count; i++) {
+			struct pf7580_mock_syncobj *o =
+				mock_syncobj_find(dev, handles[i]);
+
+			if (!o)
+				return -ENOENT;
+			if (!o->signaled)
+				o->signaled = 1;	/* submit retired it */
+			(void)timeout_ns;
+		}
+		if (first_signaled)
+			*first_signaled = 0;
+		return 0;
+	}
+	{
+		struct pf7580_syncobj_wait w;
+
+		memset(&w, 0, sizeof(w));
+		w.handles = (uint64_t)(uintptr_t)handles;
+		w.timeout_nsec = timeout_ns;
+		w.count_handles = count;
+		w.flags = flags;
+		if (ioctl(dev->fd, PF7580_IOCTL_SYNCOBJ_WAIT, &w))
+			return -errno;
+		if (first_signaled)
+			*first_signaled = w.first_signaled;
 		return 0;
 	}
 }

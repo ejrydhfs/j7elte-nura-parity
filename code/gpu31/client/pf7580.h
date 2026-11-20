@@ -147,6 +147,22 @@ struct pf7580_submit_args {
 int pf7580_submit(struct pf7580_dev *dev,
 		  const struct pf7580_submit_args *args);
 
+/* Generic DRM syncobj ioctls (0xBF-0xC5; routed by the driver's fops
+ * dispatcher, NOT the panfrost table). Needed so the submit test can
+ * wait on the job's OWN fence via out_sync: WAIT_BO is vacuous (the job
+ * fence is never attached to the BO resv — close-fix 476b75d), so only
+ * the out_sync fence proves the GPU retired the job. Mock backend:
+ * in-memory signalled/pending table mirroring the 0003 shim. */
+int pf7580_syncobj_create(struct pf7580_dev *dev, uint32_t flags,
+			  uint32_t *handle);
+int pf7580_syncobj_destroy(struct pf7580_dev *dev, uint32_t handle);
+/* Wait on count syncobj handles (handles array of count u32). timeout_ns
+ * is absolute CLOCK_MONOTONIC; flags: bit 0 WAIT_ALL (default ANY);
+ * first_signaled (non-NULL, ANY mode) gets the first signaled index. */
+int pf7580_syncobj_wait(struct pf7580_dev *dev, const uint32_t *handles,
+			uint32_t count, int64_t timeout_ns, uint32_t flags,
+			uint32_t *first_signaled);
+
 /* CPU mapping helpers. Real backend: mmap() on the DRM fd at the fake
  * offset returned by MMAP_BO. Mock backend: malloc-backed shadow memory
  * of the same size. Either way the caller must pf7580_cpu_unmap() it.

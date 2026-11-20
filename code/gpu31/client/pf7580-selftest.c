@@ -462,6 +462,7 @@ static int run_submit_test(const char *path)
 	char err[256] = "";
 	uint64_t prod = 0, map_off = 0, gpu_off = 0;
 	uint32_t h = 0;
+	uint32_t out_sync = 0;
 	unsigned char *p;
 	struct pf7580_submit_args sa;
 	struct timespec now, t0, t1;
@@ -527,13 +528,30 @@ static int run_submit_test(const char *path)
 	}
 	printf("DESC: OK NULL job (type=1, 32 B) at gpu_offset=0x%" PRIx64
 	       "\n", gpu_off);
+	/* Job-completion proof via the job's OWN fence (out_sync), not the
+	 * vacuous WAIT_BO: the BO resv never carries the job fence (close-fix
+	 * 476b75d), so WAIT_BO on a fresh BO returns instantly whether or not
+	 * the GPU retired the job. The out_sync syncobj holds the sched_job
+	 * fence installed at submit (NULL only on the not-yet-dispatched leg). */
+	printf("SYNCOBJ-CREATE: creating out_sync...\n");
+	fflush(stdout);
+	rc = pf7580_syncobj_create(dev, 0, &out_sync);
+	printf("SYNCOBJ-CREATE: rc=%d (%s) handle=%u\n", rc,
+	       pf7580_strerror(rc), out_sync);
+	if (rc || !out_sync) {
+		printf("SUBMIT-TEST: FAILED (no out_sync; see dmesg)\n");
+		pf7580_cpu_unmap(dev, p, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
 	memset(&sa, 0, sizeof(sa));
 	sa.jc = gpu_off;
 	sa.bo_handles = &h;
 	sa.bo_handle_count = 1;
 	sa.requirements = 0;
+	sa.out_sync = out_sync;
 	printf("SUBMIT: issuing one NULL job (jc=0x%" PRIx64
-	       " req=0 slot=JS1)...\n", gpu_off);
+	       " req=0 slot=JS1 out_sync=%u)...\n", gpu_off, out_sync);
 	fflush(stdout);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	rc = pf7580_submit(dev, &sa);
@@ -544,46 +562,70 @@ static int run_submit_test(const char *path)
 	       pf7580_strerror(rc), elapsed_ms);
 	if (rc) {
 		printf("SUBMIT-TEST: FAILED (submit rejected; see dmesg)\n");
+		pf7580_syncobj_destroy(dev, out_sync);
 		pf7580_cpu_unmap(dev, p, 4096);
 		pf7580_close(dev);
 		return 1;
 	}
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
-		now.tv_nsec + 8000000000LL;
-	printf("WAIT_BO: waiting (+8s abs deadline %lld ns)...\n",
-	       (long long)deadline_ns);
+	/* Pre-poll on the job's own fence: pending (-ETIME) means the fence
+	 * is live and the job really dispatched. Already-0 means fast retire,
+	 * the NULL-install leg, or a skip — dmesg (run_job/IRQ trail) decides. */
+	printf("FENCE-PROBE: 0-timeout SYNCOBJ-WAIT on out_sync=%u (expect -ETIME=pending)...\n",
+	       out_sync);
 	fflush(stdout);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
-	rc = pf7580_wait_bo(dev, h, deadline_ns);
-	clock_gettime(CLOCK_MONOTONIC, &t1);
-	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
-		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
-	printf("WAIT_BO(+8s abs): rc=%d (%s) elapsed=%ld ms\n", rc,
-	       pf7580_strerror(rc), elapsed_ms);
-	if (rc) {
-		printf("SUBMIT-TEST: FAILED (wait failed; see dmesg)\n");
-		pf7580_cpu_unmap(dev, p, 4096);
-		pf7580_close(dev);
-		return 1;
-	}
-	/* Fence proof: a 0-timeout (past absolute stamp) poll must report
-	 * the fence still pending (-ETIME) if the job really dispatched
-	 * to HW. An immediately-signalled fence here would mean the wait
-	 * below proves nothing (fence faked/skipped). */
-	printf("FENCE-PROBE: 0-timeout poll (expect -ETIME=pending)...\n");
-	fflush(stdout);
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	deadline_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-	rc = pf7580_wait_bo(dev, h, deadline_ns);
+	rc = pf7580_syncobj_wait(dev, &out_sync, 1, 0, 0, NULL);
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
 		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
 	printf("FENCE-PROBE(0-timeout): rc=%d (%s) elapsed=%ld ms\n", rc,
 	       pf7580_strerror(rc), elapsed_ms);
 	if (!rc)
-		printf("FENCE-PROBE: fence already signalled (fast retire or skip; see dmesg)\n");
+		printf("FENCE-PROBE: already signalled (fast retire, NULL-install leg, or skip; see dmesg)\n");
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
+		now.tv_nsec + 8000000000LL;
+	printf("SYNCOBJ-WAIT: waiting out_sync=%u (+8s abs deadline %lld ns)...\n",
+	       out_sync, (long long)deadline_ns);
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_syncobj_wait(dev, &out_sync, 1, deadline_ns, 0, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("SYNCOBJ-WAIT(+8s abs): rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (rc) {
+		printf("SUBMIT-TEST: FAILED (job fence wait failed; bounded -ETIME means dark-GPU timeout, see dmesg)\n");
+		pf7580_syncobj_destroy(dev, out_sync);
+		pf7580_cpu_unmap(dev, p, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	printf("SYNCOBJ-DESTROY: handle=%u...\n", out_sync);
+	fflush(stdout);
+	rc = pf7580_syncobj_destroy(dev, out_sync);
+	printf("SYNCOBJ-DESTROY: rc=%d (%s)\n", rc, pf7580_strerror(rc));
+	out_sync = 0;
+	if (rc) {
+		printf("SUBMIT-TEST: FAILED (destroy failed; see dmesg)\n");
+		pf7580_cpu_unmap(dev, p, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	/* Legacy WAIT_BO leg kept for the resv record (informational: vacuous
+	 * on a fresh BO — empty resv returns instantly — so its rc proves
+	 * nothing about the job; SYNCOBJ-WAIT above is the proof). */
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
+		now.tv_nsec + 8000000000LL;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_wait_bo(dev, h, deadline_ns);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("WAIT_BO(+8s, informational, vacuous on fresh BO): rc=%d (%s) elapsed=%ld ms\n",
+	       rc, pf7580_strerror(rc), elapsed_ms);
 	rc = pf7580_cpu_unmap(dev, p, 4096);
 	if (rc)
 		printf("WARN cpu unmap: %s\n", pf7580_strerror(rc));
