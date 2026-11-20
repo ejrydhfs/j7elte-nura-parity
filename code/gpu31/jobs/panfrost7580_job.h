@@ -67,6 +67,13 @@ struct p7580_submit_job {
 	/* BO reservation set (file-private handles + resv pointers). */
 	uint32_t *bo_handles;
 	uint32_t bo_count;
+	/* Owned BO object pointers for the completion retire path
+	 * (F-JT2): SUBMIT stores one referenced pointer per handle
+	 * here (opaque void* so this header stays drm-free); the
+	 * driver's free_job walks them with p7580_gem_job_done_sync
+	 * and drops the refs before p7580_job_free releases the
+	 * array. NULL when the job references no BOs. */
+	void **bos;
 };
 
 /* Per-file submit context: one sched entity per slot. */

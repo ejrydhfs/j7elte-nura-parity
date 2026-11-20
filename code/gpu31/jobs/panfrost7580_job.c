@@ -468,6 +468,7 @@ void p7580_job_free(struct p7580_submit_job *job)
 		dma_fence_put((struct dma_fence *)job->done_fence); /* 0001 */
 		job->done_fence = NULL;
 	}
+	kfree(job->bos);
 	kfree(job->bo_handles);
 	kfree(job);
 }

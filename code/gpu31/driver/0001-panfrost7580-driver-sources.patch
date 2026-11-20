@@ -2714,7 +2714,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,785 @@
+@@ -0,0 +1,786 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -3185,6 +3185,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		dma_fence_put((struct dma_fence *)job->done_fence); /* 0001 */
 +		job->done_fence = NULL;
 +	}
++	kfree(job->bos);
 +	kfree(job->bo_handles);
 +	kfree(job);
 +}
@@ -3503,7 +3504,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,155 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3573,6 +3574,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	/* BO reservation set (file-private handles + resv pointers). */
 +	uint32_t *bo_handles;
 +	uint32_t bo_count;
++	/* Owned BO object pointers for the completion retire path
++	 * (F-JT2): SUBMIT stores one referenced pointer per handle
++	 * here (opaque void* so this header stays drm-free); the
++	 * driver's free_job walks them with p7580_gem_job_done_sync
++	 * and drops the refs before p7580_job_free releases the
++	 * array. NULL when the job references no BOs. */
++	void **bos;
 +};
 +
 +/* Per-file submit context: one sched entity per slot. */
@@ -5682,7 +5690,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,718 @@
+@@ -0,0 +1,788 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -5814,8 +5822,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	if (p7580_drv_pm_get(drv))
 +		return ERR_PTR(-EIO);
 +	{
-+		void *fence = p7580_job_run(&drv->jd, job);
++		void *fv = p7580_job_run(&drv->jd, job);
++		struct dma_fence *fence = (struct dma_fence *)fv;
 +
++		/* F-JT1: the SUBMIT-time install site sees NULL
++		 * (sched_job->fence only appears when the 0004 shim
++		 * assigns run_job's return). The real fence exists
++		 * here on the async worker: install it on the stashed
++		 * out_sync handle so SYNCOBJ-WAIT blocks until retire.
++		 * replace_fence takes its own ref; closed handles (or
++		 * no out_sync) skip silently — the job still runs. */
++		if (!IS_ERR(fence) && fence && job->out_sync) {
++			struct drm_syncobj *s =
++				drm_syncobj_find(&df->mgr, job->out_sync);
++
++			if (s) {
++				drm_syncobj_replace_fence(s, fence);
++				drm_syncobj_put(s);
++			}
++		}
 +		p7580_drv_pm_put(drv);
 +		return fence;
 +	}
@@ -5865,9 +5890,31 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	struct drm_sched_entity *ent = sched_job->entity;
 +	struct p7580_drv_file *df;
 +	struct p7580_drv *drv;
++	uint32_t i;
 +
 +	df = container_of(ent, struct p7580_drv_file, entity[0]);
 +	drv = df ? df->drv : NULL;
++	/* F-JT2: completion-side CPU-cache invalidate. free_job runs
++	 * on finish_work strictly after the fence signal (0004: cancel
++	 * timeout, put fence, THEN free_job), so every referenced BO
++	 * is post-GPU-write here. Walk the job's owned BO pointers
++	 * (referenced at SUBMIT, stored on job->bos) and retire each
++	 * HIGHMEM SHMEM page via p7580_gem_job_done_sync
++	 * (flush_dcache_page; CMA/dma-direct pages no-op inside),
++	 * then drop the job's refs. No MMIO, never sleeps, no
++	 * locks: safe beside the PM release below. */
++	if (job && job->bo_count && job->bos) {
++		for (i = 0; i < job->bo_count; i++) {
++			struct drm_gem_object *obj =
++				(struct drm_gem_object *)job->bos[i];
++
++			if (!obj)
++				continue;
++			p7580_gem_job_done_sync(obj);
++			drm_gem_object_unreference_unlocked(obj);
++			job->bos[i] = NULL;
++		}
++	}
 +	p7580_job_free(job);
 +	/* Balances p7580_drv_job_pm_arm() at queue time: the async
 +	 * leg is over (retired or run_job dispatch failure), drop
@@ -6230,10 +6277,38 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	job->requirements = args->requirements;
 +	job->as_nr = P7580_DRV_AS_NR;
 +	job->affinity = drv->jd.shader_present;
++	/* F-JT1 stash: SUBMIT-time sched_job->fence is still NULL, so
++	 * validate the handle now (-ENOENT preserved) and let the
++	 * async run_job install the real fence on this handle. */
++	if (args->out_sync) {
++		struct drm_syncobj *vs =
++			drm_syncobj_find(&df->mgr, args->out_sync);
++
++		if (!vs) {
++			p7580_job_free(job);
++			ret = -ENOENT;
++			goto err_objs;
++		}
++		drm_syncobj_put(vs);
++		job->out_sync = args->out_sync;
++	}
++	/* F-JT2 own: transfer one lookup ref per BO onto the job so
++	 * free_job can retire HIGHMEM SHMEM pages without a
++	 * file/handle lookup (stable across close; no locks). */
++	if (nr) {
++		job->bos = kcalloc(nr, sizeof(*job->bos), GFP_KERNEL);
++		if (!job->bos) {
++			p7580_job_free(job);
++			ret = -ENOMEM;
++			goto err_objs;
++		}
++		for (i = 0; i < nr; i++)
++			job->bos[i] = objs[i];
++	}
 +
 +	sched_job = drm_sched_job_alloc(entity, &p7580_drv_sched_ops, job);
 +	if (!sched_job) {
-+		kfree(job);
++		p7580_job_free(job);
 +		ret = -ENOMEM;
 +		goto err_objs;
 +	}
@@ -6246,8 +6321,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			if (ret) {
 +				drm_sched_job_cleanup(sched_job);
 +				kfree(sched_job);
-+				p7580_job_free(job);
-+				goto err_objs;
++				goto err_job_bos;
 +			}
 +		}
 +	}
@@ -6268,8 +6342,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			if (ret) {
 +				drm_sched_job_cleanup(sched_job);
 +				kfree(sched_job);
-+				p7580_job_free(job);
-+				goto err_objs;
++				goto err_job_bos;
 +			}
 +		}
 +	}
@@ -6286,8 +6359,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		p7580_drv_job_pm_release(drv);
 +		drm_sched_job_cleanup(sched_job);
 +		kfree(sched_job);
-+		p7580_job_free(job);
-+		goto err_objs;
++		goto err_job_bos;
 +	}
 +
 +	/* 4. out-sync install (takes its own ref; NULL-safe on empty). */
@@ -6312,21 +6384,27 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			goto err_out;
 +	}
 +
-+	/* Success: drop the lookup refs (bo_list + job hold theirs). */
++	/* Success: the job owns one ref per BO now (job->bos);
++	 * drop only the in-fence refs here. bo_list holds its own
++	 * refs from map_bo; free_job drops the job's refs after
++	 * the completion retire walk. */
 +	for (i = 0; i < nf; i++)
 +		dma_fence_put(inf[i]);
-+	for (i = 0; i < nr; i++)
-+		drm_gem_object_unreference_unlocked(objs[i]);
 +	return 0;
 +
 +err_out:
-+	/* Submitted but out-sync failed: the job still runs; report. */
++	/* Submitted but out-sync failed: the job still runs (and
++	 * still owns its BO refs); report. */
 +	for (i = 0; i < nf; i++)
 +		dma_fence_put(inf[i]);
-+	for (i = 0; i < nr; i++)
-+		drm_gem_object_unreference_unlocked(objs[i]);
 +	return ret;
 +
++err_job_bos:
++	/* Job owns one ref per BO (transferred at dispatch) but was
++	 * never published: p7580_job_free releases the pointer array
++	 * (canon, no unref — refs are still ours in objs[]). */
++	p7580_job_free(job);
++	job = NULL;
 +err_objs:
 +	for (i = 0; i < nr; i++)
 +		drm_gem_object_unreference_unlocked(objs[i]);
