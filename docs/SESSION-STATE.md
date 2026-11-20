@@ -122,6 +122,14 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Mesa drives the GPU; readback stale (2026-11-20, int17)
+- After the ABI fix (tolerate SYNC_FILE on syncobj handle_to_fd; cap ioctl copies), Mesa 20.3.5
+  submits real jobs: `p7580_sched: ioctl` x2, dispatched `jc=0x21c5480/0x21c5600/0x22ea480/0x22ea600`,
+  `panfrost7580-job` IRQ count 96, FPS 2867 -> 1407 (work is happening).
+- Remaining: `egltest` readback still all-zero -> GPU DMA writes not visible to CPU under
+  COHERENCY_NONE (completion hook only does flush_dcache_page on the kernel alias; arm64, no HIGHMEM).
+  Fix in progress (`gpu31-coherency.md`): proper dma_map/sync or dcache invalidate by vaddr.
+
 ## Completion IRQ works; Mesa ABI mismatch is the remaining blocker (int16)
 - int16: job goes to **slot 0**, `post-start js_status=0x8 (NO_EXCEPTION)`, IRQ fires
   (`irq-enter rawstat=0x1`), fence signals immediately (`panfrost7580-job` count increments).
