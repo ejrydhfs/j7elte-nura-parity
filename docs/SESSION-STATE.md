@@ -122,6 +122,14 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## GPU executes, writes not visible (2026-11-20, int18)
+- int18 has the coherency model (dma_map BIDIR at bind, sync_for_device at submit, sync_for_cpu at
+  free_job, unmap at unbind). Jobs still complete cleanly (`js_status=0`, fence signalled) and Mesa
+  submits many jobs (FPS 688), but both our WRITE_VALUE pattern test and `egltest` read zeros.
+- Split required: does the GPU write the physical page at all (descriptor encoding), or is only the
+  user alias stale? A kernel-side BO dump + descriptor re-derivation is in progress
+  (`gpu31-gpuwrite.md`).
+
 ## Mesa drives the GPU; readback stale (2026-11-20, int17)
 - After the ABI fix (tolerate SYNC_FILE on syncobj handle_to_fd; cap ioctl copies), Mesa 20.3.5
   submits real jobs: `p7580_sched: ioctl` x2, dispatched `jc=0x21c5480/0x21c5600/0x22ea480/0x22ea600`,
