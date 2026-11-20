@@ -1,63 +1,88 @@
-From 8d27fc94f2e6499d0e9b35e5bfd66b5167c8cf6 Mon Sep 17 00:00:00 2001
-From: G31_Kms <kms@gpu31>
-Date: Thu, 19 Nov 2026 06:40:00 +0000
-Subject: [PATCH] gpu31-kms: Mode B render-only minor on 3.10 DRM core
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: G31_RenderOnlyFix <render-only@gpu31>
+Date: Thu, 20 Nov 2026 04:00:00 +0000
+Subject: [PATCH] gpu31-kms: Mode B render-ONLY minor on 3.10 DRM core (no
+ card0)
 
 Mode B gives a DRM render node (renderD128) for unprivileged GPU clients
 (Mali/kbase shim now, panfrost later) while the DECON fbdev keeps the
-panel.  No KMS takeover: no compatible change, no DT/dts edit, no vendor
-fbdev off-switch, no fbdev-conflicting CRTC/encoder/connector claim.
-The render node is allocated from the existing 3.10 idr carve-out
-(drm_stub.c drm_minor_get_id: base 128, limit base+255, i.e. minors
-128..383); only the allocation call was missing, and the /dev/dri
-renderD%d sysfs naming (drm_sysfs.c) is already wired.  Permission gating
-uses EXISTING 3.10 bits only: DRM_AUTH|DRM_UNLOCKED on buffer ioctls; no
-new DRM_RENDER_ALLOW bit, no dispatcher ABI change for card0/controlD64
-paths.
+panel.  v1 of this patch ADDED renderD128 next to the primary minor; the
+int4 image proved that shape unshippable: drm_get_platform_dev allocated
+BOTH card0 and renderD128 for panfrost7580, and Xorg auto-probes card0
+and deadlocks in D state (blank screen, cursor dot).  This v2 makes the
+panfrost7580 device register as render-only: NO card minor at all
+(no /dev/dri/card0, no controlD node), only renderD128.  X's platform
+probe scans card nodes only, so it can never see this device; Xorg stays
+on fbdev exactly as on M1.
 
-Hunks (context verified byte-exact against shared-tree content via
-cat -A; tree itself untouched):
+Allocation point (vendor 3.10 stub, drivers/gpu/drm/drm_platform.c,
+drm_get_platform_dev): the legacy path unconditionally allocates the
+primary minor via drm_get_minor(dev, &dev->primary, DRM_MINOR_LEGACY)
+(pristine drm_platform.c:72), with controlD64 iff DRIVER_MODESET.  The
+render carve-out (drm_stub.c drm_minor_get_id: base 128, limit
+base+255, i.e. minors 128..383) was never allocated on the platform
+path; v1 added it unconditionally after primary.  v2 branches on the new
+DRIVER_RENDER_ONLY bit (0x8000, free on 3.10): when set, allocate ONLY
+dev->render via DRM_MINOR_RENDER BEFORE ->load() (unwind on err_g3), and
+skip primary/control, the legacy mode_group setup, and the primary-based
+DRM_INFO.  Render-only consumes no primary idr slot; the exynos/G2D card0
+(if present) keeps its legacy slot untouched.
 
-1. include/drm/drmP.h: add `struct drm_minor *render` holder + comment.
-   3.10's struct drm_device has only `primary`/`control`, so the minor
-   pointer must live somewhere.  This patch stores it on the device next
-   to the other two, allocated/released by the same platform helpers.
+Diff vs v1 (code/gpu31/kms/0001-*.patch): v1 allocated render IN ADDITION
+to primary (both nodes on one device).  v2 allocates render INSTEAD OF
+primary for DRIVER_RENDER_ONLY devices only; all other devices keep the
+byte-identical legacy path.  Kept from v1 unchanged in intent: the
+dev->render holder (include/drm/drmP.h), drm_stub.c put/unplug release,
+drm_fops.c render-always-authenticated, drm_drv.c render-MASTER deny.
+Hardened for the missing primary: stub teardown branches (no
+drm_put_minor(NULL), no dev->primary deref), platform unwind legs
+release exactly the minors allocated, DRM_INFO prints the render index
+on the render-only path.
+
+Hunks (context verified byte-exact against pristine-tree `cat -A`):
+
+1. include/drm/drmP.h: add DRIVER_RENDER_ONLY 0x8000 + `struct drm_minor
+*render` holder + comment.  3.10's struct drm_device has only
+`primary`/`control`, so the minor pointer must live somewhere; the
+device struct keeps the platform/stub unwind paths symmetric with
+primary/control (no exynos driver patch needed).
 
 2. drivers/gpu/drm/drm_platform.c (drm_get_platform_dev):
-   allocate DRM_MINOR_RENDER after primary, BEFORE ->load() so a failed
-   display bring-up unwinds the node too (new err_g4 releases render,
-   err_g3 primary, err_g2 control).
-
-   Integrator note: drm_get_pci_dev (drm_pci.c) and drm_get_usb_dev
-   (drm_usb.c) have the same shape (control, primary, load).  Only the
-   platform path is patched here because M1/M2 run on the exynos platform
-   device (exynos_drm_platform_probe -> drm_platform_init); pci/usb never
-   bind on this phone.  Mirror the same alloc + unwind there only if a
-   future x86/qemu bring-up needs it.
+DRIVER_RENDER_ONLY -> drm_get_minor(dev, &dev->render, DRM_MINOR_RENDER)
+only, BEFORE ->load(); legacy path untouched otherwise.  New unwind:
+err_g3 releases render / primary respectively, err_g2 releases control
+only on the non-render-only MODESET path.
 
 3. drivers/gpu/drm/drm_stub.c (drm_put_dev / drm_unplug_dev):
-   release/unplug ->render alongside primary/control (NULL-guarded; dev
-   is kzalloc'd so the field starts NULL and drm_get_minor NULLs it on
-   failure, so the guards only fire when a render minor exists).
+release/unplug ->render (NULL-guarded; dev is kzalloc'd so the field
+starts NULL and drm_get_minor NULLs it on failure) on render-only
+devices; legacy put/unplug of primary/control otherwise untouched
+(including the MODESET-gated control release, now also gated on
+!RENDER_ONLY).
 
-4. drivers/gpu/drm/drm_fops.c (drm_open_helper):
-   render opens are always authenticated, mirroring upstream render-node
-   semantics of that era (render client is authenticated, just never
-   master). Card0 behaviour is unchanged: non-root clients still
-   authenticate via the AUTH_MAGIC dance.
+4. drivers/gpu/drm/drm_fops.c (drm_open_helper): render opens are
+always authenticated, mirroring upstream render-node semantics of that
+era (render client is authenticated, just never master).  Card0
+behaviour is unchanged: non-root clients still authenticate via the
+AUTH_MAGIC dance.
 
 5. drivers/gpu/drm/drm_drv.c (drm_ioctl dispatcher): explicit deny of any
-   DRM_MASTER-flagged ioctl arriving on a render node, even from the
-   render-minor master.  This clause is REQUIRED: mastership is per-minor
-   (drm_open_helper creates minor->master on first open of EACH node), so
-   the first render opener becomes master of the render minor and would
-   pass the plain `DRM_MASTER && !is_master` test.  With this clause,
-   SETCRTC/SETPLANE/CURSOR/ATTACH/DETACH/SETPROPERTY/PAGE_FLIP/DIRTYFB/
-   OBJ_SETPROPERTY (all DRM_MASTER) return -EACCES on renderD128: render
-   cannot modeset, without any new flag.  The existing
-   `!CONTROL_ALLOW && type == CONTROL -> -EACCES` control-node gate is
-   untouched, and buffer/GEM/PRIME/read-only-KMS ioctls keep working from
-   the render node under their existing DRM_AUTH/DRM_ROOT_ONLY bits.
+DRM_MASTER-flagged ioctl arriving on a render node, even from the
+render-minor master.  This clause is REQUIRED: mastership is per-minor
+(drm_open_helper creates minor->master on first open of EACH node), so
+the first render opener becomes master of the render minor and would
+pass the plain `DRM_MASTER && !is_master` test.  With this clause,
+SETCRTC/SETPLANE/CURSOR/ATTACH/DETACH/SETPROPERTY/PAGE_FLIP/DIRTYFB/
+OBJ_SETPROPERTY (all DRM_MASTER) return -EACCES on renderD128: render
+cannot modeset, without any new flag.  The existing
+`!CONTROL_ALLOW && type == CONTROL -> -EACCES` control-node gate is
+untouched, and buffer/GEM/PRIME/read-only-KMS ioctls keep working from
+the render node under their existing DRM_AUTH/DRM_ROOT_ONLY bits.
+
+Driver companion (code/gpu31/driver/0001-*.patch): panfrost7580 sets
+`.driver_features = DRIVER_GEM | DRIVER_PRIME | DRIVER_RENDER_ONLY`
+(no DRIVER_MODESET as before).  No other driver change is needed: the
+core branches on the bit; the driver never touches dev->primary.
 
 fbdev non-conflict statement:
 - No DT change: this patch matches no `samsung,exynos7580-decon-drm`,
@@ -73,138 +98,65 @@ fbdev non-conflict statement:
   PLUS the DT compatible flip PLUS the vendor-fbdev Kconfig off-switches,
   applied together.  None of that is in this patch.
 
+X-probe rationale (why card0 must not exist): Xorg's platform probe
+enumerates /dev/dri/cardN only (never renderD128); with a panfrost card0
+present it binds the modesetting driver, issues modeset ioctls against a
+node with no CRTC/encoder/connector, and wedges in D state.  With no card
+node for panfrost7580 at all, the probe finds only the exynos/G2D card0
+(M1 shape) or nothing, and Xorg falls back to the fbdev driver pinned by
+j7elte-gpu-soft/10-fbdev.conf -- the proven M1 UI path.
+
+Boot-path render-node audit: nothing in the boot path opens the render
+node.  Xorg is pinned to fbdev (`Driver "fbdev"`, `/dev/fb0`) and never
+touches /dev/dri/renderD128; no udev rule, init script, or userspace
+component in-tree references renderD128 (only probe/selftest tools open
+it explicitly, off-boot).  The node idles unopened until the first GPU
+client (Mesa/kbase-shim/selftest) opens it.
+
 Verification (host-side only; no build/flash in shared tree per slice rules):
-- `patch -p1 --dry-run` clean on scratch copies of the 5 files (run
-  2026-11-19); integrator re-runs `git apply --check` at build time.
+- `git apply --check` clean on pristine-tree copies of the 5 files
+  (integrator re-runs at build time).
 - Per-file `gcc -fsyntax-only` AND real `-c` object compile with the
-  recorded kbuild flags vs actual 3.10.108 headers (run 2026-11-19;
-  results in docs/reports/gpu31-kms.md).
-- On-device (post-M1-flash, M1Verify-owned): `ls /dev/dri` shows
-  card0 controlD64 renderD128; unprivileged PRIME HANDLE_TO_FD + GEM map
-  works while a modeset client holds card0 master; SETCRTC from the render
-  fd returns -EACCES.  (Device UP on kernel #35, /dev/dri absent
-  pre-M1-flash, verified live 2026-11-19 via locked SSH.)
+  recorded kbuild flags vs actual 3.10.108 headers: all 4 patched `.c`
+  files pass with zero warnings (drmP.h is covered through inclusion).
+- apply-check + compile evidence recorded in
+  docs/reports/gpu31-render-only.md.
+- On-device (post-int5-build, M1Verify-owned): `ls /dev/dri` shows
+  renderD128 and NO card0 from panfrost; fbdev X stays 720x1280;
+  unprivileged PRIME HANDLE_TO_FD + GEM map works from the render fd;
+  SETCRTC from the render fd returns -EACCES.
 
 ---
  drivers/gpu/drm/drm_drv.c      |  5 +++++
  drivers/gpu/drm/drm_fops.c     |  9 +++++++++
- drivers/gpu/drm/drm_platform.c | 17 +++++++++++++++--
- drivers/gpu/drm/drm_stub.c     |  5 +++++
- include/drm/drmP.h             |  3 +++
- 5 files changed, 37 insertions(+), 2 deletions(-)
+ drivers/gpu/drm/drm_platform.c | 49 ++++++++++++++++++++++++++++++++++++----
+ drivers/gpu/drm/drm_stub.c     | 18 ++++++++++++---
+ include/drm/drmP.h             | 11 +++++++++++
+ 5 files changed, 95 insertions(+), 13 deletions(-)
 
-diff --git a/include/drm/drmP.h b/include/drm/drmP.h
-index 1111111..2222222 100644
---- a/include/drm/drmP.h
-+++ b/include/drm/drmP.h
-@@ -1205,8 +1205,11 @@ struct drm_device {
- 	struct drm_driver *driver;
- 	struct drm_local_map *agp_buffer_map;
- 	unsigned int agp_buffer_token;
- 	struct drm_minor *control;		/**< Control node for card */
- 	struct drm_minor *primary;		/**< render type primary screen head */
-+	struct drm_minor *render;		/**< Render node (Mode B): GEM/PRIME/
-+						 * unprivileged GPU clients; no modeset,
-+						 * never owns the display pipe. */
- 
-         struct drm_mode_config mode_config;	/**< Current mode config */
- 
-diff --git a/drivers/gpu/drm/drm_platform.c b/drivers/gpu/drm/drm_platform.c
-index 1111111..2222222 100644
---- a/drivers/gpu/drm/drm_platform.c
-+++ b/drivers/gpu/drm/drm_platform.c
-@@ -72,33 +72,46 @@ int drm_get_platform_dev(struct platform_device *platdev,
- 	ret = drm_get_minor(dev, &dev->primary, DRM_MINOR_LEGACY);
- 	if (ret)
- 		goto err_g2;
-+
-+	/*
-+	 * Mode B render node: allocate from the existing 3.10 render idr
-+	 * carve-out (drm_minor_get_id: base 128, limit base+255, i.e.
-+	 * minors 128..383 -> /dev/dri/renderD128). BEFORE ->load() so a
-+	 * failed display bring-up unwinds the node too; err paths below
-+	 * release exactly the minors already allocated.
-+	 */
-+	ret = drm_get_minor(dev, &dev->render, DRM_MINOR_RENDER);
-+	if (ret)
-+		goto err_g3;
- 
- 	if (dev->driver->load) {
- 		ret = dev->driver->load(dev, 0);
- 		if (ret)
--			goto err_g3;
-+			goto err_g4;
- 	}
- 
- 	/* setup the grouping for the legacy output */
- 	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
- 		ret = drm_mode_group_init_legacy_group(dev,
- 				&dev->primary->mode_group);
- 		if (ret)
--			goto err_g3;
-+			goto err_g4;
- 	}
- 
- 	list_add_tail(&dev->driver_item, &driver->device_list);
- 
- 	mutex_unlock(&drm_global_mutex);
- 
- 	DRM_INFO("Initialized %s %d.%d.%d %s on minor %d\n",
- 		 driver->name, driver->major, driver->minor, driver->patchlevel,
- 		 driver->date, dev->primary->index);
- 
- 	return 0;
-+err_g4:
-+	drm_put_minor(&dev->render);
- 
- err_g3:
- 	drm_put_minor(&dev->primary);
- err_g2:
- 	if (drm_core_check_feature(dev, DRIVER_MODESET))
- 		drm_put_minor(&dev->control);
-diff --git a/drivers/gpu/drm/drm_stub.c b/drivers/gpu/drm/drm_stub.c
-index 1111111..2222222 100644
---- a/drivers/gpu/drm/drm_stub.c
-+++ b/drivers/gpu/drm/drm_stub.c
-@@ -479,21 +479,26 @@ void drm_put_dev(struct drm_device *dev)
- 	if (drm_core_check_feature(dev, DRIVER_MODESET))
- 		drm_put_minor(&dev->control);
- 
-+	if (dev->render)
-+		drm_put_minor(&dev->render);
-+
- 	if (driver->driver_features & DRIVER_GEM)
- 		drm_gem_destroy(dev);
- 
- 	drm_put_minor(&dev->primary);
- 
- 	list_del(&dev->driver_item);
- 	kfree(dev->devname);
- 	kfree(dev);
- }
- EXPORT_SYMBOL(drm_put_dev);
- 
- void drm_unplug_dev(struct drm_device *dev)
- {
- 	/* for a USB device */
- 	if (drm_core_check_feature(dev, DRIVER_MODESET))
- 		drm_unplug_minor(dev->control);
-+	if (dev->render)
-+		drm_unplug_minor(dev->render);
- 	drm_unplug_minor(dev->primary);
- 
-diff --git a/drivers/gpu/drm/drm_fops.c b/drivers/gpu/drm/drm_fops.c
-index 1111111..2222222 100644
+--- a/drivers/gpu/drm/drm_drv.c
++++ b/drivers/gpu/drm/drm_drv.c
+@@ -436,6 +436,11 @@
+ 	} else if (((ioctl->flags & DRM_ROOT_ONLY) && !capable(CAP_SYS_ADMIN)) ||
+ 		   ((ioctl->flags & DRM_AUTH) && !file_priv->authenticated) ||
+ 		   ((ioctl->flags & DRM_MASTER) && !file_priv->is_master) ||
++		   /* Render-only: a render node can never be modeset master,
++		    * not even the first opener (per-minor master would
++		    * otherwise pass the DRM_MASTER test above). */
++		   ((file_priv->minor->type == DRM_MINOR_RENDER) &&
++		    (ioctl->flags & DRM_MASTER)) ||
+ 		   (!(ioctl->flags & DRM_CONTROL_ALLOW) && (file_priv->minor->type == DRM_MINOR_CONTROL))) {
+ 		retcode = -EACCES;
+ 	} else {
 --- a/drivers/gpu/drm/drm_fops.c
 +++ b/drivers/gpu/drm/drm_fops.c
-@@ -273,10 +273,19 @@ static int drm_open_helper(struct inode *inode, struct file *filp,
- 	priv->minor = idr_find(&drm_minors_idr, minor_id);
+@@ -274,6 +274,15 @@
  	priv->ioctl_count = 0;
  	/* for compatibility root is always authenticated */
  	priv->authenticated = capable(CAP_SYS_ADMIN);
 +	/*
-+	 * Mode B: a render node has no privileged modeset state behind it,
-+	 * so the opener is authenticated from the start (upstream render
++	 * Render-only: a render node has no privileged modeset state behind
++	 * it, so the opener is authenticated from the start (upstream render
 +	 * semantics of the era: authenticated, just never master). Card0
 +	 * behaviour is unchanged: non-root clients still authenticate via
 +	 * the AUTH_MAGIC dance.
@@ -214,28 +166,160 @@ index 1111111..2222222 100644
  	priv->lock_count = 0;
  
  	INIT_LIST_HEAD(&priv->lhead);
- 	INIT_LIST_HEAD(&priv->fbs);
- 	mutex_init(&priv->fbs_lock);
- 	INIT_LIST_HEAD(&priv->event_list);
-diff --git a/drivers/gpu/drm/drm_drv.c b/drivers/gpu/drm/drm_drv.c
-index 1111111..2222222 100644
---- a/drivers/gpu/drm/drm_drv.c
-+++ b/drivers/gpu/drm/drm_drv.c
-@@ -433,10 +433,15 @@ long drm_ioctl(struct file *filp,
- 	if (!func) {
- 		DRM_DEBUG("no function\n");
- 		retcode = -EINVAL;
- 	} else if (((ioctl->flags & DRM_ROOT_ONLY) && !capable(CAP_SYS_ADMIN)) ||
- 		   ((ioctl->flags & DRM_AUTH) && !file_priv->authenticated) ||
- 		   ((ioctl->flags & DRM_MASTER) && !file_priv->is_master) ||
-+		   /* Mode B: a render node can never be modeset master, not
-+		    * even the first opener (per-minor master would otherwise
-+		    * pass the DRM_MASTER test above). */
-+		   ((file_priv->minor->type == DRM_MINOR_RENDER) &&
-+		    (ioctl->flags & DRM_MASTER)) ||
- 		   (!(ioctl->flags & DRM_CONTROL_ALLOW) && (file_priv->minor->type == DRM_MINOR_CONTROL))) {
- 		retcode = -EACCES;
- 	} else {
- 		if (cmd & (IOC_IN | IOC_OUT)) {
+--- a/drivers/gpu/drm/drm_platform.c
++++ b/drivers/gpu/drm/drm_platform.c
+@@ -63,15 +63,30 @@
+ 		goto err_g1;
+ 	}
+ 
+-	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
+-		ret = drm_get_minor(dev, &dev->control, DRM_MINOR_CONTROL);
++	/* Mode B render-only (panfrost7580, DRIVER_RENDER_ONLY): allocate
++	 * ONLY the render minor (DRM_MINOR_RENDER, idr carve-out base 128
++	 * -> /dev/dri/renderD128 via the already-wired drm_sysfs.c
++	 * renderD%d naming). No primary (/dev/dri/cardN) and no control
++	 * node, so the X platform probe (which scans cardN only) can never
++	 * see this device -- Xorg stays on fbdev. BEFORE ->load() so a
++	 * failed bring-up unwinds the node too. Non-render-only devices
++	 * keep the exact legacy path (control iff MODESET, then primary). */
++	if (drm_core_check_feature(dev, DRIVER_RENDER_ONLY)) {
++		ret = drm_get_minor(dev, &dev->render, DRM_MINOR_RENDER);
+ 		if (ret)
+ 			goto err_g1;
+-	}
++	} else {
++		if (drm_core_check_feature(dev, DRIVER_MODESET)) {
++			ret = drm_get_minor(dev, &dev->control,
++					    DRM_MINOR_CONTROL);
++			if (ret)
++				goto err_g1;
++		}
+ 
+-	ret = drm_get_minor(dev, &dev->primary, DRM_MINOR_LEGACY);
+-	if (ret)
+-		goto err_g2;
++		ret = drm_get_minor(dev, &dev->primary, DRM_MINOR_LEGACY);
++		if (ret)
++			goto err_g2;
++	}
+ 
+ 	if (dev->driver->load) {
+ 		ret = dev->driver->load(dev, 0);
+@@ -80,7 +95,8 @@
+ 	}
+ 
+ 	/* setup the grouping for the legacy output */
+-	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
++	if (drm_core_check_feature(dev, DRIVER_MODESET) &&
++	    !drm_core_check_feature(dev, DRIVER_RENDER_ONLY)) {
+ 		ret = drm_mode_group_init_legacy_group(dev,
+ 				&dev->primary->mode_group);
+ 		if (ret)
+@@ -91,16 +107,27 @@
+ 
+ 	mutex_unlock(&drm_global_mutex);
+ 
+-	DRM_INFO("Initialized %s %d.%d.%d %s on minor %d\n",
+-		 driver->name, driver->major, driver->minor, driver->patchlevel,
+-		 driver->date, dev->primary->index);
++	if (drm_core_check_feature(dev, DRIVER_RENDER_ONLY))
++		DRM_INFO("Initialized %s %d.%d.%d %s on minor %d (render-only)\n",
++			 driver->name, driver->major, driver->minor,
++			 driver->patchlevel, driver->date,
++			 dev->render->index);
++	else
++		DRM_INFO("Initialized %s %d.%d.%d %s on minor %d\n",
++			 driver->name, driver->major, driver->minor,
++			 driver->patchlevel, driver->date,
++			 dev->primary->index);
+ 
+ 	return 0;
+ 
+ err_g3:
+-	drm_put_minor(&dev->primary);
++	if (drm_core_check_feature(dev, DRIVER_RENDER_ONLY))
++		drm_put_minor(&dev->render);
++	else
++		drm_put_minor(&dev->primary);
+ err_g2:
+-	if (drm_core_check_feature(dev, DRIVER_MODESET))
++	if (drm_core_check_feature(dev, DRIVER_MODESET) &&
++	    !drm_core_check_feature(dev, DRIVER_RENDER_ONLY))
+ 		drm_put_minor(&dev->control);
+ err_g1:
+ 	kfree(dev);
+--- a/drivers/gpu/drm/drm_stub.c
++++ b/drivers/gpu/drm/drm_stub.c
+@@ -476,13 +476,23 @@
+ 
+ 	drm_ctxbitmap_cleanup(dev);
+ 
+-	if (drm_core_check_feature(dev, DRIVER_MODESET))
++	if (drm_core_check_feature(dev, DRIVER_MODESET) &&
++	    !drm_core_check_feature(dev, DRIVER_RENDER_ONLY))
+ 		drm_put_minor(&dev->control);
+ 
+ 	if (driver->driver_features & DRIVER_GEM)
+ 		drm_gem_destroy(dev);
+ 
+-	drm_put_minor(&dev->primary);
++	/* Render-only devices never allocated a primary/control minor:
++	 * release the render node instead. Non-render-only devices keep
++	 * the legacy path. (dev is kzalloc'd so dev->render starts NULL;
++	 * the NULL guard covers the hypothetical pre-alloc failure.) */
++	if (drm_core_check_feature(dev, DRIVER_RENDER_ONLY)) {
++		if (dev->render)
++			drm_put_minor(&dev->render);
++	} else {
++		drm_put_minor(&dev->primary);
++	}
+ 
+ 	list_del(&dev->driver_item);
+ 	kfree(dev->devname);
+@@ -493,9 +503,15 @@
+ void drm_unplug_dev(struct drm_device *dev)
+ {
+ 	/* for a USB device */
+-	if (drm_core_check_feature(dev, DRIVER_MODESET))
++	if (drm_core_check_feature(dev, DRIVER_MODESET) &&
++	    !drm_core_check_feature(dev, DRIVER_RENDER_ONLY))
+ 		drm_unplug_minor(dev->control);
+-	drm_unplug_minor(dev->primary);
++	if (drm_core_check_feature(dev, DRIVER_RENDER_ONLY)) {
++		if (dev->render)
++			drm_unplug_minor(dev->render);
++	} else {
++		drm_unplug_minor(dev->primary);
++	}
+ 
+ 	mutex_lock(&drm_global_mutex);
+ 
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -156,6 +156,11 @@
+ #define DRIVER_GEM         0x1000
+ #define DRIVER_MODESET     0x2000
+ #define DRIVER_PRIME       0x4000
++/* Render-only device: no primary or control minor, only the render node.
++ * Checked by drm_get_platform_dev (this patch) and the panfrost7580
++ * platform driver (sets the bit). 0x8000 is free on 3.10 (no other
++ * DRIVER_* bit uses it; verified against pristine drmP.h). */
++#define DRIVER_RENDER_ONLY 0x8000
+ 
+ #define DRIVER_BUS_PCI 0x1
+ #define DRIVER_BUS_PLATFORM 0x2
+@@ -1207,6 +1212,12 @@
+ 	unsigned int agp_buffer_token;
+ 	struct drm_minor *control;		/**< Control node for card */
+ 	struct drm_minor *primary;		/**< render type primary screen head */
++	struct drm_minor *render;		/**< Render node (Mode B render-only):
++						 * GEM/PRIME/unprivileged GPU clients;
++						 * no modeset, never owns the display
++						 * pipe. Allocated by
++						 * drm_get_platform_dev when
++						 * DRIVER_RENDER_ONLY is set. */
+ 
+         struct drm_mode_config mode_config;	/**< Current mode config */
+ 
 -- 
 2.34.1

@@ -2584,9 +2584,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 + *   clocks fin_pll/fout_g3d_pll/aclk_g3d/mout_g3d/dout_aclk_g3d/
 + *   aclk_g3d_400, samsung,power-domain = <&pd_g3d> (0x60, genpd-owned).
 + *
-+ * Registers a DRM device with NO modeset (no DRIVER_MODESET): the 3.10
-+ * core allocates the primary minor; the Mode-B core patch (G31_Kms)
-+ * additionally allocates renderD128 on the same device. No CRTC/
++ * Registers a DRM device with NO modeset (no DRIVER_MODESET) and no
++ * primary minor (DRIVER_RENDER_ONLY): with the Mode-B render-only core
++ * patch (G31_Kms) the same attach allocates ONLY renderD128, no
++ * /dev/dri/cardN at all, so the X platform probe can never see this
++ * device. No CRTC/
 + * encoder/connector, no fbdev conflicts; vendor DECON keeps the panel.
 + *
 + * Six v5.2 ioctls (byte-identical UAPI, panfrost_drm.h): SUBMIT 0x00,
@@ -2819,7 +2821,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +};
 +
 +static struct drm_driver p7580_drm_driver = {
-+	.driver_features = DRIVER_GEM | DRIVER_PRIME,
++	.driver_features = DRIVER_GEM | DRIVER_PRIME | DRIVER_RENDER_ONLY,
 +	.load = p7580_drv_load,
 +	.unload = p7580_drv_unload,
 +	.open = p7580_drv_open,
@@ -4521,9 +4523,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + *   dout_aclk_g3d, aclk_g3d_400), power-domain <&pd_g3d> (0x60).
 + *
 + * Registers one DRM device with NO modeset (driver_features has no
-+ * DRIVER_MODESET) so the 3.10 core allocates only the primary minor;
-+ * with the Mode-B core patch (G31_Kms) the same attach also yields
-+ * renderD128 while /dev/fb0 + fbdev X stay untouched.
++ * DRIVER_MODESET) and DRIVER_RENDER_ONLY set, so the 3.10 core
++ * allocates ONLY the render minor (no primary, no controlD); no
++ * /dev/dri/cardN appears and /dev/fb0 + fbdev X stay untouched.
 + *
 + * Six v5.2 ioctls (0x00 SUBMIT, 0x01 WAIT_BO, 0x02 CREATE_BO,
 + * 0x03 MMAP_BO, 0x04 GET_PARAM, 0x05 GET_BO_OFFSET), byte-identical to
