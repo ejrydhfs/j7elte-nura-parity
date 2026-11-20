@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-19 10:48:44.303866714 -0500
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,98 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -23,6 +23,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +#ifndef PANFROST7580_DRV_H
 +#define PANFROST7580_DRV_H
 +
++#include <linux/atomic.h>
 +#include <linux/mutex.h>
 +#include <linux/list.h>
 +#include <drm_syncobj.h>		/* 0003 */
@@ -57,6 +58,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +	struct pf7580_dvfs *dvfs;	/* devfreq (may be NULL) */
 +	struct mutex bo_lock;		/* serialises bo_list */
 +	struct list_head bo_list;
++	atomic_t pm_ref;		/* live-job runtime-PM refs (see submit.c) */
 +};
 +
 +/* Per-file state. Leading layout mirrors GEM's struct p7580_file_priv
@@ -84,6 +86,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +int p7580_drv_submit(struct p7580_drv *drv, struct drm_device *dev,
 +		     struct drm_file *file_priv,
 +		     const struct p7580_submit *args);
++
++/* Power-guard helpers (submit.c). p7580_drv_pm_get takes one
++ * runtime-PM ref for MMU/register access and fails closed (no MMIO
++ * after a failed get); p7580_drv_pm_put drops it. Live-job refs:
++ * armed at queue time, released in free_job, so the block cannot
++ * autosuspend between the ioctl and the async run_job worker. */
++int p7580_drv_pm_get(struct p7580_drv *drv);
++void p7580_drv_pm_put(struct p7580_drv *drv);
 +
 +/* MMU/GPU IRQ demux (main.c). */
 +irqreturn_t p7580_drv_mmu_irq(int irq, void *arg);
@@ -2707,7 +2717,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-19 10:48:44.321260351 -0500
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,644 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -2731,9 +2741,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 + * WAIT_BO 0x01, CREATE_BO 0x02, MMAP_BO 0x03, GET_PARAM 0x04,
 + * GET_BO_OFFSET 0x05.
 + *
-+ * Probe order: mem -> present regs -> GEM init -> MMU alloc+program ->
-+ * job slots -> power -> devfreq -> IRQs -> DRM attach. Remove unwinds
-+ * in reverse. No DT edits, no sysmmu, no display-driver changes.
++ * Probe order: mem -> ioremap -> power (first power-on) -> present-reg
++ * read -> GEM init -> MMU alloc + program_as under PM ref -> job slots
++ * -> devfreq -> IRQs -> DRM attach. No register is touched before the
++ * power domain/clocks are up (F-SUB1); remove runs the reverse under a
++ * PM ref (cores idle-checked, IRQs masked first). No DT edits, no
++ * sysmmu, no display-driver changes.
 + */
 +
 +#include <linux/device.h>
@@ -2998,6 +3011,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	if (!ddev)
 +		return 0;
 +	drv = ddev->dev_private;
++	/* Do not gate the clocks while a job owns the block: run_job /
++	 * recover touch HEAD/START/RESET registers asynchronously, and
++	 * every live job holds its own PM ref — but a stray extra
++	 * suspend (autosuspend racing queue, teardown ordering) must
++	 * still refuse rather than darken the block under MMIO.
++	 * -EBUSY tells the PM core to retry after the job retires
++	 * (its free_job put lets the next suspend succeed). */
++	if (drv && !p7580_job_is_idle(&drv->jd))
++		return -EBUSY;
 +	if (drv && drv->dvfs)
 +		pf7580_dvfs_suspend(drv->dvfs);
 +	if (drv && drv->power)
@@ -3129,25 +3151,46 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	if (drv->irq_job < 0 || drv->irq_mmu < 0 || drv->irq_gpu < 0)
 +		return -ENODEV;
 +
-+	/* Present bits before anything programs slots. */
-+	js_present = readl(regs + P7580_GPU_JS_PRESENT) & 0x7u;
-+	shader_present = readl(regs + P7580_GPU_SHADER_PRESENT_LO);
-+	if (!js_present)
-+		return -ENODEV;
-+
-+	/* GEM allocator (IOVA window). */
-+	ret = p7580_dev_init(&drv->gd, &pdev->dev);
++	/* Power FIRST (F-SUB1): no register below is touched before the
++	 * domain/clocks are up. pf7580_power_probe runs the stock
++	 * sequence (clk_get x6 -> regulator -> autosuspend 50 ms ->
++	 * get_sync [genpd + SOFT_RESET + cores L2->shader->tiler] ->
++	 * put_autosuspend) and leaves the block powered on return. */
++	ret = pf7580_power_probe(&pdev->dev, regs, &drv->power);
 +	if (ret)
 +		return ret;
++	/* Keep the block awake for the rest of probe (present-reg read,
++	 * program_as, job_dev_init below are all MMIO). Balanced at the
++	 * end of probe (or on any error leg after this point). */
++	ret = pm_runtime_get_sync(&pdev->dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(&pdev->dev);
++		goto err_power;
++	}
++	atomic_set(&drv->pm_ref, 0);
 +
-+	/* One GPU address space, programmed now. */
++	/* Present bits (MMIO: powered by the get above). */
++	js_present = readl(regs + P7580_GPU_JS_PRESENT);
++	shader_present = readl(regs + P7580_GPU_SHADER_PRESENT_LO);
++	js_present &= 0x7u;
++	if (!js_present) {
++		ret = -ENODEV;
++		goto err_pm;
++	}
++
++	/* GEM allocator (IOVA window; no MMIO). */
++	ret = p7580_dev_init(&drv->gd, &pdev->dev);
++	if (ret)
++		goto err_pm;
++
++	/* One GPU address space, programmed now (MMIO: powered). */
 +	ret = p7580_mmu_alloc(&pdev->dev, &drv->mmu);
 +	if (ret)
 +		goto err_gem;
 +	p7580_mmu_program_as(regs, P7580_DRV_AS_NR, drv->mmu.root_dma,
 +			     P7580_MEMATTR_KBASE_LO, P7580_MEMATTR_KBASE_HI);
 +
-+	/* Job slots. */
++	/* Job slots (JOB_INT_CLEAR/MASK writes: powered). */
 +	ret = p7580_job_dev_init(&drv->jd, regs, js_present,
 +				 ((u64)0 << 32) | shader_present);
 +	if (ret)
@@ -3157,11 +3200,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	 * mutex. Failure here is non-fatal: the first open retries
 +	 * via p7580_drv_sched_ensure inside file_init. */
 +	ret = p7580_drv_sched_ensure();
-+	if (ret)
-+		goto err_mmu;
-+
-+	/* Power (clocks/regulator/runtime PM + first power-on). */
-+	ret = pf7580_power_probe(&pdev->dev, regs, &drv->power);
 +	if (ret)
 +		goto err_mmu;
 +
@@ -3208,6 +3246,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +		platform_set_drvdata(pdev, ddev);
 +	}
 +
++	/* Probe MMIO is done (IRQs installed, no register touched after
++	 * this): release the probe power hold; the block idle-suspends
++	 * after PF7580_AUTOSUSPEND_MS. Later MMIO re-takes it per-path. */
++	pm_runtime_mark_last_busy(&pdev->dev);
++	pm_runtime_put_autosuspend(&pdev->dev);
 +	return 0;
 +
 +err_dvfs:
@@ -3215,14 +3258,23 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +		pf7580_dvfs_fini(drv->dvfs);
 +		drv->dvfs = NULL;
 +	}
-+	if (drv->power) {
-+		pf7580_power_remove(drv->power);
-+		drv->power = NULL;
-+	}
 +err_mmu:
 +	p7580_mmu_free(&drv->mmu);
 +err_gem:
 +	p7580_dev_fini(&drv->gd);
++err_pm:
++	/* Balance the probe power hold (get_sync after power_probe);
++	 * the block may then idle-suspend before power_remove below. */
++	pm_runtime_mark_last_busy(&pdev->dev);
++	pm_runtime_put_autosuspend(&pdev->dev);
++err_power:
++	/* power_remove force-resumes, suspends synchronously, and
++	 * disables runtime PM: the single teardown for every leg
++	 * after power_probe (probe-failure or remove path shape). */
++	if (drv->power) {
++		pf7580_power_remove(drv->power);
++		drv->power = NULL;
++	}
 +	return ret;
 +}
 +
@@ -3238,6 +3290,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +		drv = NULL;
 +
 +	if (drv) {
++		int pm_held = 0;
++
++		/* Mask the slot IRQs first: no new DONE/ERR demux (MMIO
++		 * read/CLEAR) can run while we tear the tables down. */
++		p7580_job_dev_fini(&drv->jd);
++		/* Hold the block awake for the invalidate() MMIO below.
++		 * If the resume fails the block is already dark; skip
++		 * the invalidates (table memory is still freed) rather
++		 * than hanging the bus on a dead domain. */
++		if (p7580_drv_pm_get(drv) == 0)
++			pm_held = 1;
++		else
++			dev_warn(drv->dev,
++				 "panfrost7580: remove with GPU dark;"
++				 " skipping TLB invalidate\n");
 +		/* Unmap every bound BO before freeing the tables. */
 +		mutex_lock(&drv->bo_lock);
 +		list_for_each_entry_safe(e, tmp, &drv->bo_list, node) {
@@ -3248,14 +3315,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +			for (i = 0; i < npages; i++)
 +				p7580_mmu_unmap(&drv->mmu, bo->iova +
 +						((u64)i << PAGE_SHIFT));
-+			p7580_mmu_invalidate(drv->regs, P7580_DRV_AS_NR,
-+					     bo->iova >> PAGE_SHIFT,
-+					     npages, 1);
++			if (pm_held)
++				p7580_mmu_invalidate(drv->regs,
++						     P7580_DRV_AS_NR,
++						     bo->iova >> PAGE_SHIFT,
++						     npages, 1);
 +			list_del(&e->node);
 +			drm_gem_object_unreference(e->obj);
 +			kfree(e);
 +		}
 +		mutex_unlock(&drv->bo_lock);
++		if (pm_held)
++			p7580_drv_pm_put(drv);
 +
 +		if (drv->dvfs) {
 +			pf7580_dvfs_fini(drv->dvfs);
@@ -4653,7 +4724,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,515 @@
+@@ -0,0 +1,623 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -4736,6 +4807,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + *     excl fences) + submit; out-sync install (0003 replace_fence).
 + * Errors drop every taken ref and release every taken lock; the
 + * caller (ioctl) never touches userspace here.
++ *
++ * Power contract (F-SUB1): the caller (the SUBMIT ioctl override below)
++ * holds one runtime-PM ref across this call for the synchronous
++ * MMU-map + sched-queue leg. The async leg is covered separately: one
++ * extra live-job ref is armed just before drm_sched_job_submit and
++ * released in p7580_drv_free_job after the job retires, so the block
++ * cannot autosuspend between the ioctl return and the run_job worker
++ * (or the timeout/recover path) touching HEAD/START/RESET registers.
++ * p7580_drv_pm_put is only ever called for a ref this file took via
++ * p7580_drv_pm_get (never balances someone else's get).
 + */
 +
 +/* Scheduler backend ops for the 0004 shim. The sched job owner IS
@@ -4758,8 +4839,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS)
 +		return ERR_PTR(-EINVAL);
 +	job->slot = slot;
-+	drv = df->drv;
-+	return p7580_job_run(&drv->jd, job);
++	drv = (df && df->drv) ? df->drv : NULL;
++	if (!drv)
++		return ERR_PTR(-ENODEV);
++	/* Async worker context (0004 wq): the ioctl's synchronous PM
++	 * ref is long gone (returned) and the live-job ref only
++	 * guarantees the block was continuously powered since queue
++	 * time — it cannot resurrect a block that suspended despite
++	 * that (get/put counting bug elsewhere) or that failed
++	 * resume. Re-get here so HEAD/AFFINITY/CONFIG/START writes
++	 * below never hit a dark block; fail the job (ERR_PTR, freed
++	 * by the 0004 F4 path) instead of hanging the bus. */
++	if (p7580_drv_pm_get(drv))
++		return ERR_PTR(-EIO);
++	{
++		void *fence = p7580_job_run(&drv->jd, job);
++
++		p7580_drv_pm_put(drv);
++		return fence;
++	}
 +}
 +
 +static void p7580_drv_timedout_job(struct drm_sched_job *sched_job)
@@ -4770,15 +4868,39 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	struct p7580_drv *drv;
 +
 +	df = container_of(ent, struct p7580_drv_file, entity[0]);
-+	drv = df->drv;
++	drv = (df && df->drv) ? df->drv : NULL;
++	if (!drv)
++		return;
++	/* Timeout workqueue (process context): the recover path below
++	 * re-touches COMMAND_NEXT/GPU_CMD/INT registers. The live-job
++	 * ref keeps the block powered, but re-get here so a dark block
++	 * (suspend racing the timeout) fails closed instead of hanging
++	 * the bus; skip recovery (the fence stays pending until the
++	 * next timeout re-fires with power held). */
++	if (p7580_drv_pm_get(drv))
++		return;
 +	p7580_job_timedout(&drv->jd, job);
++	p7580_drv_pm_put(drv);
 +}
 +
 +static void p7580_drv_free_job(struct drm_sched_job *sched_job)
 +{
 +	struct p7580_submit_job *job = sched_job->owner;
++	struct drm_sched_entity *ent = sched_job->entity;
++	struct p7580_drv_file *df;
++	struct p7580_drv *drv;
 +
++	df = container_of(ent, struct p7580_drv_file, entity[0]);
++	drv = df ? df->drv : NULL;
 +	p7580_job_free(job);
++	/* Balances p7580_drv_job_pm_arm() at queue time: the async
++	 * leg is over (retired or run_job dispatch failure), drop
++	 * the job-lifetime power hold so the block can idle-suspend.
++	 * df->drv is stable here: file_fini (entity teardown) waits
++	 * for queued jobs via the 0004 fini/flush path before the
++	 * file state (and its drv back-pointer) is freed. */
++	if (drv)
++		p7580_drv_job_pm_release(drv);
 +}
 +
 +static const struct drm_sched_backend_ops p7580_drv_sched_ops = {
@@ -4786,6 +4908,56 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	.timedout_job = p7580_drv_timedout_job,
 +	.free_job = p7580_drv_free_job,
 +};
++
++/* Power guard (F-SUB1). Every MMIO site in this file runs under a
++ * p7580_drv_pm_get/put pair; the get fails closed (caller must touch
++ * no register afterwards). pm_runtime_get_sync may return 1 (already
++ * active) or 0 (resumed now): both mean powered. Only a negative
++ * errno means dark. */
++int p7580_drv_pm_get(struct p7580_drv *drv)
++{
++	int ret;
++
++	if (!drv || !drv->dev)
++		return -ENODEV;
++	ret = pm_runtime_get_sync(drv->dev);
++	if (ret < 0) {
++		/* Resume failed (clock/reset/cores): the GPU is dark;
++		 * programming HEAD/START now would wedge the slot with
++		 * no IRQ ever coming (unbounded fence wait). put_noidle
++		 * balances the failed get without re-entering resume. */
++		pm_runtime_put_noidle(drv->dev);
++		return ret;
++	}
++	return 0;
++}
++
++void p7580_drv_pm_put(struct p7580_drv *drv)
++{
++	if (!drv || !drv->dev)
++		return;
++	pm_runtime_mark_last_busy(drv->dev);
++	pm_runtime_put_autosuspend(drv->dev);
++}
++
++/* Live-job ref: armed at queue time, released in free_job. Paired
++ * get/put around the whole async job lifetime (queue -> run ->
++ * retire, including the timeout/recover path which re-touches
++ * COMMAND_NEXT/RESET registers). atomic_t pm_ref counts them so a
++ * leaked (never-freed) job is visible in sysfs/debug rather than
++ * silently pinning the power domain on. */
++static void p7580_drv_job_pm_arm(struct p7580_drv *drv)
++{
++	atomic_inc(&drv->pm_ref);
++	/* Second get: first is the ioctl's synchronous leg. */
++	(void)p7580_drv_pm_get(drv);
++}
++
++static void p7580_drv_job_pm_release(struct p7580_drv *drv)
++{
++	atomic_dec(&drv->pm_ref);
++	p7580_drv_pm_put(drv);
++}
 +
 +
 +
@@ -4859,7 +5031,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	df->job_dev = NULL;
 +}
 +
-+/* Map one BO's pages into AS 0 if not yet bound; track on bo_list. */
++/* Map one BO's pages into AS 0 if not yet bound; track on bo_list.
++ * Caller (p7580_drv_submit) holds a runtime-PM ref: the invalidate()
++ * below is MMIO on the AS block and MUST NOT run while the power
++ * domain/clocks are dark (F-SUB1 bus-hang). */
 +static int p7580_drv_map_bo(struct p7580_drv *drv, struct drm_gem_object *obj)
 +{
 +	struct p7580_bo *bo = to_p7580_bo(obj);
@@ -5046,8 +5221,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		}
 +	}
 +
++	/* Arm the job-lifetime power hold BEFORE the job is visible
++	 * to the async worker: from drm_sched_job_submit on, run_job
++	 * may touch HEAD/START at any moment. The ioctl's synchronous
++	 * ref (held by our caller) covers the map + queue legs; this
++	 * second ref covers queue -> retire. Queue failure below never
++	 * publishes the job, so unwind the arm there. */
++	p7580_drv_job_pm_arm(drv);
 +	ret = drm_sched_job_submit(sched_job);
 +	if (ret) {
++		p7580_drv_job_pm_release(drv);
 +		drm_sched_job_cleanup(sched_job);
 +		kfree(sched_job);
 +		p7580_job_free(job);
@@ -5149,23 +5332,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	staged.bo_handle_count = args->bo_handle_count;
 +	staged.requirements = args->requirements;
 +
-+	/* Under runtime PM the GPU must be awake for MMU-map + submit. */
-+{
-+		int ret;
++	/* Under runtime PM the GPU must be awake for the synchronous
++	 * MMU-map + queue leg. p7580_drv_submit arms a second,
++	 * job-lifetime ref before the job is visible to the async
++	 * worker, so dropping this ref on return is safe: the block
++	 * stays powered until free_job releases the job's own ref.
++	 * Fail closed: no MMIO (not even map_bo) after a failed get. */
++	{
++		int ret = p7580_drv_pm_get(drv);
 +
-+		ret = pm_runtime_get_sync(drv->dev);
-+		if (ret < 0) {
-+			/* Resume failed (clock/reset/cores): the GPU is dark;
-+		 * programming HEAD/START now would wedge the slot with
-+		 * no IRQ ever coming (unbounded fence wait). Abort instead
-+		 * (SUBMIT-DEADLOCK FIX); put_noidle balances the get.
-+		 * Same arm as the power slice probe path. */
-+			pm_runtime_put_noidle(drv->dev);
++		if (ret)
 +			return ret;
-+		}
 +		ret = p7580_drv_submit(drv, dev, file_priv, &staged);
-+		pm_runtime_mark_last_busy(drv->dev);
-+		pm_runtime_put_autosuspend(drv->dev);
++		p7580_drv_pm_put(drv);
 +		return ret;
 +	}
 +}
