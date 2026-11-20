@@ -14,9 +14,16 @@
  *    this attr; NO_KERNEL_MAPPING is ignored by the arm64 backend and
  *    FORCE_CONTIGUOUS is a display-side mistaken carry-over, so neither
  *    is set here).
- *  - fault handler mirrors exynos_drm_gem_fault/map_buf
- *    (vm_insert_mixed over the sg/phys walk; -EAGAIN stays VM_FAULT_NOPAGE)
- *    with WC/cached prot selection.
+ *  - CPU mmap is IMMEDIATE (exynos_drm_gem_mmap_buffer /
+ *    drm_gem_cma_mmap shape): pgprot_writecombine + dma_mmap_attrs
+ *    for CMA (plain WRITE_COMBINE only), remap_pfn_range per page
+ *    for SHMEM/imported. Fault-driven vm_insert_mixed cannot work:
+ *    drm_gem_mmap() sets VM_PFNMAP and installs driver->gem_vm_ops
+ *    itself (EINVAL when that table is NULL); clearing PFNMAP for
+ *    VM_MIXEDMAP + swapping in a second ops table breaks the core
+ *    contract (mmap -EINVAL, never faults). The fault helper stays
+ *    for reference only. WC/cached prot selection is exynos
+ *    update_vm_cache_attr shape.
  *  - WAIT_BO mirrors v5.2 panfrost_wait_bo: dma_resv_wait_timeout on the
  *    embedded 0002 resv (locked inside the shim; no outer lock needed).
  *    Timeout arrives in jiffies (caller converts ns via nsecs_to_jiffies).
@@ -52,7 +59,6 @@
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/shmem_fs.h>
-#include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/sched.h>
 
@@ -69,9 +75,14 @@ struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj)
 	return container_of(obj, struct p7580_bo, base);
 }
 
-/* ------------------------------------------------------------------ */
-/* Per-device IOVA allocator (struct p7580_dev, header)               */
-/* ------------------------------------------------------------------ */
+/* Per-device IOVA allocator (struct p7580_dev, header). Units: the
+ * drm_mm window is addressed in PAGES (init with the byte window
+ * shifted by PAGE_SHIFT; node .start is therefore a PFN and the byte
+ * GPU address is node.start << PAGE_SHIFT). Raw byte init would place
+ * every BO near 0x2000000000, past the 4 GiB window -- MMAP_BO via
+ * the GEM offset manager kept working, so open/CREATE/GET_BO all
+ * passed while only the GPU alias was wrong (gpu31-mmap.md).
+ * ------------------------------------------------------------------ */
 
 int p7580_dev_init(struct p7580_dev *gd, struct device *dev)
 {
@@ -81,7 +92,8 @@ int p7580_dev_init(struct p7580_dev *gd, struct device *dev)
 		return -EINVAL;
 	gd->dev = dev;
 	mutex_init(&gd->iova_lock);
-	ret = drm_mm_init(&gd->iova_mm, P7580_IOVA_START, P7580_IOVA_SIZE);
+	ret = drm_mm_init(&gd->iova_mm, P7580_IOVA_START >> PAGE_SHIFT,
+			  P7580_IOVA_SIZE >> PAGE_SHIFT);
 	if (ret) {
 		gd->dev = NULL;
 		return ret;
@@ -490,20 +502,36 @@ int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	return p7580_fault_err(ret);
 }
 
-static const struct vm_operations_struct p7580_gem_vm_ops = {
+/* gem_vm_ops for this driver (exynos shape: fault/open/close from the
+ * core). Published to the core as driver->gem_vm_ops in main.c
+ * (non-static: referenced from another TU). */
+const struct vm_operations_struct p7580_gem_vm_ops = {
+	.fault = p7580_gem_fault,
 	.open = drm_gem_vm_open,
 	.close = drm_gem_vm_close,
-	.fault = p7580_gem_fault,
 };
 
 /* Driver .fops mmap (GEM path): resolve the fake offset to the BO via
- * drm_gem_mmap (which takes the fault-grab reference), then install our
- * fault ops + WC/cached prot (exynos update_vm_cache_attr shape).
- * KMS dumb mmap keeps its own entry point in the KMS slice. */
+ * drm_gem_mmap, then map the pages IMMEDIATELY (no fault round trip).
+ * Fault-driven vm_insert_mixed cannot work here: drm_gem_mmap() on
+ * 3.10 sets VM_PFNMAP|VM_DONTEXPAND, installs driver->gem_vm_ops
+ * itself, and rejects VM_MIXEDMAP vmas/-EINVALs when that table is
+ * NULL -- clearing PFNMAP/adding MIXEDMAP and swapping in a second
+ * ops table after the fact breaks the core's contract (mmap() returns
+ * -EINVAL without ever faulting; dmesg silent). The working shape on
+ * this tree is exynos_drm_gem_mmap_buffer/drm_gem_cma_mmap:
+ * pgprot_writecombine (WC, exynos update_vm_cache_attr shape), then
+ * one dma_mmap_attrs() for the CMA page (arm64 backend honours plain
+ * WRITE_COMBINE; NO_KERNEL_MAPPING/FORCE_CONTIGUOUS must NOT be set,
+ * F-GEM3) or one remap_pfn_range() per SHMEM/imported page with the
+ * same prot + size check. KMS dumb mmap keeps its own entry point. */
 int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct drm_gem_object *obj;
 	struct p7580_bo *bo;
+	struct scatterlist *sgl;
+	unsigned long vm_size, pfn, off;
+	unsigned int i, npages;
 	int ret;
 
 	ret = drm_gem_mmap(filp, vma);
@@ -512,19 +540,68 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	obj = vma->vm_private_data;
 	bo = to_p7580_bo(obj);
+	npages = obj->size >> PAGE_SHIFT;
+	vm_size = vma->vm_end - vma->vm_start;
 
-	vma->vm_flags &= ~VM_PFNMAP;
-	vma->vm_flags |= VM_MIXEDMAP;
+	if (vm_size > obj->size) {
+		ret = -EINVAL;
+		goto err_close;
+	}
+
+	/* WC default, cached opt-in (CMA BOs are created WC). */
 	if (bo->cache_attr & P7580_GEM_CACHABLE)
 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
-	else if (bo->cache_attr & P7580_GEM_WC)
+	else if ((bo->cache_attr & P7580_GEM_WC) ||
+		 !(bo->cache_attr & P7580_GEM_CACHABLE))
 		vma->vm_page_prot =
 			pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
-	else
-		vma->vm_page_prot =
-			pgprot_noncached(vm_get_page_prot(vma->vm_flags));
-	vma->vm_ops = &p7580_gem_vm_ops;
+
+	if (bo->backing == P7580_BO_CMA && !bo->sgt) {
+		DEFINE_DMA_ATTRS(attrs);
+		dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
+		ret = dma_mmap_attrs(obj->dev->dev, vma, bo->cma_vaddr,
+				     bo->cma_paddr, obj->size, &attrs);
+		if (ret)
+			goto err_close;
+		return 0;
+	}
+
+	if (bo->sgt) {
+		off = 0;
+		for_each_sg(bo->sgt->sgl, sgl, bo->sgt->nents, i) {
+			unsigned long chunk = (unsigned long)sgl->length;
+			if (chunk > vm_size - off)
+				chunk = vm_size - off;
+			pfn = __phys_to_pfn(sg_phys(sgl));
+			ret = remap_pfn_range(vma, vma->vm_start + off, pfn,
+					chunk, vma->vm_page_prot);
+			if (ret)
+				goto err_close;
+			off += sgl->length;
+			if (off >= vm_size)
+				break;
+		}
+		return 0;
+	}
+
+	if (!bo->pages) {
+		ret = -ENODEV;
+		goto err_close;
+	}
+	for (i = 0; i < npages; i++) {
+		if ((unsigned long)(i + 1) * PAGE_SIZE > vm_size)
+			break;
+		pfn = page_to_pfn(bo->pages[i]);
+		ret = remap_pfn_range(vma, vma->vm_start + (i << PAGE_SHIFT),
+				      pfn, PAGE_SIZE, vma->vm_page_prot);
+		if (ret)
+			goto err_close;
+	}
 	return 0;
+
+err_close:
+	drm_gem_vm_close(vma);
+	return ret;
 }
 
 /* ------------------------------------------------------------------ */

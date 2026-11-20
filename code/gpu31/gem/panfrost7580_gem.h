@@ -61,9 +61,12 @@ struct device;
 #define P7580_BO_CMA		0u
 #define P7580_BO_SHMEM		1u
 
-/* IOVA window: 32 MiB .. 4 GiB, T720 legacy 32-bit window
+/* IOVA window in BYTES: 32 MiB .. 4 GiB, T720 legacy 32-bit window
  * (panfrost v5.2: PFN 0x8000..0x100000, see panfrost_mmu_map_io_region;
- *  T720 VA bits unread until M0 runs on silicon, gpu-panfrost.md R3). */
+ *  T720 VA bits unread until M0 runs on silicon, gpu-panfrost.md R3).
+ * Units: the drm_mm allocator counts PAGES, so p7580_dev_init passes
+ * these shifted by PAGE_SHIFT; node.start is a PFN and IOVA bytes are
+ * node.start << PAGE_SHIFT. Do NOT pass raw bytes to drm_mm_init. */
 #define P7580_IOVA_START	(32u << 20)
 #define P7580_IOVA_SIZE		((4ull << 30) - P7580_IOVA_START)
 
@@ -135,6 +138,10 @@ int p7580_gem_create_with_handle(struct p7580_dev *gd,
 				 uint32_t *handle);
 void p7580_gem_free_object(struct drm_gem_object *obj);
 int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+/* Published to the core as driver->gem_vm_ops (main.c); defined in
+ * panfrost7580_gem.c. Must stay non-NULL: drm_gem_mmap() -EINVALs when
+ * the driver table is NULL. */
+extern const struct vm_operations_struct p7580_gem_vm_ops;
 int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma);
 long p7580_gem_wait(struct drm_device *dev, struct drm_file *file_priv,
 		    uint32_t handle, long timeout_jiffies, int wait_all);
