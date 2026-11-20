@@ -14,6 +14,8 @@
  */
 #ifdef __KERNEL__
 #include <linux/io.h>
+#include <linux/types.h>
+#include <linux/dma-mapping.h>
 #else
 #define __iomem
 #include <stdint.h>
@@ -26,6 +28,7 @@
 
 #ifdef __KERNEL__
 #include <linux/types.h>
+#include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #endif
@@ -101,6 +104,8 @@ struct p7580_job_dev {
 	void __iomem *regs;
 	uint32_t js_present;		/* from GPU_JS_PRESENT @probe */
 	uint64_t shader_present;	/* affinity source */
+	dma_addr_t pgd_dma;		/* AS0 root (set by probe; recover
+					 * rebinds it after GPU reset) */
 	struct p7580_submit_job *in_flight[P7580_NUM_JOB_SLOTS];
 	spinlock_t hw_lock;		/* serialises HEAD/CONFIG/COMMAND */
 	struct mutex reset_lock;	/* serialises fault recovery */
@@ -131,12 +136,18 @@ struct p7580_job_dev {
 /* ------------------------------------------------------------------ */
 #ifdef __KERNEL__
 int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
-		       uint32_t js_present, uint64_t shader_present);
+		       uint32_t js_present, uint64_t shader_present,
+		       dma_addr_t pgd_dma);
 #else
+#include <stdint.h>
+typedef uint64_t p7580_dma_addr_t;
 int p7580_job_dev_init(struct p7580_job_dev *jd, void *regs,
-		       uint32_t js_present, uint64_t shader_present);
+		       uint32_t js_present, uint64_t shader_present,
+		       p7580_dma_addr_t pgd_dma);
 #endif
 void p7580_job_dev_fini(struct p7580_job_dev *jd);
+/* CLEAR + unmask after reset/resume (power held by caller). */
+void p7580_job_dev_rearm(struct p7580_job_dev *jd);
 /* Program HEAD_NEXT/AFFINITY_NEXT/CONFIG_NEXT + COMMAND_NEXT=START.   */
 void p7580_job_hw_submit(struct p7580_job_dev *jd,
 			 struct p7580_submit_job *job);

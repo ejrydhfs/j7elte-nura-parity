@@ -57,6 +57,7 @@
 #include <drm_sched.h>			/* 0004 */
 
 #include "panfrost7580_job.h"
+#include "panfrost7580_mmu.h"
 
 /* ------------------------------------------------------------------ */
 /* Bounded job-lifecycle tracing (jobtrace ticket).                    */
@@ -213,7 +214,8 @@ static struct dma_fence *p7580_fence_create(struct p7580_job_dev *jd,
 /* ------------------------------------------------------------------ */
 
 int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
-		       uint32_t js_present, uint64_t shader_present)
+		       uint32_t js_present, uint64_t shader_present,
+		       dma_addr_t pgd_dma)
 {
 	int i;
 	uint32_t mask = 0;
@@ -224,6 +226,7 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	jd->regs = regs;
 	jd->js_present = js_present;
 	jd->shader_present = shader_present;
+	jd->pgd_dma = pgd_dma;
 	spin_lock_init(&jd->hw_lock);
 	mutex_init(&jd->reset_lock);
 	/* Snapshot the module param once: later writes change the param
@@ -234,9 +237,18 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 		mask |= P7580_MK_JS_MASK(i);
 	}
 
-	/* Clear any stale slot IRQs, then arm DONE+ERR for present slots. */
+	/* Clear any stale slot IRQs (both views: CLEAR drains RAWSTAT via
+	 * the in-tree CLEAR semantics), then unmask DONE+ERR for present
+	 * slots. Per [KT] mali_midg_regmap.h:203-206 RAWSTAT is the latch
+	 * and STAT the masked AND delivered view, so an unmasked STAT is a
+	 * subset of RAWSTAT; this read-back proves CLEAR actually drained
+	 * before the first START (bounded: two extra reads at probe). */
 	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
 	p7580_writel(jd, P7580_JOB_INT_MASK, mask & (js_present | (js_present << 16)));
+	pr_info("p7580_job: irq-arm rawstat=0x%08x stat=0x%08x mask=0x%08x js_present=0x%x\n",
+		p7580_readl(jd, P7580_JOB_INT_RAWSTAT),
+		p7580_readl(jd, P7580_JOB_INT_STAT),
+		p7580_readl(jd, P7580_JOB_INT_MASK), js_present);
 	return 0;
 }
 
@@ -246,6 +258,24 @@ void p7580_job_dev_fini(struct p7580_job_dev *jd)
 		return;
 	/* Mask everything; the IRQ handler is freed by the caller. */
 	p7580_writel(jd, P7580_JOB_INT_MASK, 0);
+}
+
+/* Re-arm after GPU reset / runtime resume: CLEAR any bits latched
+ * while dark, then unmask DONE+ERR for present slots. Caller must
+ * hold power (probe/dev_init, resume path, recover path all do).
+ * Same CLEAR+MASK pair as dev_init without touching in_flight. */
+void p7580_job_dev_rearm(struct p7580_job_dev *jd)
+{
+	uint32_t mask = 0;
+	int i;
+
+	if (!jd)
+		return;
+	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++)
+		mask |= P7580_MK_JS_MASK(i);
+	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
+	p7580_writel(jd, P7580_JOB_INT_MASK,
+		     mask & (jd->js_present | (jd->js_present << 16)));
 }
 
 /* Idle when no slot has a queued command and no job is in flight. */
@@ -300,18 +330,33 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 
 	jd->in_flight[slot] = job;
 
-	/* GO. */
+	/* GO. One wmb() before START: the HEAD/AFFINITY/CONFIG writes
+	 * must be visible to the JM before the command latches (same
+	 * order kbase_job_hw_submit uses; the lock alone is not a
+	 * device-store barrier on this weakly-ordered SoC). */
+	wmb();
 	p7580_js_write(jd, slot, P7580_JS_COMMAND_NEXT, P7580_JS_CMD_START);
+	/* One-shot RAWSTAT/JS_STATUS snapshot right after START (numeric,
+	 * unconditional for the first 8 dispatches only, then silent):
+	 * proves whether the slot latched the command or faulted
+	 * synchronously even if no IRQ ever arrives. Bounded: the same
+	 * jobtrace budget as the dispatch line. */
 
 	/* Bounded dispatch trace: slot, HEAD jc, and the CONFIG_NEXT
 	 * value actually written (START_MMU/FLUSH bits visible), one
 	 * line per traced job. Consumes one budget unit; IRQ + fence
 	 * prints below consume their own units, so one job costs <= 3. */
 	if (jd->trace_left) {
+		uint32_t rawstat, js_status;
 		jd->trace_left--;
+		rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
+		js_status = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_STATUS));
 		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u\n",
 			slot, (unsigned long long)job->jc, cfg, job->as_nr,
 			(unsigned long long)job->affinity, job->seqno);
+		pr_info("p7580_job: post-start slot=%d rawstat=0x%08x js_status=0x%08x (%s)\n",
+			slot, rawstat, js_status,
+			p7580_js_status_name(js_status));
 	}
 
 	spin_unlock_irqrestore(&jd->hw_lock, flags);
@@ -322,42 +367,62 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 /*                                                                    */
 /* DONE(j): signal job->done_fence (wakes sched retirement + any     */
 /*   WAIT_BO waiters); clear in_flight under hw_lock.                 */
-/* ERR(j): leave COMMAND_NEXT programmed; the timeout/recovery path  */
-/*   (process context) reads STATUS/HEAD/TAIL and resets. Here just   */
-/*   CLEAR the sticky bit so the line deasserts.                      */
+/* ERR(j): freeze the chain with COMMAND_NEXT=NOP (kbase/panfrost     */
+/*   shape) so a faulted job cannot re-issue; the timeout/recovery   */
+/*   path (process context) reads STATUS/HEAD/TAIL and resets. Here  */
+/*   just CLEAR the sticky bit(s) so the line deasserts.              */
+/*                                                                    */
+/* Completion condition (jobabi §4/§7): IRQ fires iff the slot's DONE */
+/* or ERR bit is set in JOB_INT_STAT (masked view of RAWSTAT). The   */
+/* dispatched job completes when this handler observes               */
+/* STAT & MK_JS_MASK(slot) with the DONE bit set, clears the slot    */
+/* bit(s), and dma_fence_signal()s the in-flight fence -- the 5 s    */
+/* timeout (timedout_job -> recover) only fires when no IRQ arrives. */
 /* ------------------------------------------------------------------ */
 
 int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 {
-	uint32_t status;
+	uint32_t status, rawstat;
 	int j;
 
 	(void)irq;
 	if (!jd)
 		return 0;	/* IRQ_NONE; int kept for request_irq shape */
 
+	rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
 	status = p7580_readl(jd, P7580_JOB_INT_STAT);
 	if (!status)
 		return 0;	/* IRQ_NONE */
+	/* Bounded entry probe (numeric, unconditional): proves the line
+	 * fired and whether RAWSTAT ever latched without STAT (mask
+	 * wrong) versus neither latched (slot never executed). */
+	pr_info("p7580_job: irq-enter rawstat=0x%08x stat=0x%08x\n",
+		rawstat, status);
 
 	for (j = 0; j < P7580_NUM_JOB_SLOTS; j++) {
 		uint32_t m = P7580_MK_JS_MASK(j);
 		uint32_t js_status;
 		int sig = 0;
 
-		if (!(status & m))
+		/* Loop on the union of the masked (STAT) and raw
+		 * (RAWSTAT) views: if MASK ever wrongly excludes a
+		 * completed slot, RAWSTAT still demuxes it here instead
+		 * of timing out. Matches kbase_job_done's RAWSTAT tail
+		 * re-check (jm_hw.c:442-455). CLEAR drains both views. */
+		if (!((status | rawstat) & m))
 			continue;
 
 		p7580_writel(jd, P7580_JOB_INT_CLEAR, m);
 
-		if (status & P7580_JOB_ERR_BIT(j)) {
-			/* Fault path: record only; recovery runs in
-			 * process context (timedout_job). */
+		if ((status | rawstat) & P7580_JOB_ERR_BIT(j)) {
+			/* Fault path: freeze the chain (NOP) so the slot
+			 * cannot re-issue; recovery runs in process
+			 * context (timedout_job -> recover). */
 			p7580_js_write(jd, j, P7580_JS_COMMAND_NEXT,
 				       P7580_JS_CMD_NOP);
 		}
 
-		if (status & P7580_JOB_DONE_BIT(j)) {
+		if ((status | rawstat) & P7580_JOB_DONE_BIT(j)) {
 			struct p7580_submit_job *job;
 			unsigned long flags;
 
@@ -397,7 +462,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 					spin_unlock_irqrestore(&jd->hw_lock, f);
 				}
 			}
-		} else if (status & P7580_JOB_ERR_BIT(j)) {
+		} else if ((status | rawstat) & P7580_JOB_ERR_BIT(j)) {
 			/* ERR without DONE: same bounded trace so faults
 			 * are visible even when no fence retires here
 			 * (recovery signals it in process context). */
@@ -705,7 +770,6 @@ int p7580_job_submit(struct p7580_job_dev *jd, struct p7580_file_ctx *fctx,
 int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 		      uint32_t status)
 {
-	uint32_t raw;
 	int i, ret = 0;
 	unsigned long end;
 	struct p7580_submit_job *fault_job = NULL;
@@ -761,15 +825,16 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 	}
 	p7580_writel(jd, P7580_GPU_INT_CLEAR, P7580_GPU_IRQ_RESET_COMPLETED);
 
-	/* 4. re-arm the slot IRQs the handler demuxes. The MMU slice   */
-	/* re-programs AS_TRANSTAB before this returns (integrator      */
-	/* wires the call between reset and re-arm). */
-	raw = 0;
-	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++)
-		raw |= P7580_MK_JS_MASK(i);
-	p7580_writel(jd, P7580_JOB_INT_CLEAR, raw);
-	p7580_writel(jd, P7580_JOB_INT_MASK,
-		     raw & (jd->js_present | (jd->js_present << 16)));
+	/* 4. re-arm the slot IRQs the handler demuxes. Order mirrors
+	 * kbase_pm_clock_on (mali_kbase_pm_driver.c: MMU first, then
+	 * JOB unmask last at :1109): TRANSTAB + MEMATTR + TRANSCFG(0) +
+	 * UPDATE rebind AS0 BEFORE CLEAR+unmask, so the first post-reset
+	 * job fetches its descriptor through valid tables. Mainline
+	 * panfrost_device_resume runs the same order (gpu_soft_reset ->
+	 * power_on -> mmu_enable(0) -> job_enable_interrupts). */
+	p7580_mmu_program_as(jd->regs, 0, jd->pgd_dma,
+			     P7580_MEMATTR_KBASE_LO, P7580_MEMATTR_KBASE_HI);
+	p7580_job_dev_rearm(jd);
 
 	mutex_unlock(&jd->reset_lock);
 

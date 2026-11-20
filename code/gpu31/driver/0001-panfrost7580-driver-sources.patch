@@ -2465,8 +2465,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +#endif
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,244 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
+@@ -0,0 +1,254 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_jm_hw.h - Midgard job-manager hardware interface for the
@@ -2571,8 +2571,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#define P7580_JOB_TIMEOUT_MS	5000u
 +#define P7580_RESET_TIMEOUT_MS	3000u
 +
-+/* Slot for a submit. [V5] panfrost_job_get_slot: FS -> JS0, else JS1. */
-+/* JS2 (compute) is wired but idle: v5.2 UAPI has no compute-only bit. */
++/* Slot for a submit. Base rule is [V5] panfrost_job_get_slot (FS ->
++ * JS0, else JS1); JS2 (compute) is wired but idle: v5.2 UAPI has no
++ * compute-only bit.
++ *
++ * IRQ-ticket fix: route requirement-less jobs (requirements == 0) to
++ * JS0. The NULL-job selftest and Mesa NULL/leftover-dependency flush
++ * jobs carry requirements == 0; the old fallthrough sent them to JS1
++ * while the trace tooling and the fragment-slot expectation assume
++ * JS0. Nonzero non-FS requirements still select JS1 (vertex/tiler
++ * chain); ONLY_COMPUTE selects JS2 (never on the v5.2 UAPI wire). */
 +#define P7580_SLOT_FRAGMENT	0
 +#define P7580_SLOT_VERTEX_TILER	1
 +#define P7580_SLOT_COMPUTE	2
@@ -2585,6 +2593,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +static inline int p7580_job_slot(uint32_t requirements)
 +{
 +	if (requirements & P7580_JD_REQ_FS)
++		return P7580_SLOT_FRAGMENT;
++	if (requirements == 0)
 +		return P7580_SLOT_FRAGMENT;
 +	if (requirements & P7580_JD_REQ_ONLY_COMPUTE)
 +		return P7580_SLOT_COMPUTE;
@@ -2713,8 +2723,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#endif /* PANFROST7580_JM_HW_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,786 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
+@@ -0,0 +1,851 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -2774,6 +2784,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +#include <drm_sched.h>			/* 0004 */
 +
 +#include "panfrost7580_job.h"
++#include "panfrost7580_mmu.h"
 +
 +/* ------------------------------------------------------------------ */
 +/* Bounded job-lifecycle tracing (jobtrace ticket).                    */
@@ -2930,7 +2941,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +/* ------------------------------------------------------------------ */
 +
 +int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
-+		       uint32_t js_present, uint64_t shader_present)
++		       uint32_t js_present, uint64_t shader_present,
++		       dma_addr_t pgd_dma)
 +{
 +	int i;
 +	uint32_t mask = 0;
@@ -2941,6 +2953,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	jd->regs = regs;
 +	jd->js_present = js_present;
 +	jd->shader_present = shader_present;
++	jd->pgd_dma = pgd_dma;
 +	spin_lock_init(&jd->hw_lock);
 +	mutex_init(&jd->reset_lock);
 +	/* Snapshot the module param once: later writes change the param
@@ -2951,9 +2964,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		mask |= P7580_MK_JS_MASK(i);
 +	}
 +
-+	/* Clear any stale slot IRQs, then arm DONE+ERR for present slots. */
++	/* Clear any stale slot IRQs (both views: CLEAR drains RAWSTAT via
++	 * the in-tree CLEAR semantics), then unmask DONE+ERR for present
++	 * slots. Per [KT] mali_midg_regmap.h:203-206 RAWSTAT is the latch
++	 * and STAT the masked AND delivered view, so an unmasked STAT is a
++	 * subset of RAWSTAT; this read-back proves CLEAR actually drained
++	 * before the first START (bounded: two extra reads at probe). */
 +	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
 +	p7580_writel(jd, P7580_JOB_INT_MASK, mask & (js_present | (js_present << 16)));
++	pr_info("p7580_job: irq-arm rawstat=0x%08x stat=0x%08x mask=0x%08x js_present=0x%x\n",
++		p7580_readl(jd, P7580_JOB_INT_RAWSTAT),
++		p7580_readl(jd, P7580_JOB_INT_STAT),
++		p7580_readl(jd, P7580_JOB_INT_MASK), js_present);
 +	return 0;
 +}
 +
@@ -2963,6 +2985,24 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		return;
 +	/* Mask everything; the IRQ handler is freed by the caller. */
 +	p7580_writel(jd, P7580_JOB_INT_MASK, 0);
++}
++
++/* Re-arm after GPU reset / runtime resume: CLEAR any bits latched
++ * while dark, then unmask DONE+ERR for present slots. Caller must
++ * hold power (probe/dev_init, resume path, recover path all do).
++ * Same CLEAR+MASK pair as dev_init without touching in_flight. */
++void p7580_job_dev_rearm(struct p7580_job_dev *jd)
++{
++	uint32_t mask = 0;
++	int i;
++
++	if (!jd)
++		return;
++	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++)
++		mask |= P7580_MK_JS_MASK(i);
++	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
++	p7580_writel(jd, P7580_JOB_INT_MASK,
++		     mask & (jd->js_present | (jd->js_present << 16)));
 +}
 +
 +/* Idle when no slot has a queued command and no job is in flight. */
@@ -3017,18 +3057,33 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +
 +	jd->in_flight[slot] = job;
 +
-+	/* GO. */
++	/* GO. One wmb() before START: the HEAD/AFFINITY/CONFIG writes
++	 * must be visible to the JM before the command latches (same
++	 * order kbase_job_hw_submit uses; the lock alone is not a
++	 * device-store barrier on this weakly-ordered SoC). */
++	wmb();
 +	p7580_js_write(jd, slot, P7580_JS_COMMAND_NEXT, P7580_JS_CMD_START);
++	/* One-shot RAWSTAT/JS_STATUS snapshot right after START (numeric,
++	 * unconditional for the first 8 dispatches only, then silent):
++	 * proves whether the slot latched the command or faulted
++	 * synchronously even if no IRQ ever arrives. Bounded: the same
++	 * jobtrace budget as the dispatch line. */
 +
 +	/* Bounded dispatch trace: slot, HEAD jc, and the CONFIG_NEXT
 +	 * value actually written (START_MMU/FLUSH bits visible), one
 +	 * line per traced job. Consumes one budget unit; IRQ + fence
 +	 * prints below consume their own units, so one job costs <= 3. */
 +	if (jd->trace_left) {
++		uint32_t rawstat, js_status;
 +		jd->trace_left--;
++		rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
++		js_status = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_STATUS));
 +		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u\n",
 +			slot, (unsigned long long)job->jc, cfg, job->as_nr,
 +			(unsigned long long)job->affinity, job->seqno);
++		pr_info("p7580_job: post-start slot=%d rawstat=0x%08x js_status=0x%08x (%s)\n",
++			slot, rawstat, js_status,
++			p7580_js_status_name(js_status));
 +	}
 +
 +	spin_unlock_irqrestore(&jd->hw_lock, flags);
@@ -3039,42 +3094,62 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +/*                                                                    */
 +/* DONE(j): signal job->done_fence (wakes sched retirement + any     */
 +/*   WAIT_BO waiters); clear in_flight under hw_lock.                 */
-+/* ERR(j): leave COMMAND_NEXT programmed; the timeout/recovery path  */
-+/*   (process context) reads STATUS/HEAD/TAIL and resets. Here just   */
-+/*   CLEAR the sticky bit so the line deasserts.                      */
++/* ERR(j): freeze the chain with COMMAND_NEXT=NOP (kbase/panfrost     */
++/*   shape) so a faulted job cannot re-issue; the timeout/recovery   */
++/*   path (process context) reads STATUS/HEAD/TAIL and resets. Here  */
++/*   just CLEAR the sticky bit(s) so the line deasserts.              */
++/*                                                                    */
++/* Completion condition (jobabi §4/§7): IRQ fires iff the slot's DONE */
++/* or ERR bit is set in JOB_INT_STAT (masked view of RAWSTAT). The   */
++/* dispatched job completes when this handler observes               */
++/* STAT & MK_JS_MASK(slot) with the DONE bit set, clears the slot    */
++/* bit(s), and dma_fence_signal()s the in-flight fence -- the 5 s    */
++/* timeout (timedout_job -> recover) only fires when no IRQ arrives. */
 +/* ------------------------------------------------------------------ */
 +
 +int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 +{
-+	uint32_t status;
++	uint32_t status, rawstat;
 +	int j;
 +
 +	(void)irq;
 +	if (!jd)
 +		return 0;	/* IRQ_NONE; int kept for request_irq shape */
 +
++	rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
 +	status = p7580_readl(jd, P7580_JOB_INT_STAT);
 +	if (!status)
 +		return 0;	/* IRQ_NONE */
++	/* Bounded entry probe (numeric, unconditional): proves the line
++	 * fired and whether RAWSTAT ever latched without STAT (mask
++	 * wrong) versus neither latched (slot never executed). */
++	pr_info("p7580_job: irq-enter rawstat=0x%08x stat=0x%08x\n",
++		rawstat, status);
 +
 +	for (j = 0; j < P7580_NUM_JOB_SLOTS; j++) {
 +		uint32_t m = P7580_MK_JS_MASK(j);
 +		uint32_t js_status;
 +		int sig = 0;
 +
-+		if (!(status & m))
++		/* Loop on the union of the masked (STAT) and raw
++		 * (RAWSTAT) views: if MASK ever wrongly excludes a
++		 * completed slot, RAWSTAT still demuxes it here instead
++		 * of timing out. Matches kbase_job_done's RAWSTAT tail
++		 * re-check (jm_hw.c:442-455). CLEAR drains both views. */
++		if (!((status | rawstat) & m))
 +			continue;
 +
 +		p7580_writel(jd, P7580_JOB_INT_CLEAR, m);
 +
-+		if (status & P7580_JOB_ERR_BIT(j)) {
-+			/* Fault path: record only; recovery runs in
-+			 * process context (timedout_job). */
++		if ((status | rawstat) & P7580_JOB_ERR_BIT(j)) {
++			/* Fault path: freeze the chain (NOP) so the slot
++			 * cannot re-issue; recovery runs in process
++			 * context (timedout_job -> recover). */
 +			p7580_js_write(jd, j, P7580_JS_COMMAND_NEXT,
 +				       P7580_JS_CMD_NOP);
 +		}
 +
-+		if (status & P7580_JOB_DONE_BIT(j)) {
++		if ((status | rawstat) & P7580_JOB_DONE_BIT(j)) {
 +			struct p7580_submit_job *job;
 +			unsigned long flags;
 +
@@ -3114,7 +3189,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +					spin_unlock_irqrestore(&jd->hw_lock, f);
 +				}
 +			}
-+		} else if (status & P7580_JOB_ERR_BIT(j)) {
++		} else if ((status | rawstat) & P7580_JOB_ERR_BIT(j)) {
 +			/* ERR without DONE: same bounded trace so faults
 +			 * are visible even when no fence retires here
 +			 * (recovery signals it in process context). */
@@ -3422,7 +3497,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 +		      uint32_t status)
 +{
-+	uint32_t raw;
 +	int i, ret = 0;
 +	unsigned long end;
 +	struct p7580_submit_job *fault_job = NULL;
@@ -3478,15 +3552,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	}
 +	p7580_writel(jd, P7580_GPU_INT_CLEAR, P7580_GPU_IRQ_RESET_COMPLETED);
 +
-+	/* 4. re-arm the slot IRQs the handler demuxes. The MMU slice   */
-+	/* re-programs AS_TRANSTAB before this returns (integrator      */
-+	/* wires the call between reset and re-arm). */
-+	raw = 0;
-+	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++)
-+		raw |= P7580_MK_JS_MASK(i);
-+	p7580_writel(jd, P7580_JOB_INT_CLEAR, raw);
-+	p7580_writel(jd, P7580_JOB_INT_MASK,
-+		     raw & (jd->js_present | (jd->js_present << 16)));
++	/* 4. re-arm the slot IRQs the handler demuxes. Order mirrors
++	 * kbase_pm_clock_on (mali_kbase_pm_driver.c: MMU first, then
++	 * JOB unmask last at :1109): TRANSTAB + MEMATTR + TRANSCFG(0) +
++	 * UPDATE rebind AS0 BEFORE CLEAR+unmask, so the first post-reset
++	 * job fetches its descriptor through valid tables. Mainline
++	 * panfrost_device_resume runs the same order (gpu_soft_reset ->
++	 * power_on -> mmu_enable(0) -> job_enable_interrupts). */
++	p7580_mmu_program_as(jd->regs, 0, jd->pgd_dma,
++			     P7580_MEMATTR_KBASE_LO, P7580_MEMATTR_KBASE_HI);
++	p7580_job_dev_rearm(jd);
 +
 +	mutex_unlock(&jd->reset_lock);
 +
@@ -3503,8 +3578,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 10:48:44.000000000 -0500
-@@ -0,0 +1,168 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
+@@ -0,0 +1,177 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3521,6 +3596,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 + */
 +#ifdef __KERNEL__
 +#include <linux/io.h>
++#include <linux/types.h>
++#include <linux/dma-mapping.h>
 +#else
 +#define __iomem
 +#include <stdint.h>
@@ -3533,6 +3610,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +
 +#ifdef __KERNEL__
 +#include <linux/types.h>
++#include <linux/dma-mapping.h>
 +#include <linux/spinlock.h>
 +#include <linux/mutex.h>
 +#endif
@@ -3608,6 +3686,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	void __iomem *regs;
 +	uint32_t js_present;		/* from GPU_JS_PRESENT @probe */
 +	uint64_t shader_present;	/* affinity source */
++	dma_addr_t pgd_dma;		/* AS0 root (set by probe; recover
++					 * rebinds it after GPU reset) */
 +	struct p7580_submit_job *in_flight[P7580_NUM_JOB_SLOTS];
 +	spinlock_t hw_lock;		/* serialises HEAD/CONFIG/COMMAND */
 +	struct mutex reset_lock;	/* serialises fault recovery */
@@ -3638,12 +3718,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +/* ------------------------------------------------------------------ */
 +#ifdef __KERNEL__
 +int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
-+		       uint32_t js_present, uint64_t shader_present);
++		       uint32_t js_present, uint64_t shader_present,
++		       dma_addr_t pgd_dma);
 +#else
 +int p7580_job_dev_init(struct p7580_job_dev *jd, void *regs,
-+		       uint32_t js_present, uint64_t shader_present);
++		       uint32_t js_present, uint64_t shader_present,
++		       dma_addr_t pgd_dma);
 +#endif
 +void p7580_job_dev_fini(struct p7580_job_dev *jd);
++/* CLEAR + unmask after reset/resume (power held by caller). */
++void p7580_job_dev_rearm(struct p7580_job_dev *jd);
 +/* Program HEAD_NEXT/AFFINITY_NEXT/CONFIG_NEXT + COMMAND_NEXT=START.   */
 +void p7580_job_hw_submit(struct p7580_job_dev *jd,
 +			 struct p7580_submit_job *job);
@@ -3675,8 +3759,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +#endif /* PANFROST7580_JOB_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-19 10:48:44.321260351 -0500
-@@ -0,0 +1,664 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
+@@ -0,0 +1,682 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -4031,6 +4115,20 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +		if (ret)
 +			return ret;
 +	}
++	/* Resume re-arms what reset + power-off lost (mainline
++	 * panfrost_device_resume order: soft_reset -> power_on ->
++	 * mmu_enable(0) -> job_enable_interrupts; kbase_pm_clock_on:
++	 * MMU reprogram, then JOB unmask last). AS0 TRANSTAB/MEMATTR
++	 * first so descriptor fetch faults nowhere, then CLEAR stale
++	 * slot bits and unmask DONE+ERR for present slots. Powered by
++	 * the resume above; safe to touch MMIO here. */
++	if (drv) {
++		p7580_mmu_program_as(drv->regs, P7580_DRV_AS_NR,
++				     drv->mmu.root_dma,
++				     P7580_MEMATTR_KBASE_LO,
++				     P7580_MEMATTR_KBASE_HI);
++		p7580_job_dev_rearm(&drv->jd);
++	}
 +	if (drv && drv->dvfs)
 +		pf7580_dvfs_resume(drv->dvfs);
 +	return 0;
@@ -4179,9 +4277,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	p7580_mmu_program_as(regs, P7580_DRV_AS_NR, drv->mmu.root_dma,
 +			     P7580_MEMATTR_KBASE_LO, P7580_MEMATTR_KBASE_HI);
 +
-+	/* Job slots (JOB_INT_CLEAR/MASK writes: powered). */
++	/* Job slots (JOB_INT_CLEAR/MASK writes: powered). Recover
++	 * rebinds this same root after every GPU reset, so stash it on
++	 * the job device here (single AS0 on this part). */
++	drv->jd.pgd_dma = drv->mmu.root_dma;
 +	ret = p7580_job_dev_init(&drv->jd, regs, js_present,
-+				 ((u64)0 << 32) | shader_present);
++				 ((u64)0 << 32) | shader_present,
++				 drv->mmu.root_dma);
 +	if (ret)
 +		goto err_mmu;
 +	/* R1: warm up the shared sched workqueue at probe so the first
