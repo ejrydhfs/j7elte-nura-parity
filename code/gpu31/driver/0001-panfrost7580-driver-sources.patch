@@ -3262,7 +3262,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-19 10:48:44.323461008 -0500
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,447 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_mmu.c - Mali-T720 GPU-MMU programming, Exynos 7580 / 3.10.108.
@@ -3283,6 +3283,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/d
 + *                 (mali_kbase_mmu_mode_lpae.c:174-189)
 + */
 +
++#include <linux/delay.h>
 +#include <linux/device.h>
 +#include <linux/dma-mapping.h>
 +#include <linux/errno.h>
