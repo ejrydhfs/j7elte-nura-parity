@@ -78,7 +78,6 @@ static inline void p7580_abi_check_submit(void)
 					bo_handle_count) != 32);
 	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit,
 					requirements) != 36);
-	BUILD_BUG_ON(sizeof(struct p7580_submit) != 40);
 }
 
 
@@ -98,6 +97,12 @@ struct p7580_submit {
 	uint32_t bo_handle_count;
 	uint32_t requirements;
 };
+/* p7580_submit mirror pin (kept after the definition: C needs the
+ * complete type for sizeof). */
+static inline void p7580_abi_check_submit_mirror(void)
+{
+	BUILD_BUG_ON(sizeof(struct p7580_submit) != 40);
+}
 int p7580_job_submit(struct p7580_job_dev *jd, struct p7580_file_ctx *fctx,
 		     const struct p7580_submit *args);
 
@@ -293,6 +298,8 @@ int panfrost_ioctl_submit(struct drm_device *dev, void *data,
 	uint32_t in_syncs[P7580_SUBMIT_IN_SYNC_MAX];
 	struct p7580_submit staged;
 
+	p7580_abi_check_submit();
+	p7580_abi_check_submit_mirror();
 	if (!args->jc || (args->jc & 7u))
 		return -EINVAL;
 	if (args->requirements & ~PANFROST_JD_REQ_FS)
