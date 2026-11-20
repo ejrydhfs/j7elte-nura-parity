@@ -36,3 +36,16 @@ Fallback if it does not come up: `/tmp/bindboot.img` (known-good) via another ph
 ## Repo
 All work committed locally (29 commits ahead of origin). `git push` fails 403: the host token is
 `alosslessdev`, the remote is `ejrydhfs/j7elte-nura-parity` — needs the right credentials.
+
+## GPU bring-up next steps (2026-11-20)
+Kernel int5+mmap2 is live: `renderD128` only, safe ioctls PASS, Xorg on fbdev.
+Submit is gated until the PM-ordering fix (MMIO before runtime-PM) is flashed.
+
+1. Flash int6 (PM-ordering fix) via p10 block node, reboot, confirm `renderD128` + Xorg `S`.
+2. Deploy `/data/wdarm` (rebuilt one-shot version) and `/tmp/pf7580-submit`, then run:
+   `rootshell sh -c '/data/wdarm 60 /tmp/pf7580-submit --submit-test /dev/dri/renderD128'`
+   - PASS -> disarm attempt + `dmesg` capture.
+   - wedge -> SoC self-resets in ~60 s (verified behaviour); capture dmesg after reboot.
+3. Mesa 20.3.5 build in `/data/mesabuild/mesa20` (gallium panfrost only) pairs with the v5.2 UAPI;
+   test with `MESA_LOADER_DRIVER_OVERRIDE=panfrost` against the render node.
+
