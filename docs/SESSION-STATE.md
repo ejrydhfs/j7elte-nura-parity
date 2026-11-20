@@ -122,6 +122,20 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Why the GPU never ran (2026-11-20, int12 trace)
+On-silicon trace of one NULL-job submit:
+```
+p7580_sched: ioctl jc=0x2000000 req=0x0 bo=1 in=0 out=1
+p7580_sched: push job_count=1
+p7580_sched: queued seq=0 slot=1 submit_rc=0
+p7580_sched: pump job_count=1
+p7580_sched: retire seq=0 slot=0
+```
+`run_job` is never called and the slot mutates 1->0: the 0004 `drm_sched` shim retires a dequeued job
+without executing it. Hence fence signalled instantly, Mesa reports 2700 FPS, readback all zeros.
+Fix in progress (`docs/reports/gpu31-pumpfix.md`): pump must call `sched_ops->run_job`, install its
+fence, and retire only after completion.
+
 ## Hardware GL via panfrost (2026-11-20, int9)
 - Full ioctl lifecycle PASS on silicon, including clean close: GET_PARAM 0x720, CREATE_BO,
   MMAP, SUBMIT rc=0, syncobj create/wait, `CLOSE: returned`, exit 0, watchdog disarmed.
