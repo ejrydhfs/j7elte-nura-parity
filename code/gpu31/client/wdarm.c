@@ -53,8 +53,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	to = atoi(argv[1]);
-	if (to <= 0 || to > 600) {
-		fprintf(stderr, "wdarm: bad timeout '%s'\n", argv[1]);
+	/* Live-SoC limit (Main, 2026-11-20): the S3C watchdog on this
+	 * part rejects anything above ~19 s (SETTIMEOUT 60 -> EINVAL).
+	 * Fail fast with a clear message instead of a kernel error. */
+	if (to <= 0 || to > 19) {
+		fprintf(stderr, "wdarm: bad timeout '%s' (this SoC caps ~19 s)\n",
+			argv[1]);
 		return 1;
 	}
 	const char *dev = "/dev/watchdog";
