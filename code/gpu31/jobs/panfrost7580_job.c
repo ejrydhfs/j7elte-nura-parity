@@ -395,6 +395,17 @@ void p7580_job_free(struct p7580_submit_job *job)
  * done_fence has not signaled within P7580_JOB_TIMEOUT_MS of dispatch.
  * Runs in process context (workqueue), so it may sleep for reset.
  * Spurious if the IRQ just signaled -> bail out.
+ *
+ * SUBMIT-DEADLOCK FIX: after recovery, signal this job's own fence if
+ * it is still pending. Recovery latches jd->in_flight[slot], which may
+ * be a *different* (newer) job than the one that timed out -- e.g. the
+ * stuck slot swallowed a START (hw_submit WARN_ON bail leaves the new
+ * fence unsignaled and the job out of flight). Without this, that fence
+ * never signals: no second timeout re-arms it and its finish_cb never
+ * fires. The signal is bounded (one timeout period + one recovery) and
+ * idempotent (guarded by is_signaled, same F-JOB4 precedent); the 0001
+ * fence carries no error state, so a plain signal marks completion and
+ * the fault status stays in the kernel log for the Mesa retry decision.
  */
 void p7580_job_timedout(struct p7580_job_dev *jd,
 			struct p7580_submit_job *job)
@@ -408,6 +419,16 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 
 	status = p7580_js_read(jd, slot, P7580_JS_STATUS);
 	p7580_job_recover(jd, slot, status);
+
+	/* Bounded-completion guarantee: recovery signals the job latched in
+	 * in_flight[slot], which may differ from this timed-out job (see
+	 * above). If ours is still pending, signal it here so its
+	 * finish_cb/syncobj/WAIT_BO waiters wake within one timeout plus
+	 * one recovery instead of hanging forever. Idempotent: the IRQ or
+	 * a concurrent recover may have signaled it first. */
+	f = (struct dma_fence *)job->done_fence;
+	if (f && !dma_fence_is_signaled(f)) /* 0001 */
+		dma_fence_signal(f); /* 0001 */
 }
 /* ------------------------------------------------------------------ */
 /* SUBMIT ioctl body. Steps (mirrors v5.2 panfrost_job_push, adapted  */
