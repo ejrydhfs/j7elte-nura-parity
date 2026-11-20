@@ -59,6 +59,27 @@
 #include "panfrost7580_job.h"
 
 /* ------------------------------------------------------------------ */
+/* Bounded job-lifecycle tracing (jobtrace ticket).                    */
+/*                                                                     */
+/* p7580_job_trace = number of SUBMITs to trace from load (0 = off).   */
+/* Each traced job prints at most 3 lines: dispatch (slot, jc, cfg     */
+/* actually written to CONFIG_NEXT), IRQ (JOB_INT_STAT bits), and      */
+/* fence-signal (which slot retired). The trace budget lives in        */
+/* jd->trace_left and is consumed under hw_lock, so the log volume is  */
+/* bounded even at Mesa frame rates (~3000 jobs/s would otherwise      */
+/* spam dmesg into a DoS). Dumps use pr_info so they survive the      */
+/* default loglevel.                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Default: trace the first 8 jobs (covers egltest startup + frames).
+ * Plain static (NOT module_param_named): the integrator's object rule
+ * defines KBUILD_MODNAME at Image link time, but the slice-level
+ * -fsyntax-only / -c checks compile this file standalone without it.
+ * Runtime tuning is the jd->trace_left budget (seeded from this). */
+#define P7580_JOB_TRACE_DEFAULT	8u
+
+static unsigned int p7580_job_trace = P7580_JOB_TRACE_DEFAULT;
+/* ------------------------------------------------------------------ */
 /* Register access                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -205,6 +226,9 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	jd->shader_present = shader_present;
 	spin_lock_init(&jd->hw_lock);
 	mutex_init(&jd->reset_lock);
+	/* Snapshot the module param once: later writes change the param
+	 * but not an already-probed device (bounded by construction). */
+	jd->trace_left = p7580_job_trace;
 	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 		jd->in_flight[i] = NULL;
 		mask |= P7580_MK_JS_MASK(i);
@@ -279,9 +303,19 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 	/* GO. */
 	p7580_js_write(jd, slot, P7580_JS_COMMAND_NEXT, P7580_JS_CMD_START);
 
+	/* Bounded dispatch trace: slot, HEAD jc, and the CONFIG_NEXT
+	 * value actually written (START_MMU/FLUSH bits visible), one
+	 * line per traced job. Consumes one budget unit; IRQ + fence
+	 * prints below consume their own units, so one job costs <= 3. */
+	if (jd->trace_left) {
+		jd->trace_left--;
+		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u\n",
+			slot, (unsigned long long)job->jc, cfg, job->as_nr,
+			(unsigned long long)job->affinity, job->seqno);
+	}
+
 	spin_unlock_irqrestore(&jd->hw_lock, flags);
 }
-
 /* ------------------------------------------------------------------ */
 /* IRQ handler: demux JOB_INT_STAT per slot. IRQ context: no sleeps,  */
 /* no mutexes, only spinlock + fence signal + JOB_INT_CLEAR.          */
@@ -308,6 +342,8 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 
 	for (j = 0; j < P7580_NUM_JOB_SLOTS; j++) {
 		uint32_t m = P7580_MK_JS_MASK(j);
+		uint32_t js_status;
+		int sig = 0;
 
 		if (!(status & m))
 			continue;
@@ -328,10 +364,55 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			spin_lock_irqsave(&jd->hw_lock, flags);
 			job = jd->in_flight[j];
 			jd->in_flight[j] = NULL;
+			/* Bounded IRQ trace: raw STAT bits plus the slot
+			 * STATUS register, so DONE vs ERR vs silent-skip
+			 * is decidable from dmesg. Skipped jobs print
+			 * nothing here (no IRQ fires); executed jobs print
+			 * this line. */
+			js_status = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_STATUS));
+			if (jd->trace_left) {
+				jd->trace_left--;
+				pr_info("p7580_job: irq slot=%d stat=0x%08x js_status=0x%08x (%s) has_job=%d\n",
+					j, status, js_status,
+					p7580_js_status_name(js_status),
+					job != NULL);
+			}
 			spin_unlock_irqrestore(&jd->hw_lock, flags);
 
-			if (job && job->done_fence)
-				dma_fence_signal((struct dma_fence *)job->done_fence); /* 0001 */
+			if (job && job->done_fence) {
+				sig = dma_fence_signal((struct dma_fence *)job->done_fence); /* 0001 */
+				/* Bounded fence-signal trace: 0 = first
+				 * signal (normal retire), -EINVAL =
+				 * already signaled (IRQ/timeout race,
+				 * idempotent by design). */
+				if (jd->trace_left) {
+					unsigned long f;
+
+					spin_lock_irqsave(&jd->hw_lock, f);
+					if (jd->trace_left) {
+						jd->trace_left--;
+						pr_info("p7580_job: fence signal slot=%d seq=%u sig_rc=%d\n",
+							j, job->seqno, sig);
+					}
+					spin_unlock_irqrestore(&jd->hw_lock, f);
+				}
+			}
+		} else if (status & P7580_JOB_ERR_BIT(j)) {
+			/* ERR without DONE: same bounded trace so faults
+			 * are visible even when no fence retires here
+			 * (recovery signals it in process context). */
+			unsigned long flags;
+			uint32_t es;
+
+			spin_lock_irqsave(&jd->hw_lock, flags);
+			es = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_STATUS));
+			if (jd->trace_left) {
+				jd->trace_left--;
+				pr_info("p7580_job: irq-err slot=%d stat=0x%08x js_status=0x%08x (%s)\n",
+					j, status, es,
+					p7580_js_status_name(es));
+			}
+			spin_unlock_irqrestore(&jd->hw_lock, flags);
 		}
 		status &= ~m;
 	}

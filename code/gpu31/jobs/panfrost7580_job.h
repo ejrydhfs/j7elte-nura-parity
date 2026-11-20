@@ -49,6 +49,10 @@ struct p7580_submit_job {
 	uint32_t as_nr;			/* address space bound to slot */
 	uint64_t affinity;		/* shader-present mask */
 	uint32_t flush_id;		/* recorded, unused (no FLUSH_REDUCTION) */
+	uint32_t out_sync;		/* syncobj handle for run_job install
+					 * (0 = none; validated at SUBMIT,
+					 * installed from render_done_fence
+					 * alias on the dispatch worker) */
 
 	/* Fences. done_fence owns the run_job ref and is signaled by the
 	 * JOB_INT handler (or the fault-recovery path, F-JOB4);
@@ -82,6 +86,11 @@ struct p7580_job_dev {
 	struct mutex reset_lock;	/* serialises fault recovery */
 	unsigned int fence_ctx[P7580_NUM_JOB_SLOTS];
 	uint64_t emit_seqno[P7580_NUM_JOB_SLOTS];
+	/* Job-lifecycle trace budget: decremented (under hw_lock) on each
+	 * dispatch / IRQ / fence-signal print, so the log stays bounded.
+	 * 0 disables tracing; set via the p7580_job_trace module param
+	 * (job.c). Default P7580_JOB_TRACE_DEFAULT (first N jobs only). */
+	unsigned int trace_left;
 };
 #else
 struct p7580_job_dev {

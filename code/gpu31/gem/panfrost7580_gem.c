@@ -64,6 +64,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/vmalloc.h>
 #include <linux/sched.h>
+#include <asm/cacheflush.h>	/* flush_dcache_page for HIGHMEM SHMEM */
 
 #include <drm/drmP.h>
 #include <drm/drm.h>
@@ -76,6 +77,42 @@
 struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj)
 {
 	return container_of(obj, struct p7580_bo, base);
+}
+
+/* ------------------------------------------------------------------ */
+/* Job-completion CPU-cache invalidate (COHERENCY_NONE readback path). */
+/*                                                                     */
+/* Why this exists: the CPU mmap is write-combined (MT_NORMAL_NC, no   */
+/* CPU lines to flush) — but the SHMEM backing pages THEMSELVES may    */
+/* live in HIGHMEM, where the CPU touches them through a kmap alias    */
+/* (d-cacheable copy) and the GPU writes them through its own port.    */
+/* After the GPU fence signals, copy the kmap-alias bytes the GPU may  */
+/* have replaced back out of the dcache so the next kmap/kunmap        */
+/* window (CPU writer), vmap readback (glReadPixels), or mmap fault    */
+/* observes the GPU bytes instead of stale dcache lines. CMA (WC,      */
+/* dma_alloc_attrs) never aliases and is skipped here; dma-direct      */
+/* SHMEM is dcache-clean by construction (dma_map_page around the      */
+/* access) and needs no city flush either — only HIGHMEM kmap pages    */
+/* take the flush_dcache_page call. Bounded by the BO page count; no   */
+/* MMIO, no sleeps, no locks: safe on the IRQ-adjacent completion path */
+/* (in practice called from process-context retire, not hard-IRQ).     */
+/* ------------------------------------------------------------------ */
+void p7580_gem_job_done_sync(struct drm_gem_object *obj)
+{
+	struct p7580_bo *bo = to_p7580_bo(obj);
+	unsigned int i;
+
+	/* WC/CMA has no CPU cache alias: nothing to invalidate. */
+	if (bo->backing != P7580_BO_SHMEM || !bo->pages)
+		return;
+	for (i = 0; i < bo->nr_pages; i++) {
+		struct page *p = bo->pages[i];
+
+		if (!p || !PageHighMem(p))
+			continue;
+		flush_dcache_page(p);
+	}
+	bo->kmap_flushed = 1;
 }
 
 /* Per-device IOVA allocator (struct p7580_dev, header). Units: the

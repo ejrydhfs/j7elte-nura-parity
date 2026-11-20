@@ -111,8 +111,15 @@ struct p7580_bo {
 	 * count mirrors them (p7580_gem_prime_vmap/vunmap). */
 	void *vaddrs[P7580_VMAP_MAX];
 	unsigned int vmap_count;
+	/* Completion-side CPU-cache maintenance (jobtrace ticket). The
+	 * SUBMIT path records one snapshot of sync state here when the
+	 * SHMEM page array uses HIGHMEM: pages under a kmap_atomic
+	 * window are flushed there via flush_dcache_page, so the job
+	 * completion invalidate (p7580_gem_job_done_sync below) only
+	 * re-flushes the pages this flag marks. Zero for dma-direct
+	 * pages (dcache-clean by construction). */
+	unsigned int kmap_flushed;
 };
-
 /* Per-device GEM state: IOVA allocator + the lock that serialises it
  * (the driver allocates this in probe and stores it in dev_private;
  * the GEM helpers below take it by pointer so they stay testable). */
@@ -163,6 +170,14 @@ long p7580_gem_wait(struct drm_device *dev, struct drm_file *file_priv,
 unsigned int p7580_bo_npages(struct drm_gem_object *obj);
 phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
 			       unsigned int idx, int *ok);
+/* Job-completion CPU-cache invalidate (jobtrace ticket, COHERENCY_NONE).
+ * Called on the fence-completion path with one BO the finished job
+ * referenced: for SHMEM pages backed by HIGHMEM (kmap alias), issues
+ * flush_dcache_page per page so CPU reads (glReadPixels, mmap) see
+ * GPU-written bytes; for CMA (MT_NORMAL_NC, no CPU lines) and
+ * dma-direct SHMEM (dcache-clean via dma_map_page) it is a no-op.
+ * Safe in any process context; never sleeps for this BO layout. */
+void p7580_gem_job_done_sync(struct drm_gem_object *obj);
 struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
 struct drm_gem_object *p7580_gem_prime_import_sg_table(
 		struct drm_device *dev, size_t size, struct sg_table *sgt);
