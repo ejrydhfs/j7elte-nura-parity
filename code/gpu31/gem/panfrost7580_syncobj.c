@@ -40,8 +40,10 @@
  *    private already-signaled fence (see CREATE_SIGNALED). Signaling
  *    an already-signaled (or empty) syncobj is a no-op 0 -- Mesa
  *    re-signals without checking.
- *  - HANDLE_TO_FD/FD_TO_HANDLE with flags != 0 -> -EINVAL (only
- *    plain fence transport exists: no sync_file.c in 3.10).
+ *  - HANDLE_TO_FD/FD_TO_HANDLE tolerate bit 0 (libdrm 2.4.134 sets
+ *    EXPORT/IMPORT_SYNC_FILE unconditionally; no sync_file.c on 3.10
+ *    but the plain-fence anon-inode fd satisfies Mesa's snapshot use)
+ *    and reject all other unknown bits (TIMELINE bit 1 included).
  *  - copy_from_user/copy_to_user faults -> -EFAULT (the 3.10 core
  *    copies the fixed struct, NOT the pointed-to handle array; the
  *    array is copied here).
@@ -130,6 +132,70 @@ struct p7580_syncobj_array {
 	__u32 pad;
 };
 
+/* ABI gate (gpu31-abialign, both TUs): Mesa 20.3 bundles the 20.x
+ * drm.h syncobj shapes (verified on-device 2026-11-20 from
+ * /data/mesabuild/mesa20/include/drm-uapi/drm.h + disassembled
+ * libdrm.so.2.134.0 wrappers):
+ *   CREATE 8 B  IOWR(0xBF), DESTROY 8 B (v5.2-era: IOWR, current is
+ *   IOWR too -- the old IOW comment in pf7580.c predates the check),
+ *   HANDLE 16 B IOWR(0xC1/0xC2, NO point field),
+ *   WAIT   32 B IOWR(0xC3, NO deadline_nsec tail),
+ *   ARRAY  16 B IOWR(0xC4/0xC5).
+ * The 3.10 core keys copy_from/to_user on OUR asize (the dispatcher's
+ * asize table below), so the struct MUST stay 16/32 B: a 24/40 B
+ * current-header struct would over-copy into the stack buffer. The
+ * dispatcher ALSO keys on _IOC_NR only (not _IOC_SIZE), so a 24 B
+ * HANDLE_TO_FD from libdrm 2.4.134 lands here with usize=24; the
+ * handler reads only the first 16 B and ignores the point tail.
+ * ioctl direction (client pf7580.c asserts the same): CREATE+WAIT are
+ * IOWR, DESTROY is IOWR on the wire the kernel serves (20.x drm.h says
+ * DRM_IOWR for all three; the legacy IOW DESTROY encoding aliases the
+ * same _IOC_NR so dispatch is unaffected, but new code MUST use IOWR).
+ * Flag contract: SYNC_FILE bits (HTOF/FTOH bit 0) need sync_file.c
+ * (absent on 3.10) and are the ONLY rejected HTOF/FTOH bits; WAIT
+ * rejects FOR_SUBMIT/AVAILABLE/DEADLINE. See the handle_to_fd body for
+ * why SYNC_FILE is silently tolerated on plain-fence exports. */
+#include <linux/bug.h>
+/* Bit 0 doubles as the only valid HTOF/FTOH flag on BOTH the 20.x
+ * header (EXPORT/IMPORT_SYNC_FILE) and mainline (TIMELINE is bit 1). */
+#define P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE	(1u << 0)
+#define P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE	(1u << 0)
+static inline void p7580_syncobj_abi_check(void)
+{
+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_create) != 8);
+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_destroy) != 8);
+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_handle) != 16);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
+					handle) != 0);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
+					flags) != 4);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
+					fd) != 8);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_handle,
+					pad) != 12);
+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_wait) != 32);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
+					handles) != 0);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
+					timeout_nsec) != 8);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
+					count_handles) != 16);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
+					flags) != 20);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
+					first_signaled) != 24);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_syncobj_wait,
+					pad) != 28);
+	BUILD_BUG_ON(sizeof(struct p7580_syncobj_array) != 16);
+	BUILD_BUG_ON(P7580_SYNCOBJ_CREATE_SIGNALED !=
+		     (1u << 0));
+	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_ALL != (1u << 0));
+	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_FOR_SUBMIT != (1u << 1));
+	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_AVAILABLE != (1u << 2));
+	BUILD_BUG_ON(P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE != (1u << 0));
+	BUILD_BUG_ON(P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE != (1u << 0));
+}
+
 /* The manager lives first in driver_priv (GEM p7580_file_priv and the
  * driver's p7580_drv_file share the layout: mgr, ...). */
 static struct drm_syncobj_manager *p7580_sync_mgr(struct drm_file *fp)
@@ -187,6 +253,7 @@ int panfrost_syncobj_create(struct drm_device *dev, void *data,
 	int ret;
 
 	(void)dev;
+	p7580_syncobj_abi_check();
 	if (!mgr)
 		return -ENODEV;
 	/* Mainline rejects any unknown bit at once (flags & ~SIGNALED). */
@@ -239,7 +306,8 @@ int panfrost_syncobj_destroy(struct drm_device *dev, void *data,
 /* ---- FD export/import: plain-fence anon_inode transport ---- */
 /* 3.10 has no sync_file.c, so HANDLE_TO_FD exports the CURRENT fence
  * (snapshot ref at export time; later replaces do not follow the fd).
- * flags must be 0: *_EXPORT_SYNC_FILE needs the sync_file layer. */
+ * Bit 0 (EXPORT/IMPORT_SYNC_FILE) is tolerated (see handler bodies);
+ * all other flag bits are -EINVAL. */
 
 struct p7580_syncobj_export {
 	struct dma_fence *fence;	/* ref held for the file */
@@ -273,11 +341,25 @@ int panfrost_syncobj_handle_to_fd(struct drm_device *dev, void *data,
 	int fd;
 
 	(void)dev;
+	p7580_syncobj_abi_check();
 	if (!mgr)
 		return -ENODEV;
-	if (args->flags)
-		return -EINVAL;
 	if (args->pad)
+		return -EINVAL;
+	/* Mesa 20.3 libdrm 2.4.134 unconditionally sets bit 0
+	 * (EXPORT_SYNC_FILE) in drmSyncobjExportSyncFile/HandleToFD
+	 * (disassembled: stp w1=handle,w2=-1 + mov w1=#1 for the flag
+	 * word; pan_screen.c panfrost_fence_create calls ExportSyncFile
+	 * so EVERY fence snapshot -- and therefore every glFinish/
+	 * ReadPixels flush -- goes through here). There is no sync_file
+	 * layer on 3.10, but the plain-fence anon-inode fd we install
+	 * satisfies the only thing Mesa does with it: import the fence
+	 * into a fresh syncobj. Rejecting bit 0 broke all draws (3x
+	 * EINVAL per flush, SUBMIT never reached). So: tolerate bit 0,
+	 * reject every OTHER unknown bit (TIMELINE bit 1 included --
+	 * the 0003 shim has no timeline points, and silently dropping
+	 * them would hang Mesa on a fence we never signalled). */
+	if (args->flags & ~P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE)
 		return -EINVAL;
 	s = drm_syncobj_find(mgr, args->handle);
 	if (!s)
@@ -317,9 +399,14 @@ int panfrost_syncobj_fd_to_handle(struct drm_device *dev, void *data,
 	(void)dev;
 	if (!mgr)
 		return -ENODEV;
-	if (args->flags)
-		return -EINVAL;
 	if (args->pad)
+		return -EINVAL;
+	/* Mirror HANDLE_TO_FD: libdrm drmSyncobjImportSyncFile sets bit 0
+	 * (IMPORT_SYNC_FILE); tolerate it, reject the rest (TIMELINE bit 1
+	 * included). A foreign sync_file fd (real sync_file.c file) still
+	 * fails the f_op check below -- we only snapshot fences from fds
+	 * this driver exported. */
+	if (args->flags & ~P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE)
 		return -EINVAL;
 	if (args->fd < 0)
 		return -EINVAL;
@@ -614,7 +701,13 @@ static long p7580_syncobj_dispatch(struct drm_device *dev, void *kdata,
 /* Same copy discipline as drm_ioctl (drm_drv.c:444-490): fixed-size
  * struct is kernel-copied; only the pointed-to handle arrays are
  * copied in the handlers. asize>usize zero-pads (older libdrm with a
- * shorter WAIT struct keeps working). */
+ * shorter WAIT struct keeps working); usize>asize truncates (newer
+ * libdrm with a LONGER struct: 24 B HANDLE with point tail, 40 B WAIT
+ * with deadline_nsec -- the extra tail bytes are NOT copied in, so
+ * the handler never sees them, and the copy_to_user writes back only
+ * usize... see below). Copy-back is capped at asize (never usize):
+ * with a 24 B userspace HANDLE, blindly writing 24 B back would leak
+ * 8 B of stack past our 16 B struct into userspace. */
 static long p7580_syncobj_do(struct file *filp, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -663,20 +756,31 @@ static long p7580_syncobj_do(struct file *filp, unsigned int cmd,
 	if (asize > usize)
 		memset(kdata + usize, 0, asize - usize);
 	if (cmd & IOC_IN) {
+		/* Truncate: copy at most asize (our struct); a longer
+		 * userspace struct (24 B HANDLE, 40 B WAIT) leaves its
+		 * tail in userspace, untouched. */
+		unsigned int cpin = usize < asize ? usize : asize;
+
 		if (copy_from_user(kdata, (void __user __force *)arg,
-				   usize) != 0) {
+				   cpin) != 0) {
 			ret = -EFAULT;
 			goto out;
 		}
+		if (cpin < asize)
+			memset(kdata + cpin, 0, asize - cpin);
 	} else {
-		memset(kdata, 0, usize);
+		memset(kdata, 0, asize);
 	}
 	ret = p7580_syncobj_dispatch(dev, kdata, file_priv, nr);
 	if (ret == -ENOENT)
 		ret = drm_ioctl(filp, cmd, arg);
 	else if ((cmd & IOC_OUT) && ret == 0) {
+		/* Cap the write-back at asize: never leak stack past our
+		 * struct into a longer userspace struct's tail. */
+		unsigned int cpout = usize < asize ? usize : asize;
+
 		if (copy_to_user((void __user __force *)arg, kdata,
-				 usize) != 0)
+				 cpout) != 0)
 			ret = -EFAULT;
 	}
 out:

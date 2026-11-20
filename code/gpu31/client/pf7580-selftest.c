@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "pf7580.h"
 
@@ -78,7 +79,54 @@ static void print_abi(void)
 	printf("mmap_bo           %zu\n", sizeof(struct pf7580_mmap_bo));
 	printf("get_param         %zu\n", sizeof(struct pf7580_get_param));
 	printf("get_bo_offset     %zu\n", sizeof(struct pf7580_get_bo_offset));
+	printf("syncobj_handle    %zu\n", sizeof(struct pf7580_syncobj_handle));
+	printf("syncobj_wait      %zu\n", sizeof(struct pf7580_syncobj_wait));
 	printf("T720 prod id       0x%04x\n", PF7580_T720_PROD_ID);
+}
+
+/* Mesa 20.3's exact GET_PARAM sequence (pan_props.c panfrost_query_raw):
+ * the struct is zeroed, param set, IOWR(0x44/16 B) issued; non-PROD_ID
+ * probes must fail -EINVAL (never success-with-garbage) so the caller
+ * takes its compiled-in default. Exercises the first EINVAL row. */
+static void t_get_param_abi(struct pf7580_dev *dev)
+{
+	uint64_t v = 0xdeadbeefull;
+
+	CHECK_RC(pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &v), 0,
+		 "get_param prod_id u64");
+	CHECK(v == PF7580_T720_PROD_ID, "prod id 0x%" PRIx64, v);
+	/* Mesa probes SHADER_PRESENT with required=false; the driver must
+	 * fail EINVAL (Mesa then uses 0xffff -> MP2 core count). */
+	CHECK_RC(pf7580_get_param(dev, 2, &v), -EINVAL,
+		 "get_param SHADER_PRESENT EINVAL");
+	CHECK_RC(pf7580_get_param(dev, 1, &v), -EINVAL,
+		 "get_param REVISION EINVAL");
+}
+
+/* Mesa 20.3's exact fence-snapshot sequence (pan_screen.c
+ * panfrost_fence_create): CREATE signaled ctx syncobj, export it with
+ * flags=1 (SYNC_FILE, as libdrm 2.4.134 encodes), import the fd into
+ * a fresh syncobj, wait on it. Exercises the second EINVAL row fix. */
+static void t_syncobj_abi(struct pf7580_dev *dev)
+{
+	uint32_t ctx_sync = 0, imp = 0;
+	int fd = -1;
+
+	CHECK_RC(pf7580_syncobj_create(dev, 1, &ctx_sync), 0,
+		 "syncobj create signaled (ctx)");
+	CHECK_RC(pf7580_syncobj_handle_to_fd(dev, ctx_sync, 1, &fd), 0,
+		 "handle_to_fd SYNC_FILE (Mesa export)");
+	CHECK(fd >= 0, "exported fd %d", fd);
+	CHECK_RC(pf7580_syncobj_fd_to_handle(dev, fd, 1, &imp), 0,
+		 "fd_to_handle SYNC_FILE (Mesa import)");
+	CHECK(imp != 0 && imp != ctx_sync, "import handle %u", imp);
+	CHECK_RC(pf7580_syncobj_wait(dev, &imp, 1, 0, 1, NULL), 0,
+		 "wait imported signaled");
+	CHECK_RC(pf7580_syncobj_destroy(dev, imp), 0, "destroy imported");
+	if (!pf7580_is_mock(dev))
+		close(fd);
+	CHECK_RC(pf7580_syncobj_destroy(dev, ctx_sync), 0,
+		 "destroy ctx syncobj");
 }
 
 /* SUBMIT-free node probe: GET_PARAM + CREATE_BO(4K) + MMAP_BO +
@@ -336,6 +384,9 @@ static int run_mock_suite(void)
 	CHECK(pf7580_fd(dev) == -1, "mock fd is -1");
 
 	t_get_param(dev);
+	/* Mesa-exact ABI sequences (gpu31-abialign): must pass on mock. */
+	t_get_param_abi(dev);
+	t_syncobj_abi(dev);
 	t_create_bo(dev, &h, &gpu_off);
 	t_offsets(dev, h, gpu_off, &map_off);
 	t_cpu_map(dev, h, map_off);
@@ -434,9 +485,71 @@ static int run_device(const char *path)
 		}
 	}
 	if (!failures) {
+		/* Mesa-exact sequences on silicon (gpu31-abialign): the
+		 * GET_PARAM u64 probe order and the export/import fence
+		 * snapshot. SUBMIT-free; SUBMIT is --submit-test only. */
+		uint64_t v = 0;
+
+		rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &v);
+		if (rc || v != PF7580_T720_PROD_ID) {
+			printf("FAIL get_param u64: rc=%d (%s) v=0x%" PRIx64
+			       "\n", rc, pf7580_strerror(rc), v);
+			failures++;
+		} else {
+			printf("GET_PARAM u64: OK 0x%" PRIx64 "\n", v);
+		}
+		rc = pf7580_get_param(dev, 2, &v);
+		if (rc != -EINVAL) {
+			printf("FAIL get_param SHADER_PRESENT: rc=%d (%s), want -EINVAL\n",
+			       rc, pf7580_strerror(rc));
+			failures++;
+		} else {
+			printf("GET_PARAM SHADER_PRESENT: EINVAL ok (Mesa default path)\n");
+		}
+	}
+	if (!failures) {
+		uint32_t ctx_sync = 0, imp = 0;
+		int efd = -1;
+
+		rc = pf7580_syncobj_create(dev, 1, &ctx_sync);
+		if (rc || !ctx_sync) {
+			printf("FAIL syncobj_create signaled: %s\n",
+			       pf7580_strerror(rc));
+			failures++;
+		} else {
+			printf("SYNCOBJ_CREATE signaled: OK handle=%u\n",
+			       ctx_sync);
+			rc = pf7580_syncobj_handle_to_fd(dev, ctx_sync,
+							  1, &efd);
+			if (rc || efd < 0) {
+				printf("FAIL handle_to_fd SYNC_FILE: %s\n",
+				       pf7580_strerror(rc));
+				failures++;
+			} else {
+				printf("HANDLE_TO_FD SYNC_FILE: OK fd=%d\n",
+				       efd);
+				rc = pf7580_syncobj_fd_to_handle(dev, efd,
+								  1, &imp);
+				if (rc || !imp) {
+					printf("FAIL fd_to_handle SYNC_FILE: %s\n",
+					       pf7580_strerror(rc));
+					failures++;
+				} else {
+					printf("FD_TO_HANDLE SYNC_FILE: OK handle=%u (round-trip)\n",
+					       imp);
+				}
+				close(efd);
+				if (imp)
+					pf7580_syncobj_destroy(dev, imp);
+			}
+			pf7580_syncobj_destroy(dev, ctx_sync);
+		}
+	}
+	if (!failures) {
 		rc = pf7580_wait_bo(dev, h, 0);
 		if (rc) {
-			printf("FAIL wait_bo: %s\n", pf7580_strerror(rc));
+			printf("FAIL wait_bo: %s\n",
+			       pf7580_strerror(rc));
 			failures++;
 		} else {
 			printf("wait_bo(0) ok\n");

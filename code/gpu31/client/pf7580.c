@@ -50,7 +50,12 @@
 
 /* Generic syncobj ioctls (core numbers 0xBF-0xC5, NOT driver-private;
  * the driver's fops dispatcher routes them — G31_SyncobjIoctl. Wire types
- * are the stock drm.h structs (verified below against <drm/drm.h>). */
+ * are the 20.x drm.h shapes Mesa 20.3 was built against (verified
+ * on-device 2026-11-20): HANDLE 16 B (no point tail), WAIT 32 B (no
+ * deadline_nsec tail). The driver dispatches on _IOC_NR and truncates
+ * longer userspace structs, so the 24/40 B current-header shapes keep
+ * working through libdrm -- but THIS client encodes the 16/32 B shapes
+ * exactly (gpu31-abialign table). */
 struct pf7580_syncobj_create {
 	uint32_t handle;
 	uint32_t flags;
@@ -59,22 +64,26 @@ struct pf7580_syncobj_destroy {
 	uint32_t handle;
 	uint32_t pad;
 };
-struct pf7580_syncobj_wait {
-	uint64_t handles;
-	int64_t timeout_nsec;	/* absolute CLOCK_MONOTONIC */
-	uint32_t count_handles;
-	uint32_t flags;
-	uint32_t first_signaled;
-	uint32_t pad;
-};
 #define PF7580_IOCTL_SYNCOBJ_CREATE \
 	DRM_IOWR(0xBF, struct pf7580_syncobj_create)
+/* 20.x drm.h says DRM_IOWR for DESTROY (libdrm 2.4.134 encodes
+ * 0xc00864c0 -- verified disassembly); the old DRM_IOW spelling
+ * aliases the same _IOC_NR so dispatch is identical, but new code
+ * must use IOWR (direction is part of the ABI contract). */
 #define PF7580_IOCTL_SYNCOBJ_DESTROY \
-	DRM_IOW(0xC0, struct pf7580_syncobj_destroy)
+	DRM_IOWR(0xC0, struct pf7580_syncobj_destroy)
+#define PF7580_IOCTL_SYNCOBJ_HANDLE_TO_FD \
+	DRM_IOWR(0xC1, struct pf7580_syncobj_handle)
+#define PF7580_IOCTL_SYNCOBJ_FD_TO_HANDLE \
+	DRM_IOWR(0xC2, struct pf7580_syncobj_handle)
 #define PF7580_IOCTL_SYNCOBJ_WAIT_SZ 32
 #define PF7580_IOCTL_SYNCOBJ_WAIT \
 	DRM_IOWR(0xC3, char[PF7580_IOCTL_SYNCOBJ_WAIT_SZ])
 #define PF7580_SYNCOBJ_WAIT_ALL		(1u << 0)
+/* libdrm 2.4.134 sets bit 0 (SYNC_FILE) unconditionally on HTOF/FTOH;
+ * the driver tolerates it (plain-fence snapshot satisfies Mesa). */
+#define PF7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE	(1u << 0)
+#define PF7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE	(1u << 0)
 
 /* Compile-time wire check: our mirrors must encode exactly like the
  * v5.2 directions above (a direction flip changes the ioctl number). */
@@ -96,23 +105,25 @@ _Static_assert(PF7580_IOCTL_GET_PARAM ==
 _Static_assert(PF7580_IOCTL_GET_BO_OFFSET ==
 	DRM_IOWR(DRM_COMMAND_BASE + 0x05, struct pf7580_get_bo_offset),
 	"get_bo_offset encoding");
-/* CREATE/DESTROY match stock drm.h (8 B); WAIT matches the DRIVER's
- * p7580_syncobj_wait (32 B, no deadline tail — the host drm.h added a
+/* CREATE 8 B, DESTROY 8 B, HANDLE 16 B match 20.x drm.h; WAIT matches
+ * the DRIVER's 32 B wait (no deadline tail -- the host drm.h added a
  * u64 deadline_nsec the 3.10 driver does not know). The driver's fops
- * dispatcher keys on _IOC_NR and copies _IOC_SIZE bytes, so WAIT must
- * encode a 32 B payload: fixed-size macro below, NOT sizeof(struct
- * drm_syncobj_wait) (40 B on this host). */
+ * dispatcher keys on _IOC_NR and truncates longer userspace structs,
+ * so WAIT is encoded as a fixed 32 B payload, NOT sizeof(struct
+ * drm_syncobj_wait) (40 B on current hosts). */
 _Static_assert(sizeof(struct pf7580_syncobj_create) ==
 	sizeof(struct drm_syncobj_create), "syncobj_create wire size");
 _Static_assert(sizeof(struct pf7580_syncobj_destroy) ==
 	sizeof(struct drm_syncobj_destroy), "syncobj_destroy wire size");
+_Static_assert(sizeof(struct pf7580_syncobj_handle) == 16,
+	"syncobj_handle driver wire size");
 _Static_assert(sizeof(struct pf7580_syncobj_wait) == 32,
 	"syncobj_wait driver wire size");
 #define PF7580_SYNCOBJ_WAIT_SIZE 32
 _Static_assert(PF7580_IOCTL_SYNCOBJ_CREATE ==
 	DRM_IOWR(0xBF, struct drm_syncobj_create), "syncobj_create enc");
 _Static_assert(PF7580_IOCTL_SYNCOBJ_DESTROY ==
-	DRM_IOW(0xC0, struct drm_syncobj_destroy), "syncobj_destroy enc");
+	DRM_IOWR(0xC0, struct drm_syncobj_destroy), "syncobj_destroy enc");
 
 /* ------------------------------------------------------------------ */
 /* Device handle. */
@@ -545,6 +556,88 @@ int pf7580_syncobj_destroy(struct pf7580_dev *dev, uint32_t handle)
 		d.handle = handle;
 		if (ioctl(dev->fd, PF7580_IOCTL_SYNCOBJ_DESTROY, &d))
 			return -errno;
+		return 0;
+	}
+}
+
+/* Mesa fence-snapshot round-trip (gpu31-abialign §4): export + import.
+ * Mock backend: the fd is faked as the syncobj handle cast to int
+ * (signalled state travels with the mock entry); FTOH of any other
+ * int is -EINVAL, mirroring the kernel f_op check. */
+int pf7580_syncobj_handle_to_fd(struct pf7580_dev *dev, uint32_t handle,
+				uint32_t flags, int *fd)
+{
+	if (!dev || !handle || !fd)
+		return -EINVAL;
+	if (flags & ~(PF7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE))
+		return -EINVAL;
+	if (dev->is_mock) {
+		struct pf7580_mock_syncobj *o;
+		int rc = mock_inject(dev);
+
+		if (rc)
+			return rc;
+		o = mock_syncobj_find(dev, handle);
+		if (!o)
+			return -ENOENT;
+		if (!o->signaled)
+			return -EINVAL;	/* nothing to export (kernel parity) */
+		*fd = (int)o->handle;
+		return 0;
+	}
+	{
+		struct pf7580_syncobj_handle h;
+
+		memset(&h, 0, sizeof(h));
+		h.handle = handle;
+		h.flags = flags;
+		h.fd = -1;
+		if (ioctl(dev->fd, PF7580_IOCTL_SYNCOBJ_HANDLE_TO_FD, &h))
+			return -errno;
+		*fd = h.fd;
+		return 0;
+	}
+}
+
+int pf7580_syncobj_fd_to_handle(struct pf7580_dev *dev, int fd,
+				uint32_t flags, uint32_t *handle)
+{
+	if (!dev || fd < 0 || !handle)
+		return -EINVAL;
+	if (flags & ~(PF7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE))
+		return -EINVAL;
+	if (dev->is_mock) {
+		struct pf7580_mock_syncobj *o;
+		unsigned i;
+		int rc = mock_inject(dev);
+
+		if (rc)
+			return rc;
+		o = mock_syncobj_find(dev, (uint32_t)fd);
+		if (!o)
+			return -EINVAL;	/* foreign fd (kernel f_op parity) */
+		for (i = 0; i < PF7580_MOCK_MAX_SYNCOBJS; i++) {
+			if (!dev->syncobjs[i].used) {
+				dev->syncobjs[i].used = 1;
+				dev->syncobjs[i].handle = dev->next_syncobj++;
+				if (dev->next_syncobj == 0)
+					dev->next_syncobj = 1;
+				dev->syncobjs[i].signaled = o->signaled;
+				*handle = dev->syncobjs[i].handle;
+				return 0;
+			}
+		}
+		return -ENOSPC;
+	}
+	{
+		struct pf7580_syncobj_handle h;
+
+		memset(&h, 0, sizeof(h));
+		h.flags = flags;
+		h.fd = fd;
+		if (ioctl(dev->fd, PF7580_IOCTL_SYNCOBJ_FD_TO_HANDLE, &h))
+			return -errno;
+		*handle = h.handle;
 		return 0;
 	}
 }

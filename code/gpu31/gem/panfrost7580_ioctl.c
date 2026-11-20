@@ -44,6 +44,43 @@
 #include "panfrost7580_gem.h"
 #include "panfrost7580_ioctl.h"
 #include "panfrost_drm.h"
+/* ABI gate (gpu31-abialign): v5.2/Mesa-20.3 wire sizes + offsets. The
+ * 3.10 core keys copy_from/to_user on the driver's own _IOC_SIZE, so
+ * any field/size drift silently mis-copies userspace. Fail the build
+ * instead. See also the mirror asserts in panfrost7580_syncobj.c. */
+#include <linux/bug.h>
+/* get_param is the Mesa handshake: identical on v5.2 and Mesa 20.3. */
+static inline void p7580_abi_check_get_param(void)
+{
+	BUILD_BUG_ON(sizeof(struct drm_panfrost_get_param) != 16);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_get_param,
+					param) != 0);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_get_param,
+					pad) != 4);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_get_param,
+					value) != 8);
+	BUILD_BUG_ON(DRM_PANFROST_PARAM_GPU_PROD_ID != 0);
+}
+/* SUBMIT is the 40-byte v5.2 shape (no jm_ctx_handle/pad tail). */
+static inline void p7580_abi_check_submit(void)
+{
+	BUILD_BUG_ON(sizeof(struct drm_panfrost_submit) != 40);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit, jc) != 0);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit,
+					in_syncs) != 8);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit,
+					in_sync_count) != 16);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit,
+					out_sync) != 20);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit,
+					bo_handles) != 24);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit,
+					bo_handle_count) != 32);
+	BUILD_BUG_ON(__builtin_offsetof(struct drm_panfrost_submit,
+					requirements) != 36);
+	BUILD_BUG_ON(sizeof(struct p7580_submit) != 40);
+}
+
 
 /* Jobs-slice SUBMIT core (code/gpu31/jobs/panfrost7580_job.h shape,
  * mirrored locally so this file -c compiles without the jobs tree).
@@ -116,9 +153,17 @@ int panfrost_ioctl_get_param(struct drm_device *dev, void *data,
 
 	(void)dev;
 	(void)file_priv;
-	if (args->pad)
-		return -EINVAL;
+	/* ABI gate: run the build-time checks on every call path so a
+	 * header drift cannot slip past an unbuilt TU. Cheap (constant). */
+	p7580_abi_check_get_param();
+	/* Mesa 20.3 panfrost_query_raw zeroes the struct, sets param, and
+	 * issues the IOWR(0x44/16 B) ioctl; non-PROD_ID probes arrive with
+	 * pad == 0 and must fail -EINVAL (NOT success-with-garbage): the
+	 * caller asserts !required and falls back to compiled-in defaults.
+	 * Upstream v5.2 panfrost_ioctl_get_param has the identical gate. */
 	if (args->param != DRM_PANFROST_PARAM_GPU_PROD_ID)
+		return -EINVAL;
+	if (args->pad)
 		return -EINVAL;
 	args->value = P7580_GPU_PROD_ID;
 	args->pad = 0;
