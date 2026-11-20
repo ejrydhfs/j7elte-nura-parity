@@ -403,11 +403,19 @@ static void drm_sched_job_finish(struct work_struct *work)
 		complete_all(&entity->entity_idle);
 
 	/* ST-FENCE: fence signalled (finish queued by fence_cb),
-	 * retirement handed to the backend free_job. */
+	 * retirement handed to the backend free_job. ST-FINISH adds
+	 * the ran stamp + slot so dmesg tells "retire without ever
+	 * running" (ran=0) from "run_job returned but its probe was
+	 * skipped" (ran=1). */
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
 		pr_info("p7580_sched: fence job_count=%d\n",
 			atomic_read(&entity->job_count));
+	}
+	if (p7580_sched_trace) {
+		p7580_sched_trace--;
+		pr_info("p7580_sched: finish ran=%d slot=%d\n",
+			job->ran, job->slot);
 	}
 
 	if (job->ops->free_job)
@@ -481,15 +489,49 @@ static void drm_sched_pump(struct work_struct *work)
 	entity->in_flight = job;
 	spin_unlock_irqrestore(&entity->queue_lock, flags);
 
-	/* ST-PUMP: worker dequeued (dep met or dep-less); run_job next. */
+	/* ST-PUMP: worker dequeued (dep met or dep-less); run_job next.
+	 * The pumpfix probe prints the job's ops/run_job pointers plus the
+	 * carried slot, so a header/ABI skew (run_job at the wrong offset,
+	 * NULL-ops job) shows up in dmesg. job->ops is trusted only after
+	 * the NULL check below: a NULL-ops job retires through the F4
+	 * free path (no dispatch) instead of faulting. */
 	if (p7580_sched_trace) {
 		p7580_sched_trace--;
 		pr_info("p7580_sched: pump job_count=%d\n",
 			atomic_read(&entity->job_count));
 	}
+	if (p7580_sched_trace) {
+		p7580_sched_trace--;
+		pr_info("p7580_sched: ops ops=%p run=%p slot=%d\n",
+			job->ops, job->ops ? job->ops->run_job : NULL,
+			job->slot);
+	}
 
+	if (!job->ops || !job->ops->run_job) {
+		spin_lock_irqsave(&entity->queue_lock, flags);
+		entity->in_flight = NULL;
+		spin_unlock_irqrestore(&entity->queue_lock, flags);
+		dma_fence_remove_callback(job->dep_fence, &job->dep_cb);
+		dma_fence_put(job->dep_fence);
+		job->dep_fence = NULL;
+		if (job->ops && job->ops->free_job)
+			job->ops->free_job(job);
+		else
+			kfree(job);
+		queue_work(entity->wq, &entity->sched_work);
+		return;
+	}
+
+	/* Preserve the submit-chosen slot: the backend must not re-derive
+	 * it from the entity pointer (container layouts shift the index;
+	 * int12 retired slot 0 for a slot-1 submit). */
+	if (job->slot < 0)
+		job->slot = 0;
 	run_fence = job->ops->run_job(job);
-	if (IS_ERR(run_fence)) {
+	job->ran = 1;
+	if (IS_ERR_OR_NULL(run_fence)) {
+		if (!run_fence)
+			run_fence = ERR_PTR(-ENODATA);
 		spin_lock_irqsave(&entity->queue_lock, flags);
 		entity->in_flight = NULL;
 		spin_unlock_irqrestore(&entity->queue_lock, flags);

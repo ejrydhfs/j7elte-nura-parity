@@ -5690,7 +5690,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,842 @@
+@@ -0,0 +1,866 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -5813,12 +5813,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	struct p7580_drv *drv;
 +	int slot;
 +
-+	df = container_of(ent, struct p7580_drv_file, entity[0]);
-+	/* Which slot? The entity pointer tells us. */
-+	slot = (int)(ent - &df->entity[0]);
++	/* Pumpfix: trust the submit-chosen slot carried on the sched job.
++	 * The old entity-pointer derivation (container_of(ent, ...,
++	 * entity[0]) + index math) is kept only as a dark fallback: under
++	 * the real container layout it recomputes index 0 for every slot,
++	 * which is exactly the int12 signature (submit slot 1, retire
++	 * slot 0, ST-RUN never reached because -EINVAL bailed first). */
++	slot = sched_job->slot;
++	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS) {
++		df = container_of(ent, struct p7580_drv_file, entity[0]);
++		if (ent >= &df->entity[0] &&
++		    ent < &df->entity[P7580_NUM_JOB_SLOTS])
++			slot = (int)(ent - &df->entity[0]);
++	}
 +	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS)
 +		return ERR_PTR(-EINVAL);
 +	job->slot = slot;
++	df = container_of(ent, struct p7580_drv_file, entity[0]);
++	if (ent < &df->entity[0] || ent >= &df->entity[P7580_NUM_JOB_SLOTS])
++		df = NULL;
 +	drv = (df && df->drv) ? df->drv : NULL;
 +	if (!drv)
 +		return ERR_PTR(-ENODEV);
@@ -5834,8 +5847,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * and dispatched; job->seqno assigned at SUBMIT order). */
 +	if (p7580_sched_trace) {
 +		p7580_sched_trace--;
-+		pr_info("p7580_sched: run_job seq=%u slot=%d jc=0x%llx\n",
-+			job->seqno, slot, (unsigned long long)job->jc);
++		pr_info("p7580_sched: run_job seq=%u slot=%d sslot=%d jc=0x%llx owner=%p\n",
++			job->seqno, slot, sched_job->slot,
++			(unsigned long long)job->jc, job);
 +	}
 +	if (p7580_drv_pm_get(drv)) {
 +		/* ST-PMGET (fail): dark block, job failed closed. */
@@ -5886,6 +5900,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	void *f;
 +
 +	df = container_of(ent, struct p7580_drv_file, entity[0]);
++	if (ent < &df->entity[0] || ent >= &df->entity[P7580_NUM_JOB_SLOTS])
++		df = NULL;
 +	drv = (df && df->drv) ? df->drv : NULL;
 +	if (!drv)
 +		return;
@@ -5924,6 +5940,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	uint32_t i;
 +
 +	df = container_of(ent, struct p7580_drv_file, entity[0]);
++	if (ent < &df->entity[0] || ent >= &df->entity[P7580_NUM_JOB_SLOTS])
++		df = NULL;
 +	drv = df ? df->drv : NULL;
 +	/* F-JT2: completion-side CPU-cache invalidate. free_job runs
 +	 * on finish_work strictly after the fence signal (0004: cancel
@@ -5951,8 +5969,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * queue -> dispatch -> retire chain completed. */
 +	if (p7580_sched_trace) {
 +		p7580_sched_trace--;
-+		pr_info("p7580_sched: retire seq=%u slot=%d\n",
-+			job ? job->seqno : 0, job ? job->slot : -1);
++		pr_info("p7580_sched: retire seq=%u slot=%d sslot=%d\n",
++			job ? job->seqno : 0, job ? job->slot : -1,
++			sched_job ? sched_job->slot : -1);
 +	}
 +	p7580_job_free(job);
 +	/* Balances p7580_drv_job_pm_arm() at queue time: the async
@@ -6361,6 +6380,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		goto err_objs;
 +	}
 +	drm_sched_job_arm(sched_job);
++	/* Pumpfix: carry the SUBMIT-chosen slot on the sched job so the
++	 * async run_job never re-derives it from the entity pointer
++	 * (container layouts shift the index; int12 derived 0 for a
++	 * slot-1 submit and bailed before ST-RUN). */
++	sched_job->slot = slot;
 +
 +	for (i = 0; i < nf; i++) {
 +		if (!dma_fence_is_signaled(inf[i])) {

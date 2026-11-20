@@ -335,12 +335,20 @@ static void test_syncobj_drain(void)
 /* 0004 sched tests: one entity, backend counters.                      */
 /* ------------------------------------------------------------------ */
 static int run_count, free_count;
+/* Pumpfix call-order log: run_log records run_job entry order, free_log
+ * records free_job (retire) order; each entry is the job owner id.
+ * retire_after_run asserts every retire lands after its run. */
+#define ORDER_MAX 16
+static int run_log[ORDER_MAX], free_log[ORDER_MAX];
+static int run_log_n, free_log_n;
 
 static struct dma_fence *sched_run_ok(struct drm_sched_job *job)
 {
 	struct test_fence *tf;
 
 	run_count++;
+	if (run_log_n < ORDER_MAX)
+		run_log[run_log_n++] = (int)(long)job->owner;
 	tf = mkfence(9, (unsigned)run_count);
 	if (!tf)
 		return ERR_PTR(-ENOMEM);
@@ -367,6 +375,8 @@ static void sched_free(struct drm_sched_job *job)
 	struct test_fence *tf;
 
 	free_count++;
+	if (free_log_n < ORDER_MAX)
+		free_log[free_log_n++] = (int)(long)job->owner;
 	if (job->fence) {
 		tf = to_test(job->fence);
 		dma_fence_put(job->fence);
@@ -761,6 +771,146 @@ static void test_close_null_dep(void)
 	}
 }
 
+/* pumpfix: run_job runs exactly once per queued job; retire lands    */
+/* after fence completion (never before run). Slot carried at submit  */
+/* survives the pump; NULL run_job retires via the free path.         */
+/* ------------------------------------------------------------------ */
+
+/* run_job exactly once per queued job; retire-after-run ordering. */
+static void test_pumpfix_run_once_ordered(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j[3];
+	int i, k;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+	run_log_n = 0;
+	free_log_n = 0;
+
+	/* Queue 3 jobs with distinct owner ids + submit-chosen slots. */
+	for (i = 0; i < 3; i++) {
+		j[i] = drm_sched_job_alloc(&e, &sched_ops_ok,
+					   (void *)(long)(11 + i));
+		CHECK(j[i] != NULL);
+		j[i]->slot = i;
+		CHECK_EQ(drm_sched_job_submit(j[i]), 0);
+	}
+
+	/* Pump until all 3 dispatch; each pump runs exactly one job
+	 * (in_flight serialises: the second pump sees in_flight set).
+	 * The emulation marks work pending instead of running it, so
+	 * drive each dispatch by hand: pump, then finish, repeat. */
+	for (i = 0; i < 3; i++) {
+		e.sched_work.fn(&e.sched_work);
+		spin_lock(&e.queue_lock);
+		e.in_flight = NULL;
+		spin_unlock(&e.queue_lock);
+	}
+	CHECK_EQ(run_count, 3);
+	CHECK_EQ(run_log_n, 3);
+	for (i = 0; i < 3; i++)
+		CHECK_EQ(run_log[i], 11 + i);
+	/* Nothing retired yet: retire happens only on fence signal. */
+	CHECK_EQ(free_count, 0);
+	/* Slots preserved through dispatch. */
+	for (i = 0; i < 3; i++)
+		CHECK_EQ(j[i]->slot, i);
+	/* Retire in order; each retire lands after its run. */
+	for (i = 0; i < 3; i++) {
+		CHECK(j[i]->fence != NULL);
+		dma_fence_signal(j[i]->fence);
+		j[i]->finish_work.fn(&j[i]->finish_work);
+		CHECK_EQ(free_count, i + 1);
+	}
+	CHECK_EQ(free_log_n, 3);
+	for (i = 0; i < 3; i++)
+		CHECK_EQ(free_log[i], 11 + i);
+	for (k = 0; k < 3; k++) {
+		int ri = -1, ni = -1;
+
+		for (i = 0; i < 3; i++) {
+			if (run_log[i] == 11 + k)
+				ri = i;
+			if (free_log[i] == 11 + k)
+				ni = i;
+		}
+		CHECK(ri >= 0 && ni >= 0 && ni >= ri);
+	}
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
+/* NULL-returning run_job retires via the error path (no hang). */
+static struct dma_fence *sched_run_null(struct drm_sched_job *job)
+{
+	run_count++;
+	if (run_log_n < ORDER_MAX)
+		run_log[run_log_n++] = (int)(long)job->owner;
+	return NULL;
+}
+
+/* NULL run_job (header/ABI skew) retires via the free path, no oops. */
+static void test_pumpfix_null_run_job(void)
+{
+	static const struct drm_sched_backend_ops null_run_ops = {
+		NULL, sched_timedout, sched_free,
+	};
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j = drm_sched_job_alloc(&e, &null_run_ops, (void *)(long)99);
+	j->slot = 1;
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 0);
+	CHECK_EQ(free_count, 1);
+	CHECK_EQ(j->slot, 1);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
+static void test_pumpfix_null_fence(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+	static const struct drm_sched_backend_ops null_fence_ops = {
+		sched_run_null, sched_timedout, sched_free,
+	};
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+	run_log_n = 0;
+
+	j = drm_sched_job_alloc(&e, &null_fence_ops, (void *)(long)77);
+	j->slot = 2;
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+	CHECK_EQ(free_count, 1);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
+
 int main(void)
 {
 	test_fence_init();
@@ -778,6 +928,9 @@ int main(void)
 	test_close_inflight();
 	test_close_syncobj_pending();
 	test_close_null_dep();
+	test_pumpfix_run_once_ordered();
+	test_pumpfix_null_run_job();
+	test_pumpfix_null_fence();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

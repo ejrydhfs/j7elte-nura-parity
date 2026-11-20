@@ -91,7 +91,14 @@ struct drm_sched_job {
 	struct dma_fence_cb finish_cb;	/* waits on fence (completion role) */
 	struct delayed_work timeout_work;
 	struct work_struct finish_work;	/* retirement sweep */
-	int credits;
+	int slot;			/* dispatch slot chosen at submit; the
+					 * pump preserves it, run_job must not
+					 * re-derive it (entity-pointer math
+					 * breaks under container layouts) */
+	int ran;			/* pumpfix stamp: set to 1 when run_job
+					 * returns; finish prints it so dmesg
+					 * distinguishes "never ran" (0) from
+					 * "ran but probe skipped" (1) */
 	void *owner;			/* backend private (panfrost_job) */
 };
 

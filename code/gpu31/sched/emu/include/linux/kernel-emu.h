@@ -286,8 +286,10 @@ static inline void *kcalloc(size_t n, size_t s, gfp_t g)
 #define EXPORT_SYMBOL(sym)
 #define MODULE_LICENSE(x)
 #define IS_ERR(p) ((unsigned long)(p) > (unsigned long)-1000UL)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define PTR_ERR(p) ((long)(p))
 #define ERR_PTR(e) ((void *)(long)(e))
+#define ENODATA 61
 #define EOPNOTSUPP 95
 #define ENOMEM 12
 #define EINVAL 22
