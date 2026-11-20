@@ -122,6 +122,16 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Completion IRQ works; Mesa ABI mismatch is the remaining blocker (int16)
+- int16: job goes to **slot 0**, `post-start js_status=0x8 (NO_EXCEPTION)`, IRQ fires
+  (`irq-enter rawstat=0x1`), fence signals immediately (`panfrost7580-job` count increments).
+  Hardware completion path is therefore correct.
+- Mesa 20.3.5 still renders nothing: strace shows **no `PANFROST_SUBMIT` at all**, plus
+  `GET_PARAM` -> EINVAL (3x), `SYNCOBJ_HANDLE_TO_FD` -> EINVAL (3x), and 385 rejected
+  MADVISE-class calls. Draws are no-ops because the UAPI handshake fails before any submit.
+- Next: struct/flag alignment between our kernel headers and Mesa 20.3's drm-uapi
+  (`gpu31-abialign.md`).
+
 ## Panfrost dispatches to hardware; completion IRQ missing (2026-11-20, int15)
 - After fixing the scheduler (pump now calls run_job) and stamping file/drv at SUBMIT,
   one NULL job reaches hardware:
