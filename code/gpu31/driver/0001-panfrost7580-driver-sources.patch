@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-19 10:48:44.303866714 -0500
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,107 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -98,6 +98,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +/* MMU/GPU IRQ demux (main.c). */
 +irqreturn_t p7580_drv_mmu_irq(int irq, void *arg);
 +irqreturn_t p7580_drv_gpu_irq(int irq, void *arg);
++
++/* Teardown guards (submit.c: PM-held wrappers around MMIO teardown).
++ * postclose/remove MUST NOT touch the AS block / slot mask dark. */
++int p7580_drv_teardown_hold(struct p7580_drv *drv);
++void p7580_drv_teardown_release(struct p7580_drv *drv);
++/* Unmap + invalidate one BO's IOVA range (MMU-table writes are
++ * CPU-side and safe dark; the invalidate MMIO needs power). */
++int p7580_drv_unmap_bo(struct p7580_drv *drv, struct drm_gem_object *obj,
++		       int invalidate);
 +
 +#endif /* PANFROST7580_DRV_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
@@ -3504,7 +3513,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-19 10:48:44.321260351 -0500
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,664 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -3696,14 +3705,32 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +static void p7580_drv_postclose(struct drm_device *dev,
 +				struct drm_file *file_priv)
 +{
++	struct drm_device *ddev = dev;
++	struct p7580_drv *drv;
 +	struct p7580_drv_file *df = file_priv->driver_priv;
++	int pm_held = 0;
 +
 +	(void)dev;
 +	if (!df)
 +		return;
++	/* Close-after-idle is the observed watchdog path: the fd dies
++	 * while the block is runtime-suspended, and entity fini +
++	 * queued-job retirement touches HEAD/START/RESET below. Hold
++	 * one PM ref across file_fini (which takes its own inner hold
++	 * for the entity walk; nesting gets is refcounted, both must
++	 * be put). On get failure the block is dark: workers fail
++	 * closed via their own arms and fini still flushes CPU-side
++	 * state so nothing leaks. */
++	drv = (ddev && ddev->dev_private) ? ddev->dev_private : NULL;
++	if (!drv)
++		drv = df->drv;
++	if (drv && p7580_drv_teardown_hold(drv))
++		pm_held = 1;
 +	file_priv->driver_priv = NULL;
 +	p7580_drv_file_fini(df);
 +	kfree(df);
++	if (pm_held)
++		p7580_drv_teardown_release(drv);
 +}
 +
 +static void p7580_drv_lastclose(struct drm_device *dev)
@@ -4094,38 +4121,28 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +		/* Mask the slot IRQs first: no new DONE/ERR demux (MMIO
 +		 * read/CLEAR) can run while we tear the tables down. */
 +		p7580_job_dev_fini(&drv->jd);
-+		/* Hold the block awake for the invalidate() MMIO below.
-+		 * If the resume fails the block is already dark; skip
-+		 * the invalidates (table memory is still freed) rather
-+		 * than hanging the bus on a dead domain. */
-+		if (p7580_drv_pm_get(drv) == 0)
++		/* Hold the block awake for the invalidate() MMIO below
++		 * (teardown_hold/teardown_release pair; fail-closed on
++		 * dark: skip the TLB flush but still free table memory
++		 * and the IOVA range). */
++		if (p7580_drv_teardown_hold(drv)) {
 +			pm_held = 1;
-+		else
++		} else {
 +			dev_warn(drv->dev,
 +				 "panfrost7580: remove with GPU dark;"
 +				 " skipping TLB invalidate\n");
++		}
 +		/* Unmap every bound BO before freeing the tables. */
 +		mutex_lock(&drv->bo_lock);
 +		list_for_each_entry_safe(e, tmp, &drv->bo_list, node) {
-+			struct p7580_bo *bo = to_p7580_bo(e->obj);
-+			unsigned int npages = p7580_bo_npages(e->obj);
-+			unsigned int i;
-+
-+			for (i = 0; i < npages; i++)
-+				p7580_mmu_unmap(&drv->mmu, bo->iova +
-+						((u64)i << PAGE_SHIFT));
-+			if (pm_held)
-+				p7580_mmu_invalidate(drv->regs,
-+						     P7580_DRV_AS_NR,
-+						     bo->iova >> PAGE_SHIFT,
-+						     npages, 1);
++			p7580_drv_unmap_bo(drv, e->obj, pm_held);
 +			list_del(&e->node);
 +			drm_gem_object_unreference(e->obj);
 +			kfree(e);
 +		}
 +		mutex_unlock(&drv->bo_lock);
 +		if (pm_held)
-+			p7580_drv_pm_put(drv);
++			p7580_drv_teardown_release(drv);
 +
 +		if (drv->dvfs) {
 +			pf7580_dvfs_fini(drv->dvfs);
@@ -5523,7 +5540,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-19 10:48:44.332468764 -0500
-@@ -0,0 +1,625 @@
+@@ -0,0 +1,691 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -5698,9 +5715,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	/* Balances p7580_drv_job_pm_arm() at queue time: the async
 +	 * leg is over (retired or run_job dispatch failure), drop
 +	 * the job-lifetime power hold so the block can idle-suspend.
-+	 * df->drv is stable here: file_fini (entity teardown) waits
-+	 * for queued jobs via the 0004 fini/flush path before the
-+	 * file state (and its drv back-pointer) is freed. */
++	 * Completion-IRQ safety: the IRQ handler only reads STAT +
++	 * CLEARs + signals the fence (finish path) — it runs strictly
++	 * before fence signal, and free_job runs strictly after
++	 * (finish_work: cancel timeout, put fence, THEN free_job), so
++	 * no IRQ demux MMIO can run after this put suspends the block.
++	 * Timeout/recover MMIO likewise precedes free_job (timeout
++	 * work calls timedout_job, then the fence signals, then
++	 * finish_work calls free_job). df->drv is stable here:
++	 * file_fini (entity teardown) waits for queued jobs via the
++	 * 0004 fini/flush path before the file state (and its drv
++	 * back-pointer) is freed. */
 +	if (drv)
 +		p7580_drv_job_pm_release(drv);
 +}
@@ -5760,6 +5785,45 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	p7580_drv_pm_put(drv);
 +}
 +
++/* Teardown hold (F-SUB1 teardown leg): one PM ref across a whole
++ * unmap/invalidate/mask walk so the AS block cannot suspend mid-walk.
++ * Returns 1 if power is held (MMIO allowed), 0 if the block is dark
++ * (caller must skip MMIO but still free CPU-side table/memory). Puts
++ * are balanced 1:1 via teardown_release; never balances another
++ * leg's ref. */
++int p7580_drv_teardown_hold(struct p7580_drv *drv)
++{
++	return p7580_drv_pm_get(drv) == 0;
++}
++
++void p7580_drv_teardown_release(struct p7580_drv *drv)
++{
++	p7580_drv_pm_put(drv);
++}
++
++/* Unmap one BO's IOVA range. Table writes (p7580_mmu_unmap) are
++ * CPU-side dma_sync + kmap and safe while dark; only the TLB
++ * invalidate is MMIO. When invalidate == 0 (dark block) the caller
++ * skips the TLB flush: stale entries die with the context teardown
++ * (AS unbound + root freed at remove; idle suspend preserves no GPU
++ * state that a later resume could misread because resume always
++ * re-programs TRANSTAB + invalidates before the next job). */
++int p7580_drv_unmap_bo(struct p7580_drv *drv, struct drm_gem_object *obj,
++		       int invalidate)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++	unsigned int npages = p7580_bo_npages(obj);
++	unsigned int i;
++
++	for (i = 0; i < npages; i++)
++		p7580_mmu_unmap(&drv->mmu, bo->iova +
++				((u64)i << PAGE_SHIFT));
++	if (invalidate)
++		p7580_mmu_invalidate(drv->regs, P7580_DRV_AS_NR,
++				     bo->iova >> PAGE_SHIFT, npages, 1);
++	return 0;
++}
++
 +
 +
 +int p7580_drv_sched_ensure(void)
@@ -5817,10 +5881,27 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +void p7580_drv_file_fini(struct p7580_drv_file *df)
 +{
++	struct p7580_drv *drv;
++	int pm_held = 0;
 +	int i;
 +
 +	if (!df)
 +		return;
++	drv = df->drv;
++	/* Teardown can run while runtime-suspended (close after idle):
++	 * entity fini retires queued jobs whose free_job drops the
++	 * live-job PM ref, and the 0004 fini/flush path runs the
++	 * retirement workqueue. Hold one PM ref across the walk so a
++	 * concurrent run_job/timeout worker (still covered by its own
++	 * re-get) and the fini flush both see a powered block. The
++	 * free_job puts below are per-job refs, NOT this hold: this
++	 * hold is released once, after the last entity is torn down.
++	 * On get failure the block is already dark: MMIO inside fini
++	 * (there is none directly) is skipped by the workers'
++	 * fail-closed arms, and the CPU-side list flush below still
++	 * runs so no job/fence leaks. */
++	if (drv && p7580_drv_teardown_hold(drv))
++		pm_held = 1;
 +	if (df->entities_live) {
 +		for (i = 0; i < P7580_NUM_JOB_SLOTS; i++)
 +			drm_sched_entity_fini(&p7580_drv_sched,
@@ -5828,6 +5909,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		df->entities_live = 0;
 +	}
 +	drm_syncobj_manager_fini(&df->mgr);
++	if (pm_held)
++		p7580_drv_teardown_release(drv);
 +	df->drv = NULL;
 +	df->job_dev = NULL;
 +}

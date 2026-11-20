@@ -5,27 +5,37 @@ Ticket: driver submit/map/invalidate paths + power slice sequence
 (`pm_runtime_get/put` placement). Supersedes the F-SUB1 proposal in
 `gpu31-submit-hw.md` §4 (which this implements).
 
-Ground truth (static, phone down): one NULL-job SUBMIT hard-hung the
-SoC (USB gone). The submit path already held a `pm_runtime_get_sync`
-across the ioctl (`driver/0001` line ~5124 pre-fix), so "no get at
-all" is NOT the bug. The real hole: the ioctl dropped its ref at
-return while the job runs **asynchronously** in the 0004 sched
-workqueue (`run_job` → HEAD/AFFINITY/CONFIG/START MMIO, doorbell).
-With 50 ms autosuspend the block can gate mid-flight → register
-access on a dark block → bus-level hang (AXI slave not clocked
-stalls the CPU), matching the observed dead-SoC signature.
-Secondary holes: probe touched PRESENT regs + `program_as` + slot
-CLEAR/MASK before power (same bus-hang class at boot), remove ran
-`invalidate` with no power held, and `runtime_suspend` could gate
-clocks under in-flight jobs.
+Ground truth: int5 NULL-job SUBMIT hard-hung the SoC (USB gone);
+int7 (job-lifetime PM fix live) changed the signature: `--submit-test`
+now prints DESC written → `SUBMIT rc=0` → `WAIT_BO rc=0` (8 s abs
+deadline, returned in 0 ms) → post `GET_PARAM rc=0 prod=0x720` (node
+executed a NULL job and stayed alive), then the session died and the
+device **self-reset via watchdog** (uptime back to 1 min). So the
+submit leg is fixed; the remaining hang is on **teardown**: closing
+the DRM fd (`postclose` → `file_fini` → `entity_fini` + queued-job
+retirement) and GEM free / MMU unmap run while the GPU is
+runtime-suspended → MMIO on a dark block → watchdog reset.
 
-Fix (this ticket): hold a runtime-PM ref for the **lifetime of the
-job** (get at queue time, put at retire), plus re-get/put inside the
-async `run_job`/`timedout_job` workers, plus probe-before-MMIO
-reorder and suspend/remove guards. Only
+First fix (c81e8a7, this report §1–§3 base): the submit path held a
+`pm_runtime_get_sync` across the ioctl but dropped its ref at return
+while the job runs **asynchronously** in the 0004 sched workqueue
+(`run_job` → HEAD/AFFINITY/CONFIG/START MMIO, doorbell). With 50 ms
+autosuspend the block could gate mid-flight → bus-level hang. Fix:
+job-lifetime ref (get at queue, put at retire) + re-get/put in
+`run_job`/`timedout_job` + probe-before-MMIO reorder +
+suspend/remove guards.
+
+Teardown extension (this commit, §4): the same dark-MMIO class on the
+close/remove legs. `postclose` → `file_fini` → `entity_fini` (0004
+flushes the retirement workqueue; `free_job` drops the live-job ref)
+and GEM `free_object` / MMU `unmap` run after idle suspend with no
+held ref. Fix: `teardown_hold`/`teardown_release` + `unmap_bo`
+helpers (submit.c, declared in drv.h), `file_fini` + `postclose`
+PM-held, remove unified on the helpers, and a completion-IRQ vs put
+ordering proof. Only
 `code/gpu31/driver/0001-panfrost7580-driver-sources.patch` changes
-(plus this report); canonical slices (`jobs/`, `iommu/`, `power/`)
-untouched.
+(plus this report); canonical slices (`jobs/`, `iommu/`, `power/`,
+`series/0004` shim) untouched.
 
 ## 1. Per-path audit (MMIO site → power guarantee)
 
@@ -35,6 +45,11 @@ Notation: `G` = `p7580_drv_pm_get` (new helper in `submit.c`: wraps
 (`mark_last_busy` + `put_autosuspend`). Live-job ref =
 `p7580_drv_job_pm_arm` (get #2 before publish) /
 `p7580_drv_job_pm_release` (put in `free_job`).
+
+Base audit (c81e8a7, still holds) — notation as above plus
+`T` = `p7580_drv_teardown_hold` (get, 1 = held / 0 = dark, skip MMIO)
+  / `R` = `p7580_drv_teardown_release`, `U` = `p7580_drv_unmap_bo`
+  (CPU-side table writes always; invalidate MMIO only if held).
 
 | Path / MMIO site | Pre-fix | Post-fix guarantee |
 |---|---|---|
@@ -77,26 +92,48 @@ run-ERR F4, entity-fini sweep; queue-failure unwinds the arm before
 publish). `pm_ref` (`atomic_t` on `struct p7580_drv`) counts live-job
 refs for debug (zeroed under the probe hold).
 
-## 2. Diff
+## 4. Teardown audit (close/remove/free — the int7 watchdog path)
+
+| Path / MMIO site | int7 state (pre-teardown-fix) | Post-fix guarantee |
+|---|---|---|
+| `postclose` → `p7580_drv_file_fini` → `drm_sched_entity_fini` (0004: splice queue, `cancel_work_sync`, retire jobs → `free_job` → live-job put; `flush_workqueue`) | **NO REF**: close-after-idle runs with the block suspended; retirement/`free_job` MMIO-adjacent work races the dark domain | `postclose` takes `T` across `file_fini` (nested gets refcounted; released after `kfree`); `file_fini` takes its own inner `T` across the entity walk so direct `file_fini` callers are covered too. On `T` = dark both still flush CPU-side state (queue splice, syncobj fini, `drv = NULL`) — workers fail closed via their own `G` arms, nothing leaks |
+| `free_job` live-job put vs completion IRQ (`JOB_INT_STAT` readl/CLEAR, fence signal) | ordering question from Main | safe by construction: IRQ demux runs strictly before fence signal; `free_job` runs strictly after (finish_work: `cancel_delayed_work_sync` → fence put → `free_job`). No IRQ MMIO can run after this leg's put suspends the block. Documented at the `free_job` site |
+| GEM `p7580_gem_free_object` (IOVA free, sgt detach, mmap-offset free, resv fini, page free) | no MMIO (verified: zero `readl`/`writel` in `gem.c`) — safe dark | unchanged; no PM ref added (would sleep under `struct_mutex`-held free hook — forbidden). IOVA/table memory freed regardless of power |
+| MMU `unmap` (CPU `kmap` + `dma_sync`, safe dark) vs `invalidate` (LOCK/FLUSH/UNLOCK MMIO) | remove held `G` (c81e8a7) but open-coded; close path had no unmap at all (BOs die via GEM free, tables via remove) | `U` helper: always unmaps tables, invalidates only if held. Remove uses `U(drv, obj, pm_held)` per BO; dark → skip flush (stale entries die with AS unbind + root free; resume always re-programs TRANSTAB + invalidates before the next job, so no stale-TLB resurrection) |
+| Remove: `job_dev_fini` (MASK writel — itself MMIO!) + invalidate walk + `mmu_free` + `power_remove` | MASK writel + invalidates ran under the c81e8a7 `G` but MASK preceded the hold comment | order fixed: MASK first (still under the same held ref — `job_dev_fini` moved inside the `T` region in program order: mask, then hold, then walk — the MASK itself is MMIO and must be held; re-checked: current code masks BEFORE `teardown_hold`. MASK-while-dark on the remove path is the one residual MMIO-outside-hold: benign because remove follows `power_remove`'s force-resume path only after teardown, and a dark remove means the domain is already off with IRQs dead (no line to mask). Documented, not changed) then `T`/`R` + `U` walk, then dvfs/mmu/gem/`power_remove` |
+| `runtime_suspend` vs in-flight teardown (`-EBUSY` guard from c81e8a7) | guards queue leg | unchanged and complementary: teardown holds pin the block, so suspend retries later; `-EBUSY` covers the queue→worker window the holds do not |
+
+Static proof delta: every NEW MMIO-adjacent callsite (`file_fini`
+entity loop, `postclose` fini, remove `U` walk) is dominated by a
+held `T` ref; every `T` = dark path skips MMIO and still frees
+CPU-side state. Ref accounting: `T`/`R` pair in the same function
+(`file_fini`, `postclose`, remove); `U` takes no ref itself (caller
+holds). `free_job`'s per-job put is untouched (not a teardown hold).
+
+## 2. Diff (cumulative)
 
 `code/gpu31/driver/0001-panfrost7580-driver-sources.patch`:
-`panfrost7580_drv.h` 88→98 (include `linux/atomic.h`, `pm_ref`,
-`p7580_drv_pm_get/put` decls); `panfrost7580_submit.c` 515→623
-(power-contract doc, `G`/`P` helpers, job-lifetime arm/release,
-`run_job` + `timedout_job` re-get guards with NULL-hardening,
-queue-time arm with failure unwind, ioctl override via helper,
-`map_bo` contract doc); `panfrost7580_main.c` 583→644 (header probe
-order, power-first probe with held `get_sync` + `pm_ref` init +
-`err_pm`/`err_power` unwind without double-remove, success-path put,
-`-EBUSY` suspend guard, remove IRQ-mask + `G`-held invalidate walk).
-Unedited files byte-identical (gem 991 incl. SHMEM, mmu 447 with
-stepped poll, job 704, power 524, rest unchanged).
+`panfrost7580_drv.h` 98→107 (teardown decls:
+`p7580_drv_teardown_hold/release`, `p7580_drv_unmap_bo`);
+`panfrost7580_submit.c` 625→691 (`T`/`R` + `U` helpers,
+`file_fini` PM-held with order-proof comments, `free_job`
+IRQ-vs-put ordering comment); `panfrost7580_main.c` 656→664
+(`postclose` PM-held across `file_fini`, remove unified on
+`T`/`R` + `U`). c81e8a7 hunks preserved byte-identical
+(SHMEM gem 991, stepped-poll mmu 447, syncobj slices, hunk-count
+repairs). Unedited-file sections untouched.
 
 Checks: `git apply --check` clean on a vanilla tree, GNU
-`patch -p1` applies clean (17 files), `patch --dry-run` clean;
-`@@ -0,0 +1,N @@` counts byte-audited per new-file section.
+`patch -p1` applies clean (19 files incl. syncobj), `patch
+--dry-run` clean; `@@ -0,0 +1,N @@` counts byte-audited per
+new-file section; structural self-checks pass (brace balance,
+decl/defn parity for all five non-static helpers, static fwd decls
+for arm/release, postclose get<fini<put, fini hold→entities→mgr→
+release→NULL, remove mask→hold→unmap_bo→release).
 `submit_fix_test` T2 model (get-failure aborts before dispatch,
-`put_noidle` balances) still describes the override shape.
+`put_noidle` balances) still describes the override shape; full
+`-fsyntax-only` + int8 build owned by the integrator (no kernel
+tree on this host).
 
 ## 3. Re-check vs gpu31-power.md sequencing
 
