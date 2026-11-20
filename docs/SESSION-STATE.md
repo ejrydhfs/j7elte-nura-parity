@@ -122,6 +122,16 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Panfrost submit works on silicon (2026-11-20, int7)
+- int7 (render-only + shmem BOs + job-lifetime PM + syncobj) boots with `renderD128`, X healthy.
+- `--submit-test` on the real node: NULL job DESC written, **SUBMIT rc=0**, **WAIT_BO rc=0**
+  (0 ms, 8 s deadline), `POST GET_PARAM rc=0 prod=0x720` — the GPU executed a job and the
+  fence completed. This is the first hardware GPU job through our panfrost port.
+- Remaining hang is **teardown**: fd close -> GEM free / MMU unmap / entity fini touches MMIO
+  while the GPU is runtime-suspended, wedging the SoC until the watchdog resets (~14 s).
+  Fix in progress (PM guards on teardown paths).
+- Watchdog cap is ~19 s (SETTIMEOUT 60 -> EINVAL); `/data/wdarm 15 <cmd>` is the retry form.
+
 ## Panfrost submit hard-hang (2026-11-20)
 - A single NULL-job submit **hard-hung the SoC** and took the USB gadget with it (no device on
   the bus). Safe ioctls are unaffected: after reset, `--probe-only` still PASSes
