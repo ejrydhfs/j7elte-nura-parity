@@ -140,11 +140,15 @@ int panfrost_ioctl_create_bo(struct drm_device *dev, void *data,
 	if (!args->size)
 		return -EINVAL;
 
-	ret = p7580_gem_create(gd, dev, args->size, P7580_BO_CMA,
+	/* SHMEM for general BOs (upstream panfrost uses drm_gem_shmem;
+	 * CMA carries no size beyond the display window and fails 8 MiB+
+	 * via dma_alloc_attrs -> swiotlb ENOMEM, blocking Mesa's 16 MiB
+	 * tiler heap. CMA stays available for explicit WC scanout only,
+	 * selected via p7580_gem_create_with_handle, never here). */
+	ret = p7580_gem_create(gd, dev, args->size, P7580_BO_SHMEM,
 			       P7580_GEM_WC, &obj);
 	if (ret)
 		return ret;
-
 	ret = drm_gem_handle_create(file_priv, obj, &handle);
 	if (ret) {
 		drm_gem_object_unreference_unlocked(obj);

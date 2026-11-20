@@ -6,12 +6,15 @@
  * MMAP via drm_gem_mmap + drm_gem_shmem_mmap, WAIT via dma_resv_wait_timeout,
  * GET_PARAM/GET_BO_OFFSET trivially. Adapted to 3.10:
  *
- *  - drm_gem_shmem_* does not exist: CMA path mirrors exynos/drm_gem_cma
- *    (drm_gem_object_init + dma_alloc_attrs WRITE_COMBINE +
- *    drm_gem_create_mmap_offset); SHMEM path mirrors drm_gem_object_init's
+ *  - drm_gem_shmem_* does not exist: SHMEM path mirrors drm_gem_object_init's
  *    own shmem_file_setup + shmem_read_mapping_page per page (mm/shmem.c).
- *    CMA uses plain WRITE_COMBINE only (arm64 dma-mapping honours exactly
- *    this attr; NO_KERNEL_MAPPING is ignored by the arm64 backend and
+ *    CREATE_BO allocates SHMEM (general BOs carry no contiguity
+ *    requirement, so Mesa's 16 MiB tiler heap succeeds where CMA/swiotlb
+ *    fails ENOMEM). The CMA path (drm_gem_object_init + dma_alloc_attrs
+ *    WRITE_COMBINE + drm_gem_create_mmap_offset, exynos/drm_gem_cma shape)
+ *    is retained for WC scanout sharing only, never CREATE_BO. CMA uses
+ *    plain WRITE_COMBINE only (arm64 dma-mapping honours exactly this
+ *    attr; NO_KERNEL_MAPPING is ignored by the arm64 backend and
  *    FORCE_CONTIGUOUS is a display-side mistaken carry-over, so neither
  *    is set here).
  *  - CPU mmap is IMMEDIATE (exynos_drm_gem_mmap_buffer /
@@ -186,6 +189,16 @@ static void p7580_cma_free(struct drm_device *dev, struct p7580_bo *bo)
 
 /* ------------------------------------------------------------------ */
 /* SHMEM backing (private page array, no shmem helper in 3.10)        */
+/*                                                                     */
+/* Pages come from shmem_read_mapping_page: each returned page holds   */
+/* exactly one reference, and that reference IS the pin -- the free   */
+/* hook drops it with one put_page per page, and the private filp is  */
+/* never exposed to userspace so ftruncate cannot drop pages under    */
+/* us. No get_page, no sg, no dma_map lives in this file: GPU mapping */
+/* (phys -> IOVA) is the owning driver's map_bo step (p7580_drv_map_bo in */
+/* the driver snapshot; contract in the create comment below), which reads */
+/* p7580_bo_page_phys and programs the Mali LPAE tables, with dma_sync */
+/* maintenance for COHERENCY_NONE. */
 /* ------------------------------------------------------------------ */
 
 static int p7580_shmem_alloc(struct drm_device *dev, struct p7580_bo *bo,
@@ -264,9 +277,16 @@ int p7580_gem_create(struct p7580_dev *gd, struct drm_device *dev,
 	if (!gd || !dev || !size || !out)
 		return -EINVAL;
 	size = round_up(size, PAGE_SIZE);
+	/* No driver-side size cap: SHMEM pages come from the page cache,
+	 * so a 16 MiB tiler heap is 4096 ordinary pages, not one 16 MiB
+	 * dma_alloc_attrs call (which fails ENOMEM on this board: the
+	 * shipping defconfig reserves no CMA area, and 8+ MiB coherent
+	 * allocations fall through to swiotlb). Only the IOVA window
+	 * bounds the BO (P7580_IOVA_SIZE, ~4 GiB minus 32 MiB). CMA is
+	 * kept only for explicit WC scanout (create_with_handle);
+	 * CREATE_BO never selects it. */
 	if (backing != P7580_BO_CMA && backing != P7580_BO_SHMEM)
 		return -EINVAL;
-
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
 	if (!bo)
 		return -ENOMEM;
@@ -564,7 +584,11 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 		goto err_close;
 	}
 
-	/* WC default, cached opt-in (CMA BOs are created WC). */
+	/* WC default (covers both SHMEM CREATE_BO and CMA scanout), cached
+	 * opt-in (exynos update_vm_cache_attr shape). COHERENCY_NONE: WC is
+	 * MT_NORMAL_NC, so no CPU cache lines exist to flush on either
+	 * path; the GPU PTW side is synced by the driver's map_bo
+	 * dma_sync maintenance, not here. */
 	if (bo->cache_attr & P7580_GEM_CACHABLE)
 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 	else if ((bo->cache_attr & P7580_GEM_WC) ||

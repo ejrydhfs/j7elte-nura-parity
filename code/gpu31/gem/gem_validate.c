@@ -2,7 +2,8 @@
  * gem_validate.c - host unit test for the panfrost GEM offset/size validation.
  *
  * Exercises the pure-C surface of panfrost7580_gem.h without kernel headers:
- * IOVA window geometry, CREATE_BO/CMA/SHMEM rounding + rejection rules,
+ * IOVA window geometry, CREATE_BO/CMA/SHMEM rounding + rejection rules
+ * (incl. the 8/16 MiB SHMEM tiler-heap regression from gpu31-gem-shmem.md),
  * WAIT_BO absolute->relative conversion, and the MMU map-loop helper
  * contract (npages/phys walk). Mirrors the kernel .c logic line-for-line;
  * the kernel build is covered by `make kcheck`/`make kobj` in the Makefile.
@@ -96,7 +97,12 @@ int main(void)
 	CHECK(round_page(4097) == 8192ul);
 	CHECK(create_ok(4096, 7u) == -22);
 	CHECK(create_ok(1u << 20, P7580_BO_SHMEM) == 0);
-
+	/* tiler-heap regression (gpu31-gem-shmem): the sizes that failed
+	 * under CMA dma_alloc_attrs/swiotlb must validate as SHMEM --
+	 * page count, not one contiguous extent */
+	CHECK(create_ok(8u << 20, P7580_BO_SHMEM) == 0);
+	CHECK(create_ok(16u << 20, P7580_BO_SHMEM) == 0);
+	CHECK((round_page(16u << 20) >> P7580_PAGE_SHIFT) == 4096ul);
 	/* IOVA placement: window edges, overflow, zero */
 	CHECK(iova_ok(P7580_IOVA_START, 4096ul) == 0);
 	CHECK(iova_ok(P7580_IOVA_START, P7580_IOVA_SIZE) == 0);
