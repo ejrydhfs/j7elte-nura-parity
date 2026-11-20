@@ -122,6 +122,15 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Panfrost driver — first silicon boot (2026-11-19)
+- int4 image (sha256 5678dca4…, `p7580_drv_probe`) **boots**: `/dev/dri/card0` + `renderD128`
+  appear, fbdev stays intact, kbase `/dev/mali0` is gone (d4 cutover).
+- Two defects found on silicon:
+  1. **card0 must not exist** — Xorg auto-probes it and hangs in `D` state (blank screen,
+     cursor dot). Render-only registration is the fix (in progress).
+  2. **SUBMIT deadlocks uninterruptibly** — `pf7580-selftest` and Xorg stuck in `D` until reboot.
+- Reverted to the M1 image (`cf25ed70…`) for a working UI; no `/dev/dri`, Xorg `S`, shell up.
+
 ## FM radio (2026-11-19)
 - HCI path works: enable+tune/commit+RSSI all ACK (`status=0x00`) at 94.5 MHz, repeatable across
   fresh boots; mixer route applied (SRC3, CH3Rec, DOUT=RMIX_OUT, LINEIN on) — see `docs/reports/fm-audio.md`.
