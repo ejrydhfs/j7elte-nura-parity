@@ -107,6 +107,7 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 int p7580_job_dev_init(struct p7580_job_dev *jd, void *regs,
 		       uint32_t js_present, uint64_t shader_present);
 #endif
+void p7580_job_dev_fini(struct p7580_job_dev *jd);
 /* Program HEAD_NEXT/AFFINITY_NEXT/CONFIG_NEXT + COMMAND_NEXT=START.   */
 void p7580_job_hw_submit(struct p7580_job_dev *jd,
 			 struct p7580_submit_job *job);

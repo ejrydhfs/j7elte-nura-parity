@@ -2575,7 +2575,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-19 10:48:44.319089866 -0500
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,139 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -2685,6 +2685,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +int p7580_job_dev_init(struct p7580_job_dev *jd, void *regs,
 +		       uint32_t js_present, uint64_t shader_present);
 +#endif
++void p7580_job_dev_fini(struct p7580_job_dev *jd);
 +/* Program HEAD_NEXT/AFFINITY_NEXT/CONFIG_NEXT + COMMAND_NEXT=START.   */
 +void p7580_job_hw_submit(struct p7580_job_dev *jd,
 +			 struct p7580_submit_job *job);
