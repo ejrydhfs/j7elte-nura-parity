@@ -74,3 +74,14 @@ Decode the exact JD layout from Mesa 20.3 `pan_job.c` / `mali_job_header_packed`
 `panfrost_job_hw_submit` in v5.2 (which sets `HEAD_NEXT = jc`); instrument one draw to print `jc`, the
 first 16 words the *CPU* wrote at that address, and the words the driver programs. That resolves
 "offset vs writeback" without further speculation.
+
+### Correction (same day)
+Mesa sets `submit.jc = first_job_desc` (pan_job.c:960), i.e. the header **is** at offset 0 of the
+job's CPU buffer. Therefore the submit-time `sw` line showing `w0..w3 = 0` is an artefact of the
+snapshot's owner lookup (it read the wrong BO), not the job's real content. The fault-time `w0=0x52`
+is the hardware's exception-status writeback into the header.
+
+Net: the descriptor is valid, the tables are correct, and the GPU still reports
+INSTR_TYPE_MISMATCH while executing the fragment job's command stream. Resolving this needs
+genxml-level decoding of the JD body (FBD/shader pointers) against Mesa 20.3's writer — a
+substantially larger effort than the bring-up done here.
