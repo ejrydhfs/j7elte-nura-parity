@@ -59,10 +59,12 @@ int main(void)
 	CHECK(P7580_JOB_ERR_BIT(0) == 0x10000u);
 	CHECK(P7580_JOB_ERR_BIT(2) == 0x40000u);
 
-	/* Slot routing (v5.2 base: FS->JS0, else JS1; compute internal;
-	 * irq-ticket: requirement-less (0) jobs ride JS0, not JS1). */
+	/* Slot routing (mainline v5.2 panfrost_job_get_slot: FS->JS0,
+	 * everything else->JS1; ONLY_COMPUTE->JS2 kernel-internal.
+	 * Mesa vertex/tiler chain carries requirements==0 -> JS1;
+	 * mesa-render: req==0 on JS0 faulted every batch). */
 	CHECK(p7580_job_slot(P7580_JD_REQ_FS) == 0);
-	CHECK(p7580_job_slot(0) == 0);
+	CHECK(p7580_job_slot(0) == 1);
 	CHECK(p7580_job_slot(P7580_JD_REQ_ONLY_COMPUTE) == 2);
 	CHECK(p7580_job_slot(P7580_JD_REQ_FS |
 			     P7580_JD_REQ_ONLY_COMPUTE) == 0);

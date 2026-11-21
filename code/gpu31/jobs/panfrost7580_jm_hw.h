@@ -102,16 +102,22 @@
 #define P7580_JOB_TIMEOUT_MS	5000u
 #define P7580_RESET_TIMEOUT_MS	3000u
 
-/* Slot for a submit. Base rule is [V5] panfrost_job_get_slot (FS ->
- * JS0, else JS1); JS2 (compute) is wired but idle: v5.2 UAPI has no
- * compute-only bit.
+/* Slot for a submit. Matches mainline v5.2 panfrost_job_get_slot
+ * (drivers/gpu/drm/panfrost/panfrost_job.c:102-122): FS -> JS0
+ * (fragment); everything else -> JS1 (vertex/tiler). ONLY_COMPUTE ->
+ * JS2 is kernel-internal (never on the v5.2 UAPI wire).
  *
- * IRQ-ticket fix: route requirement-less jobs (requirements == 0) to
- * JS0. The NULL-job selftest and Mesa NULL/leftover-dependency flush
- * jobs carry requirements == 0; the old fallthrough sent them to JS1
- * while the trace tooling and the fragment-slot expectation assume
- * JS0. Nonzero non-FS requirements still select JS1 (vertex/tiler
- * chain); ONLY_COMPUTE selects JS2 (never on the v5.2 UAPI wire). */
+ * Mesa 20.3 emits two submits per batch: the vertex/tiler chain with
+ * requirements == 0 and the fragment job with PANFROST_JD_REQ_FS.
+ * The chain (WRITE_VALUE type 2, VERTEX type 5, TILER type 7) must
+ * run on JS1: on this 3-slot part a vertex/tiler chain dispatched on
+ * JS0 faults (slot 0 ERR storm, fragment slot cannot run tiler work),
+ * and every later submit faults behind it. Requirement-less therefore
+ * means JS1 -- never JS0 (gpu31-mesa-render: 120/120 Mesa submits ERR
+ * on slot 0 with req==0 routed to JS0; WRITE_VALUE alone on JS0 is
+ * DONE, proving the slot, not the job, rejects the chain). NULL jobs
+ * run on any slot, so the selftest pattern/submit tests are unaffected
+ * by the routing (they only assert fence completion). */
 #define P7580_SLOT_FRAGMENT	0
 #define P7580_SLOT_VERTEX_TILER	1
 #define P7580_SLOT_COMPUTE	2
@@ -124,8 +130,6 @@
 static inline int p7580_job_slot(uint32_t requirements)
 {
 	if (requirements & P7580_JD_REQ_FS)
-		return P7580_SLOT_FRAGMENT;
-	if (requirements == 0)
 		return P7580_SLOT_FRAGMENT;
 	if (requirements & P7580_JD_REQ_ONLY_COMPUTE)
 		return P7580_SLOT_COMPUTE;
