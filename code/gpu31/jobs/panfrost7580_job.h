@@ -143,6 +143,15 @@ struct p7580_job_dev {
 	 * job.c, created at dev_init, removed at dev_fini. Opaque void*
 	 * so this header stays dentry-free under -fsyntax-only. */
 	void *dbg_dir;
+	/* PM device + get/put hooks (driver-owned) so the dump path can
+	 * take a runtime-PM ref before touching JOB_INT/JS registers:
+	 * without it a dump read while autosuspended hits a dark bus
+	 * (external abort). Opaque void*/int-returning hooks so this
+	 * header stays device/PM-free under -fsyntax-only. Wired by
+	 * p7580_job_dev_init. */
+	void *pm_dev;
+	int (*pm_get)(void *dev);
+	void (*pm_put)(void *dev);
 };
 #else
 struct p7580_job_dev {
@@ -164,7 +173,8 @@ struct p7580_job_dev {
 #ifdef __KERNEL__
 int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 		       uint32_t js_present, uint64_t shader_present,
-		       dma_addr_t pgd_dma);
+		       dma_addr_t pgd_dma, void *pm_dev,
+		       int (*pm_get)(void *dev), void (*pm_put)(void *dev));
 #else
 #include <stdint.h>
 typedef uint64_t p7580_dma_addr_t;

@@ -262,7 +262,8 @@ static void p7580_job_debugfs_fini(struct p7580_job_dev *jd);
 
 int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 		       uint32_t js_present, uint64_t shader_present,
-		       dma_addr_t pgd_dma)
+		       dma_addr_t pgd_dma, void *pm_dev,
+		       int (*pm_get)(void *dev), void (*pm_put)(void *dev))
 {
 	int i;
 	uint32_t mask = 0;
@@ -274,6 +275,9 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	jd->js_present = js_present;
 	jd->shader_present = shader_present;
 	jd->pgd_dma = pgd_dma;
+	jd->pm_dev = pm_dev;
+	jd->pm_get = pm_get;
+	jd->pm_put = pm_put;
 	spin_lock_init(&jd->hw_lock);
 	mutex_init(&jd->reset_lock);
 	/* Snapshot the module param once: later writes change the param
@@ -1033,13 +1037,12 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 /*                                                                     */
 /* dump file: single_open seq_file rendering the last-dispatch         */
 /* snapshot (slot/jc/cfg/as/affinity/seq) plus live per-slot           */
-/* STATUS/HEAD/TAIL and the JOB_INT_STAT/RAWSTAT/MASK views. Plain    */
-/* MMIO reads (power must be held by the reader path: debugfs reads    */
-/* run in process context while the block is awake; a dark read        */
-/* returns whatever the bus gives, same as the existing irq-arm       */
-/* read-back). No locks beyond a short hw_lock for the snapshot copy;  */
-/* register reads run outside the lock (same discipline as the IRQ     */
-/* handler's register block).                                          */
+/* STATUS/HEAD/TAIL and the JOB_INT_STAT/RAWSTAT/MASK views. Takes a   */
+/* runtime-PM ref via the jd->pm_get/put hooks wired at dev_init, so   */
+/* a read while autosuspended takes the snapshot-only (dark-marked)    */
+/* view instead of hitting a dark bus. No locks beyond a short         */
+/* hw_lock for the snapshot copy; register reads run outside the lock */
+/* (same discipline as the IRQ handler's register block).              */
 /* ------------------------------------------------------------------ */
 
 void p7580_job_trace_arm(struct p7580_job_dev *jd, unsigned int n)
@@ -1060,10 +1063,18 @@ int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 	unsigned long flags;
 	struct p7580_job_last last;
 	uint32_t job_stat, job_raw, job_mask;
-	int i;
+	int i, pm = -ENODEV;
 
 	if (!jd || !m)
 		return -EINVAL;
+	/* Take a PM ref so the MMIO below never hits a dark bus: the
+	 * block autosuspends after PF7580_AUTOSUSPEND_MS, and a debugfs
+	 * read in process context is the normal dark victim (external
+	 * abort on the first JOB_INT read). get failure (or no PM hooks
+	 * wired yet) degrades to the snapshot-only view rather than
+	 * hanging the reader. */
+	if (jd->pm_get && jd->pm_dev)
+		pm = jd->pm_get(jd->pm_dev);
 	/* Snapshot the last dispatch under hw_lock, then read the live
 	 * registers outside it (MMIO reads must not hold a spinlock
 	 * across a dark bus). */
@@ -1071,20 +1082,29 @@ int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 	last = jd->last;
 	spin_unlock_irqrestore(&jd->hw_lock, flags);
 
-	job_stat = p7580_readl(jd, P7580_JOB_INT_STAT);
-	job_raw = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
-	job_mask = p7580_readl(jd, P7580_JOB_INT_MASK);
+	if (!pm) {
+		job_stat = p7580_readl(jd, P7580_JOB_INT_STAT);
+		job_raw = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
+		job_mask = p7580_readl(jd, P7580_JOB_INT_MASK);
+	} else {
+		job_stat = 0xdead0000u;
+		job_raw = 0xdead0000u;
+		job_mask = 0xdead0000u;
+	}
 
 	if (!last.valid) {
-		seq_printf(m, "no job yet (trace_arm=%u trace_left=%u stat=0x%08x rawstat=0x%08x mask=0x%08x)\n",
+		seq_printf(m, "no job yet (trace_arm=%u trace_left=%u stat=0x%08x rawstat=0x%08x mask=0x%08x%s)\n",
 			   jd->trace_arm, jd->trace_left,
-			   job_stat, job_raw, job_mask);
+			   job_stat, job_raw, job_mask,
+			   pm ? " dark" : "");
+		if (!pm)
+			jd->pm_put(jd->pm_dev);
 		return 0;
 	}
-	seq_printf(m, "last slot=%u seq=%u jc=0x%llx cfg=0x%08x as=%u aff=0x%llx (trace_arm=%u trace_left=%u)\n",
+	seq_printf(m, "last slot=%u seq=%u jc=0x%llx cfg=0x%08x as=%u aff=0x%llx (trace_arm=%u trace_left=%u%s)\n",
 		   last.slot, last.seqno, (unsigned long long)last.jc,
 		   last.cfg, last.as_nr, (unsigned long long)last.affinity,
-		   jd->trace_arm, jd->trace_left);
+		   jd->trace_arm, jd->trace_left, pm ? " dark" : "");
 	seq_printf(m, "job_int stat=0x%08x rawstat=0x%08x mask=0x%08x js_present=0x%x pgd=0x%llx\n",
 		   job_stat, job_raw, job_mask, jd->js_present,
 		   (unsigned long long)jd->pgd_dma);
@@ -1092,11 +1112,16 @@ int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 		uint32_t st, h_lo, h_hi, t_lo, t_hi;
 		uint64_t head, tail;
 
-		st = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_STATUS));
-		h_lo = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_HEAD_LO));
-		h_hi = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_HEAD_HI));
-		t_lo = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_TAIL_LO));
-		t_hi = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_TAIL_HI));
+		if (!pm) {
+			st = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_STATUS));
+			h_lo = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_HEAD_LO));
+			h_hi = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_HEAD_HI));
+			t_lo = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_TAIL_LO));
+			t_hi = p7580_readl(jd, P7580_JS_REG(i, P7580_JS_TAIL_HI));
+		} else {
+			st = 0xdead0000u;
+			h_lo = h_hi = t_lo = t_hi = 0xdead0000u;
+		}
 		head = ((uint64_t)h_hi << 32) | h_lo;
 		tail = ((uint64_t)t_hi << 32) | t_lo;
 		seq_printf(m, "slot%d status=0x%08x (%s) head=0x%llx tail=0x%llx\n",
@@ -1104,6 +1129,8 @@ int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 			   (unsigned long long)head,
 			   (unsigned long long)tail);
 	}
+	if (!pm)
+		jd->pm_put(jd->pm_dev);
 	return 0;
 }
 
