@@ -122,6 +122,14 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## GPU renders the clear colour (2026-11-20, int20)
+- int20 fixed slot routing (req==0 chain -> JS1). Both jobs execute with NO_EXCEPTION and
+  `egltest` now reads **the correct clear colour** (`RGBA=26,26,102,255` at the corner).
+- The triangle is still missing (centre stays clear colour) -> tiler->fragment handoff
+  (polygon list/FBD/heap) is the remaining defect (`gpu31-tilerchain.md`).
+- Note: `--pattern-test` PASS earlier proves GPU writes + coherency; this is now purely the
+  geometry path.
+
 ## GPU memory writes proven; Mesa output still zero (2026-11-20, int19)
 - `--pattern-test` PASS: page pre-filled 0xA5A5A5A5, Zero-fill job executed, **both USER and KERN
   views read 0x00000000** -> GPU writes memory and the coherency model is correct.
