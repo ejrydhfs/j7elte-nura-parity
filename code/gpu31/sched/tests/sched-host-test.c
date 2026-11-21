@@ -1447,6 +1447,233 @@ static void test_multidep_errors(void)
 	kfree(sig);
 }
 
+/* ------------------------------------------------------------------ */
+/* serialfence (gpu31-serialfence): per-file strict ordering.             */
+/* Mesa submits the tiler chain and the fragment as two independent      */
+/* SUBMITs with no fence between them (polylist §5: in_count=0           */
+/* out_sync=0 on all probed submits). The driver serialises them by      */
+/* attaching the previous SUBMIT's armed fence as an implicit sched      */
+/* dependency of the next SUBMIT (skipped when already signaled). Slot   */
+/* assignment is untouched: the two jobs may sit on different entities   */
+/* (JS1 tiler, JS0 fragment); the dep edge — not a shared entity — is   */
+/* what orders them. These tests pin the mechanism the driver relies    */
+/* on, with one entity per slot exactly as the driver owns them:         */
+/*  S1 cross-entity chain: frag (entity B) waits on tiler (entity A).    */
+/*  S2 signaled previous: skipped (no gate, dispatch immediate).        */
+/*  S3 retire order: frag retires only after tiler, even cross-entity.   */
+/*  S4 same-fence re-add: no-op (no AND-node growth, no error).          */
+/* ------------------------------------------------------------------ */
+
+/* S1: cross-entity chain. j1 on entity A (tiler/JS1), j2 on entity B
+ * (fragment/JS0) with j2 chained on j1's armed fence: j2 must not run
+ * until j1's fence signals, even though the entities dispatch
+ * independently. */
+static void test_serial_cross_entity(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity ea, eb;
+	struct drm_sched_job *j1, *j2;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&ea, &sched);
+	drm_sched_entity_init(&eb, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	/* Tiler submit on entity A (slot 1). */
+	j1 = drm_sched_job_alloc(&ea, &sched_ops_ok, (void *)(long)71);
+	j1->slot = 1;
+	drm_sched_job_arm(j1);
+	CHECK_EQ(drm_sched_job_submit(j1), 0);
+
+	/* Fragment submit on entity B (slot 0), chained on j1's fence
+	 * (the driver's serial_prev attach). */
+	j2 = drm_sched_job_alloc(&eb, &sched_ops_ok, (void *)(long)72);
+	j2->slot = 0;
+	drm_sched_job_arm(j2);
+	CHECK_EQ(drm_sched_job_add_dependency(j2, j1->fence), 0);
+	CHECK_EQ(drm_sched_job_submit(j2), 0);
+
+	/* Fragment pump first: must NOT run (tiler fence pending),
+	 * even though entity B is otherwise idle. */
+	eb.sched_work.fn(&eb.sched_work);
+	CHECK_EQ(run_count, 0);
+
+	/* Tiler runs. */
+	ea.sched_work.fn(&ea.sched_work);
+	CHECK_EQ(run_count, 1);
+	spin_lock(&ea.queue_lock);
+	ea.in_flight = NULL;
+	spin_unlock(&ea.queue_lock);
+
+	/* Fragment still gated on the unsignaled tiler fence. */
+	eb.sched_work.pending = 0;
+	eb.sched_work.fn(&eb.sched_work);
+	CHECK_EQ(run_count, 1);
+
+	/* Retire the tiler: fragment released, runs next. */
+	dma_fence_signal(j1->fence);
+	CHECK(eb.sched_work.pending);
+	eb.sched_work.pending = 0;
+	j1->finish_work.fn(&j1->finish_work);
+	CHECK_EQ(free_count, 1);
+	eb.sched_work.fn(&eb.sched_work);
+	CHECK_EQ(run_count, 2);
+	spin_lock(&eb.queue_lock);
+	eb.in_flight = NULL;
+	spin_unlock(&eb.queue_lock);
+	dma_fence_signal(j2->fence);
+	j2->finish_work.fn(&j2->finish_work);
+	CHECK_EQ(free_count, 2);
+
+	drm_sched_entity_fini(&sched, &ea);
+	drm_sched_entity_fini(&sched, &eb);
+	drm_sched_fini(&sched);
+}
+
+/* S2: signaled previous is skipped. The driver checks is_signaled
+ * before attaching; a retired predecessor imposes no gate. */
+static void test_serial_signaled_prev_skipped(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity eb;
+	struct drm_sched_job *j2;
+	struct test_fence *retired = mkfence(4, 79);
+
+	/* A retired predecessor: already signaled, still alive (the
+	 * driver's serial slot holds its own ref until the next SUBMIT
+	 * replaces it, so the fence outlives the job that armed it). */
+	dma_fence_signal(&retired->base);
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&eb, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	/* Next submit: driver sees signaled prev, attaches nothing. */
+	j2 = drm_sched_job_alloc(&eb, &sched_ops_ok, (void *)(long)74);
+	drm_sched_job_arm(j2);
+	CHECK_EQ(drm_sched_job_add_dependency(j2, &retired->base), 0);
+	CHECK(j2->dep_fence == NULL);
+	CHECK_EQ(drm_sched_job_submit(j2), 0);
+	eb.sched_work.fn(&eb.sched_work);
+	CHECK_EQ(run_count, 1);
+	spin_lock(&eb.queue_lock);
+	eb.in_flight = NULL;
+	spin_unlock(&eb.queue_lock);
+	dma_fence_signal(j2->fence);
+	j2->finish_work.fn(&j2->finish_work);
+	CHECK_EQ(free_count, 1);
+
+	drm_sched_entity_fini(&sched, &eb);
+	drm_sched_fini(&sched);
+	kfree(retired);
+}
+
+/* S3: retire order across entities. Tiler then fragment, chained:
+ * run log and free log must both read tiler-then-fragment. */
+static void test_serial_retire_order(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity ea, eb;
+	struct drm_sched_job *j1, *j2;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&ea, &sched);
+	drm_sched_entity_init(&eb, &sched);
+	run_count = 0;
+	free_count = 0;
+	run_log_n = 0;
+	free_log_n = 0;
+
+	j1 = drm_sched_job_alloc(&ea, &sched_ops_ok, (void *)(long)75);
+	j1->slot = 1;
+	drm_sched_job_arm(j1);
+	CHECK_EQ(drm_sched_job_submit(j1), 0);
+	j2 = drm_sched_job_alloc(&eb, &sched_ops_ok, (void *)(long)76);
+	j2->slot = 0;
+	drm_sched_job_arm(j2);
+	CHECK_EQ(drm_sched_job_add_dependency(j2, j1->fence), 0);
+	CHECK_EQ(drm_sched_job_submit(j2), 0);
+
+	ea.sched_work.fn(&ea.sched_work);
+	spin_lock(&ea.queue_lock);
+	ea.in_flight = NULL;
+	spin_unlock(&ea.queue_lock);
+	dma_fence_signal(j1->fence);
+	if (eb.sched_work.pending)
+		eb.sched_work.pending = 0;
+	j1->finish_work.fn(&j1->finish_work);
+	eb.sched_work.fn(&eb.sched_work);
+	spin_lock(&eb.queue_lock);
+	eb.in_flight = NULL;
+	spin_unlock(&eb.queue_lock);
+	dma_fence_signal(j2->fence);
+	j2->finish_work.fn(&j2->finish_work);
+
+	CHECK_EQ(run_log_n, 2);
+	CHECK_EQ(free_log_n, 2);
+	CHECK_EQ(run_log[0], 75);
+	CHECK_EQ(run_log[1], 76);
+	CHECK_EQ(free_log[0], 75);
+	CHECK_EQ(free_log[1], 76);
+
+	drm_sched_entity_fini(&sched, &ea);
+	drm_sched_entity_fini(&sched, &eb);
+	drm_sched_fini(&sched);
+}
+
+/* S4: same-fence re-add is a no-op. The serial attach plus an
+ * identical explicit dep must not grow an AND node or fail. */
+static void test_serial_same_fence_noop(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j1, *j2;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j1 = drm_sched_job_alloc(&e, &sched_ops_ok, (void *)(long)77);
+	drm_sched_job_arm(j1);
+	CHECK_EQ(drm_sched_job_submit(j1), 0);
+
+	j2 = drm_sched_job_alloc(&e, &sched_ops_ok, (void *)(long)78);
+	drm_sched_job_arm(j2);
+	CHECK_EQ(drm_sched_job_add_dependency(j2, j1->fence), 0);
+	/* Duplicate attach (serial + explicit same fence): no-op. */
+	CHECK_EQ(drm_sched_job_add_dependency(j2, j1->fence), 0);
+	CHECK(j2->dep_fence == j1->fence);
+	CHECK_EQ(drm_sched_job_submit(j2), 0);
+
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+	spin_lock(&e.queue_lock);
+	e.in_flight = NULL;
+	spin_unlock(&e.queue_lock);
+	dma_fence_signal(j1->fence);
+	if (e.sched_work.pending)
+		e.sched_work.pending = 0;
+	j1->finish_work.fn(&j1->finish_work);
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 2);
+	spin_lock(&e.queue_lock);
+	e.in_flight = NULL;
+	spin_unlock(&e.queue_lock);
+	dma_fence_signal(j2->fence);
+	j2->finish_work.fn(&j2->finish_work);
+	CHECK_EQ(free_count, 2);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
 int main(void)
 {
 	test_fence_init();
@@ -1476,6 +1703,10 @@ int main(void)
 	test_multidep_many();
 	test_multidep_ordering();
 	test_multidep_errors();
+	test_serial_cross_entity();
+	test_serial_signaled_prev_skipped();
+	test_serial_retire_order();
+	test_serial_same_fence_noop();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

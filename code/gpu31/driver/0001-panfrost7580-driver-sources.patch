@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,138 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -76,6 +76,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +	struct drm_sched_entity entity[P7580_NUM_JOB_SLOTS];
 +	uint32_t next_seqno;
 +	int entities_live;
++	/* Per-file serial chain (gpu31-serialfence): the armed fence of
++	 * the previously submitted job, or NULL when no job is
++	 * outstanding. Guarded by serial_lock; every SUBMIT after arm
++	 * attaches the previous fence as an implicit dependency (when
++	 * still unsignaled) and then replaces it with its own armed
++	 * fence (one ref taken at swap, one dropped after queue).
++	 * Ref discipline: the slot holds exactly one ref on a live
++	 * fence; the in-flight job owns the other ref via out_sync (or
++	 * its own fence pointer) until retire. Fini drops the slot ref
++	 * so a queued-but-never-run job cannot leak. */
++	struct mutex serial_lock;
++	struct dma_fence *serial_prev;
 +};
 +
 +struct p7580_submit;
@@ -6175,7 +6187,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1612 @@
+@@ -0,0 +1,1695 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -7132,6 +7144,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	df->drv = drv;
 +	df->next_seqno = 0;
 +	df->entities_live = 0;
++	mutex_init(&df->serial_lock);
++	df->serial_prev = NULL;
 +	drm_syncobj_manager_init(&df->mgr);
 +	df->job_fctx = NULL;
 +	df->job_dev = &drv->jd;
@@ -7191,6 +7205,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +					      &df->entity[i]);
 +		df->entities_live = 0;
 +	}
++	/* Drop the serial-chain reference (if any): no new dispatch can
++	 * attach it after the entities above drained, and the job that
++	 * armed it still owns its own ref via out_sync/retire. */
++	mutex_lock(&df->serial_lock);
++	if (df->serial_prev) {
++		dma_fence_put(df->serial_prev);
++		df->serial_prev = NULL;
++	}
++	mutex_unlock(&df->serial_lock);
 +	drm_syncobj_manager_fini(&df->mgr);
 +	if (pm_held)
 +		p7580_drv_teardown_release(drv);
@@ -7352,6 +7375,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	struct p7580_submit_job *job;
 +	struct drm_sched_entity *entity;
 +	struct drm_sched_job *sched_job;
++	struct dma_fence *published = NULL;
 +	unsigned int i, nr = 0, nf = 0;
 +	int slot, ret;
 +
@@ -7612,6 +7636,62 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * NULL-install shape (job still runs; waiters see no fence). */
 +	drm_sched_job_arm(sched_job);
 +
++	/* Per-file serial chain (gpu31-serialfence): make submits from
++	 * one file strictly ordered. Attach the previous job's armed
++	 * fence as an implicit dependency (when it is still unsignaled)
++	 * and then replace the slot with this job's armed fence. Slot
++	 * assignment above is untouched (requirements -> slot). The
++	 * dispatch context (df) is stable here: the ioctl holds the file
++	 * (driver_priv) across this call, and close drains entities
++	 * before freeing df (file_fini). Slot replacement happens
++	 * before queueing so a concurrent SUBMIT serialises on
++	 * serial_lock and always sees the newest predecessor.
++	 * Signaled (retired) previous fences are skipped:
++	 * they impose no ordering and must not accumulate AND leaves.
++	 * Same-fence submission (should not happen: every SUBMIT arms
++	 * a fresh fence, but guarded anyway) is skipped by the
++	 * duplicate check in add_dependency. */
++	{
++		struct dma_fence *prev;
++
++		/* Borrow the previous fence under the lock; take a
++		 * temporary ref so it cannot be freed by a concurrent
++		 * close while add_dependency reads it. The put after
++		 * the attach balances this get (add_dependency holds
++		 * its own ref when it gates). */
++		mutex_lock(&df->serial_lock);
++		prev = df->serial_prev;
++		if (prev)
++			dma_fence_get(prev);
++		mutex_unlock(&df->serial_lock);
++		if (prev && prev != sched_job->fence &&
++		    !dma_fence_is_signaled(prev)) {
++			ret = drm_sched_job_add_dependency(sched_job, prev);
++			dma_fence_put(prev);
++			if (ret) {
++				ret = (int)p7580_submit_err("dep", ret);
++				drm_sched_job_cleanup(sched_job);
++				kfree(sched_job);
++				goto err_job_bos;
++			}
++		} else if (prev) {
++			dma_fence_put(prev);
++		}
++		/* Publish this job's armed fence as the new previous.
++		 * The slot holds one ref; the job/out_sync path owns
++		 * the other refs (installed below, released at retire).
++		 * A NULL armed fence (arm failed closed) clears the
++		 * chain: the next SUBMIT has no predecessor to wait on. */
++		published = sched_job->fence;
++		mutex_lock(&df->serial_lock);
++		if (df->serial_prev)
++			dma_fence_put(df->serial_prev);
++		df->serial_prev = published;
++		if (df->serial_prev)
++			dma_fence_get(df->serial_prev);
++		mutex_unlock(&df->serial_lock);
++	}
++
 +	for (i = 0; i < nf; i++) {
 +		if (!dma_fence_is_signaled(inf[i])) {
 +			ret = drm_sched_job_add_dependency(sched_job,
@@ -7708,6 +7788,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	return ret;
 +
 +err_job_bos:
++	/* Roll back the serial chain when this SUBMIT published but
++	 * never queued (dep/queue failure above): retract the slot ref
++	 * only if it still points at this job's fence. sched_job is
++	 * freed below, so compare by the saved pointer, not through
++	 * it. A concurrent SUBMIT cannot interleave here (one file's
++	 * ioctls serialise in the caller), but close may have cleared
++	 * the slot; the check keeps the put balanced either way. */
++	if (published) {
++		mutex_lock(&df->serial_lock);
++		if (df->serial_prev == published) {
++			dma_fence_put(df->serial_prev);
++			df->serial_prev = NULL;
++		}
++		mutex_unlock(&df->serial_lock);
++	}
 +	/* Job owns one ref per BO (transferred at dispatch) but was
 +	 * never published: p7580_job_free releases the pointer array
 +	 * (canon, no unref — refs are still ours in objs[]). */
