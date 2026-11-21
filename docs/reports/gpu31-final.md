@@ -54,3 +54,23 @@ its own cache/TLB and needs a stronger invalidate before `START`.
 | Mesa bring-up | works (renderer, submits, clear) |
 | Draw geometry | **open**: one deterministic fragment fault per frame |
 | 2D / UI | unaffected, fbdev X healthy |
+
+## Update 2026-11-21 (int31, decisive comparison)
+Submit-time snapshot vs fault-time bytes at the same address:
+```
+sw: 00000000 00000000 00000000 00000000  00010013 00000000 00000000 00000000
+w : 00000052 00000000 021d6005 00000000  00010013 00000000 00000000 00000000
+```
+- Page tables are **correct** (`PTEWALK ... leaf_phys==bo_phys MATCH`), so IOVA/TLB lifetime is not the cause.
+- At SUBMIT the first four words are zero and the header-like word sits at offset 0x10; at fault the GPU
+  has written status (`0x52`) and a fault pointer (`0x021d6005`) into w0/w2.
+- This points to a **descriptor-layout mismatch**: Mesa's `mali_job_header_packed` is at the start of the
+  job's CPU buffer, yet the block we program at `JS_HEAD` shows a valid type word only at +0x10.
+  Open question: whether our submit must point HEAD at `jc` or whether the snapshot/offset used for
+  compare is off by 0x10 for this batch.
+
+### Next single experiment
+Decode the exact JD layout from Mesa 20.3 `pan_job.c` / `mali_job_header_packed` writers and compare with
+`panfrost_job_hw_submit` in v5.2 (which sets `HEAD_NEXT = jc`); instrument one draw to print `jc`, the
+first 16 words the *CPU* wrote at that address, and the words the driver programs. That resolves
+"offset vs writeback" without further speculation.
