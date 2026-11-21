@@ -43,12 +43,14 @@
  * Review fixes (gpu31-review §4): sched->entities is the membership
  * list with its own link (F1); the pump skips jobs whose dep fence
  * is still pending and re-queues itself behind the dep callback (F2);
- * the dep waiter is a separate cb so -EBUSY completion races and
- * dual-role overlap are gone -- one in-fence per job, rejected with
- * -EOPNOTSUPP otherwise (F3, matches the one-in-fence Mesa contract);
- * the run_job ERR_PTR path frees the job instead of dropping it (F4);
- * the timeout comes from entity->timeout, seeded from sched->timeout
- * at entity_init (F5); push_job is implemented (minor).
+ * the dep waiter is a separate cb and a job may carry N in-fences
+ * (F3 multidep: the first fence stores directly; the second and later
+ * distinct fences merge into a compound wait-all AND node -- the old
+ * -EOPNOTSUPP single-dep reject is gone, ordering is unchanged: the
+ * pump still gates only the FIFO head); the run_job ERR_PTR path
+ * frees the job instead of dropping it (F4); the timeout comes from
+ * entity->timeout, seeded from sched->timeout at entity_init (F5);
+ * push_job is implemented (minor).
  *
  * Close path (gpu31-close-fix): entity_fini cancels queued jobs, detaches
  * from the scheduler, then waits BOUNDED for dispatched-but-unretired
@@ -121,8 +123,14 @@ struct drm_sched_job {
 					 * (mainline semantics), installed on
 					 * out_sync at SUBMIT, signaled by
 					 * run_job/completion (never replaced) */
-	struct dma_fence *dep_fence;	/* in-fence: must signal before dispatch */
-	struct dma_fence_cb dep_cb;	/* waits on dep_fence (dependency role) */
+	struct dma_fence *dep_fence;	/* in-fence gate: either a single
+					 * unsignaled fence (fast path) or a
+					 * compound wait-all AND node
+					 * (multidep: N distinct fences);
+					 * must signal before dispatch */
+	struct dma_fence_cb dep_cb;	/* waits on dep_fence (dependency role;
+					 * re-pointed at the AND node when a
+					 * second distinct fence merges) */
 	struct dma_fence_cb finish_cb;	/* waits on fence (completion role) */
 	struct delayed_work timeout_work;
 	struct work_struct finish_work;	/* retirement sweep */

@@ -6175,7 +6175,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1594 @@
+@@ -0,0 +1,1612 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6291,6 +6291,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * p7580_job_trace a plain static). Racy dec under concurrent
 + * ioctls overshoots by at most a line or two; harmless. */
 +static unsigned int p7580_sched_trace = 8;
++
++/* Bounded SUBMIT error attribution (gpu31-multidep): every early
++ * error return in p7580_drv_submit routes its errno through here so
++ * the next silicon assert carries stage + errno instead of a bare
++ * ioctl rc. Shares the ST budget discipline (first 8 SUBMITs print).
++ * stage is a short verb: validate/in_sync/bo/job/ops/dep/queue/
++ * out_sync. */
++static long p7580_submit_err(const char *stage, long err)
++{
++	if (p7580_sched_trace && err) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: submit_err stage=%s rc=%ld\n", stage, err);
++	}
++	return err;
++}
 +
 +/* gpu31-iova: dedicated budget for the map/unmap trace (map prints
 + * once per fresh bind, unmap once per free-time unbind; the fault
@@ -7341,15 +7356,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	int slot, ret;
 +
 +	if (!drv || !dev || !file_priv || !args || !df)
-+		return -EINVAL;
++		return (int)p7580_submit_err("validate", -EINVAL);
 +	if (!p7580_jc_valid(args->jc))
-+		return -EINVAL;
++		return (int)p7580_submit_err("validate", -EINVAL);
 +	if (args->requirements & ~(P7580_JD_REQ_FS |
 +				   P7580_JD_REQ_ONLY_COMPUTE))
-+		return -EINVAL;
++		return (int)p7580_submit_err("validate", -EINVAL);
 +	if (args->in_sync_count > P7580_MAX_IN_SYNCS ||
 +	    args->bo_handle_count > P7580_MAX_SUBMIT_BOS)
-+		return -EINVAL;
++		return (int)p7580_submit_err("validate", -EINVAL);
 +
 +	/* ST-IOCTL: ioctl reached the driver with a valid envelope. */
 +	if (p7580_sched_trace) {
@@ -7362,9 +7377,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +	slot = p7580_job_slot(args->requirements);
 +	if (slot < 0 || slot >= P7580_NUM_JOB_SLOTS)
-+		return -EINVAL;
++		return (int)p7580_submit_err("validate", -EINVAL);
 +	if (!(drv->jd.js_present & (1u << slot)))
-+		return -ENODEV;
++		return (int)p7580_submit_err("validate", -ENODEV);
 +
 +	ret = p7580_drv_sched_ensure();
 +	if (ret)
@@ -7382,7 +7397,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			struct dma_fence *f;
 +
 +			if (!s) {
-+				ret = -ENOENT;
++ret = (int)p7580_submit_err("in_sync", -ENOENT);
 +				goto err_inf;
 +			}
 +			f = drm_syncobj_find_fence(s);
@@ -7406,7 +7421,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +						      uh[i]);
 +
 +			if (!obj) {
-+				ret = -ENOENT;
++ret = (int)p7580_submit_err("bo", -ENOENT);
 +				goto err_objs;
 +			}
 +			objs[nr++] = obj;
@@ -7425,7 +7440,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	/* 3. job + sched dispatch. */
 +	job = kzalloc(sizeof(*job), GFP_KERNEL);
 +	if (!job) {
-+		ret = -ENOMEM;
++ret = (int)p7580_submit_err("job", -ENOMEM);
 +		goto err_objs;
 +	}
 +	job->seqno = df->next_seqno++;
@@ -7512,7 +7527,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +		if (!vs) {
 +			p7580_job_free(job);
-+			ret = -ENOENT;
++ret = (int)p7580_submit_err("out_sync", -ENOENT);
 +			goto err_objs;
 +		}
 +		drm_syncobj_put(vs);
@@ -7530,7 +7545,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		job->bos = kcalloc(nr, sizeof(*job->bos), GFP_KERNEL);
 +		if (!job->bos) {
 +			p7580_job_free(job);
-+			ret = -ENOMEM;
++ret = (int)p7580_submit_err("job", -ENOMEM);
 +			goto err_objs;
 +		}
 +		for (i = 0; i < nr; i++)
@@ -7551,7 +7566,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		if (!job->iova_handles || !job->iova_addrs ||
 +		    !job->iova_sizes) {
 +			p7580_job_free(job);
-+			ret = -ENOMEM;
++ret = (int)p7580_submit_err("job", -ENOMEM);
 +			goto err_objs;
 +		}
 +		for (i = 0; i < nr; i++) {
@@ -7567,7 +7582,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	sched_job = drm_sched_job_alloc(entity, &p7580_drv_sched_ops, job);
 +	if (!sched_job) {
 +		p7580_job_free(job);
-+		ret = -ENOMEM;
++ret = (int)p7580_submit_err("job", -ENOMEM);
 +		goto err_objs;
 +	}
 +
@@ -7583,7 +7598,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		drm_sched_job_cleanup(sched_job);
 +		p7580_job_free(job);
 +		kfree(sched_job);
-+		ret = -EFAULT;
++ret = (int)p7580_submit_err("ops", -EFAULT);
 +		goto err_objs;
 +	}
 +	/* Pumpfix: carry the SUBMIT-chosen slot on the sched job so the
@@ -7602,6 +7617,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			ret = drm_sched_job_add_dependency(sched_job,
 +							   inf[i]);
 +			if (ret) {
++				ret = (int)p7580_submit_err("dep", ret);
 +				drm_sched_job_cleanup(sched_job);
 +				kfree(sched_job);
 +				goto err_job_bos;
@@ -7623,6 +7639,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +								   f);
 +			dma_fence_put(f);
 +			if (ret) {
++				ret = (int)p7580_submit_err("dep", ret);
 +				drm_sched_job_cleanup(sched_job);
 +				kfree(sched_job);
 +				goto err_job_bos;
@@ -7645,6 +7662,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			job->seqno, slot, ret);
 +	}
 +	if (ret) {
++		ret = (int)p7580_submit_err("queue", ret);
 +		p7580_drv_job_pm_release(drv);
 +		drm_sched_job_cleanup(sched_job);
 +		kfree(sched_job);
@@ -7664,7 +7682,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +		s = drm_syncobj_find(&df->mgr, args->out_sync);
 +		if (!s) {
-+			ret = -ENOENT;
++ret = (int)p7580_submit_err("out_sync", -ENOENT);
 +			goto err_out;
 +		}
 +		if (fence)

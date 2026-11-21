@@ -21,7 +21,13 @@
  *            entities list non-empty after init, empty after fini.
  *  0004 F2  dependencies gate dispatch (unsignaled dep blocks run_job;
  *            pump re-queued by the dep callback runs it after signal).
- *  0004 F3  one finish_cb per role; second distinct dep -> -EOPNOTSUPP.
+ *  0004 F3multidep  N in-fences per job: the first stores directly,
+ *            the 2nd+ DISTINCT fences merge into a wait-all AND node
+ *            (the old -EOPNOTSUPP single-dep reject is gone); same
+ *            fence twice is a no-op; the pump still gates only the
+ *            FIFO head, so ordering is unchanged.
+ *  multidep  0/1/2/N deps + ordering (test_multidep_* below); every
+ *            early error path prints stage+errno bounded (err test).
  *  0004 F4  run_job ERR_PTR frees the job (free_job called, FIFO advances).
  *  armfence fence exists and is armed at submit (non-NULL, unsignaled);
  *           the SAME pointer is signalled at completion (no second
@@ -480,7 +486,9 @@ static void test_entity_lists(void)
 	CHECK(sched.wq == NULL);
 }
 
-/* F2: unsignaled dep blocks dispatch; signal + pump re-queue runs it. */
+/* F2/multidep: unsignaled deps block dispatch; the second DISTINCT dep
+ * merges into a wait-all AND node (no -EOPNOTSUPP): the pump runs the
+ * job only after EVERY leaf signals. Same fence twice stays a no-op. */
 static void test_dep_gating(void)
 {
 	struct drm_sched sched;
@@ -503,20 +511,28 @@ static void test_dep_gating(void)
 	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_job_add_dependency(j, dep2 == dep ? NULL :
 					      &dep->base), 0);
-	/* F3: second distinct dep rejected. */
-	CHECK_EQ(drm_sched_job_add_dependency(j, &dep2->base), -EOPNOTSUPP);
-	/* Same fence again: no-op success. */
+	/* Multidep F3: second distinct dep MERGES (wait-all AND node). */
+	CHECK_EQ(drm_sched_job_add_dependency(j, &dep2->base), 0);
+	/* Same fence (either leaf) again: no-op success. */
 	CHECK_EQ(drm_sched_job_add_dependency(j, &dep->base), 0);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &dep2->base), 0);
 	CHECK_EQ(drm_sched_job_submit(j), 0);
 
-	/* Pump with dep pending: run_job must NOT run, job stays queued. */
+	/* Pump with deps pending: run_job must NOT run, job stays queued. */
 	e.sched_work.fn(&e.sched_work);
 	CHECK_EQ(run_count, 0);
 	CHECK(!list_empty(&e.queue_list));
 
-	/* Signal the dep (fires dep_cb, which re-queues the pump): the
-	 * emulation marks sched_work pending; run the pump again. */
+	/* Signal ONE leaf: still gated (AND needs both). */
 	dma_fence_signal(&dep->base);
+	CHECK_EQ(e.sched_work.pending, 1);
+	e.sched_work.pending = 0;
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 0);
+	CHECK(!list_empty(&e.queue_list));
+
+	/* Signal the other leaf: the node fires, the pump runs the job. */
+	dma_fence_signal(&dep2->base);
 	CHECK_EQ(e.sched_work.pending, 1);
 	e.sched_work.pending = 0;
 	e.sched_work.fn(&e.sched_work);
@@ -1110,7 +1126,326 @@ static void test_opsfix_roundtrip(void)
 	drm_sched_fini(&sched);
 }
 
+/* ------------------------------------------------------------------ */
+/* multidep (gpu31-multidep): 0/1/2/N in-fences + ordering + errors.    */
+/* A tiler-chain SUBMIT carries an array of in_syncs plus implicit BO  */
+/* excl fences: the shim must wait ALL of them (wait-all AND), never   */
+/* reject the 2nd distinct fence (old -EOPNOTSUPP juddered the Mesa     */
+/* assert at pan_job.c:1033). Ordering is unchanged: the pump still    */
+/* gates only the FIFO head on dep_fence, so jobs retire in order.      */
+/* ------------------------------------------------------------------ */
 
+/* 0 deps: dep-less job dispatches immediately. */
+static void test_multidep_zero(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 5, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
+	CHECK(j->dep_fence == NULL);
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+	CHECK(list_empty(&e.queue_list));
+	dma_fence_signal(j->fence);
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(free_count, 1);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
+/* 1 dep: fast path (leaf stored directly, no AND node); signaled
+ * fences are skipped (NULL dep, immediate dispatch). */
+static void test_multidep_one(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+	struct test_fence *dep = mkfence(4, 21);
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 5, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &dep->base), 0);
+	/* One leaf: stored directly (no node allocation). */
+	CHECK(j->dep_fence == &dep->base);
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 0);
+	dma_fence_signal(&dep->base);
+	CHECK_EQ(e.sched_work.pending, 1);
+	e.sched_work.pending = 0;
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+	dma_fence_signal(j->fence);
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(free_count, 1);
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+	kfree(dep);
+
+	/* Pre-signaled dep: skipped, dep stays NULL, direct dispatch. */
+	dep = mkfence(4, 22);
+	dma_fence_signal(&dep->base);
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 5, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &dep->base), 0);
+	CHECK(j->dep_fence == NULL);
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+	dma_fence_signal(j->fence);
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(free_count, 1);
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+	kfree(dep);
+}
+
+/* 2 deps: second DISTINCT fence merges (AND node); the job runs only
+ * after BOTH signal, in either order. */
+static void test_multidep_two(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+	int order;
+
+	for (order = 0; order < 2; order++) {
+		struct test_fence *a = mkfence(4, 31);
+		struct test_fence *b = mkfence(4, 32);
+
+		memset(&sched, 0, sizeof(sched));
+		drm_sched_init(&sched, &sched_ops_ok, 5, "t");
+		drm_sched_entity_init(&e, &sched);
+		run_count = 0;
+		free_count = 0;
+
+		j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+		drm_sched_job_arm(j);
+		CHECK_EQ(drm_sched_job_add_dependency(j, &a->base), 0);
+		CHECK_EQ(drm_sched_job_add_dependency(j, &b->base), 0);
+		CHECK(j->dep_fence != &a->base);
+		CHECK(j->dep_fence != &b->base);
+		CHECK_EQ(drm_sched_job_submit(j), 0);
+		e.sched_work.fn(&e.sched_work);
+		CHECK_EQ(run_count, 0);
+		/* First leaf (either order): still gated. */
+		dma_fence_signal(order ? &b->base : &a->base);
+		/* The leaf signal re-queues the pump via the node. */
+		if (e.sched_work.pending) {
+			e.sched_work.pending = 0;
+			e.sched_work.fn(&e.sched_work);
+		}
+		CHECK_EQ(run_count, 0);
+		CHECK(!list_empty(&e.queue_list));
+		/* Second leaf: node fires, job dispatches. */
+		dma_fence_signal(order ? &a->base : &b->base);
+		if (e.sched_work.pending) {
+			e.sched_work.pending = 0;
+			e.sched_work.fn(&e.sched_work);
+		} else {
+			e.sched_work.fn(&e.sched_work);
+		}
+		CHECK_EQ(run_count, 1);
+		CHECK(list_empty(&e.queue_list));
+		dma_fence_signal(j->fence);
+		j->finish_work.fn(&j->finish_work);
+		CHECK_EQ(free_count, 1);
+		drm_sched_entity_fini(&sched, &e);
+		drm_sched_fini(&sched);
+		kfree(a);
+		kfree(b);
+	}
+}
+
+/* N deps (5 leaves): wait-all across the set; one signal short of all
+ * still gates. Exercises the append-a-leaf (3rd+) merge path. */
+static void test_multidep_many(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+	struct test_fence *leaf[5];
+	int i;
+
+	for (i = 0; i < 5; i++)
+		leaf[i] = mkfence(4, 40 + (unsigned)i);
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 5, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
+	for (i = 0; i < 5; i++)
+		CHECK_EQ(drm_sched_job_add_dependency(j, &leaf[i]->base),
+			 0);
+	CHECK(j->dep_fence != &leaf[0]->base);
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	/* Signal all but the last: still gated. */
+	for (i = 0; i < 4; i++) {
+		dma_fence_signal(&leaf[i]->base);
+		if (e.sched_work.pending) {
+			e.sched_work.pending = 0;
+			e.sched_work.fn(&e.sched_work);
+		} else {
+			e.sched_work.fn(&e.sched_work);
+		}
+		CHECK_EQ(run_count, 0);
+		CHECK(!list_empty(&e.queue_list));
+	}
+	/* Last leaf: dispatch. */
+	dma_fence_signal(&leaf[4]->base);
+	if (e.sched_work.pending) {
+		e.sched_work.pending = 0;
+		e.sched_work.fn(&e.sched_work);
+	} else {
+		e.sched_work.fn(&e.sched_work);
+	}
+	CHECK_EQ(run_count, 1);
+	CHECK(list_empty(&e.queue_list));
+	dma_fence_signal(j->fence);
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(free_count, 1);
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+	for (i = 0; i < 5; i++)
+		kfree(leaf[i]);
+}
+
+/* Ordering: two jobs on one entity retire in FIFO order with a shared
+ * dep chain (job2 waits on job1's fence + its own dep). The head gate
+ * serialises dispatch; the second job never jumps the first. */
+static void test_multidep_ordering(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j1, *j2;
+	struct test_fence *dep = mkfence(4, 51);
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+	run_log_n = 0;
+	free_log_n = 0;
+
+	/* Job 1: dep-gated, owner 61. Job 2: waits on dep AND job1's
+	 * completion fence (chain), owner 62. */
+	j1 = drm_sched_job_alloc(&e, &sched_ops_ok, (void *)(long)61);
+	j2 = drm_sched_job_alloc(&e, &sched_ops_ok, (void *)(long)62);
+	CHECK(j1 != NULL && j2 != NULL);
+	drm_sched_job_arm(j1);
+	drm_sched_job_arm(j2);
+	CHECK_EQ(drm_sched_job_add_dependency(j1, &dep->base), 0);
+	CHECK_EQ(drm_sched_job_add_dependency(j2, &dep->base), 0);
+	CHECK_EQ(drm_sched_job_add_dependency(j2, j1->fence), 0);
+	CHECK_EQ(drm_sched_job_submit(j1), 0);
+	CHECK_EQ(drm_sched_job_submit(j2), 0);
+
+	/* Nothing runs while dep is pending (head gate holds j1). */
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 0);
+
+	/* Signal dep: j1 dispatches (head), j2 still gated on j1->fence. */
+	dma_fence_signal(&dep->base);
+	if (e.sched_work.pending) {
+		e.sched_work.pending = 0;
+		e.sched_work.fn(&e.sched_work);
+	}
+	CHECK_EQ(run_count, 1);
+	CHECK_EQ(run_log[0], 61);
+	/* j1 dispatched and holds the pump slot: clear the emulated
+	 * in-flight (the real wq serialises the same way). */
+	spin_lock(&e.queue_lock);
+	e.in_flight = NULL;
+	spin_unlock(&e.queue_lock);
+	/* j2's turn at the head: still gated on the unsignaled j1 fence. */
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+
+	/* Retire j1: signals j1->fence, which releases j2's AND node. */
+	dma_fence_signal(j1->fence);
+	CHECK(e.sched_work.pending);
+	e.sched_work.pending = 0;
+	/* Finish j1 first (retire), then pump j2. */
+	j1->finish_work.fn(&j1->finish_work);
+	CHECK_EQ(free_count, 1);
+	CHECK_EQ(free_log[0], 61);
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 2);
+	CHECK_EQ(run_log[1], 62);
+	spin_lock(&e.queue_lock);
+	e.in_flight = NULL;
+	spin_unlock(&e.queue_lock);
+	dma_fence_signal(j2->fence);
+	j2->finish_work.fn(&j2->finish_work);
+	CHECK_EQ(free_count, 2);
+	CHECK_EQ(free_log[1], 62);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+	kfree(dep);
+}
+
+/* Error attribution: every early error path returns its errno AND the
+ * bounded stage print fires (visible above as "p7580_sched: err
+ * stage=..."). This pins the contract the next silicon assert needs:
+ * stage + rc instead of a bare ioctl code. */
+static void test_multidep_errors(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+	struct test_fence *dep = mkfence(4, 71);
+	struct test_fence *sig = mkfence(4, 72);
+
+	dma_fence_signal(&sig->base);
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 5, "t");
+	drm_sched_entity_init(&e, &sched);
+
+	/* NULL submit: stage=submit, -EINVAL. */
+	CHECK_EQ(drm_sched_entity_push_job(NULL), -EINVAL);
+	CHECK_EQ(drm_sched_job_submit(NULL), -EINVAL);
+
+	/* Signaled / NULL fences: skipped, never an error. */
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
+	CHECK_EQ(drm_sched_job_add_dependency(j, NULL), 0);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &sig->base), 0);
+	CHECK(j->dep_fence == NULL);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &dep->base), 0);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &dep->base), 0);
+	CHECK_EQ(drm_sched_job_add_dependency(j, &sig->base), 0);
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+	kfree(dep);
+	kfree(sig);
+}
 
 int main(void)
 {
@@ -1135,6 +1470,12 @@ int main(void)
 	test_armfence_submit_armed_same_signalled();
 	test_armfence_noalloc_fails_closed();
 	test_opsfix_roundtrip();
+	test_multidep_zero();
+	test_multidep_one();
+	test_multidep_two();
+	test_multidep_many();
+	test_multidep_ordering();
+	test_multidep_errors();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

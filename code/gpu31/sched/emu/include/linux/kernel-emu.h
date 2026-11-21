@@ -300,6 +300,9 @@ static inline void *kcalloc(size_t n, size_t s, gfp_t g)
 #define ENODEV 19
 #define ENOSYS 38
 #define EAGAIN 11
+#define ENOSPC 28
+#define EEXIST 17
+#define EFAULT 14
 #ifndef max
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #endif
