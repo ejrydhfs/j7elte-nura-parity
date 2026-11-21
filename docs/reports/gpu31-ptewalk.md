@@ -9,6 +9,15 @@ reuse fence, landed), `gpu31-armfence.md` (arm-time fence, landed),
 `gpu31-lastjob.md` (descriptor dump: CPU view == kernel view, valid
 FRAGMENT bytes), `gpu31-integration26.md` (int26 build, pending).
 
++> Fix 2026-11-21 (G31_PteWalkFix): the `if (jc & ~PAGE_MASK) return`
++> guard silently dropped every non-page-aligned job (faulting
++> `jc=0x21c5600`, off 0x600). Walker now uses `jc_page = jc & PAGE_MASK`
++> for all four table indexes; prints keep the full `jc`, re-read keeps
++> `page_off`, existing `page_off + 32 <= PAGE_SIZE` bound unchanged.
++> Verified: hunk 1487/1487, `git apply --check` clean, `-fsyntax-only`
++> clean vs real 3.10.108 headers + 0001-0004 shims. Hand to integrator
++> for int29.
++
 ## 0. Defect (silicon, unchanged through int25)
 
 Per-frame deterministic fault on the last Mesa submit:

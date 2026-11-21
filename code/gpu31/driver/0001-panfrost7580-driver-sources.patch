@@ -6477,6 +6477,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	unsigned int l;
 +	u64 e = 0;
 +	u64 jc;
++	u64 jc_page;
 +	unsigned int slot;
 +	unsigned int seq;
 +	u64 leaf_pte = 0;
@@ -6502,14 +6503,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	jc = job->jc;
 +	slot = (unsigned int)job->slot;
 +	seq = job->seqno;
-+	if (jc & ~PAGE_MASK)
-+		return;
++	jc_page = jc & PAGE_MASK;
 +	cur = drv->mmu.root_dma;
 +	for (l = 0; l < 3; l++) {
 +		u64 *cpu;
 +		struct page *pg;
 +		unsigned int shift = 12 + (3 - l) * 9;
-+		unsigned int idx = (unsigned int)((jc >> shift) & 0x1FFu);
++		unsigned int idx = (unsigned int)((jc_page >> shift) & 0x1FFu);
 +
 +		pg = pfn_to_page((unsigned long)(cur >> PAGE_SHIFT));
 +		cpu = kmap(pg);
@@ -6525,7 +6525,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	{
 +		u64 *cpu;
 +		struct page *pg;
-+		unsigned int idx = (unsigned int)((jc >> 12) & 0x1FFu);
++		unsigned int idx = (unsigned int)((jc_page >> 12) & 0x1FFu);
 +
 +		pg = pfn_to_page((unsigned long)(cur >> PAGE_SHIFT));
 +		cpu = kmap(pg);
