@@ -286,6 +286,38 @@ int panfrost_ioctl_wait_bo(struct drm_device *dev, void *data,
 		return (int)timeout;
 	return 0;
 }
+/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side BO
+ * word readback after completion. Same maintenance as free_job
+ * (p7580_gem_debug_read_word calls p7580_gem_job_done_sync), so the
+ * kernel view cannot reproduce the userspace-alias ambiguity. Plain
+ * static enable: always on while the ticket is open; the cutover
+ * deletes this function + its 0xCF route. No MMIO, no sleeps. */
+struct p7580_debug_read_bo {
+	uint32_t handle;
+	uint32_t offset;	/* byte offset of the u32 to read */
+	uint32_t value;		/* OUT: u32 at that offset */
+	uint32_t pad;		/* must be zero */
+};
+int panfrost_debug_read_bo(struct drm_device *dev, void *data,
+			   struct drm_file *file_priv)
+{
+	struct p7580_debug_read_bo *args = data;
+	struct drm_gem_object *obj;
+	uint32_t v = 0;
+	int ret;
+
+	if (args->pad)
+		return -EINVAL;
+	obj = drm_gem_object_lookup(dev, file_priv, args->handle);
+	if (!obj)
+		return -ENOENT;
+	ret = p7580_gem_debug_read_word(obj, args->offset, &v);
+	drm_gem_object_unreference_unlocked(obj);
+	if (ret)
+		return ret;
+	args->value = v;
+	return 0;
+}
 
 /* SUBMIT: validate-only in this slice is over -- full dispatch goes to
  * the jobs core, with user arrays staged on the stack first. */

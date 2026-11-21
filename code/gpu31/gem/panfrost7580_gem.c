@@ -154,6 +154,37 @@ void p7580_gem_job_done_sync(struct drm_gem_object *obj)
 					PAGE_SIZE, DMA_BIDIRECTIONAL);
 	}
 }
+/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
+ * readback. Guardrail: reuse the exact free_job maintenance -- call
+ * p7580_gem_job_done_sync first (dma_sync_single_for_cpu per bound
+ * SHMEM page), then read one u32 via the kernel linear map
+ * (kmap_atomic single-arg on this !HIGHMEM arm64 tree). Never-bound
+ * CMA/imported follow job_done_sync's no-op rules; unmapped pages
+ * fail ENOENT. No MMIO, no sleeps, no locks. */
+int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
+			      uint32_t *out)
+{
+	struct p7580_bo *bo = to_p7580_bo(obj);
+	unsigned int idx;
+	struct page *pg;
+	void *kv;
+	uint32_t w;
+
+	if (!obj || !out)
+		return -EINVAL;
+	if (offset + sizeof(w) > obj->size)
+		return -EINVAL;
+	p7580_gem_job_done_sync(obj);
+	idx = offset >> PAGE_SHIFT;
+	if (idx >= bo->nr_pages || !bo->pages || !bo->pages[idx])
+		return -ENOENT;
+	pg = bo->pages[idx];
+	kv = kmap_atomic(pg);
+	w = *(uint32_t *)((char *)kv + (offset & (PAGE_SIZE - 1)));
+	kunmap_atomic(kv);
+	*out = w;
+	return 0;
+}
 
 /* Bind: dma_map the SHMEM pages for GPU access (before the AS0        */
 /* page-table walk). Idempotent: already-bound BOs return 0 without    */

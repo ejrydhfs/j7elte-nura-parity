@@ -1,6 +1,6 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-20 18:25:46.757374321 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-20 19:18:35.156637348 -0500
 @@ -0,0 +1,107 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -111,8 +111,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +#endif /* PANFROST7580_DRV_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-20 18:25:46.759554917 -0500
-@@ -0,0 +1,1182 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-20 19:18:35.158981126 -0500
+@@ -0,0 +1,1213 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -268,6 +268,37 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		dma_sync_single_for_cpu(bo->sync_dev, bo->dma_addrs[i],
 +					PAGE_SIZE, DMA_BIDIRECTIONAL);
 +	}
++}
++/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
++ * readback. Guardrail: reuse the exact free_job maintenance -- call
++ * p7580_gem_job_done_sync first (dma_sync_single_for_cpu per bound
++ * SHMEM page), then read one u32 via the kernel linear map
++ * (kmap_atomic single-arg on this !HIGHMEM arm64 tree). Never-bound
++ * CMA/imported follow job_done_sync's no-op rules; unmapped pages
++ * fail ENOENT. No MMIO, no sleeps, no locks. */
++int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
++			      uint32_t *out)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++	unsigned int idx;
++	struct page *pg;
++	void *kv;
++	uint32_t w;
++
++	if (!obj || !out)
++		return -EINVAL;
++	if (offset + sizeof(w) > obj->size)
++		return -EINVAL;
++	p7580_gem_job_done_sync(obj);
++	idx = offset >> PAGE_SHIFT;
++	if (idx >= bo->nr_pages || !bo->pages || !bo->pages[idx])
++		return -ENOENT;
++	pg = bo->pages[idx];
++	kv = kmap_atomic(pg);
++	w = *(uint32_t *)((char *)kv + (offset & (PAGE_SIZE - 1)));
++	kunmap_atomic(kv);
++	*out = w;
++	return 0;
 +}
 +
 +/* Bind: dma_map the SHMEM pages for GPU access (before the AS0        */
@@ -1297,8 +1328,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-20 18:25:46.761191795 -0500
-@@ -0,0 +1,205 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-20 19:18:35.161152467 -0500
+@@ -0,0 +1,212 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
@@ -1493,6 +1524,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +void p7580_gem_submit_sync(struct drm_gem_object *obj);
 +void p7580_gem_dma_unbind(struct drm_gem_object *obj);
 +phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
++/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
++ * readback of a BO page after completion. Reuses p7580_gem_job_done_sync
++ * (same dma_sync_for_cpu path as free_job) then reads one u32 via kmap.
++ * No new maintenance implementation; CMA/imported-never-bound BOs follow
++ * the same no-op rules as job_done_sync. offset is a byte offset. */
++int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
++			      uint32_t *out);
 +struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
 +struct drm_gem_object *p7580_gem_prime_import_sg_table(
 +		struct drm_device *dev, size_t size, struct sg_table *sgt);
@@ -1506,8 +1544,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +#endif /* PANFROST7580_GEM_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-20 18:25:46.763979594 -0500
-@@ -0,0 +1,340 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-20 19:18:35.163304742 -0500
+@@ -0,0 +1,372 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_ioctl.c - six v5.2 ioctl handlers on the GEM core.
@@ -1796,6 +1834,38 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +		return (int)timeout;
 +	return 0;
 +}
++/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side BO
++ * word readback after completion. Same maintenance as free_job
++ * (p7580_gem_debug_read_word calls p7580_gem_job_done_sync), so the
++ * kernel view cannot reproduce the userspace-alias ambiguity. Plain
++ * static enable: always on while the ticket is open; the cutover
++ * deletes this function + its 0xCF route. No MMIO, no sleeps. */
++struct p7580_debug_read_bo {
++	uint32_t handle;
++	uint32_t offset;	/* byte offset of the u32 to read */
++	uint32_t value;		/* OUT: u32 at that offset */
++	uint32_t pad;		/* must be zero */
++};
++int panfrost_debug_read_bo(struct drm_device *dev, void *data,
++			   struct drm_file *file_priv)
++{
++	struct p7580_debug_read_bo *args = data;
++	struct drm_gem_object *obj;
++	uint32_t v = 0;
++	int ret;
++
++	if (args->pad)
++		return -EINVAL;
++	obj = drm_gem_object_lookup(dev, file_priv, args->handle);
++	if (!obj)
++		return -ENOENT;
++	ret = p7580_gem_debug_read_word(obj, args->offset, &v);
++	drm_gem_object_unreference_unlocked(obj);
++	if (ret)
++		return ret;
++	args->value = v;
++	return 0;
++}
 +
 +/* SUBMIT: validate-only in this slice is over -- full dispatch goes to
 + * the jobs core, with user arrays staged on the stack first. */
@@ -1850,8 +1920,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-20 18:25:46.766113814 -0500
-@@ -0,0 +1,45 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-20 19:18:35.165329488 -0500
+@@ -0,0 +1,52 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_ioctl.h - v5.2 UAPI handler prototypes for the T720 port.
@@ -1892,6 +1962,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 +			     struct drm_file *file_priv);
 +int panfrost_ioctl_get_bo_offset(struct drm_device *dev, void *data,
 +				 struct drm_file *file_priv);
++/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side BO
++ * word readback after completion. Routed via the syncobj fops
++ * dispatcher (nr 0xCF), NOT the six-ioctl driver table. Takes a
++ * handle + byte offset, returns the u32 at that offset after the
++ * same dma_sync_for_cpu maintenance free_job runs. */
++int panfrost_debug_read_bo(struct drm_device *dev, void *data,
++			   struct drm_file *file_priv);
 +
 +int p7580_file_priv_init(struct drm_device *dev, struct drm_file *file_priv);
 +void p7580_file_priv_fini(struct drm_device *dev, struct drm_file *file_priv);
@@ -1899,7 +1976,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 +#endif /* PANFROST7580_IOCTL_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-20 18:25:46.768196981 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-20 19:18:35.167367294 -0500
 @@ -0,0 +1,254 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -2157,7 +2234,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#endif /* PANFROST7580_JM_HW_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 18:25:46.770310109 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 19:18:35.169499385 -0500
 @@ -0,0 +1,851 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -3012,7 +3089,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 18:25:46.772530375 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 19:18:35.171576232 -0500
 @@ -0,0 +1,179 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -3195,7 +3272,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +#endif /* PANFROST7580_JOB_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-20 18:25:46.774689598 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-20 19:18:35.173758539 -0500
 @@ -0,0 +1,682 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -3881,7 +3958,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +MODULE_ALIAS("platform:panfrost7580");
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-20 18:25:46.776733584 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-20 19:18:35.175983029 -0500
 @@ -0,0 +1,447 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -4332,7 +4409,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-20 18:25:46.778726305 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-20 19:18:35.178043603 -0500
 @@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -4507,7 +4584,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/d
 +#endif /* PANFROST7580_MMU_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b/drivers/gpu/drm/panfrost/panfrost7580_power.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-20 18:25:46.780767497 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-20 19:18:35.180116190 -0500
 @@ -0,0 +1,524 @@
 +/*
 + * panfrost7580_power.c - PM / clock / reset sequencing for Mali-T720
@@ -5035,7 +5112,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b/drivers/gpu/drm/panfrost/panfrost7580_power.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-20 18:25:46.783015349 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-20 19:18:35.182234382 -0500
 @@ -0,0 +1,201 @@
 +/*
 + * panfrost7580_power.h - PM / clock / reset sequencing for Mali-T720
@@ -5240,7 +5317,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 +#endif /* PANFROST7580_POWER_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-20 18:25:46.784962045 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-20 19:18:35.184232100 -0500
 @@ -0,0 +1,995 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -6239,8 +6316,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-20 18:25:46.787158774 -0500
-@@ -0,0 +1,812 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-20 19:18:35.186274097 -0500
+@@ -0,0 +1,848 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_syncobj.c - generic DRM syncobj ioctl bodies for the
@@ -6333,6 +6410,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +#define P7580_SYNCOBJ_NR_WAIT		0xC3u
 +#define P7580_SYNCOBJ_NR_RESET		0xC4u
 +#define P7580_SYNCOBJ_NR_SIGNAL		0xC5u
++/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel BO word
++ * readback route. 0xCF sits above the syncobj 0xBF-0xC5 block and
++ * below DRM_COMMAND_BASE 0x40-space driver numbers: no collision
++ * with either table; the six-ioctl driver table is untouched. */
++#define P7580_DEBUG_READ_BO_NR		0xCFu
 +
 +#define P7580_SYNCOBJ_CREATE_SIGNALED	(1u << 0)
 +
@@ -6374,6 +6456,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +	__u32 count_handles;
 +	__u32 pad;
 +};
++/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): 16 B payload
++ * mirror of struct p7580_debug_read_bo (ioctl.c): handle + byte
++ * offset + OUT value + zero pad. Same 16 B shape discipline as the
++ * syncobj structs. */
++struct p7580_debug_read_bo {
++	__u32 handle;
++	__u32 offset;
++	__u32 value;
++	__u32 pad;
++};
++int panfrost_debug_read_bo(struct drm_device *dev, void *data,
++			   struct drm_file *file_priv);
 +
 +/* ABI gate (gpu31-abialign, both TUs): Mesa 20.3 bundles the 20.x
 + * drm.h syncobj shapes (verified on-device 2026-11-20 from
@@ -6437,6 +6531,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_AVAILABLE != (1u << 2));
 +	BUILD_BUG_ON(P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE != (1u << 0));
 +	BUILD_BUG_ON(P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE != (1u << 0));
++	/* DEBUG-ONLY (gpu31-gpuwrite): 16 B readback payload pin. */
++	BUILD_BUG_ON(sizeof(struct p7580_debug_read_bo) != 16);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
++					handle) != 0);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
++					offset) != 4);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
++					value) != 8);
++	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
++					pad) != 12);
++	BUILD_BUG_ON(P7580_DEBUG_READ_BO_NR != 0xCFu);
 +}
 +
 +/* The manager lives first in driver_priv (GEM p7580_file_priv and the
@@ -6936,6 +7041,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +		return panfrost_syncobj_reset(dev, kdata, file_priv);
 +	case P7580_SYNCOBJ_NR_SIGNAL:
 +		return panfrost_syncobj_signal(dev, kdata, file_priv);
++	case P7580_DEBUG_READ_BO_NR:
++		/* DEBUG-ONLY (gpu31-gpuwrite): kernel BO word readback.
++		 * Not a syncobj number and not a driver-table number:
++		 * handled here at the fops layer only. */
++		return panfrost_debug_read_bo(dev, kdata, file_priv);
 +	default:
 +		return -ENOENT;	/* not a syncobj number: caller forwards */
 +	}
@@ -6987,6 +7097,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +	case P7580_SYNCOBJ_NR_RESET:
 +	case P7580_SYNCOBJ_NR_SIGNAL:
 +		asize = sizeof(struct p7580_syncobj_array);
++		break;
++	case P7580_DEBUG_READ_BO_NR:
++		asize = sizeof(struct p7580_debug_read_bo);
 +		break;
 +	default:
 +		return drm_ioctl(filp, cmd, arg);
@@ -7055,7 +7168,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +#endif
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-20 18:25:46.789383998 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-20 19:18:35.188469394 -0500
 @@ -0,0 +1,70 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -7129,7 +7242,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
 +#endif /* PANFROST7580_SYNCOBJ_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drivers/gpu/drm/panfrost/panfrost_drm.h
 --- a/drivers/gpu/drm/panfrost/panfrost_drm.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-20 18:25:46.791695686 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-20 19:18:35.190565237 -0500
 @@ -0,0 +1,155 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
@@ -7288,7 +7401,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drive
 +#endif /* _PANFROST_DRM_H_ */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/drivers/gpu/drm/panfrost/pf7580_devfreq.c
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-20 18:25:46.793867831 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-20 19:18:35.192551851 -0500
 @@ -0,0 +1,355 @@
 +/*
 + * pf7580_devfreq.c - panfrost devfreq/DVFS for Mali-T720 on 3.10.108.
@@ -7647,7 +7760,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/dri
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.h b/drivers/gpu/drm/panfrost/pf7580_devfreq.h
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-20 18:25:46.796100249 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-20 19:18:35.194775083 -0500
 @@ -0,0 +1,251 @@
 +/*
 + * pf7580_devfreq.h - panfrost devfreq/DVFS for Mali-T720 (Exynos 7580,

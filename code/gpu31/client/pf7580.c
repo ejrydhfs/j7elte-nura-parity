@@ -694,6 +694,44 @@ int pf7580_syncobj_wait(struct pf7580_dev *dev, const uint32_t *handles,
 int pf7580_cpu_map_errno;
 uint64_t pf7580_cpu_map_off;
 size_t pf7580_cpu_map_len;
+/* DEBUG-ONLY (gpu31-gpuwrite): kernel BO word readback. Fops-routed
+ * IOWR(0xCF) 16 B payload {handle, offset, value OUT, pad}. Mock
+ * reads the shadow directly. */
+struct pf7580_debug_read_bo {
+	uint32_t handle;
+	uint32_t offset;
+	uint32_t value;
+	uint32_t pad;
+};
+#define PF7580_IOCTL_DEBUG_READ_BO \
+	DRM_IOWR(0xCF, struct pf7580_debug_read_bo)
+int pf7580_debug_read_bo(struct pf7580_dev *dev, uint32_t handle,
+			 uint32_t offset, uint32_t *value)
+{
+	if (!dev || !value)
+		return -EINVAL;
+	if (offset & 3u)
+		return -EINVAL;
+	if (dev->is_mock) {
+		struct pf7580_mock_bo *bo = mock_find(dev, handle);
+
+		if (!bo || offset + 4 > bo->size)
+			return -ENOENT;
+		*value = *(uint32_t *)((char *)bo->shadow + offset);
+		return 0;
+	}
+	{
+		struct pf7580_debug_read_bo r;
+
+		memset(&r, 0, sizeof(r));
+		r.handle = handle;
+		r.offset = offset;
+		if (ioctl(dev->fd, PF7580_IOCTL_DEBUG_READ_BO, &r))
+			return -errno;
+		*value = r.value;
+		return 0;
+	}
+}
 
 
 void *pf7580_cpu_map(struct pf7580_dev *dev, uint32_t handle,

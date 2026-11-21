@@ -16,16 +16,17 @@
  *                 BO's own gpu_offset + fence-wait it. Proves dispatch +
  *                 retire; does NOT prove GPU writes are visible (a NULL
  *                 job writes nothing).
- *   --pattern-test PATH ("coherency proof", gpu31-coherency): write one
- *                 56-byte WRITE_VALUE job (Mesa midgard.xml: type 2,
- *                 Immediate-32) whose payload targets a second 4 KiB
- *                 result BO at a known GPU VA with a known u32 pattern
- *                 (0xC0C3E8E1). SUBMIT it (req=0 -> JS1), fence-wait the
- *                 out_sync, re-mmap the result BO, and compare the word.
- *                 PASS (pattern word == expected) proves the full
- *                 COHERENCY_NONE chain: CPU write -> sync_for_device ->
- *                 GPU DMA write -> IRQ retire -> sync_for_cpu -> CPU read.
- *                 FAIL prints expected-vs-actual + JS_STATUS hint.
+ *   --pattern-test PATH ("gpu write proof", gpu31-gpuwrite): one
+ *                 56-byte WRITE_VALUE job (type 2, Zero) whose payload
+ *                 targets a second 4 KiB result BO pre-filled with
+ *                 0xA5A5A5A5. SUBMIT (req=0 -> JS0), fence-wait the
+ *                 out_sync, then compare word 0 in BOTH views:
+ *                 userspace re-mmap AND the DEBUG_READ_BO kernel
+ *                 readback (same sync_for_cpu as free_job). PASS (both
+ *                 zero) proves the GPU wrote the page. Kernel-zero +
+ *                 user-0xA5 = stale CPU alias (visibility bug); both
+ *                 0xA5 + fence signalled = GPU never wrote
+ *                 (encoding/slot); +JS_STATUS fault = bad job/VA.
  *
  * Exit codes: 0 success, 2 device absent, 1 failure. The mock suite runs
  * on any build host; the real-node path is skipped (exit 2) when the
@@ -780,30 +781,41 @@ static int run_submit_test(const char *path)
 	fflush(stdout);
 	return 0;
 }
-/* WRITE_VALUE pattern test ("coherency proof", gpu31-coherency).
+/* WRITE_VALUE pattern test ("gpu write proof", gpu31-gpuwrite).
  * Layout (two 4 KiB BOs, both mapped through the driver's AS0):
  *   job BO:    56-byte job at offset 0: 32-byte header (type 2 =
  *              WRITE_VALUE, 64-bit next=NULL) + 24-byte payload
- *              (u64 address = result gpu_offset, u32 type = 6 =
- *              Immediate-32, u64 immediate = PATTERN). Byte layout
- *              follows Mesa 20.3's midgard.xml pack order exactly:
- *              header words [0..7] = {exc=0, first=0, fault=0,0,
- *              w4 = is64b|type<<1, deps=0, next=0,0},
- *              payload words [8..13] = {addr_lo, addr_hi, type32,
- *              0, imm_lo, imm_hi}.
- *   result BO: zeroed; word 0 is the GPU write target.
- *
- * Sequence: SUBMIT(jc=job gpu_offset, both BOs, req=0 -> JS1) +
- * out_sync fence-wait (+8 s abs) + munmap + re-mmap result + compare.
- * Expected: result[0] == PATTERN. Before the coherency fix the CPU
- * read back 0 (stale cache lines: flush_dcache_page is a flag-clear
- * no-op on arm64, no HIGHMEM); after the fix (dma_map at bind,
- * sync_for_device at SUBMIT, sync_for_cpu at completion) it reads
- * the GPU-written pattern. A faulting job (bad address/type) shows
- * result[0] == 0 AND a nonzero JS_STATUS — distinguishable in dmesg
- * from a coherency miss (IRQ DONE + clean status, word still 0).
- * Exit: 0 pattern matched, 1 mismatch/failure, 2 node unavailable. */
-#define PF7580_PATTERN_EXPECTED		0xC0C3E8E1u
+ *              (u64 address = result gpu_offset, u32 type = 3 =
+ *              Zero, u64 immediate = 0, ignored). Byte layout follows
+ *              Mesa 20.3's midgard.xml pack order exactly: header
+ *              words [0..7] = {exc=0, first=0, fault=0,0,
+ *              w4 = is64b|type<<1, deps=0, next=0,0}, payload words
+ *              [8..13] = {addr_lo, addr_hi, type32, 0, 0, 0}.
+ *   result BO: pre-filled from userspace with 0xA5A5A5A5; word 0 is
+ *              the GPU write target (Zero fill writes zeroes over
+ *              the target range; we check word 0 == 0 after completion).
+ * Why Zero and not Immediate-32: the T720 is a PAN_ARCH 4 (Midgard
+ * v4) part (pan_model.h: 0x720 -> arch 4); the v4/v5 genxml used for
+ * it (Mesa 20.3 lib/midgard.xml, on-device) defines only three
+ * Write Value Types (1 Cycle Counter, 2 System Timestamp, 3 Zero).
+ * Immediate 8/16/32/64 (4..7) exist only in the v6+ genxml for
+ * Bifrost parts. The old test encoded type 6 (Immediate-32): on
+ * this GPU that type field is reserved, so the job either faults
+ * (JS_STATUS) or no-ops while the fence still signals. The Zero
+ * job makes the write visible by construction: target starts
+ * 0xA5-filled, GPU zeroes it.
+ * Sequence: fill result with 0xA5 + SUBMIT(jc=job gpu_offset, both
+ * BOs, req=0 -> JS0) + out_sync fence-wait (+8 s abs) + userspace
+ * re-mmap + compare + kernel-side debug readback (DEBUG_READ_BO,
+ * fops-routed 0xCF, NOT in the six-ioctl table) + compare.
+ * Expected: result[0] == 0 in BOTH views. Mismatch in both views
+ * with fence signalled + clean JS_STATUS = GPU never wrote
+ * (encoding/slot); kernel-zero + user-0xA5 = visibility bug (CPU
+ * alias stale). Exit: 0 matched, 1 mismatch/failure, 2 unavailable.
+ * DEBUG-ONLY kernel surface: the readback ioctl is a temporary
+ * debug switch, never in the v5.2 table; the cutover removes it
+ * (see gpu31-gpuwrite.md). */
+#define PF7580_PATTERN_PREFILL		0xA5A5A5A5u
 static int run_pattern_test(const char *path)
 {
 	struct pf7580_dev *dev;
@@ -890,29 +902,33 @@ static int run_pattern_test(const char *path)
 		pf7580_close(dev);
 		return 1;
 	}
+	{
+		uint32_t i;
+
+		/* 0xA5 prefill: the GPU Zero job must visibly clear it. */
+		for (i = 0; i < 4096 / 4; i++)
+			((uint32_t *)rp)[i] = PF7580_PATTERN_PREFILL;
+	}
 	memset(jp, 0, 4096);
-	memset(rp, 0, 4096);
 	w = (uint32_t *)jp;
 	w[4] = (1u << 0) | (2u << 1);
 	w[8] = (uint32_t)(res_gpu & 0xffffffffu);
 	w[9] = (uint32_t)(res_gpu >> 32);
-	w[10] = 6u;
+	w[10] = 3u;	/* Zero (v4/v5 genxml: only 1/2/3 exist) */
 	w[11] = 0u;
-	w[12] = (uint32_t)PF7580_PATTERN_EXPECTED;
+	w[12] = 0u;	/* immediate ignored for Zero */
 	w[13] = 0u;
-	__builtin___clear_cache((char *)jp, (char *)jp + 4096);
-	__builtin___clear_cache((char *)rp, (char *)rp + 4096);
-	if (((uint32_t *)rp)[0] != 0) {
-		printf("PATTERN: FAIL result not zero before submit (0x%08x)\n",
+	if (((uint32_t *)rp)[0] != PF7580_PATTERN_PREFILL) {
+		printf("PATTERN: FAIL prefill not visible (0x%08x)\n",
 		       ((uint32_t *)rp)[0]);
 		pf7580_cpu_unmap(dev, jp, 4096);
 		pf7580_cpu_unmap(dev, rp, 4096);
 		pf7580_close(dev);
 		return 1;
 	}
-	printf("DESC: OK WRITE_VALUE type=2 imm32=0x%08x -> [0x%" PRIx64
-	       "] at jc=0x%" PRIx64 "\n", PF7580_PATTERN_EXPECTED, res_gpu,
-	       job_gpu);
+	printf("DESC: OK WRITE_VALUE type=2 Zero -> [0x%" PRIx64
+	       "] at jc=0x%" PRIx64 " (prefill 0x%08x)\n", res_gpu,
+	       job_gpu, PF7580_PATTERN_PREFILL);
 	rc = pf7580_syncobj_create(dev, 0, &out_sync);
 	if (rc || !out_sync) {
 		printf("SYNCOBJ-CREATE: FAIL rc=%d (%s)\n", rc,
@@ -990,19 +1006,41 @@ static int run_pattern_test(const char *path)
 		return 1;
 	}
 	got = ((uint32_t *)rp)[0];
-	printf("PATTERN: expected=0x%08x actual=0x%08x %s\n",
-	       PF7580_PATTERN_EXPECTED, got,
-	       got == PF7580_PATTERN_EXPECTED ? "MATCH" : "MISMATCH");
-	if (got != PF7580_PATTERN_EXPECTED)
-		printf("HINT: MISMATCH with fence signalled = stale CPU lines (coherency); "
-		       "MISMATCH with JS_STATUS fault in dmesg = bad job/VA.\n");
+	printf("USER: word0=0x%08x (prefill 0x%08x, expect 0x00000000) %s\n",
+	       got, PF7580_PATTERN_PREFILL,
+	       got == 0 ? "ZERO" : "STALE");
+	/* Kernel-side view: same page via the debug readback (same
+	 * dma_sync_for_cpu maintenance the free_job path runs). */
+	{
+		uint32_t kv = 0xdeadbeef;
+		int krc = pf7580_debug_read_bo(dev, rh, 0, &kv);
+
+		if (krc) {
+			printf("KERN: DEBUG_READ_BO rc=%d (%s)\n",
+			       krc, pf7580_strerror(krc));
+		} else {
+			printf("KERN: word0=0x%08x %s\n", kv,
+			       kv == 0 ? "ZERO" : "STALE");
+		}
+		if (!krc && kv == 0 && got == 0) {
+			printf("PATTERN-TEST: PASS (GPU wrote; both views zero)\n");
+			pf7580_cpu_unmap(dev, jp, 4096);
+			pf7580_cpu_unmap(dev, rp, 4096);
+			pf7580_close(dev);
+			return 0;
+		}
+		if (!krc && kv == 0 && got != 0)
+			printf("HINT: kernel zero + user 0xA5 = stale CPU alias (visibility bug).\n");
+		else if (got == PF7580_PATTERN_PREFILL)
+			printf("HINT: both views 0xA5 + fence signalled = GPU never wrote (encoding/slot); check dmesg JS_STATUS.\n");
+		else
+			printf("HINT: partial write or fault; check dmesg JS_STATUS + MMU fault lines.\n");
+	}
 	pf7580_cpu_unmap(dev, jp, 4096);
 	pf7580_cpu_unmap(dev, rp, 4096);
 	pf7580_close(dev);
-	printf(got == PF7580_PATTERN_EXPECTED ?
-	       "PATTERN-TEST: PASS (GPU write visible to CPU)\n" :
-	       "PATTERN-TEST: FAILED (GPU write NOT visible)\n");
-	return got == PF7580_PATTERN_EXPECTED ? 0 : 1;
+	printf("PATTERN-TEST: FAILED (GPU write NOT visible)\n");
+	return 1;
 }
 
 int main(int argc, char **argv)

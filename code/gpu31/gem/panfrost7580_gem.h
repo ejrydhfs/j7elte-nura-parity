@@ -192,6 +192,13 @@ int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev);
 void p7580_gem_submit_sync(struct drm_gem_object *obj);
 void p7580_gem_dma_unbind(struct drm_gem_object *obj);
 phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
+/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
+ * readback of a BO page after completion. Reuses p7580_gem_job_done_sync
+ * (same dma_sync_for_cpu path as free_job) then reads one u32 via kmap.
+ * No new maintenance implementation; CMA/imported-never-bound BOs follow
+ * the same no-op rules as job_done_sync. offset is a byte offset. */
+int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
+			      uint32_t *out);
 struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
 struct drm_gem_object *p7580_gem_prime_import_sg_table(
 		struct drm_device *dev, size_t size, struct sg_table *sgt);

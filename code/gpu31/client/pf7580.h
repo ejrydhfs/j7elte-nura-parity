@@ -186,6 +186,12 @@ int pf7580_syncobj_fd_to_handle(struct pf7580_dev *dev, int fd,
 int pf7580_syncobj_wait(struct pf7580_dev *dev, const uint32_t *handles,
 			uint32_t count, int64_t timeout_ns, uint32_t flags,
 			uint32_t *first_signaled);
+/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side BO
+ * word readback. Fops nr 0xCF (outside the six-ioctl driver table).
+ * Mock backend: reads the shadow dword directly (no sync needed).
+ * Real backend: IOWR(0xCF) 16 B {handle, offset, value OUT, pad}. */
+int pf7580_debug_read_bo(struct pf7580_dev *dev, uint32_t handle,
+			 uint32_t offset, uint32_t *value);
 
 /* CPU mapping helpers. Real backend: mmap() on the DRM fd at the fake
  * offset returned by MMAP_BO. Mock backend: malloc-backed shadow memory

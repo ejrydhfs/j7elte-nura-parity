@@ -90,6 +90,11 @@
 #define P7580_SYNCOBJ_NR_WAIT		0xC3u
 #define P7580_SYNCOBJ_NR_RESET		0xC4u
 #define P7580_SYNCOBJ_NR_SIGNAL		0xC5u
+/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel BO word
+ * readback route. 0xCF sits above the syncobj 0xBF-0xC5 block and
+ * below DRM_COMMAND_BASE 0x40-space driver numbers: no collision
+ * with either table; the six-ioctl driver table is untouched. */
+#define P7580_DEBUG_READ_BO_NR		0xCFu
 
 #define P7580_SYNCOBJ_CREATE_SIGNALED	(1u << 0)
 
@@ -131,6 +136,18 @@ struct p7580_syncobj_array {
 	__u32 count_handles;
 	__u32 pad;
 };
+/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): 16 B payload
+ * mirror of struct p7580_debug_read_bo (ioctl.c): handle + byte
+ * offset + OUT value + zero pad. Same 16 B shape discipline as the
+ * syncobj structs. */
+struct p7580_debug_read_bo {
+	__u32 handle;
+	__u32 offset;
+	__u32 value;
+	__u32 pad;
+};
+int panfrost_debug_read_bo(struct drm_device *dev, void *data,
+			   struct drm_file *file_priv);
 
 /* ABI gate (gpu31-abialign, both TUs): Mesa 20.3 bundles the 20.x
  * drm.h syncobj shapes (verified on-device 2026-11-20 from
@@ -194,6 +211,17 @@ static inline void p7580_syncobj_abi_check(void)
 	BUILD_BUG_ON(P7580_SYNCOBJ_WAIT_AVAILABLE != (1u << 2));
 	BUILD_BUG_ON(P7580_SYNCOBJ_HTOF_EXPORT_SYNC_FILE != (1u << 0));
 	BUILD_BUG_ON(P7580_SYNCOBJ_FTOH_IMPORT_SYNC_FILE != (1u << 0));
+	/* DEBUG-ONLY (gpu31-gpuwrite): 16 B readback payload pin. */
+	BUILD_BUG_ON(sizeof(struct p7580_debug_read_bo) != 16);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
+					handle) != 0);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
+					offset) != 4);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
+					value) != 8);
+	BUILD_BUG_ON(__builtin_offsetof(struct p7580_debug_read_bo,
+					pad) != 12);
+	BUILD_BUG_ON(P7580_DEBUG_READ_BO_NR != 0xCFu);
 }
 
 /* The manager lives first in driver_priv (GEM p7580_file_priv and the
@@ -693,6 +721,11 @@ static long p7580_syncobj_dispatch(struct drm_device *dev, void *kdata,
 		return panfrost_syncobj_reset(dev, kdata, file_priv);
 	case P7580_SYNCOBJ_NR_SIGNAL:
 		return panfrost_syncobj_signal(dev, kdata, file_priv);
+	case P7580_DEBUG_READ_BO_NR:
+		/* DEBUG-ONLY (gpu31-gpuwrite): kernel BO word readback.
+		 * Not a syncobj number and not a driver-table number:
+		 * handled here at the fops layer only. */
+		return panfrost_debug_read_bo(dev, kdata, file_priv);
 	default:
 		return -ENOENT;	/* not a syncobj number: caller forwards */
 	}
@@ -744,6 +777,9 @@ static long p7580_syncobj_do(struct file *filp, unsigned int cmd,
 	case P7580_SYNCOBJ_NR_RESET:
 	case P7580_SYNCOBJ_NR_SIGNAL:
 		asize = sizeof(struct p7580_syncobj_array);
+		break;
+	case P7580_DEBUG_READ_BO_NR:
+		asize = sizeof(struct p7580_debug_read_bo);
 		break;
 	default:
 		return drm_ioctl(filp, cmd, arg);

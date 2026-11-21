@@ -1,0 +1,15 @@
+# D4 — panfrost7580 render-only driver (integration test build).
+# Apply ON TOP of d0-m1-minimal.fragment (M1 state stands: vendor fbdev
+# keeps the panel, stock dt.img is never rebuilt, no display-driver swap).
+# Enables ONLY the new CONFIG_DRM_PANFROST7580 driver (tristate, default n
+# in drivers/gpu/drm/panfrost7580/Kconfig). Deps already closed by
+# stock/M1: CONFIG_DRM=y, CONFIG_OF=y, CONFIG_DMA_SHARED_BUFFER=y;
+# CONFIG_DRM_GEM_CMA_HELPER (bool, depends on DRM) is select'ed by the
+# driver symbol itself. Deliberately NOT selected: DRM_KMS_HELPER (render
+# only, no modeset helpers), PM_DEVFREQ/THERMAL (devfreq hook is a stub;
+# OPP table is static in C per docs/reports/gpu31-dt.md section 4).
+# =y (built-in) so there is no module/ramdisk install step: the candidate
+# boot.img carries the driver. =m is equally supported by
+# drivers/gpu/drm/panfrost7580/Makefile (deferred follow-up, needs
+# modules_install into ramdisk-new.gz).
+CONFIG_DRM_PANFROST7580=y
