@@ -52,10 +52,10 @@ struct p7580_submit_job {
 	uint32_t as_nr;			/* address space bound to slot */
 	uint64_t affinity;		/* shader-present mask */
 	uint32_t flush_id;		/* recorded, unused (no FLUSH_REDUCTION) */
-	uint32_t out_sync;		/* syncobj handle for run_job install
+	uint32_t out_sync;		/* syncobj handle for the arm-time fence
 					 * (0 = none; validated at SUBMIT,
-					 * installed from render_done_fence
-					 * alias on the dispatch worker) */
+					 * installed from sched_job->fence
+					 * during the ioctl) */
 	/* Chain-head descriptor words 4/5 snapshot (gpu31-lastjob):
 	 * stamped at SUBMIT from the mapped descriptor BO (w4 holds
 	 * bit0 + type + index, w5 the dep pair). The dispatch path
@@ -73,11 +73,12 @@ struct p7580_submit_job {
 	uint64_t *iova_addrs;
 	uint32_t *iova_sizes;
 	uint32_t iova_bo_count;
-	/* Fences. done_fence owns the run_job ref and is signaled by the
-	 * JOB_INT handler (or the fault-recovery path, F-JOB4);
-	 * render_done_fence is a non-owning alias of the same fence
-	 * handed to out_sync/sched (F-JOB3: never put twice).
-	 * in_fences are explicit SUBMIT deps (owned here). */
+	/* Fences. done_fence owns the arm-time fence ref and is signaled
+	 * by the JOB_INT handler (or the fault-recovery path, F-JOB4).
+	 * Under the 0004 arm-time contract done_fence IS sched_job->fence
+	 * (same pointer, shared ref); render_done_fence is kept only as a
+	 * non-owning alias for the legacy out_sync leg (F-JOB3: never
+	 * put twice). in_fences are explicit SUBMIT deps (owned here). */
 	void *done_fence;
 	void *render_done_fence;
 	void **in_fences;
@@ -239,7 +240,12 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 /* JOB_INT handler: demux DONE/ERR per slot (IRQ context). */
 int p7580_job_irq(int irq, struct p7580_job_dev *jd);
 
-/* Scheduler backend: run_job / timedout_job / free_job. */
+/* Scheduler backend: alloc_fence / run_job / timedout_job / free_job.
+ * alloc_fence allocates the arm-time completion fence (the job's ONLY
+ * fence); run_job binds that same fence and programs the slot. */
+struct dma_fence;
+struct dma_fence *p7580_job_alloc_fence(struct p7580_job_dev *jd,
+					int slot, uint64_t *seqno_out);
 void *p7580_job_run(struct p7580_job_dev *jd,
 		    struct p7580_submit_job *job);
 void p7580_job_timedout(struct p7580_job_dev *jd,

@@ -4,19 +4,33 @@
  *
  * What this provides: the exact drm_sched surface panfrost_job.c needs --
  * entity (one runqueue per JM slot context), job (fence-backed unit of
- * work with .run_job/.timedout_job callbacks), FIFO dispatch on an
- * ordered workqueue, dependency tracking via dma-fence callbacks, job
+ * work with .run_job/.timedout_job/.free_job callbacks), FIFO dispatch on
+ * an ordered workqueue, dependency tracking via dma-fence callbacks, job
  * timeout via delayed work, and entity flush on release. Panfrost mapping:
  * one sched per device, one entity per open-file submit context, one job
- * per SUBMIT ioctl batch; run_job programs the JM slot registers and
- * installs the returned job fence; hw completion (JOB_INT) signals it.
+ * per SUBMIT ioctl batch.
+ *
+ * Arm-time fence (gpu31-armfence): drm_sched_job_arm allocates the job's
+ * completion fence (mainline drm_sched_job_arm semantics) and assigns
+ * job->fence BEFORE the job is queued, so SUBMIT installs it on out_sync
+ * during the ioctl (Mesa sees a live fence and cannot recycle the batch
+ * BO while the GPU still reads it). run_job and the completion paths
+ * signal that SAME fence (the backend must not create a second one for
+ * the job): the pump wires finish_cb to job->fence at dispatch and the
+ * IRQ / timeout paths dma_fence_signal it. Every error path after a
+ * successful arm drops the extra reference (arm fails closed with
+ * fence == NULL).
  *
  * What this deliberately OMITs vs mainline drm_sched (2684 LOC: scheduler
  * + fence + entity): priority runqueues (single FIFO), credit-based load
  * balancing (one queue = T720 JM slot set), GPU reset/recovery workers,
  * guilty-job tracking, dynamic job-flow control, and free-job workqueue
  * batching (synchronous put). This is a correctness shim, not a
- * performance scheduler: jobs retire in submit order.
+ * performance scheduler: jobs retire in submit order. The arm-time fence
+ * here is a plain dma_fence (no sched_fence scheduled/finished split):
+ * alloc initialises the container only; arm allocates the fence exactly
+ * once (idempotent: a second arm is a no-op); cleanup detaches the dep
+ * and completion callbacks and drops both refs.
  *
  * Depends on patches 01+02 (dma-fence). Verified 3.10 primitives:
  * alloc_ordered_workqueue (workqueue.h:434), INIT_DELAYED_WORK (260),
@@ -79,14 +93,21 @@ enum drm_sched_priority {
 
 /**
  * struct drm_sched_backend_ops - device callbacks, mirrors mainline subset.
- * @run_job: execute @sched_job; must return the in-flight job fence, or
- *           ERR_PTR on immediate failure. Called in FIFO submit order.
+ * @run_job: execute @sched_job; must program the hardware for the job
+ *           whose completion fence was armed at arm time
+ *           (sched_job->fence) and return that SAME fence, or ERR_PTR on
+ *           immediate failure. Called in FIFO submit order. Must not
+ *           create a second fence for the job.
+ * @alloc_fence: allocate the job's completion fence at arm time; called
+ *           once by drm_sched_job_arm. NULL means the shim has no way
+ *           to arm early (arm then fails closed with fence == NULL).
  * @timedout_job: called from timeout work when the job fence has not
  *           signaled in @timeout msecs; backend should reset the JM slot.
  * @free_job: release backend resources for a retired job (may be NULL).
  */
 struct drm_sched_backend_ops {
 	struct dma_fence *(*run_job)(struct drm_sched_job *sched_job);
+	struct dma_fence *(*alloc_fence)(struct drm_sched_job *sched_job);
 	void (*timedout_job)(struct drm_sched_job *sched_job);
 	void (*free_job)(struct drm_sched_job *sched_job);
 };
@@ -95,7 +116,11 @@ struct drm_sched_job {
 	struct list_head node;
 	struct drm_sched_entity *entity;
 	const struct drm_sched_backend_ops *ops;
-	struct dma_fence *fence;	/* completion fence for this job */
+	struct dma_fence *fence;	/* completion fence for this job:
+					 * allocated by drm_sched_job_arm
+					 * (mainline semantics), installed on
+					 * out_sync at SUBMIT, signaled by
+					 * run_job/completion (never replaced) */
 	struct dma_fence *dep_fence;	/* in-fence: must signal before dispatch */
 	struct dma_fence_cb dep_cb;	/* waits on dep_fence (dependency role) */
 	struct dma_fence_cb finish_cb;	/* waits on fence (completion role) */
@@ -223,6 +248,11 @@ struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,
 typedef struct dma_fence *(*drm_sched_run_fn)(struct drm_sched_job *);
 drm_sched_run_fn p7580_drv_run_job_addr(void);
 void drm_sched_job_cleanup(struct drm_sched_job *job);
+/* Allocate the completion fence (mainline drm_sched_job_arm semantics):
+ * calls ops->alloc_fence exactly once and assigns job->fence. Idempotent
+ * (a second call is a no-op); fails closed (NULL alloc_fence or a NULL /
+ * ERR_PTR return leaves fence == NULL). The driver installs this fence
+ * on out_sync during the ioctl; run_job must return this same fence. */
 void drm_sched_job_arm(struct drm_sched_job *job);
 int drm_sched_job_add_dependency(struct drm_sched_job *job,
 				 struct dma_fence *fence);

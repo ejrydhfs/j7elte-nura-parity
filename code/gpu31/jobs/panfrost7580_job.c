@@ -32,11 +32,15 @@
  * context (shim timeout workqueue): they take reset_lock, then
  * hw_lock only for register pokes.
  *
- * Fences: each job owns exactly one ref (job->done_fence), created in
- * p7580_job_run. job->render_done_fence is a non-owning alias of the
- * same fence handed to the sched/out-sync paths; only done_fence is
- * ever signaled or put. Fault recovery signals done_fence exactly
- * once so waiters never hang (see p7580_job_recover).
+ * Fences: each job owns exactly one ref (job->done_fence), which IS
+ * the 0004 arm-time completion fence (sched_job->fence, same pointer,
+ * shared ref): allocated once by the sched alloc_fence hook before
+ * queueing, installed on out_sync during SUBMIT, and signaled by the
+ * JOB_INT handler (or the fault-recovery path, F-JOB4). p7580_job_run
+ * binds it (never creates a second fence). job->render_done_fence is a
+ * non-owning alias of the same fence for the legacy out_sync leg; only
+ * done_fence is ever signaled or put. Fault recovery signals done_fence
+ * exactly once so waiters never hang (see p7580_job_recover).
  */
 #include <linux/io.h>
 #include <linux/interrupt.h>
@@ -281,20 +285,10 @@ static struct dma_fence *p7580_fence_create(struct p7580_job_dev *jd,
 	pf->slot = slot;
 	pf->seqno = ++(*seqno_out);
 
-	/* REVIEW-FIX (gpu31-review 0001 F1/F2): the landed 0001 has no
-	 * dma_fence_init and its struct keeps a dangling lock pointer;
-	 * until G31_Sched lands the F1/F2 fix, init the fields by hand
-	 * exactly as the fixed helper will: kref, completion, cb_list,
-	 * cb_lock, cleared flags, ops/context/seqno. Nothing here
-	 * dereferences fence->lock. */
-	kref_init(&pf->base.refcount);
-	init_completion(&pf->base.completion);
-	INIT_LIST_HEAD(&pf->base.cb_list);
-	spin_lock_init(&pf->base.cb_lock);
-	pf->base.flags = 0;
-	pf->base.ops = &p7580_fence_ops;
-	pf->base.context = jd->fence_ctx[slot];
-	pf->base.seqno = (unsigned)pf->seqno;
+	/* 0001 provides dma_fence_init (F1/F2 fixed): centralised
+	 * kref/completion/cb_list/cb_lock/flags + ops/context/seqno. */
+	dma_fence_init(&pf->base, &p7580_fence_ops,
+		       jd->fence_ctx[slot], (unsigned)pf->seqno);
 	return &pf->base;
 }
 
@@ -325,6 +319,14 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	jd->pm_put = pm_put;
 	spin_lock_init(&jd->hw_lock);
 	mutex_init(&jd->reset_lock);
+	/* Arm-time fence timelines (gpu31-armfence): one dma-fence
+	 * context per slot + zeroed per-slot emit seqno, so the first
+	 * SUBMIT's alloc_fence hands out a valid (context, seqno).
+	 * dma_fence_context_alloc never fails (monotonic counter). */
+	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
+		jd->fence_ctx[i] = dma_fence_context_alloc(1);
+		jd->emit_seqno[i] = 0;
+	}
 	/* Snapshot the module param once: later writes change the param
 	 * but not an already-probed device (bounded by construction).
 	 * trace_arm is the re-armable source: the debugfs knob rewrites
@@ -718,32 +720,45 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 }
 
 /* ------------------------------------------------------------------ */
-/* Scheduler backend (0004 ops: run_job / timedout_job / free_job).   */
-/* The 0004 shim also supports add_dependency via fence callbacks;    */
-/* in_sync + implicit BO fences are attached as shim dependencies by  */
-/* the SUBMIT path before drm_sched_job_submit().                    */
+/* Scheduler backend (0004 ops: alloc_fence / run_job / timedout_job  */
+/* / free_job). The 0004 shim also supports add_dependency via fence   */
+/* callbacks; in_sync + implicit BO fences are attached as shim        */
+/* dependencies by the SUBMIT path before drm_sched_job_submit().     */
+/* Arm-time contract (gpu31-armfence): alloc_fence runs once per job  */
+/* at arm time (before queueing); the fence it returns IS             */
+/* sched_job->fence (installed on out_sync during SUBMIT). run_job    */
+/* binds that same fence onto the submit job (one shared ref, never  */
+/* a second allocation) and programs the slot; the IRQ / timeout      */
+/* paths signal it.                                                   */
 /* ------------------------------------------------------------------ */
+
+/* Allocate the job's completion fence (0004 alloc_fence hook): one
+ * ordered-context fence per slot submission, monotonic per-slot seqno.
+ * This is the ONLY fence allocation for the job; run_job binds the
+ * returned fence instead of creating another one. */
+struct dma_fence *p7580_job_alloc_fence(struct p7580_job_dev *jd,
+					int slot, uint64_t *seqno_out)
+{
+	return p7580_fence_create(jd, slot, seqno_out);
+}
 
 void *p7580_job_run(struct p7580_job_dev *jd, struct p7580_submit_job *job)
 {
-	struct dma_fence *fence;
+	struct dma_fence *fence = (struct dma_fence *)job->done_fence;
 
-	fence = p7580_fence_create(jd, job->slot, &jd->emit_seqno[job->slot]);
-	if (IS_ERR(fence))
-		return fence;
-
-	/* One ref per job, owned by done_fence. render_done_fence is a
-	 * non-owning alias (F-JOB3: never put a second time). Dropping a
-	 * stale previous fence here keeps submit_args (which starts with
-	 * NULL fences) and re-run paths under the same rule. */
-	if (job->done_fence && job->done_fence != fence)
-		dma_fence_put((struct dma_fence *)job->done_fence); /* 0001 */
+	/* Bind the arm-time fence: the sched job's fence (already on
+	 * out_sync since SUBMIT) becomes this submit job's done_fence
+	 * (one shared ref, no second allocation). A NULL bind means
+	 * arm failed closed: fail the dispatch (F4 path frees it). */
+	if (!fence)
+		return ERR_PTR(-ENODATA);
 	dma_fence_get(fence);			/* 0001: void, NULL-safe */
 	job->done_fence = fence;
 
 	p7580_job_hw_submit(jd, job);
 	/* Non-owning alias: consumers (sched/out-sync) must take their
-	 * own ref (e.g. syncobj replace takes one). */
+	 * own ref (e.g. syncobj replace takes one). Under the arm-time
+	 * contract this aliases the same fence installed at SUBMIT. */
 	job->render_done_fence = fence;
 	return fence;
 }
@@ -876,8 +891,9 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 /*  2. resolve in_sync handles -> fences (0003 find_fence)            */
 /*  3. attach fences as sched dependencies (0004 add_dependency)      */
 /*  4. reserve BOs, attach excl fence on completion (0002)            */
-/*  5. submit to per-slot entity (0004 job_alloc/submit)              */
-/*  6. install out_sync fence (0003 replace_fence)                    */
+/*  5. submit to per-slot entity (0004 job_alloc/arm/submit): the arm */
+/*     allocates the completion fence, installed on out_sync below    */
+/*  6. install arm-time out_sync fence (0003 replace_fence)            */
 /*                                                                    */
 /* BO lookup / resv lock / syncobj table live in the GEM + DrmCore    */
 /* slices; this file takes them as callbacks so -c compiles standalone.*/
@@ -1020,9 +1036,10 @@ int p7580_job_submit_args(struct p7580_job_dev *jd, struct p7580_file_ctx *fc,
 	if (ret)
 		goto err;
 
-	/* 6. out-sync. */
+	/* 6. out-sync: install the arm-time fence (sched_job->fence is
+	 * already allocated at arm time, before queueing). render alias
+	 * is fine: replace takes its own ref on the fence. */
 	if (args->out_sync && ops->sync_replace) {
-		/* Alias is fine: replace takes its own ref on the fence. */
 		ret = ops->sync_replace(ops->sync_priv, args->out_sync,
 					(struct dma_fence *)job->render_done_fence);
 		if (ret)

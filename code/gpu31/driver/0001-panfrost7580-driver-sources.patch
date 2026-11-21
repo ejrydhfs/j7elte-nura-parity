@@ -2360,7 +2360,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1404 @@
+@@ -0,0 +1,1420 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -2395,11 +2395,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 + * context (shim timeout workqueue): they take reset_lock, then
 + * hw_lock only for register pokes.
 + *
-+ * Fences: each job owns exactly one ref (job->done_fence), created in
-+ * p7580_job_run. job->render_done_fence is a non-owning alias of the
-+ * same fence handed to the sched/out-sync paths; only done_fence is
-+ * ever signaled or put. Fault recovery signals done_fence exactly
-+ * once so waiters never hang (see p7580_job_recover).
++ * Fences: each job owns exactly one ref (job->done_fence), which IS
++ * the 0004 arm-time completion fence (sched_job->fence, same pointer,
++ * shared ref): allocated once by the sched alloc_fence hook before
++ * queueing, installed on out_sync during SUBMIT, and signaled by the
++ * JOB_INT handler (or the fault-recovery path, F-JOB4). p7580_job_run
++ * binds it (never creates a second fence). job->render_done_fence is a
++ * non-owning alias of the same fence for the legacy out_sync leg; only
++ * done_fence is ever signaled or put. Fault recovery signals done_fence
++ * exactly once so waiters never hang (see p7580_job_recover).
 + */
 +#include <linux/io.h>
 +#include <linux/interrupt.h>
@@ -2644,20 +2648,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	pf->slot = slot;
 +	pf->seqno = ++(*seqno_out);
 +
-+	/* REVIEW-FIX (gpu31-review 0001 F1/F2): the landed 0001 has no
-+	 * dma_fence_init and its struct keeps a dangling lock pointer;
-+	 * until G31_Sched lands the F1/F2 fix, init the fields by hand
-+	 * exactly as the fixed helper will: kref, completion, cb_list,
-+	 * cb_lock, cleared flags, ops/context/seqno. Nothing here
-+	 * dereferences fence->lock. */
-+	kref_init(&pf->base.refcount);
-+	init_completion(&pf->base.completion);
-+	INIT_LIST_HEAD(&pf->base.cb_list);
-+	spin_lock_init(&pf->base.cb_lock);
-+	pf->base.flags = 0;
-+	pf->base.ops = &p7580_fence_ops;
-+	pf->base.context = jd->fence_ctx[slot];
-+	pf->base.seqno = (unsigned)pf->seqno;
++	/* 0001 provides dma_fence_init (F1/F2 fixed): centralised
++	 * kref/completion/cb_list/cb_lock/flags + ops/context/seqno. */
++	dma_fence_init(&pf->base, &p7580_fence_ops,
++		       jd->fence_ctx[slot], (unsigned)pf->seqno);
 +	return &pf->base;
 +}
 +
@@ -2688,6 +2682,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	jd->pm_put = pm_put;
 +	spin_lock_init(&jd->hw_lock);
 +	mutex_init(&jd->reset_lock);
++	/* Arm-time fence timelines (gpu31-armfence): one dma-fence
++	 * context per slot + zeroed per-slot emit seqno, so the first
++	 * SUBMIT's alloc_fence hands out a valid (context, seqno).
++	 * dma_fence_context_alloc never fails (monotonic counter). */
++	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
++		jd->fence_ctx[i] = dma_fence_context_alloc(1);
++		jd->emit_seqno[i] = 0;
++	}
 +	/* Snapshot the module param once: later writes change the param
 +	 * but not an already-probed device (bounded by construction).
 +	 * trace_arm is the re-armable source: the debugfs knob rewrites
@@ -3081,32 +3083,45 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +}
 +
 +/* ------------------------------------------------------------------ */
-+/* Scheduler backend (0004 ops: run_job / timedout_job / free_job).   */
-+/* The 0004 shim also supports add_dependency via fence callbacks;    */
-+/* in_sync + implicit BO fences are attached as shim dependencies by  */
-+/* the SUBMIT path before drm_sched_job_submit().                    */
++/* Scheduler backend (0004 ops: alloc_fence / run_job / timedout_job  */
++/* / free_job). The 0004 shim also supports add_dependency via fence   */
++/* callbacks; in_sync + implicit BO fences are attached as shim        */
++/* dependencies by the SUBMIT path before drm_sched_job_submit().     */
++/* Arm-time contract (gpu31-armfence): alloc_fence runs once per job  */
++/* at arm time (before queueing); the fence it returns IS             */
++/* sched_job->fence (installed on out_sync during SUBMIT). run_job    */
++/* binds that same fence onto the submit job (one shared ref, never  */
++/* a second allocation) and programs the slot; the IRQ / timeout      */
++/* paths signal it.                                                   */
 +/* ------------------------------------------------------------------ */
++
++/* Allocate the job's completion fence (0004 alloc_fence hook): one
++ * ordered-context fence per slot submission, monotonic per-slot seqno.
++ * This is the ONLY fence allocation for the job; run_job binds the
++ * returned fence instead of creating another one. */
++struct dma_fence *p7580_job_alloc_fence(struct p7580_job_dev *jd,
++					int slot, uint64_t *seqno_out)
++{
++	return p7580_fence_create(jd, slot, seqno_out);
++}
 +
 +void *p7580_job_run(struct p7580_job_dev *jd, struct p7580_submit_job *job)
 +{
-+	struct dma_fence *fence;
++	struct dma_fence *fence = (struct dma_fence *)job->done_fence;
 +
-+	fence = p7580_fence_create(jd, job->slot, &jd->emit_seqno[job->slot]);
-+	if (IS_ERR(fence))
-+		return fence;
-+
-+	/* One ref per job, owned by done_fence. render_done_fence is a
-+	 * non-owning alias (F-JOB3: never put a second time). Dropping a
-+	 * stale previous fence here keeps submit_args (which starts with
-+	 * NULL fences) and re-run paths under the same rule. */
-+	if (job->done_fence && job->done_fence != fence)
-+		dma_fence_put((struct dma_fence *)job->done_fence); /* 0001 */
++	/* Bind the arm-time fence: the sched job's fence (already on
++	 * out_sync since SUBMIT) becomes this submit job's done_fence
++	 * (one shared ref, no second allocation). A NULL bind means
++	 * arm failed closed: fail the dispatch (F4 path frees it). */
++	if (!fence)
++		return ERR_PTR(-ENODATA);
 +	dma_fence_get(fence);			/* 0001: void, NULL-safe */
 +	job->done_fence = fence;
 +
 +	p7580_job_hw_submit(jd, job);
 +	/* Non-owning alias: consumers (sched/out-sync) must take their
-+	 * own ref (e.g. syncobj replace takes one). */
++	 * own ref (e.g. syncobj replace takes one). Under the arm-time
++	 * contract this aliases the same fence installed at SUBMIT. */
 +	job->render_done_fence = fence;
 +	return fence;
 +}
@@ -3239,8 +3254,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +/*  2. resolve in_sync handles -> fences (0003 find_fence)            */
 +/*  3. attach fences as sched dependencies (0004 add_dependency)      */
 +/*  4. reserve BOs, attach excl fence on completion (0002)            */
-+/*  5. submit to per-slot entity (0004 job_alloc/submit)              */
-+/*  6. install out_sync fence (0003 replace_fence)                    */
++/*  5. submit to per-slot entity (0004 job_alloc/arm/submit): the arm */
++/*     allocates the completion fence, installed on out_sync below    */
++/*  6. install arm-time out_sync fence (0003 replace_fence)            */
 +/*                                                                    */
 +/* BO lookup / resv lock / syncobj table live in the GEM + DrmCore    */
 +/* slices; this file takes them as callbacks so -c compiles standalone.*/
@@ -3383,9 +3399,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	if (ret)
 +		goto err;
 +
-+	/* 6. out-sync. */
++	/* 6. out-sync: install the arm-time fence (sched_job->fence is
++	 * already allocated at arm time, before queueing). render alias
++	 * is fine: replace takes its own ref on the fence. */
 +	if (args->out_sync && ops->sync_replace) {
-+		/* Alias is fine: replace takes its own ref on the fence. */
 +		ret = ops->sync_replace(ops->sync_priv, args->out_sync,
 +					(struct dma_fence *)job->render_done_fence);
 +		if (ret)
@@ -3764,11 +3781,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	debugfs_remove_recursive((struct dentry *)jd->dbg_dir);
 +	jd->dbg_dir = NULL;
 +}
-+
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,284 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3823,10 +3839,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	uint32_t as_nr;			/* address space bound to slot */
 +	uint64_t affinity;		/* shader-present mask */
 +	uint32_t flush_id;		/* recorded, unused (no FLUSH_REDUCTION) */
-+	uint32_t out_sync;		/* syncobj handle for run_job install
++	uint32_t out_sync;		/* syncobj handle for the arm-time fence
 +					 * (0 = none; validated at SUBMIT,
-+					 * installed from render_done_fence
-+					 * alias on the dispatch worker) */
++					 * installed from sched_job->fence
++					 * during the ioctl) */
 +	/* Chain-head descriptor words 4/5 snapshot (gpu31-lastjob):
 +	 * stamped at SUBMIT from the mapped descriptor BO (w4 holds
 +	 * bit0 + type + index, w5 the dep pair). The dispatch path
@@ -3844,11 +3860,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	uint64_t *iova_addrs;
 +	uint32_t *iova_sizes;
 +	uint32_t iova_bo_count;
-+	/* Fences. done_fence owns the run_job ref and is signaled by the
-+	 * JOB_INT handler (or the fault-recovery path, F-JOB4);
-+	 * render_done_fence is a non-owning alias of the same fence
-+	 * handed to out_sync/sched (F-JOB3: never put twice).
-+	 * in_fences are explicit SUBMIT deps (owned here). */
++	/* Fences. done_fence owns the arm-time fence ref and is signaled
++	 * by the JOB_INT handler (or the fault-recovery path, F-JOB4).
++	 * Under the 0004 arm-time contract done_fence IS sched_job->fence
++	 * (same pointer, shared ref); render_done_fence is kept only as a
++	 * non-owning alias for the legacy out_sync leg (F-JOB3: never
++	 * put twice). in_fences are explicit SUBMIT deps (owned here). */
 +	void *done_fence;
 +	void *render_done_fence;
 +	void **in_fences;
@@ -4010,7 +4027,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +/* JOB_INT handler: demux DONE/ERR per slot (IRQ context). */
 +int p7580_job_irq(int irq, struct p7580_job_dev *jd);
 +
-+/* Scheduler backend: run_job / timedout_job / free_job. */
++/* Scheduler backend: alloc_fence / run_job / timedout_job / free_job.
++ * alloc_fence allocates the arm-time completion fence (the job's ONLY
++ * fence); run_job binds that same fence and programs the slot. */
++struct dma_fence;
++struct dma_fence *p7580_job_alloc_fence(struct p7580_job_dev *jd,
++					int slot, uint64_t *seqno_out);
 +void *p7580_job_run(struct p7580_job_dev *jd,
 +		    struct p7580_submit_job *job);
 +void p7580_job_timedout(struct p7580_job_dev *jd,
@@ -4047,7 +4069,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +int p7580_job_is_idle(struct p7580_job_dev *jd);
 +
 +#endif /* PANFROST7580_JOB_H */
-+
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-21 00:00:00.000000000 -0500
@@ -6129,7 +6150,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1282 @@
+@@ -0,0 +1,1313 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6374,25 +6395,26 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			job->seqno, slot);
 +	}
 +	{
-+		void *fv = p7580_job_run(&drv->jd, job);
-+		struct dma_fence *fence = (struct dma_fence *)fv;
++		/* Arm-time fence (gpu31-armfence): bind sched_job->fence
++		 * (allocated at arm time, already on out_sync since
++		 * SUBMIT) as this job's done_fence (one shared ref) and
++		 * program the slot. No out_sync work here: the install
++		 * happened during the ioctl. */
++		struct dma_fence *armed = sched_job->fence;
++		struct dma_fence *fence;
 +
-+		/* F-JT1: the SUBMIT-time install site sees NULL
-+		 * (sched_job->fence only appears when the 0004 shim
-+		 * assigns run_job's return). The real fence exists
-+		 * here on the async worker: install it on the stashed
-+		 * out_sync handle so SYNCOBJ-WAIT blocks until retire.
-+		 * replace_fence takes its own ref; closed handles (or
-+		 * no out_sync) skip silently -- the job still runs. */
-+		if (!IS_ERR(fence) && fence && job->out_sync) {
-+			struct drm_syncobj *s =
-+				drm_syncobj_find(&df->mgr, job->out_sync);
++		if (!armed)
++			return ERR_PTR(-ENODATA);
++		/* Bind the arm-time fence: one shared ref, never a
++		 * second allocation (the shim pump verifies pointer
++		 * identity on return). */
++		job->done_fence = armed;
++		dma_fence_get(armed);
++		p7580_job_hw_submit(&drv->jd, job);
++		fence = armed;
++		/* Non-owning alias for the legacy out_sync leg. */
++		job->render_done_fence = fence;
 +
-+			if (s) {
-+				drm_syncobj_replace_fence(s, fence);
-+				drm_syncobj_put(s);
-+			}
-+		}
 +		/* gpu31-instrtype: publish this job's fence as the exclusive
 +		 * (write) fence on every submitted BO. Later submits of the
 +		 * same BOs take it as an implicit sched dependency at queue
@@ -6408,7 +6430,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		 * excl until this stamp lands; deps are taken on the
 +		 * latest *unsignaled* fence, so a retired excl does not
 +		 * gate. */
-+		if (!IS_ERR(fence) && fence) {
++		{
 +			struct p7580_submit_job *rj = job;
 +			uint32_t k;
 +
@@ -6532,8 +6554,32 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		p7580_drv_job_pm_release(drv);
 +}
 +
++/* Arm-time fence allocator (0004 alloc_fence hook): one fence per
++ * SUBMIT, allocated before queueing so out_sync is live at ioctl
++ * return. Context: per-slot ordered timeline; seqno: per-slot emit
++ * counter shared with the jobs slice. dma_fence_init + NOT signaled
++ * (completion comes from the JOB_INT IRQ or the timeout path). */
++static struct dma_fence *p7580_drv_alloc_fence(struct drm_sched_job *sched_job)
++{
++	struct p7580_submit_job *job = sched_job ? sched_job->owner : NULL;
++	struct p7580_drv *drv;
++
++	if (!sched_job || !job)
++		return NULL;
++	if (job->slot < 0 || job->slot >= P7580_NUM_JOB_SLOTS)
++		return NULL;
++	/* Dispatch context was stamped at SUBMIT (file_priv/drv_priv);
++	 * same pattern as run_job/timedout_job/free_job. */
++	drv = (struct p7580_drv *)job->drv_priv;
++	if (!drv)
++		return NULL;
++	return p7580_job_alloc_fence(&drv->jd, job->slot,
++				     &drv->jd.emit_seqno[job->slot]);
++}
++
 +static const struct drm_sched_backend_ops p7580_drv_sched_ops = {
 +	.run_job = p7580_drv_run_job,
++	.alloc_fence = p7580_drv_alloc_fence,
 +	.timedout_job = p7580_drv_timedout_job,
 +	.free_job = p7580_drv_free_job,
 +};
@@ -7226,19 +7272,24 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * never a real NULL-ops job: fail the ioctl, do not queue. */
 +BUILD_BUG_ON(offsetof(struct drm_sched_job, ops) != 24);
 +if (!entity || sched_job->entity != entity ||
-+    sched_job->ops != &p7580_drv_sched_ops || !sched_job->ops->run_job) {
++    sched_job->ops != &p7580_drv_sched_ops || !sched_job->ops->run_job ||
++    !sched_job->ops->alloc_fence) {
 +		drm_sched_job_cleanup(sched_job);
 +		p7580_job_free(job);
 +		kfree(sched_job);
 +		ret = -EFAULT;
 +		goto err_objs;
 +	}
-+	drm_sched_job_arm(sched_job);
 +	/* Pumpfix: carry the SUBMIT-chosen slot on the sched job so the
 +	 * async run_job never re-derives it from the entity pointer
 +	 * (container layouts shift the index; int12 derived 0 for a
 +	 * slot-1 submit and bailed before ST-RUN). */
 +	sched_job->slot = slot;
++	/* Arm-time fence (gpu31-armfence): allocate job->fence BEFORE
++	 * queueing so the out_sync install below hands Mesa a live
++	 * fence. Fails closed: NULL fence keeps the old run_job-time
++	 * NULL-install shape (job still runs; waiters see no fence). */
++	drm_sched_job_arm(sched_job);
 +
 +	for (i = 0; i < nf; i++) {
 +		if (!dma_fence_is_signaled(inf[i])) {
@@ -7294,16 +7345,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		goto err_job_bos;
 +	}
 +
-+	/* 4. out-sync install (takes its own ref; NULL-safe on empty). */
++	/* 4. out-sync install (takes its own ref). The fence is armed
++	 * above, before queueing: installing it HERE (during the ioctl)
++	 * is the whole fix -- Mesa holds a live fence at SUBMIT return
++	 * and cannot recycle the batch BO while the GPU still reads
++	 * it. Arm-fail-closed: a NULL fence installs nothing (the job
++	 * still runs). The handle was validated before queueing, so a
++	 * missing handle here is -ENOENT on a handle closed under us. */
 +	if (args->out_sync) {
 +		struct dma_fence *fence = sched_job->fence;
 +		struct drm_syncobj *s;
 +
-+		if (!fence) {
-+			/* Not yet dispatched: nothing to install yet;
-+			 * the fence appears at run_job; report OK. */
-+			fence = NULL;
-+		}
 +		s = drm_syncobj_find(&df->mgr, args->out_sync);
 +		if (!s) {
 +			ret = -ENOENT;

@@ -304,6 +304,7 @@ struct drm_sched_job *drm_sched_job_alloc(struct drm_sched_entity *entity,
 	DRM_SCHED_BUILD_BUG_ON(offsetof(struct drm_sched_job, ops) != 24);
 	BUG_ON(job->ops != ops);
 	job->owner = owner;
+	job->fence = NULL;
 	INIT_DELAYED_WORK(&job->timeout_work, drm_sched_job_timeout);
 	INIT_WORK(&job->finish_work, drm_sched_job_finish);
 
@@ -326,8 +327,23 @@ EXPORT_SYMBOL(drm_sched_job_cleanup);
 
 void drm_sched_job_arm(struct drm_sched_job *job)
 {
+	struct dma_fence *fence;
+
 	INIT_LIST_HEAD(&job->dep_cb.node);
 	INIT_LIST_HEAD(&job->finish_cb.node);
+	/* Arm-time fence (mainline semantics): exactly one allocation per
+	 * job, before queueing. Idempotent: a set fence is never replaced.
+	 * Fails closed: NULL ops/alloc_fence or a NULL/ERR_PTR return
+	 * leaves fence == NULL and the SUBMIT-time out_sync install
+	 * becomes a no-op (job still runs; waiters see no fence). */
+	if (!job || job->fence)
+		return;
+	if (!job->ops || !job->ops->alloc_fence)
+		return;
+	fence = job->ops->alloc_fence(job);
+	if (IS_ERR_OR_NULL(fence))
+		return;
+	job->fence = fence;
 }
 EXPORT_SYMBOL(drm_sched_job_arm);
 
@@ -559,6 +575,12 @@ static void drm_sched_pump(struct work_struct *work)
 	 * int12 retired slot 0 for a slot-1 submit). */
 	if (job->slot < 0)
 		job->slot = 0;
+	/* Arm-time fence contract (gpu31-armfence): job->fence was
+	 * allocated at arm time and installed on out_sync during the
+	 * ioctl. run_job must return that SAME fence (never a second
+	 * one): completion (IRQ/timeout dma_fence_signal) retires the
+	 * exact fence Mesa already holds. A mismatched return fails
+	 * the job (F4 path) instead of stranding a live out_sync. */
 	run_fence = job->ops->run_job(job);
 	job->ran = 1;
 	if (IS_ERR_OR_NULL(run_fence)) {
@@ -573,6 +595,12 @@ static void drm_sched_pump(struct work_struct *work)
 		dma_fence_remove_callback(job->dep_fence, &job->dep_cb);
 		dma_fence_put(job->dep_fence);
 		job->dep_fence = NULL;
+		if (job->fence) {
+			dma_fence_remove_callback(job->fence,
+						  &job->finish_cb);
+			dma_fence_put(job->fence);
+			job->fence = NULL;
+		}
 		if (job->ops->free_job)
 			job->ops->free_job(job);
 		else
@@ -580,10 +608,36 @@ static void drm_sched_pump(struct work_struct *work)
 		queue_work(entity->wq, &entity->sched_work);
 		return;
 	}
+	if (!job->fence || run_fence != job->fence) {
+		/* Backend returned a second fence (or none was armed):
+		 * never publish it. Drop its reference when it is a real
+		 * fence, drop the armed fence too (never queued, never
+		 * signaled), and free the job on the F4 path so out_sync
+		 * never points at a fence the completion path will not
+		 * signal. */
+		if (!IS_ERR_OR_NULL(run_fence) && run_fence != job->fence)
+			dma_fence_put(run_fence);
+		spin_lock_irqsave(&entity->queue_lock, flags);
+		entity->in_flight = NULL;
+		spin_unlock_irqrestore(&entity->queue_lock, flags);
+		dma_fence_remove_callback(job->dep_fence, &job->dep_cb);
+		dma_fence_put(job->dep_fence);
+		job->dep_fence = NULL;
+		if (job->fence) {
+			dma_fence_remove_callback(job->fence,
+						  &job->finish_cb);
+			dma_fence_put(job->fence);
+			job->fence = NULL;
+		}
+		if (job->ops && job->ops->free_job)
+			job->ops->free_job(job);
+		else
+			kfree(job);
+		queue_work(entity->wq, &entity->sched_work);
+		return;
+	}
 
-	job->fence = run_fence;
-
-	ret = dma_fence_add_callback(run_fence, &job->finish_cb,
+	ret = dma_fence_add_callback(job->fence, &job->finish_cb,
 				     drm_sched_fence_cb);
 	if (ret == -ENOENT) {
 		/* Already done (empty batch): retire synchronously. */

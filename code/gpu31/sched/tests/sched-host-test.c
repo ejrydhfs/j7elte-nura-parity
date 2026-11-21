@@ -23,6 +23,10 @@
  *            pump re-queued by the dep callback runs it after signal).
  *  0004 F3  one finish_cb per role; second distinct dep -> -EOPNOTSUPP.
  *  0004 F4  run_job ERR_PTR frees the job (free_job called, FIFO advances).
+ *  armfence fence exists and is armed at submit (non-NULL, unsignaled);
+ *           the SAME pointer is signalled at completion (no second
+ *           fence); no-alloc-hook arm fails closed (NULL fence, job
+ *           freed on dispatch).
  *  0004 F5  timeout comes from entity->timeout (== sched->timeout), and
  *            a zero timeout arms nothing.
  *  0004 minor drm_sched_entity_push_job is defined and queues work.
@@ -342,17 +346,28 @@ static int run_count, free_count;
 static int run_log[ORDER_MAX], free_log[ORDER_MAX];
 static int run_log_n, free_log_n;
 
-static struct dma_fence *sched_run_ok(struct drm_sched_job *job)
+/* Arm-time fence backend (gpu31-armfence): one fence per job, armed
+ * before queueing. run_job binds and returns this same fence. */
+static struct dma_fence *sched_alloc_ok(struct drm_sched_job *job)
 {
 	struct test_fence *tf;
 
+	(void)job;
+	tf = mkfence(9, (unsigned)(run_count + free_count + 1));
+	if (!tf)
+		return NULL;
+	return &tf->base;
+}
+
+static struct dma_fence *sched_run_ok(struct drm_sched_job *job)
+{
+	/* Mainline contract: return the arm-time fence, never a new one. */
+	if (!job->fence)
+		return ERR_PTR(-ENODATA);
 	run_count++;
 	if (run_log_n < ORDER_MAX)
 		run_log[run_log_n++] = (int)(long)job->owner;
-	tf = mkfence(9, (unsigned)run_count);
-	if (!tf)
-		return ERR_PTR(-ENOMEM);
-	return &tf->base;
+	return job->fence;
 }
 
 static struct dma_fence *sched_run_fail(struct drm_sched_job *job)
@@ -392,12 +407,23 @@ static void sched_free(struct drm_sched_job *job)
 
 static const struct drm_sched_backend_ops sched_ops_ok = {
 	.run_job = sched_run_ok,
+	.alloc_fence = sched_alloc_ok,
+	.timedout_job = sched_timedout,
+	.free_job = sched_free,
+};
+
+/* No alloc_fence: arm fails closed (fence stays NULL); run_job then
+ * fails the dispatch and the job is freed. */
+static const struct drm_sched_backend_ops sched_ops_noalloc = {
+	.run_job = sched_run_ok,
+	.alloc_fence = NULL,
 	.timedout_job = sched_timedout,
 	.free_job = sched_free,
 };
 
 static const struct drm_sched_backend_ops sched_ops_fail = {
 	.run_job = sched_run_fail,
+	.alloc_fence = sched_alloc_ok,
 	.timedout_job = sched_timedout,
 	.free_job = sched_free,
 };
@@ -434,6 +460,7 @@ static void test_entity_lists(void)
 			drm_sched_job_alloc(&e1, &sched_ops_ok, NULL);
 
 		CHECK(j != NULL);
+		drm_sched_job_arm(j);
 		CHECK_EQ(drm_sched_job_submit(j), 0);
 		n = 0;
 		list_for_each_entry(pos, &sched.entities, sched_link)
@@ -469,6 +496,11 @@ static void test_dep_gating(void)
 	free_count = 0;
 
 	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	/* Arm-time fence first (mainline order: alloc -> arm -> deps ->
+	 * submit): arm INITs the cb nodes, so it must precede any
+	 * add_dependency (re-INIT after a queue would detach the dep
+	 * waiter and wedge the signal drain). */
+	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_job_add_dependency(j, dep2 == dep ? NULL :
 					      &dep->base), 0);
 	/* F3: second distinct dep rejected. */
@@ -523,7 +555,9 @@ static void test_errptr_frees_job(void)
 	j1 = drm_sched_job_alloc(&e, &sched_ops_fail, NULL);
 	j2 = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
 	j2->ops = &sched_ops_ok;
+	drm_sched_job_arm(j1);
 	drm_sched_job_submit(j1);
+	drm_sched_job_arm(j2);
 	drm_sched_job_submit(j2);
 
 	/* First pump: j1 fails -> freed, pump re-queued. */
@@ -558,6 +592,7 @@ static void test_timeout_push_ready(void)
 	/* push_job queues + counts + kicks the pump. */
 	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
 	run_count = 0;
+	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_entity_push_job(j), 0);
 	CHECK_EQ((long long)atomic_load_explicit(&e.job_count.counter, memory_order_relaxed), 1LL);
 	CHECK_EQ(e.sched_work.pending, 1);
@@ -574,6 +609,7 @@ static void test_timeout_push_ready(void)
 	/* Nonzero timeout arms the delayed work with entity->timeout. */
 	e.timeout = 42;
 	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
 	e.sched_work.fn(&e.sched_work); /* queue empty path first */
 	drm_sched_job_submit(j);
 	e.sched_work.fn(&e.sched_work);
@@ -586,6 +622,7 @@ static void test_timeout_push_ready(void)
 	/* ready=false stops dispatch. */
 	run_count = 0;
 	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
 	drm_sched_job_submit(j);
 	sched.ready = false;
 	e.sched_work.fn(&e.sched_work);
@@ -642,6 +679,7 @@ static void test_close_rearm(void)
 	 * later wait observes the new job, not the stale completion. */
 	CHECK_EQ(drm_sched_entity_wait_idle(&e, 0), 0);
 	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_entity_push_job(j), 0);
 	CHECK_EQ(completion_done(&e.entity_idle), 0);
 	/* Retire it: dispatch then signal then finish. */
@@ -668,6 +706,8 @@ static void test_close_queued(void)
 	free_count = 0;
 
 	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	/* Mainline order (arm before deps): arm INITs the cb nodes. */
+	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_job_add_dependency(j, &dep->base), 0);
 	CHECK_EQ(drm_sched_job_submit(j), 0);
 	/* Pump sees the unsignaled dep and leaves the job queued. */
@@ -706,6 +746,7 @@ static void test_close_inflight(void)
 
 	/* Dispatch one job; fence stays pending (mock GPU never IRQs). */
 	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	drm_sched_job_arm(j);
 	drm_sched_entity_push_job(j);
 	e.sched_work.pending = 0;
 	e.sched_work.fn(&e.sched_work);
@@ -798,6 +839,7 @@ static void test_pumpfix_run_once_ordered(void)
 					   (void *)(long)(11 + i));
 		CHECK(j[i] != NULL);
 		j[i]->slot = i;
+		drm_sched_job_arm(j[i]);
 		CHECK_EQ(drm_sched_job_submit(j[i]), 0);
 	}
 
@@ -859,7 +901,7 @@ static struct dma_fence *sched_run_null(struct drm_sched_job *job)
 static void test_pumpfix_null_run_job(void)
 {
 	static const struct drm_sched_backend_ops null_run_ops = {
-		NULL, sched_timedout, sched_free,
+		NULL, sched_alloc_ok, sched_timedout, sched_free,
 	};
 	struct drm_sched sched;
 	struct drm_sched_entity e;
@@ -873,6 +915,7 @@ static void test_pumpfix_null_run_job(void)
 
 	j = drm_sched_job_alloc(&e, &null_run_ops, (void *)(long)99);
 	j->slot = 1;
+	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_job_submit(j), 0);
 	e.sched_work.fn(&e.sched_work);
 	CHECK_EQ(run_count, 0);
@@ -889,7 +932,7 @@ static void test_pumpfix_null_fence(void)
 	struct drm_sched_entity e;
 	struct drm_sched_job *j;
 	static const struct drm_sched_backend_ops null_fence_ops = {
-		sched_run_null, sched_timedout, sched_free,
+		sched_run_null, sched_alloc_ok, sched_timedout, sched_free,
 	};
 
 	memset(&sched, 0, sizeof(sched));
@@ -901,6 +944,7 @@ static void test_pumpfix_null_fence(void)
 
 	j = drm_sched_job_alloc(&e, &null_fence_ops, (void *)(long)77);
 	j->slot = 2;
+	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_job_submit(j), 0);
 	e.sched_work.fn(&e.sched_work);
 	CHECK_EQ(run_count, 1);
@@ -909,6 +953,92 @@ static void test_pumpfix_null_fence(void)
 	drm_sched_entity_fini(&sched, &e);
 	drm_sched_fini(&sched);
 }
+/* Armfence: fence exists and is armed at submit; the same pointer
+ * is signalled at completion (mainline drm_sched_job_arm semantics).
+ * Call order proven: alloc -> arm (fence live) -> submit (still live)
+ * -> dispatch (pump wires the SAME fence) -> signal (fence signalled)
+ * -> finish (retire). Pointer identity is asserted at every step. */
+static void test_armfence_submit_armed_same_signalled(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+	struct dma_fence *armed;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_ok, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	CHECK(j != NULL);
+	/* alloc alone arms nothing: the fence appears at arm time. */
+	CHECK(j->fence == NULL);
+
+	/* Arm: the completion fence exists BEFORE queueing. */
+	drm_sched_job_arm(j);
+	armed = j->fence;
+	CHECK(armed != NULL);
+	CHECK(!dma_fence_is_signaled(armed));
+
+	/* Second arm is a no-op (idempotent): same pointer, no leak. */
+	drm_sched_job_arm(j);
+	CHECK(j->fence == armed);
+
+	/* Submit keeps the armed fence live (this is the out_sync
+	 * install point in the driver: sched_job->fence is non-NULL
+	 * during the ioctl, so Mesa gets a live fence). */
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	CHECK(j->fence == armed);
+	CHECK(!dma_fence_is_signaled(armed));
+
+	/* Dispatch: run_job binds and returns the SAME fence (pump
+	 * enforces pointer identity; a second fence fails the job). */
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(run_count, 1);
+	CHECK(j->fence == armed);
+
+	/* Completion: signalling the armed fence retires the job. */
+	dma_fence_signal(armed);
+	CHECK(dma_fence_is_signaled(armed));
+	j->finish_work.fn(&j->finish_work);
+	CHECK_EQ(free_count, 1);
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
+/* Armfence error legs: no alloc hook (or NULL/ERR return) fails
+ * closed -- fence stays NULL, dispatch fails the job via the F4
+ * path, and the NULL fence is never installed or signalled. */
+static void test_armfence_noalloc_fails_closed(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+
+	memset(&sched, 0, sizeof(sched));
+	drm_sched_init(&sched, &sched_ops_noalloc, 50, "t");
+	drm_sched_entity_init(&e, &sched);
+	run_count = 0;
+	free_count = 0;
+
+	j = drm_sched_job_alloc(&e, &sched_ops_noalloc, NULL);
+	CHECK(j != NULL);
+	drm_sched_job_arm(j);
+	/* No alloc hook: arm fails closed, fence stays NULL. */
+	CHECK(j->fence == NULL);
+	CHECK_EQ(drm_sched_job_submit(j), 0);
+	/* run_job sees the NULL fence and fails; the pump frees it. */
+	e.sched_work.fn(&e.sched_work);
+	CHECK_EQ(free_count, 1);
+	CHECK(list_empty(&e.queue_list));
+
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
 /* Opsfix: ops pointer round-trips alloc -> pump -> run_job.
  * Silicon ST-OPS showed ops=NULL despite a correct store; this test
  * pins the contract at host level: (1) alloc writes job->ops, (2) the
@@ -921,20 +1051,19 @@ static void test_pumpfix_null_fence(void)
 static const struct drm_sched_backend_ops *ops_seen_in_run;
 static struct dma_fence *sched_run_record_ops(struct drm_sched_job *job)
 {
-	struct test_fence *tf;
-
 	run_count++;
 	ops_seen_in_run = job->ops;
-	tf = mkfence(9, (unsigned)run_count);
-	if (!tf)
-		return ERR_PTR(-ENOMEM);
-	return &tf->base;
+	/* Same contract as sched_run_ok: the armed fence, never new. */
+	if (!job->fence)
+		return ERR_PTR(-ENODATA);
+	return job->fence;
 }
 
 static void test_opsfix_roundtrip(void)
 {
 	static const struct drm_sched_backend_ops ops_a = {
-		sched_run_record_ops, sched_timedout, sched_free,
+		sched_run_record_ops, sched_alloc_ok, sched_timedout,
+		sched_free,
 	};
 	struct drm_sched sched;
 	struct drm_sched_entity e;
@@ -958,6 +1087,7 @@ static void test_opsfix_roundtrip(void)
 	CHECK_EQ(j->slot, 0); /* kzalloc default: submit stamps it */
 	CHECK_EQ(j->ran, 0); /* unset until run_job returns */
 	j->slot = 1;
+	drm_sched_job_arm(j);
 	CHECK_EQ(drm_sched_job_submit(j), 0);
 
 	/* (2) pump dispatches through the same ops (run fires once). */
@@ -1002,6 +1132,8 @@ int main(void)
 	test_pumpfix_run_once_ordered();
 	test_pumpfix_null_run_job();
 	test_pumpfix_null_fence();
+	test_armfence_submit_armed_same_signalled();
+	test_armfence_noalloc_fails_closed();
 	test_opsfix_roundtrip();
 
 	printf("%d checks, %d failures\n", checks, failures);
