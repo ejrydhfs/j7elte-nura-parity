@@ -145,6 +145,111 @@ static void t_syncobj_abi(struct pf7580_dev *dev)
 		 "destroy ctx syncobj");
 }
 
+/* Syncobj wait blocks on a pending fence (sim-clock, mock only).
+ * Programs fence fires on the virtual clock and proves the wait —
+ * with no sleeping — advances to the firing (rc 0) or expires at
+ * the deadline (-ETIME), for both ANY and WAIT_ALL. This is the
+ * host mirror of the kernel WAIT loop: the absolute deadline is
+ * honoured, a signal inside the budget wins, and a pending fence
+ * with an empty budget (-ETIME) never reports success. */
+static void t_syncobj_wait_block(struct pf7580_dev *dev)
+{
+	uint32_t a = 0, b = 0;
+	uint32_t first = 0xdeadbeefu;
+	int64_t t0;
+
+	if (!pf7580_is_mock(dev))
+		return;
+	t0 = pf7580_mock_now(dev);
+	CHECK(t0 == 0, "sim clock starts at 0 (%" PRId64 ")", t0);
+	/* Pending fence, zero deadline: non-blocking probe expires. */
+	CHECK_RC(pf7580_syncobj_create(dev, 0, &a), 0, "waitblk create a");
+	CHECK_RC(pf7580_syncobj_wait(dev, &a, 1, t0, 0, NULL), -ETIME,
+		 "waitblk ANY pending t=0 expires");
+	CHECK(pf7580_mock_now(dev) == t0, "waitblk ANY probe consumes no time");
+	CHECK_RC(pf7580_syncobj_create(dev, 0, &b), 0, "waitblk create b");
+	CHECK_RC(pf7580_syncobj_wait(dev, &b, 1, t0, 1, NULL), -ETIME,
+		 "waitblk ALL pending t=0 expires");
+	pf7580_syncobj_destroy(dev, b);
+	b = 0;
+	/* Fire inside the deadline: ANY blocks (in sim time) to it. */
+	CHECK_RC(pf7580_mock_signal_at(dev, a, t0 + 5000000000LL), 0,
+		 "waitblk program a+5s");
+	CHECK_RC(pf7580_syncobj_wait(dev, &a, 1, t0 + 8000000000LL, 0,
+				      &first), 0, "waitblk ANY fires at +5s");
+	CHECK(first == 0, "waitblk ANY first==0 (%u)", first);
+	CHECK(pf7580_mock_now(dev) == t0 + 5000000000LL,
+	      "waitblk clock advanced to fire (%" PRId64 ")",
+	      pf7580_mock_now(dev));
+	/* A fired fence stays signaled: zero-deadline wait succeeds. */
+	CHECK_RC(pf7580_syncobj_wait(dev, &a, 1,
+				      pf7580_mock_now(dev), 0, NULL), 0,
+		 "waitblk signaled t=0 succeeds");
+	/* Deadline before the fire: expires, clock jumps to deadline. */
+	CHECK_RC(pf7580_syncobj_create(dev, 0, &b), 0, "waitblk create b");
+	CHECK_RC(pf7580_mock_signal_at(dev, b,
+					pf7580_mock_now(dev) + 5000000000LL),
+		 0, "waitblk program b+5s");
+	CHECK_RC(pf7580_syncobj_wait(dev, &b, 1,
+				      pf7580_mock_now(dev) + 2000000000LL, 0,
+				      NULL), -ETIME,
+		 "waitblk ANY deadline-first expires");
+	/* WAIT_ALL consumes the latest fire inside the budget. Each
+	 * phase uses fresh handles: a fired fence stays signaled and
+	 * the clock never runs backward. */
+	pf7580_syncobj_destroy(dev, a);
+	pf7580_syncobj_destroy(dev, b);
+	a = b = 0;
+	pf7580_mock_advance(dev, t0 + 10000000000LL);
+	t0 = pf7580_mock_now(dev);
+	CHECK_RC(pf7580_syncobj_create(dev, 0, &a), 0, "waitblk re-create a");
+	CHECK_RC(pf7580_syncobj_create(dev, 0, &b), 0, "waitblk re-create b");
+	CHECK_RC(pf7580_mock_signal_at(dev, a, t0 + 2000000000LL), 0,
+		 "waitblk program a+2s");
+	CHECK_RC(pf7580_mock_signal_at(dev, b, t0 + 5000000000LL), 0,
+		 "waitblk program b+5s");
+	{
+		uint32_t hs[2] = { a, b };
+
+		CHECK_RC(pf7580_syncobj_wait(dev, hs, 2, t0 + 8000000000LL,
+					      1, NULL), 0,
+			 "waitblk ALL fires consume latest");
+	}
+	CHECK(pf7580_mock_now(dev) == t0 + 5000000000LL,
+	      "waitblk ALL clock at latest fire (%" PRId64 ")",
+	      pf7580_mock_now(dev));
+	/* WAIT_ALL with one fire past the deadline: expires. */
+	pf7580_syncobj_destroy(dev, a);
+	a = 0;
+	pf7580_mock_advance(dev, t0);
+	t0 = pf7580_mock_now(dev);
+	CHECK_RC(pf7580_syncobj_create(dev, 0, &a), 0, "waitblk recreate a2");
+	CHECK_RC(pf7580_mock_signal_at(dev, b, t0 + 5000000000LL), 0,
+		 "waitblk reprogram b+5s");
+	CHECK_RC(pf7580_mock_signal_at(dev, a, t0 + 9000000000LL), 0,
+		 "waitblk program a2+9s");
+	{
+		uint32_t hs[2] = { a, b };
+
+		CHECK_RC(pf7580_syncobj_wait(dev, hs, 2, t0 + 8000000000LL,
+					      1, NULL), -ETIME,
+			 "waitblk ALL past-deadline expires");
+	}
+	CHECK(pf7580_mock_now(dev) == t0 + 8000000000LL,
+	      "waitblk ALL expiry lands on deadline (%" PRId64 ")",
+	      pf7580_mock_now(dev));
+	/* Unknown handle still fails like the 0003 shim. */
+	{
+		uint32_t bad = 0xdeadbeefu;
+
+		CHECK_RC(pf7580_syncobj_wait(dev, &bad, 1, t0 + 1000, 0,
+					      NULL), -ENOENT,
+			 "waitblk unknown handle ENOENT");
+	}
+	pf7580_syncobj_destroy(dev, a);
+	pf7580_syncobj_destroy(dev, b);
+}
+
 /* SUBMIT-free node probe: GET_PARAM + CREATE_BO(4K) + MMAP_BO +
  * GET_BO_OFFSET only. No SUBMIT (a test jc would fault HW), no WAIT_BO,
  * no CPU mapping — the ioctl sequence mutates nothing beyond one
@@ -403,6 +508,7 @@ static int run_mock_suite(void)
 	/* Mesa-exact ABI sequences (gpu31-abialign): must pass on mock. */
 	t_get_param_abi(dev);
 	t_syncobj_abi(dev);
+	t_syncobj_wait_block(dev);
 	t_create_bo(dev, &h, &gpu_off);
 	t_offsets(dev, h, gpu_off, &map_off);
 	t_cpu_map(dev, h, map_off);
@@ -730,6 +836,23 @@ static int run_submit_test(const char *path)
 		pf7580_cpu_unmap(dev, p, 4096);
 		pf7580_close(dev);
 		return 1;
+	}
+	/* Syncobj-wait blocking contract (gpu31-syncobjwait): the 8 s
+	 * wait on a pending job fence MUST consume wall time — either
+	 * the IRQ round-trip (fast retire) or the ~5 s sched-timeout
+	 * recovery (dark/stuck slot signals the same fence). An
+	 * instant-0 return on a fence the 0-timeout probe just proved
+	 * pending means the wait never blocked (empty-syncobj leg:
+	 * pre-armfence kernels installed nothing at SUBMIT). Only the
+	 * already-signaled probe outcome excuses elapsed==0. */
+	if (elapsed_ms == 0) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
+			now.tv_nsec;
+		rc = pf7580_syncobj_wait(dev, &out_sync, 1, deadline_ns,
+					 0, NULL);
+		printf("WAIT-RECHECK(0-timeout, post-wait): rc=%d (%s)\n",
+		       rc, pf7580_strerror(rc));
 	}
 	printf("SYNCOBJ-DESTROY: handle=%u...\n", out_sync);
 	fflush(stdout);

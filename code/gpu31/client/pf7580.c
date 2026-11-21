@@ -29,6 +29,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <stdint.h>
+
 #include <drm/drm.h>
 
 #include "pf7580.h"
@@ -155,6 +157,7 @@ struct pf7580_mock_syncobj {
 	int used;
 	uint32_t handle;
 	int signaled;	/* 0 pending, 1 signaled (binary payload) */
+	int64_t signal_at_ns;	/* sim-clock: pending fence fires here */
 };
 
 struct pf7580_dev {
@@ -166,6 +169,14 @@ struct pf7580_dev {
 	struct pf7580_mock_bo bos[PF7580_MOCK_MAX_BOS];
 	uint32_t next_syncobj;
 	struct pf7580_mock_syncobj syncobjs[PF7580_MOCK_MAX_SYNCOBJS];
+	/* Sim-clock (mock syncobj waits): virtual CLOCK_MONOTONIC ns.
+	 * WAIT compares the absolute deadline against each fence's
+	 * signal_at_ns WITHOUT sleeping: a programmed signal inside
+	 * the budget returns 0 and advances now_ns to the signal; a
+	 * deadline that passes first advances now_ns to the deadline
+	 * and returns -ETIME. Proves the block-vs-expire logic
+	 * deterministically (see t_syncobj_wait_block in selftest). */
+	int64_t mock_now_ns;
 };
 
 static struct pf7580_mock_bo *mock_find(struct pf7580_dev *dev,
@@ -493,6 +504,38 @@ static struct pf7580_mock_syncobj *mock_syncobj_find(struct pf7580_dev *dev,
 	return NULL;
 }
 
+int64_t pf7580_mock_now(struct pf7580_dev *dev)
+{
+	if (!dev || !dev->is_mock)
+		return -EINVAL;
+	return dev->mock_now_ns;
+}
+
+void pf7580_mock_advance(struct pf7580_dev *dev, int64_t to_ns)
+{
+	if (!dev || !dev->is_mock)
+		return;
+	if (to_ns > dev->mock_now_ns)
+		dev->mock_now_ns = to_ns;
+}
+
+int pf7580_mock_signal_at(struct pf7580_dev *dev, uint32_t handle,
+			   int64_t fire_ns)
+{
+	struct pf7580_mock_syncobj *o;
+
+	if (!dev || !dev->is_mock || !handle)
+		return -EINVAL;
+	o = mock_syncobj_find(dev, handle);
+	if (!o)
+		return -ENOENT;
+	if (o->signaled)
+		return 0;
+	o->signal_at_ns = fire_ns;
+	return 0;
+}
+
+
 int pf7580_syncobj_create(struct pf7580_dev *dev, uint32_t flags,
 			  uint32_t *handle)
 {
@@ -515,6 +558,7 @@ int pf7580_syncobj_create(struct pf7580_dev *dev, uint32_t flags,
 				dev->syncobjs[i].signaled =
 					(flags & PF7580_SYNCOBJ_CREATE_SIGNALED)
 					? 1 : 0;
+				dev->syncobjs[i].signal_at_ns = INT64_MAX;
 				*handle = dev->syncobjs[i].handle;
 				return 0;
 			}
@@ -623,6 +667,7 @@ int pf7580_syncobj_fd_to_handle(struct pf7580_dev *dev, int fd,
 				if (dev->next_syncobj == 0)
 					dev->next_syncobj = 1;
 				dev->syncobjs[i].signaled = o->signaled;
+				dev->syncobjs[i].signal_at_ns = o->signal_at_ns;
 				*handle = dev->syncobjs[i].handle;
 				return 0;
 			}
@@ -654,25 +699,105 @@ int pf7580_syncobj_wait(struct pf7580_dev *dev, const uint32_t *handles,
 	if (dev->is_mock) {
 		uint32_t i;
 		int rc = mock_inject(dev);
+		int all;
 
 		if (rc)
 			return rc;
-		/* Mock has no fences: every known syncobj reads
-		 * signalled (mirrors the stub's known-BO-is-idle rule),
-		 * unknown handles fail like the 0003 shim. */
+		/* Sim-clock wait (no sleeping): unknown handles fail
+		 * like the 0003 shim (-ENOENT); empty/signaled fences
+		 * count as signaled (kernel NULL-fence parity). A
+		 * pending fence "blocks" in virtual time: the first
+		 * signal inside the absolute deadline advances
+		 * mock_now_ns to the firing time; a deadline that
+		 * passes first expires with -ETIME. Programs via
+		 * pf7580_mock_signal_at(); pf7580_mock_now() reads
+		 * and pf7580_mock_advance() moves the clock. */
+		if (timeout_ns < 0)
+			return -EINVAL;
+		all = (flags & PF7580_SYNCOBJ_WAIT_ALL) != 0;
+		if (all) {
+			int64_t latest = dev->mock_now_ns;
+			int pending = 0;
+
+			for (i = 0; i < count; i++) {
+				struct pf7580_mock_syncobj *o =
+					mock_syncobj_find(dev, handles[i]);
+
+				if (!o)
+					return -ENOENT;
+				if (o->signaled)
+					continue;
+				if (o->signal_at_ns <= dev->mock_now_ns)
+					continue;
+				if (o->signal_at_ns > timeout_ns) {
+					pending = 1;
+					continue;
+				}
+				if (o->signal_at_ns > latest)
+					latest = o->signal_at_ns;
+			}
+			if (pending) {
+				dev->mock_now_ns = timeout_ns;
+				return -ETIME;
+			}
+			dev->mock_now_ns = latest;
+			for (i = 0; i < count; i++) {
+				struct pf7580_mock_syncobj *o =
+					mock_syncobj_find(dev, handles[i]);
+
+				o->signaled = 1;
+			}
+			if (first_signaled)
+				*first_signaled = 0;
+			return 0;
+		}
 		for (i = 0; i < count; i++) {
 			struct pf7580_mock_syncobj *o =
 				mock_syncobj_find(dev, handles[i]);
 
 			if (!o)
 				return -ENOENT;
-			if (!o->signaled)
-				o->signaled = 1;	/* submit retired it */
-			(void)timeout_ns;
+			if (o->signaled)
+				continue;
+			if (o->signal_at_ns <= dev->mock_now_ns) {
+				o->signaled = 1;
+				if (first_signaled)
+					*first_signaled = i;
+				return 0;
+			}
+			if (o->signal_at_ns > timeout_ns) {
+				/* Past the deadline: ANY expires at once
+				 * (kernel: sub-budget 0 probe finds it
+				 * unsignaled). */
+				dev->mock_now_ns = timeout_ns;
+				return -ETIME;
+			}
+			dev->mock_now_ns = o->signal_at_ns;
+			o->signaled = 1;
+			if (first_signaled)
+				*first_signaled = i;
+			return 0;
 		}
-		if (first_signaled)
-			*first_signaled = 0;
-		return 0;
+		/* All signaled already (or fired at/past the current
+		 * instant with a zero budget): success without moving. */
+		{
+			int any_pending = 0;
+			uint32_t k;
+
+			for (k = 0; k < count; k++) {
+				struct pf7580_mock_syncobj *o =
+					mock_syncobj_find(dev, handles[k]);
+
+				if (!o->signaled &&
+				    o->signal_at_ns > dev->mock_now_ns)
+					any_pending = 1;
+			}
+			if (!any_pending) {
+				if (first_signaled)
+					*first_signaled = 0;
+				return 0;
+			}
+		}
 	}
 	{
 		struct pf7580_syncobj_wait w;

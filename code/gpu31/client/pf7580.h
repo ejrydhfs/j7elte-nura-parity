@@ -122,6 +122,17 @@ int pf7580_is_mock(const struct pf7580_dev *dev);
 /* One-shot fault injection for the mock backend: the next call of any
  * ioctl wrapper fails with -fail_err (a positive errno). Zero disables. */
 void pf7580_mock_fail_next(struct pf7580_dev *dev, int fail_err);
+/* Sim-clock controls (mock backend only; no-ops on real fds):
+ * pf7580_mock_now reads the virtual CLOCK_MONOTONIC ns;
+ * pf7580_mock_advance moves it forward (never backward);
+ * pf7580_mock_signal_at programs a pending syncobj's fence to fire
+ * at fire_ns (absolute virtual ns; INT64_MAX = never). WAIT then
+ * "blocks" deterministically: first fire inside the deadline wins
+ * (clock jumps there, rc 0), else the deadline expires (-ETIME). */
+int64_t pf7580_mock_now(struct pf7580_dev *dev);
+void pf7580_mock_advance(struct pf7580_dev *dev, int64_t to_ns);
+int pf7580_mock_signal_at(struct pf7580_dev *dev, uint32_t handle,
+			   int64_t fire_ns);
 
 /* The six ioctls. */
 int pf7580_get_param(struct pf7580_dev *dev, uint32_t param, uint64_t *value);

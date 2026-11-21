@@ -238,21 +238,24 @@ static struct drm_syncobj_manager *p7580_sync_mgr(struct drm_file *fp)
 
 /* A pre-signaled fence: 0001 has no timeline/signaled constructor, so
  * init a private fence and signal it once. Ops mirror the submit-job
- * fence backend contract (release via release_base). */
-static const struct dma_fence_ops p7580_sync_signaled_ops = {
-	.get_driver_name = NULL,
-	.get_timeline_name = NULL,
-	.enable_signaling = NULL,
-	.signaled = NULL,
-	.wait = NULL,
-	.release = NULL,	/* filled at first use (no static fn) */
-};
-
+ * fence backend contract (release via release_base). The table is
+ * writable static (NOT const): dma_fence_init BUGs on a NULL release,
+ * so the hook must be assignable at definition time, and a const
+ * table would take a .rodata write on first CREATE_SIGNALED/SIGNAL. */
 static void p7580_sync_signaled_release(struct dma_fence *fence)
 {
 	dma_fence_release_base(fence);
 	kfree(fence);
 }
+
+static struct dma_fence_ops p7580_sync_signaled_ops = {
+	.get_driver_name = NULL,
+	.get_timeline_name = NULL,
+	.enable_signaling = NULL,
+	.signaled = NULL,
+	.wait = NULL,
+	.release = p7580_sync_signaled_release,
+};
 
 static struct dma_fence *p7580_sync_signaled_fence(void)
 {
@@ -261,10 +264,6 @@ static struct dma_fence *p7580_sync_signaled_fence(void)
 	f = kzalloc(sizeof(*f), GFP_KERNEL);
 	if (!f)
 		return NULL;
-	/* release hook is per-instance (static ops has no .release
-	 * until set here; init BUGs on NULL release). */
-	((struct dma_fence_ops *)&p7580_sync_signaled_ops)->release =
-		p7580_sync_signaled_release;
 	dma_fence_init(f, &p7580_sync_signaled_ops,
 		       dma_fence_context_alloc(1), 1);
 	dma_fence_signal(f);
@@ -559,6 +558,16 @@ int panfrost_syncobj_wait(struct drm_device *dev, void *data,
 				ret = (int)r;
 				goto out_put_all;
 			}
+			/* r == 0 is ambiguous: non-blocking probe on a
+			 * pending fence (timeout == 0) also yields 0
+			 * (0001 maps helper-0 to 0 when no budget was
+			 * given). Only a signaled fence counts: re-test
+			 * and time out otherwise, or a WAIT_ALL poll on
+			 * a pending fence would falsely report success. */
+			if (!dma_fence_is_signaled(fences[i])) {
+				ret = -ETIME;
+				goto out_put_all;
+			}
 			/* Chained budget: each fence consumes from what
 			 * the previous one left (0001 returns remaining;
 			 * 0 with budget left means signaled now). */
@@ -591,9 +600,11 @@ int panfrost_syncobj_wait(struct drm_device *dev, void *data,
 				ret = (int)r;
 				goto out_put_all;
 			}
-			if (r >= 0 || !r) {
-				/* signaled (r>=0 remaining) or 0-budget
-				 * hit exactly at signal: re-test. */
+			/* r >= 0: signaled with remaining budget (or a
+			 * 0-budget hit exactly at signal). r == 0 with an
+			 * unsignaled fence is the non-blocking probe
+			 * outcome: fall through to the -ETIME below. */
+			if (r >= 0) {
 				if (!fences[i] ||
 				    dma_fence_is_signaled(fences[i])) {
 					args->first_signaled = i;
