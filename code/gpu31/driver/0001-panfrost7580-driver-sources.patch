@@ -2300,7 +2300,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 20:30:09.957713177 -0500
-@@ -0,0 +1,1203 @@
+@@ -0,0 +1,1270 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -2419,13 +2419,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +static void p7580_job_err_pin(int slot, uint32_t js_status,
 +			      uint32_t job_int_stat, uint32_t rawstat,
 +			      uint64_t head, uint64_t tail,
-+			      unsigned int seqno, uint64_t jc)
++			      unsigned int seqno, uint64_t jc,
++			      uint32_t desc_w4, uint32_t desc_w5,
++			      uint32_t cfg)
 +{
-+	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx\n",
++	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
 +		slot, js_status, p7580_js_status_name(js_status),
 +		job_int_stat, rawstat,
 +		(unsigned long long)head, (unsigned long long)tail,
-+		seqno, (unsigned long long)jc);
++		seqno, (unsigned long long)jc, desc_w4, desc_w5, cfg);
 +}
 +/* ------------------------------------------------------------------ */
 +/* Register access                                                    */
@@ -2591,6 +2593,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	jd->trace_arm = p7580_job_trace;
 +	jd->last.valid = 0;
 +	jd->dbg_dir = NULL;
++	jd->chain_mode = 0;
 +	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 +		jd->in_flight[i] = NULL;
 +		mask |= P7580_MK_JS_MASK(i);
@@ -2691,6 +2694,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		       (uint32_t)(job->affinity >> 32));
 +
 +	cfg = p7580_js_config(job->as_nr);
++	/* Chain-bit experiment variant A (gpu31-lastjob): when the
++	 * chain head's descriptor bit0 (job_descriptor_size/chain
++	 * marker) is set, honour it in CONFIG_NEXT. T720 has no
++	 * JOBCHAIN_DISAMBIGUATION HW, but kbase still programs the
++	 * CHAIN bit from the atom; mode 1 mirrors that. Gated by the
++	 * chain_mode knob (0 = off, stock 0x83700 behaviour). */
++	if (jd->chain_mode == 1 && (job->desc_w4 & 0x1u))
++		cfg |= P7580_JS_CFG_JOB_CHAIN_FLAG;
 +	p7580_js_write(jd, slot, P7580_JS_CONFIG_NEXT, cfg);
 +
 +	jd->in_flight[slot] = job;
@@ -2726,9 +2737,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		jd->trace_left--;
 +		rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
 +		js_status = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_STATUS));
-+		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u\n",
++		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u w4=0x%08x w5=0x%08x chain_mode=%u\n",
 +			slot, (unsigned long long)job->jc, cfg, job->as_nr,
-+			(unsigned long long)job->affinity, job->seqno);
++			(unsigned long long)job->affinity, job->seqno,
++			job->desc_w4, job->desc_w5, jd->chain_mode);
 +		pr_info("p7580_job: post-start slot=%d rawstat=0x%08x js_status=0x%08x (%s)\n",
 +			slot, rawstat, js_status,
 +			p7580_js_status_name(js_status));
@@ -2809,6 +2821,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			uint64_t head, tail;
 +			unsigned int seq = 0;
 +			uint64_t jc = 0;
++			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
 +
 +			spin_lock_irqsave(&jd->hw_lock, flags);
 +			job = jd->in_flight[j];
@@ -2828,18 +2841,23 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			if (job) {
 +				seq = job->seqno;
 +				jc = job->jc;
++				dw4 = job->desc_w4;
++				dw5 = job->desc_w5;
 +			} else if (jd->last.valid &&
 +				   jd->last.slot == (unsigned int)j) {
 +				seq = jd->last.seqno;
 +				jc = jd->last.jc;
 +			}
++			if (jd->last.valid &&
++			    jd->last.slot == (unsigned int)j)
++				lcfg = jd->last.cfg;
 +			/* ERR alongside DONE: always pin (never budgeted).
 +			 * JS_STATUS can latch a fault code even when the
 +			 * DONE bit also set (short chain / sticky bit). */
 +			if (p7580_js_status_is_fault(js_status))
 +				p7580_job_err_pin(j, js_status, status,
 +						  rawstat, head, tail,
-+						  seq, jc);
++						  seq, jc, dw4, dw5, lcfg);
 +			if (jd->trace_left) {
 +				jd->trace_left--;
 +				pr_info("p7580_job: irq slot=%d stat=0x%08x js_status=0x%08x (%s) has_job=%d\n",
@@ -2895,6 +2913,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			uint64_t head, tail;
 +			unsigned int seq = 0;
 +			uint64_t jc = 0;
++			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
 +
 +			spin_lock_irqsave(&jd->hw_lock, flags);
 +			es = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_STATUS));
@@ -2904,13 +2923,22 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			tail_hi = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_TAIL_HI));
 +			head = ((uint64_t)head_hi << 32) | head_lo;
 +			tail = ((uint64_t)tail_hi << 32) | tail_lo;
-+			if (jd->last.valid &&
-+			    jd->last.slot == (unsigned int)j) {
++			if (jd->in_flight[j]) {
++				seq = jd->in_flight[j]->seqno;
++				jc = jd->in_flight[j]->jc;
++				dw4 = jd->in_flight[j]->desc_w4;
++				dw5 = jd->in_flight[j]->desc_w5;
++			} else if (jd->last.valid &&
++				   jd->last.slot == (unsigned int)j) {
 +				seq = jd->last.seqno;
 +				jc = jd->last.jc;
 +			}
++			if (jd->last.valid &&
++			    jd->last.slot == (unsigned int)j)
++				lcfg = jd->last.cfg;
 +			p7580_job_err_pin(j, es, status, rawstat,
-+					  head, tail, seq, jc);
++					  head, tail, seq, jc,
++					  dw4, dw5, lcfg);
 +			if (jd->trace_left) {
 +				jd->trace_left--;
 +				pr_info("p7580_job: irq-err slot=%d stat=0x%08x js_status=0x%08x (%s)\n",
@@ -3024,11 +3052,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		t_hi = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_TAIL_HI));
 +		head = ((uint64_t)h_hi << 32) | h_lo;
 +		tail = ((uint64_t)t_hi << 32) | t_lo;
-+		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx\n",
++		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
 +			slot, status, p7580_js_status_name(status),
 +			t_stat, t_raw,
 +			(unsigned long long)head, (unsigned long long)tail,
-+			job->seqno, (unsigned long long)job->jc);
++			job->seqno, (unsigned long long)job->jc,
++			job->desc_w4, job->desc_w5,
++			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0);
 +	}
 +	p7580_job_recover(jd, slot, status);
 +
@@ -3361,6 +3391,20 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	pr_info("p7580_job: trace re-armed to %u\n", n);
 +}
 +
++void p7580_job_chain_set(struct p7580_job_dev *jd, unsigned int mode)
++{
++	unsigned long flags;
++
++	if (!jd)
++		return;
++	if (mode > 2)
++		mode = 0;
++	spin_lock_irqsave(&jd->hw_lock, flags);
++	jd->chain_mode = mode;
++	spin_unlock_irqrestore(&jd->hw_lock, flags);
++	pr_info("p7580_job: chain_mode set to %u\n", mode);
++}
++
 +int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 +{
 +	unsigned long flags;
@@ -3456,6 +3500,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +DEFINE_SIMPLE_ATTRIBUTE(p7580_job_trace_fops, p7580_job_trace_get,
 +			p7580_job_trace_set, "%llu\n");
 +
++static int p7580_job_chain_get(void *data, u64 *val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd || !val)
++		return -EINVAL;
++	*val = jd->chain_mode;
++	return 0;
++}
++
++static int p7580_job_chain_set_k(void *data, u64 val)
++{
++	p7580_job_chain_set(data, (unsigned int)val);
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(p7580_job_chain_fops, p7580_job_chain_get,
++			p7580_job_chain_set_k, "%llu\n");
++
 +static int p7580_job_dump_show_seq(struct seq_file *m, void *v)
 +{
 +	struct p7580_job_dev *jd = m->private;
@@ -3491,6 +3554,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +				&p7580_job_trace_fops);
 +	if (IS_ERR_OR_NULL(f))
 +		pr_info("p7580_job: trace_arm knob unavailable\n");
++	f = debugfs_create_file("chain_mode", 0600, dir, jd,
++				&p7580_job_chain_fops);
++	if (IS_ERR_OR_NULL(f))
++		pr_info("p7580_job: chain_mode knob unavailable\n");
 +	f = debugfs_create_file("dump", 0400, dir, jd,
 +				&p7580_job_dump_fops);
 +	if (IS_ERR_OR_NULL(f))
@@ -3507,7 +3574,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 20:30:09.959635747 -0500
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,245 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3566,6 +3633,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +					 * (0 = none; validated at SUBMIT,
 +					 * installed from render_done_fence
 +					 * alias on the dispatch worker) */
++	/* Chain-head descriptor words 4/5 snapshot (gpu31-lastjob):
++	 * stamped at SUBMIT from the mapped descriptor BO (w4 holds
++	 * bit0 + type + index, w5 the dep pair). The dispatch path
++	 * uses w4 bit0 for variant A; the dump/ERR paths print all
++	 * 8 words for the working-vs-faulting discriminator. Zero
++	 * when the submit-time snapshot was unavailable. */
++	uint32_t desc_w4;
++	uint32_t desc_w5;
 +
 +	/* Fences. done_fence owns the run_job ref and is signaled by the
 +	 * JOB_INT handler (or the fault-recovery path, F-JOB4);
@@ -3662,6 +3737,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	void *pm_dev;
 +	int (*pm_get)(void *dev);
 +	void (*pm_put)(void *dev);
++	/* Chain-bit experiment (gpu31-lastjob): runtime switch, no
++	 * rebuild needed to A/B. 0 = off (both variants disabled,
++	 * submit bytes untouched); 1 = variant A (set JS_CONFIG
++	 * JOB_CHAIN_FLAG when the chain head's descriptor bit0 is
++	 * set); 2 = variant B (clear descriptor bit0, next stays
++	 * NULL, before submit-sync). Wired to the chain_mode debugfs
++	 * knob below; defaults to 0. Plain data, no locks beyond the
++	 * hw_lock writers already hold on the dispatch path. */
++	unsigned int chain_mode;
 +};
 +#else
 +struct p7580_job_dev {
@@ -3698,6 +3782,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 + * renders the last-dispatch snapshot + live slot registers into buf
 + * (seq_file show; returns 0, prints "no job yet" when !valid). */
 +void p7580_job_trace_arm(struct p7580_job_dev *jd, unsigned int n);
++/* Chain-bit experiment knob (gpu31-lastjob): write 0/1/2 selects the
++ * variant (0 off, 1 = A set cfg CHAIN flag on desc-bit0, 2 = B clear
++ * desc bit0 via the driver's pre-submit word patch). Applied on the
++ * dispatch path under hw_lock; no rebuild needed to A/B. */
++void p7580_job_chain_set(struct p7580_job_dev *jd, unsigned int mode);
 +struct seq_file;
 +int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m);
 +/* CLEAR + unmask after reset/resume (power held by caller). */
@@ -6604,6 +6693,53 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	job->requirements = args->requirements;
 +	job->as_nr = P7580_DRV_AS_NR;
 +	job->affinity = drv->jd.shader_present;
++	job->desc_w4 = 0;
++	job->desc_w5 = 0;
++	/* Chain-bit experiment (gpu31-lastjob): snapshot the chain-head
++	 * descriptor words 4/5 from the mapped BO before submit-sync.
++	 * Variant B (chain_mode==2) clears descriptor bit0 in the
++	 * submit-time snapshot consumed at dispatch; the stored BO
++	 * bytes are patched too (via vmap + submit-sync re-drain),
++	 * next pointer stays NULL. Mode 0/1 snapshot only. */
++	{
++		struct p7580_bo *jbo = NULL;
++		unsigned int bi;
++		for (bi = 0; bi < nr; bi++) {
++			struct p7580_bo *c = to_p7580_bo(objs[bi]);
++			/* jc must lie inside one submitted BO's IOVA */
++			if (c && c->iova_valid &&
++			    args->jc >= c->iova &&
++			    args->jc + 32 <= c->iova + c->base.size) {
++				jbo = c;
++				break;
++			}
++		}
++		if (jbo && jbo->pages) {
++			uint32_t off = (uint32_t)(args->jc - jbo->iova);
++			unsigned int idx = off >> PAGE_SHIFT;
++			unsigned int poff = off & (PAGE_SIZE - 1);
++			if (idx < jbo->nr_pages && jbo->pages[idx] &&
++			    poff + 32 <= PAGE_SIZE) {
++				void *kv;
++				uint32_t w4, w5;
++				/* Same invalidate the completion path
++				 * runs, so the snapshot sees CPU bytes. */
++				p7580_gem_job_done_sync(&jbo->base);
++				kv = kmap_atomic(jbo->pages[idx]);
++				w4 = *(uint32_t *)((char *)kv + poff + 16);
++				w5 = *(uint32_t *)((char *)kv + poff + 20);
++				if (drv->jd.chain_mode == 2)
++					*(uint32_t *)((char *)kv + poff + 16) =
++						w4 & ~0x1u;
++				kunmap_atomic(kv);
++				job->desc_w4 = (drv->jd.chain_mode == 2) ?
++					(w4 & ~0x1u) : w4;
++				job->desc_w5 = w5;
++				if (drv->jd.chain_mode == 2)
++					p7580_gem_submit_sync(&jbo->base);
++			}
++		}
++	}
 +	/* F-JT1 stash: SUBMIT-time sched_job->fence is still NULL, so
 +	 * validate the handle now (-ENOENT preserved) and let the
 +	 * async run_job install the real fence on this handle. */

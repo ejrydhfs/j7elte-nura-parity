@@ -56,6 +56,14 @@ struct p7580_submit_job {
 					 * (0 = none; validated at SUBMIT,
 					 * installed from render_done_fence
 					 * alias on the dispatch worker) */
+	/* Chain-head descriptor words 4/5 snapshot (gpu31-lastjob):
+	 * stamped at SUBMIT from the mapped descriptor BO (w4 holds
+	 * bit0 + type + index, w5 the dep pair). The dispatch path
+	 * uses w4 bit0 for variant A; the dump/ERR paths print all
+	 * 8 words for the working-vs-faulting discriminator. Zero
+	 * when the submit-time snapshot was unavailable. */
+	uint32_t desc_w4;
+	uint32_t desc_w5;
 
 	/* Fences. done_fence owns the run_job ref and is signaled by the
 	 * JOB_INT handler (or the fault-recovery path, F-JOB4);
@@ -152,6 +160,15 @@ struct p7580_job_dev {
 	void *pm_dev;
 	int (*pm_get)(void *dev);
 	void (*pm_put)(void *dev);
+	/* Chain-bit experiment (gpu31-lastjob): runtime switch, no
+	 * rebuild needed to A/B. 0 = off (both variants disabled,
+	 * submit bytes untouched); 1 = variant A (set JS_CONFIG
+	 * JOB_CHAIN_FLAG when the chain head's descriptor bit0 is
+	 * set); 2 = variant B (clear descriptor bit0, next stays
+	 * NULL, before submit-sync). Wired to the chain_mode debugfs
+	 * knob below; defaults to 0. Plain data, no locks beyond the
+	 * hw_lock writers already hold on the dispatch path. */
+	unsigned int chain_mode;
 };
 #else
 struct p7580_job_dev {
@@ -188,6 +205,11 @@ void p7580_job_dev_fini(struct p7580_job_dev *jd);
  * renders the last-dispatch snapshot + live slot registers into buf
  * (seq_file show; returns 0, prints "no job yet" when !valid). */
 void p7580_job_trace_arm(struct p7580_job_dev *jd, unsigned int n);
+/* Chain-bit experiment knob (gpu31-lastjob): write 0/1/2 selects the
+ * variant (0 off, 1 = A set cfg CHAIN flag on desc-bit0, 2 = B clear
+ * desc bit0 via the driver's pre-submit word patch). Applied on the
+ * dispatch path under hw_lock; no rebuild needed to A/B. */
+void p7580_job_chain_set(struct p7580_job_dev *jd, unsigned int mode);
 struct seq_file;
 int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m);
 /* CLEAR + unmask after reset/resume (power held by caller). */

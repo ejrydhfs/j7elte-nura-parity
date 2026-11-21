@@ -116,13 +116,15 @@ static unsigned int p7580_job_trace = P7580_JOB_TRACE_DEFAULT;
 static void p7580_job_err_pin(int slot, uint32_t js_status,
 			      uint32_t job_int_stat, uint32_t rawstat,
 			      uint64_t head, uint64_t tail,
-			      unsigned int seqno, uint64_t jc)
+			      unsigned int seqno, uint64_t jc,
+			      uint32_t desc_w4, uint32_t desc_w5,
+			      uint32_t cfg)
 {
-	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx\n",
+	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
 		slot, js_status, p7580_js_status_name(js_status),
 		job_int_stat, rawstat,
 		(unsigned long long)head, (unsigned long long)tail,
-		seqno, (unsigned long long)jc);
+		seqno, (unsigned long long)jc, desc_w4, desc_w5, cfg);
 }
 /* ------------------------------------------------------------------ */
 /* Register access                                                    */
@@ -288,6 +290,7 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	jd->trace_arm = p7580_job_trace;
 	jd->last.valid = 0;
 	jd->dbg_dir = NULL;
+	jd->chain_mode = 0;
 	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 		jd->in_flight[i] = NULL;
 		mask |= P7580_MK_JS_MASK(i);
@@ -388,6 +391,14 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 		       (uint32_t)(job->affinity >> 32));
 
 	cfg = p7580_js_config(job->as_nr);
+	/* Chain-bit experiment variant A (gpu31-lastjob): when the
+	 * chain head's descriptor bit0 (job_descriptor_size/chain
+	 * marker) is set, honour it in CONFIG_NEXT. T720 has no
+	 * JOBCHAIN_DISAMBIGUATION HW, but kbase still programs the
+	 * CHAIN bit from the atom; mode 1 mirrors that. Gated by the
+	 * chain_mode knob (0 = off, stock 0x83700 behaviour). */
+	if (jd->chain_mode == 1 && (job->desc_w4 & 0x1u))
+		cfg |= P7580_JS_CFG_JOB_CHAIN_FLAG;
 	p7580_js_write(jd, slot, P7580_JS_CONFIG_NEXT, cfg);
 
 	jd->in_flight[slot] = job;
@@ -423,9 +434,10 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 		jd->trace_left--;
 		rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
 		js_status = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_STATUS));
-		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u\n",
+		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u w4=0x%08x w5=0x%08x chain_mode=%u\n",
 			slot, (unsigned long long)job->jc, cfg, job->as_nr,
-			(unsigned long long)job->affinity, job->seqno);
+			(unsigned long long)job->affinity, job->seqno,
+			job->desc_w4, job->desc_w5, jd->chain_mode);
 		pr_info("p7580_job: post-start slot=%d rawstat=0x%08x js_status=0x%08x (%s)\n",
 			slot, rawstat, js_status,
 			p7580_js_status_name(js_status));
@@ -506,6 +518,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			uint64_t head, tail;
 			unsigned int seq = 0;
 			uint64_t jc = 0;
+			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
 
 			spin_lock_irqsave(&jd->hw_lock, flags);
 			job = jd->in_flight[j];
@@ -525,18 +538,23 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			if (job) {
 				seq = job->seqno;
 				jc = job->jc;
+				dw4 = job->desc_w4;
+				dw5 = job->desc_w5;
 			} else if (jd->last.valid &&
 				   jd->last.slot == (unsigned int)j) {
 				seq = jd->last.seqno;
 				jc = jd->last.jc;
 			}
+			if (jd->last.valid &&
+			    jd->last.slot == (unsigned int)j)
+				lcfg = jd->last.cfg;
 			/* ERR alongside DONE: always pin (never budgeted).
 			 * JS_STATUS can latch a fault code even when the
 			 * DONE bit also set (short chain / sticky bit). */
 			if (p7580_js_status_is_fault(js_status))
 				p7580_job_err_pin(j, js_status, status,
 						  rawstat, head, tail,
-						  seq, jc);
+						  seq, jc, dw4, dw5, lcfg);
 			if (jd->trace_left) {
 				jd->trace_left--;
 				pr_info("p7580_job: irq slot=%d stat=0x%08x js_status=0x%08x (%s) has_job=%d\n",
@@ -592,6 +610,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			uint64_t head, tail;
 			unsigned int seq = 0;
 			uint64_t jc = 0;
+			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
 
 			spin_lock_irqsave(&jd->hw_lock, flags);
 			es = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_STATUS));
@@ -601,13 +620,22 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			tail_hi = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_TAIL_HI));
 			head = ((uint64_t)head_hi << 32) | head_lo;
 			tail = ((uint64_t)tail_hi << 32) | tail_lo;
-			if (jd->last.valid &&
-			    jd->last.slot == (unsigned int)j) {
+			if (jd->in_flight[j]) {
+				seq = jd->in_flight[j]->seqno;
+				jc = jd->in_flight[j]->jc;
+				dw4 = jd->in_flight[j]->desc_w4;
+				dw5 = jd->in_flight[j]->desc_w5;
+			} else if (jd->last.valid &&
+				   jd->last.slot == (unsigned int)j) {
 				seq = jd->last.seqno;
 				jc = jd->last.jc;
 			}
+			if (jd->last.valid &&
+			    jd->last.slot == (unsigned int)j)
+				lcfg = jd->last.cfg;
 			p7580_job_err_pin(j, es, status, rawstat,
-					  head, tail, seq, jc);
+					  head, tail, seq, jc,
+					  dw4, dw5, lcfg);
 			if (jd->trace_left) {
 				jd->trace_left--;
 				pr_info("p7580_job: irq-err slot=%d stat=0x%08x js_status=0x%08x (%s)\n",
@@ -721,11 +749,13 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 		t_hi = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_TAIL_HI));
 		head = ((uint64_t)h_hi << 32) | h_lo;
 		tail = ((uint64_t)t_hi << 32) | t_lo;
-		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx\n",
+		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
 			slot, status, p7580_js_status_name(status),
 			t_stat, t_raw,
 			(unsigned long long)head, (unsigned long long)tail,
-			job->seqno, (unsigned long long)job->jc);
+			job->seqno, (unsigned long long)job->jc,
+			job->desc_w4, job->desc_w5,
+			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0);
 	}
 	p7580_job_recover(jd, slot, status);
 
@@ -1058,6 +1088,20 @@ void p7580_job_trace_arm(struct p7580_job_dev *jd, unsigned int n)
 	pr_info("p7580_job: trace re-armed to %u\n", n);
 }
 
+void p7580_job_chain_set(struct p7580_job_dev *jd, unsigned int mode)
+{
+	unsigned long flags;
+
+	if (!jd)
+		return;
+	if (mode > 2)
+		mode = 0;
+	spin_lock_irqsave(&jd->hw_lock, flags);
+	jd->chain_mode = mode;
+	spin_unlock_irqrestore(&jd->hw_lock, flags);
+	pr_info("p7580_job: chain_mode set to %u\n", mode);
+}
+
 int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 {
 	unsigned long flags;
@@ -1153,6 +1197,25 @@ static int p7580_job_trace_set(void *data, u64 val)
 DEFINE_SIMPLE_ATTRIBUTE(p7580_job_trace_fops, p7580_job_trace_get,
 			p7580_job_trace_set, "%llu\n");
 
+static int p7580_job_chain_get(void *data, u64 *val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd || !val)
+		return -EINVAL;
+	*val = jd->chain_mode;
+	return 0;
+}
+
+static int p7580_job_chain_set_k(void *data, u64 val)
+{
+	p7580_job_chain_set(data, (unsigned int)val);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(p7580_job_chain_fops, p7580_job_chain_get,
+			p7580_job_chain_set_k, "%llu\n");
+
 static int p7580_job_dump_show_seq(struct seq_file *m, void *v)
 {
 	struct p7580_job_dev *jd = m->private;
@@ -1188,6 +1251,10 @@ static void p7580_job_debugfs_init(struct p7580_job_dev *jd)
 				&p7580_job_trace_fops);
 	if (IS_ERR_OR_NULL(f))
 		pr_info("p7580_job: trace_arm knob unavailable\n");
+	f = debugfs_create_file("chain_mode", 0600, dir, jd,
+				&p7580_job_chain_fops);
+	if (IS_ERR_OR_NULL(f))
+		pr_info("p7580_job: chain_mode knob unavailable\n");
 	f = debugfs_create_file("dump", 0400, dir, jd,
 				&p7580_job_dump_fops);
 	if (IS_ERR_OR_NULL(f))

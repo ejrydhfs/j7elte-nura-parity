@@ -96,9 +96,17 @@ Findings:
   `glFinish` flush; `has_frag = has_tiler || batch->clear` is true,
   `has_draws` true).
 - What it should do: run on JS0 like its 60 twins (slot mapping is
-  correct, `p7580_job_slot`: FS → JS0). No different slot/cfg/skip
-  is indicated — the bytes are a legal FRAGMENT job. The defect is
-  driver-side (why the JM rejects this fetch), not Mesa content.
+  correct, `p7580_job_slot`: FS → JS0). The bytes are a legal FRAGMENT
+  job — but Main's chain-bit hypothesis reframes them: faulting `w4`
+  has **bit0 set** with `next=NULL`, while `JS_CONFIG` (`0x83700`)
+  has `JOB_CHAIN_FLAG` (bit 11) **clear**. For a chain-marked head
+  with a null successor the JM can report INSTR_TYPE_MISMATCH.
+  Update 2026-11-21 (chain-bit experiment, this ticket): the
+  discriminator test is now in-tree — every dispatch/ERR/TIMEOUT
+  line prints `w4`/`w5`/`cfg`, so the 60 working fragments' `w4`
+  vs the faulting `w4=0x00010013` is directly comparable on silicon.
+  Both A/B variants are implemented behind the `chain_mode`
+  debugfs knob (no rebuild to A/B).
 
 ## 3. Fixes (repo-side, this ticket)
 
@@ -132,8 +140,30 @@ Verification exercised: host `jobs/job_test` PASS (all checks);
 `git apply --check` clean on the full 19-block patch; phone-side
 `dump` re-read pending Main's int24 flash (acceptance §4).
 
-### 3b. Faulting-submit handling
+### 3b. Chain-bit experiment (Main's hypothesis, this ticket)
 
+Hypothesis: faulting fragment `w4=0x00010013` (bit0 set, `next=NULL`)
+with `JS_CONFIG=0x83700` (`JOB_CHAIN_FLAG` bit 11 clear) is a
+JM-visible contradiction; the 60 working fragments decide it (their
+`w4` now prints on every dispatch line, §4 sequence step 2). Given
+T720 has no JOBCHAIN_DISAMBIGUATION HW, variant B may be correct;
+A mirrors kbase, which programs CHAIN from the atom. Both are
+in-tree behind one runtime switch — no rebuild to A/B:
+
+- `code/gpu31/jobs/panfrost7580_job.{h,c}`: `struct p7580_submit_job`
+  gains `desc_w4`/`desc_w5` (stamped at SUBMIT); `struct p7580_job_dev`
+  gains `chain_mode` (0 = off, 1 = A, 2 = B, default 0); dispatch
+  applies variant A (`cfg |= JOB_CHAIN_FLAG` when `desc_w4 & 1`);
+  every dispatch/ERR/TIMEOUT line prints `w4`/`w5`/`cfg`; new
+  `chain_mode` (0600) + `p7580_job_chain_set` debugfs knob.
+- `code/gpu31/driver/0001-...-driver-sources.patch`: job.c/job.h
+  blocks regen'd (`--check` clean); `p7580_drv_submit` snapshots
+  `w4`/`w5` from the mapped descriptor BO (kmap_atomic + done-sync
+  invalidate, cross-page guarded, `iova_valid` checked) and, in
+  mode 2 only, clears descriptor bit0 in the BO (`next` stays NULL)
+  then re-drains via `p7580_gem_submit_sync`.
+
+### 3c. Faulting-submit handling (pre-chain-bit analysis)
 No Mesa-content fix is warranted (bytes proven good, §1). The
 deterministic last-only signature with a valid descriptor and a
 resident mapping points at slot/JM state at end-of-batch rather than
@@ -149,19 +179,46 @@ identical bytes, the remaining suspects are (1) JS_HEAD/latch
 staleness on the recycled IOVA, (2) upscale the fragment submit to
 carry an explicit dep on the last chain fence.
 
-## 4. Verification status (honest)
+## 4. Verification status + device test sequence (Main: int24 build + flash)
 
-- `egltest` full run on the current phone kernel: **NOT 0 ERR** —
-  `ERR slot=0 js_status=0x52 ... seq=121` + TIMEOUT, `corner` OK,
-  `centre` clear (`RENDER_MISMATCH`). This matches the pre-fix
-  kernel, not a failure of the §3a fix (which is not flashed).
-- Exercised: descriptor dump (CPU == kernel, §1), host `job_test`
-  PASS, patch `--check` clean. NOT exercised: on-silicon `dump`
-  read, int23+§3a flash, 0-ERR egltest run.
-- Required Main actions: rebuild int24 (this ticket + int23),
-  flash, `dmesg -c`, `/data/eglrun.sh`, expect zero `ERR` lines;
-  `cat /sys/kernel/debug/p7580/dump` must print the `last ...` view
-  (or `... dark`) with no oops.
+Exercised this ticket: descriptor dump (CPU == kernel, §1),
+host `job_test` PASS, patch `git apply --check` clean (19 blocks).
+NOT exercised (phone runs a pre-int23 kernel): on-silicon `dump`
+read, 0-ERR egltest run. The pre-fix-kernel run still shows the
+seq=121 `0x52` ERR — expected, not a failure of the unflashed fix.
+
+One image covers all arms (runtime switch, no reflash between arms):
+
+```
+# 0. flash int24 (int23 excl publish + this ticket), boot, clear ring
+/usr/local/bin/rootshell "dmesg -c >/dev/null"
+# 1. baseline (chain_mode=0, stock cfg 0x83700): expect seq=121 ERR w4=0x00010013
+/usr/local/bin/rootshell "dmesg -c >/dev/null; /data/wdarm 14 /data/eglrun.sh"
+/usr/local/bin/rootshell "dmesg | grep 'p7580_job: ERR' | tail -3"
+# 2. discriminator: working fragments' w4 (trace first submits)
+/usr/local/bin/rootshell "echo 8 > /sys/kernel/debug/p7580/trace_arm"
+/usr/local/bin/rootshell "dmesg -c >/dev/null; /data/wdarm 14 /data/eglrun.sh"
+/usr/local/bin/rootshell "dmesg | grep 'p7580_job: dispatch' | head -8"
+#    compare: working fragment w4 vs faulting w4=0x00010013 (bit0 set?)
+# 3. variant A (set CHAIN flag when desc bit0 set)
+/usr/local/bin/rootshell "echo 1 > /sys/kernel/debug/p7580/chain_mode"
+/usr/local/bin/rootshell "dmesg -c >/dev/null; /data/wdarm 14 /data/eglrun.sh"
+/usr/local/bin/rootshell "dmesg | grep -E 'p7580_job: (ERR|TIMEOUT)' | tail -5"
+#    if A correct: zero ERRs (centre may stay clear: triangle is separate)
+# 4. variant B (clear desc bit0, next stays NULL)
+/usr/local/bin/rootshell "echo 2 > /sys/kernel/debug/p7580/chain_mode"
+/usr/local/bin/rootshell "dmesg -c >/dev/null; /data/wdarm 14 /data/eglrun.sh"
+/usr/local/bin/rootshell "dmesg | grep -E 'p7580_job: (ERR|TIMEOUT)' | tail -5"
+# 5. dump knob (PM-hold fix): must not oops, live or dark-marked
+/usr/local/bin/rootshell "cat /sys/kernel/debug/p7580/dump"
+# 6. restore stock
+/usr/local/bin/rootshell "echo 0 > /sys/kernel/debug/p7580/chain_mode"
+```
+
+Acceptance: §1 descriptor + §2 Mesa origin (done); `dump` clean
+(§3a); zero-ERR arm recorded (A or B) with centre-pixel note (a
+zero-ERR run with clear centre still advances this ticket; the
+triangle is separate).
 
 Device-only artefacts (not committed, stay on phone): `/tmp/g31last*.c`,
 `/tmp/g31last*.so`, `/tmp/g31last.log`, `/tmp/egl.ioctl`.
