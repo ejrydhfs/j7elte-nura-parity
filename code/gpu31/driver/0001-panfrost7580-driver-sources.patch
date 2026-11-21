@@ -2360,7 +2360,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1420 @@
+@@ -0,0 +1,1439 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -2484,7 +2484,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			      uint32_t job_int_stat, uint32_t rawstat,
 +			      uint64_t head, uint64_t tail,
 +			      unsigned int seqno, uint64_t jc,
-+			      uint32_t desc_w4, uint32_t desc_w5,
++			      const uint32_t *sw,
 +			      uint32_t cfg,
 +			      int (*resolve)(void *priv, char *buf,
 +					     size_t len,
@@ -2499,11 +2499,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	char map[256];
 +	int mlen = 0;
 +
-+	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
++	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 +		slot, js_status, p7580_js_status_name(js_status),
 +		job_int_stat, rawstat,
 +		(unsigned long long)head, (unsigned long long)tail,
-+		seqno, (unsigned long long)jc, desc_w4, desc_w5, cfg);
++		seqno, (unsigned long long)jc, cfg,
++		sw ? sw[0] : 0, sw ? sw[1] : 0, sw ? sw[2] : 0, sw ? sw[3] : 0,
++		sw ? sw[4] : 0, sw ? sw[5] : 0, sw ? sw[6] : 0, sw ? sw[7] : 0);
 +	if (resolve && handles && addrs && sizes && n) {
 +		mlen = resolve(resolve_priv, map, sizeof(map),
 +			       handles, addrs, sizes, n);
@@ -2805,14 +2807,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	 * JOBCHAIN_DISAMBIGUATION HW, but kbase still programs the
 +	 * CHAIN bit from the atom; mode 1 mirrors that. Gated by the
 +	 * chain_mode knob (0 = off, stock 0x83700 behaviour). */
-+	if (jd->chain_mode == 1 && (job->desc_w4 & 0x1u))
++	if (jd->chain_mode == 1 && (job->desc[4] & 0x1u))
 +		cfg |= P7580_JS_CFG_JOB_CHAIN_FLAG;
 +	p7580_js_write(jd, slot, P7580_JS_CONFIG_NEXT, cfg);
 +
 +	jd->in_flight[slot] = job;
 +	/* Last-dispatch snapshot (always, not budget-gated): the ERR /
 +	 * timeout / dump paths report the faulting job from here, so
-+	 * fault detail survives budget exhaustion. Under hw_lock. */
++	 * fault detail survives budget exhaustion. Under hw_lock. The
++	 * sw[] copy is 8 plain u32 stores, IRQ-safe (no GEM deref). */
 +	jd->last.valid = 1;
 +	jd->last.slot = (unsigned int)slot;
 +	jd->last.seqno = job->seqno;
@@ -2820,6 +2823,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	jd->last.cfg = cfg;
 +	jd->last.as_nr = job->as_nr;
 +	jd->last.affinity = job->affinity;
++	jd->last.sw[0] = job->desc[0];
++	jd->last.sw[1] = job->desc[1];
++	jd->last.sw[2] = job->desc[2];
++	jd->last.sw[3] = job->desc[3];
++	jd->last.sw[4] = job->desc[4];
++	jd->last.sw[5] = job->desc[5];
++	jd->last.sw[6] = job->desc[6];
++	jd->last.sw[7] = job->desc[7];
 +
 +	/* GO. One wmb() before START: the HEAD/AFFINITY/CONFIG writes
 +	 * must be visible to the JM before the command latches (same
@@ -2842,10 +2853,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		jd->trace_left--;
 +		rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
 +		js_status = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_STATUS));
-+		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u w4=0x%08x w5=0x%08x chain_mode=%u\n",
++		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u sw=%08x %08x %08x %08x %08x %08x %08x %08x chain_mode=%u\n",
 +			slot, (unsigned long long)job->jc, cfg, job->as_nr,
 +			(unsigned long long)job->affinity, job->seqno,
-+			job->desc_w4, job->desc_w5, jd->chain_mode);
++			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
++			job->desc[4], job->desc[5], job->desc[6], job->desc[7],
++			jd->chain_mode);
 +		pr_info("p7580_job: post-start slot=%d rawstat=0x%08x js_status=0x%08x (%s)\n",
 +			slot, rawstat, js_status,
 +			p7580_js_status_name(js_status));
@@ -2926,7 +2939,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			uint64_t head, tail;
 +			unsigned int seq = 0;
 +			uint64_t jc = 0;
-+			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
++			const uint32_t *swp = NULL;
++			uint32_t lcfg = 0;
 +			const uint32_t *eh = NULL;
 +			const uint64_t *ea = NULL;
 +			const uint32_t *ez = NULL;
@@ -2950,8 +2964,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			if (job) {
 +				seq = job->seqno;
 +				jc = job->jc;
-+				dw4 = job->desc_w4;
-+				dw5 = job->desc_w5;
++				swp = job->desc;
 +				/* gpu31-iova: snapshot stamped at SUBMIT
 +				 * while the job owned refs; the resolver
 +				 * renders it without touching GEM. */
@@ -2963,6 +2976,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +				   jd->last.slot == (unsigned int)j) {
 +				seq = jd->last.seqno;
 +				jc = jd->last.jc;
++				swp = jd->last.sw;
 +			}
 +			if (jd->last.valid &&
 +			    jd->last.slot == (unsigned int)j)
@@ -2973,7 +2987,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			if (p7580_js_status_is_fault(js_status))
 +				p7580_job_err_pin(j, js_status, status,
 +						  rawstat, head, tail,
-+						  seq, jc, dw4, dw5, lcfg,
++						  seq, jc, swp, lcfg,
 +						  jd->iova_resolve,
 +						  jd->iova_resolve_priv,
 +						  eh, ea, ez, en);
@@ -3032,7 +3046,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			uint64_t head, tail;
 +			unsigned int seq = 0;
 +			uint64_t jc = 0;
-+			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
++			const uint32_t *swp = NULL;
++			uint32_t lcfg = 0;
 +			const uint32_t *eh = NULL;
 +			const uint64_t *ea = NULL;
 +			const uint32_t *ez = NULL;
@@ -3049,8 +3064,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			if (jd->in_flight[j]) {
 +				seq = jd->in_flight[j]->seqno;
 +				jc = jd->in_flight[j]->jc;
-+				dw4 = jd->in_flight[j]->desc_w4;
-+				dw5 = jd->in_flight[j]->desc_w5;
++				swp = jd->in_flight[j]->desc;
 +				eh = jd->in_flight[j]->iova_handles;
 +				ea = jd->in_flight[j]->iova_addrs;
 +				ez = jd->in_flight[j]->iova_sizes;
@@ -3059,13 +3073,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +				   jd->last.slot == (unsigned int)j) {
 +				seq = jd->last.seqno;
 +				jc = jd->last.jc;
++				swp = jd->last.sw;
 +			}
 +			if (jd->last.valid &&
 +			    jd->last.slot == (unsigned int)j)
 +				lcfg = jd->last.cfg;
 +			p7580_job_err_pin(j, es, status, rawstat,
 +					  head, tail, seq, jc,
-+					  dw4, dw5, lcfg,
++					  swp, lcfg,
 +					  jd->iova_resolve,
 +					  jd->iova_resolve_priv,
 +					  eh, ea, ez, en);
@@ -3204,13 +3219,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		t_hi = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_TAIL_HI));
 +		head = ((uint64_t)h_hi << 32) | h_lo;
 +		tail = ((uint64_t)t_hi << 32) | t_lo;
-+		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
++		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 +			slot, status, p7580_js_status_name(status),
 +			t_stat, t_raw,
 +			(unsigned long long)head, (unsigned long long)tail,
 +			job->seqno, (unsigned long long)job->jc,
-+			job->desc_w4, job->desc_w5,
-+			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0);
++			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0,
++			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
++			job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
 +		/* gpu31-iova: same mapping line as the ERR pin (process
 +		 * context here, but the hook is IRQ-safe anyway). */
 +		if (jd->iova_resolve && job->iova_handles &&
@@ -3623,6 +3639,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		   last.slot, last.seqno, (unsigned long long)last.jc,
 +		   last.cfg, last.as_nr, (unsigned long long)last.affinity,
 +		   jd->trace_arm, jd->trace_left, pm ? " dark" : "");
++	seq_printf(m, "sw %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		   last.sw[0], last.sw[1], last.sw[2], last.sw[3],
++		   last.sw[4], last.sw[5], last.sw[6], last.sw[7]);
 +	seq_printf(m, "job_int stat=0x%08x rawstat=0x%08x mask=0x%08x js_present=0x%x pgd=0x%llx\n",
 +		   job_stat, job_raw, job_mask, jd->js_present,
 +		   (unsigned long long)jd->pgd_dma);
@@ -3784,7 +3803,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,289 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3843,14 +3862,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +					 * (0 = none; validated at SUBMIT,
 +					 * installed from sched_job->fence
 +					 * during the ioctl) */
-+	/* Chain-head descriptor words 4/5 snapshot (gpu31-lastjob):
-+	 * stamped at SUBMIT from the mapped descriptor BO (w4 holds
-+	 * bit0 + type + index, w5 the dep pair). The dispatch path
-+	 * uses w4 bit0 for variant A; the dump/ERR paths print all
-+	 * 8 words for the working-vs-faulting discriminator. Zero
-+	 * when the submit-time snapshot was unavailable. */
-+	uint32_t desc_w4;
-+	uint32_t desc_w5;
++	/* SUBMIT-time chain-head descriptor snapshot (gpu31-lastjob,
++	 * extended gpu31-submitsnap): the 8 words at jc, read from the
++	 * mapped descriptor BO before submit-sync (same invalidate the
++	 * completion path runs, so the snapshot sees CPU bytes).
++	 * desc[4] carries bit0 (job_descriptor_size) + type + index
++	 * for the chain_mode/dispatch consumer, desc[5] the dep pair;
++	 * the ERR/TIMEOUT/dispatch/PTEWALK lines print all 8 words
++	 * next to the fault-time bytes for the working-vs-faulting
++	 * discriminator. All zeros when the submit-time snapshot was
++	 * unavailable (cross-page jc, unmapped page, jc outside every
++	 * submitted BO). */
++	uint32_t desc[8];
 +	/* gpu31-iova: BO identity snapshot for fault-time mapping dump.
 +	 * Stamped at SUBMIT (stable handles + IOVA/size while the job
 +	 * owns refs): iova_bo_count entries of {handle, iova, size}.
@@ -3917,6 +3940,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	uint32_t cfg;		/* CONFIG_NEXT value actually written */
 +	uint32_t as_nr;		/* job->as_nr at dispatch */
 +	uint64_t affinity;	/* job->affinity at dispatch */
++	uint32_t sw[8];		/* SUBMIT-time descriptor words */
 +};
 +#ifdef __KERNEL__
 +struct p7580_job_dev {
@@ -6151,7 +6175,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1542 @@
+@@ -0,0 +1,1547 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6639,7 +6663,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		have_bytes = 1;
 +	}
 +	if (have_bytes && owner && owner_bo) {
-+		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s snap=0x%llx/0x%zx live=0x%llx/0x%zx iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s snap=0x%llx/0x%zx live=0x%llx/0x%zx iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 +		       slot, seq, (unsigned long long)jc,
 +		       (unsigned long long)leaf_pte,
 +		       (unsigned long long)leaf_phys,
@@ -6649,16 +6673,20 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		       (unsigned long long)live_iova, live_size,
 +		       owner_iova, owner_npages,
 +		       pw[0], pw[1], pw[2], pw[3],
-+		       pw[4], pw[5], pw[6], pw[7]);
++		       pw[4], pw[5], pw[6], pw[7],
++		       job->desc[0], job->desc[1], job->desc[2], job->desc[3],
++		       job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
 +	} else {
-+		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx NO-OWNER snap=0x%llx/0x%zx live=0x%llx/0x%zx w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx NO-OWNER snap=0x%llx/0x%zx live=0x%llx/0x%zx w=%08x %08x %08x %08x %08x %08x %08x %08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 +		       slot, seq, (unsigned long long)jc,
 +		       (unsigned long long)leaf_pte,
 +		       (unsigned long long)leaf_phys,
 +		       (unsigned long long)snap_iova, snap_size,
 +		       (unsigned long long)live_iova, live_size,
 +		       pw[0], pw[1], pw[2], pw[3],
-+		       pw[4], pw[5], pw[6], pw[7]);
++		       pw[4], pw[5], pw[6], pw[7],
++		       job->desc[0], job->desc[1], job->desc[2], job->desc[3],
++		       job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
 +	}
 +	if (live_obj)
 +		drm_gem_object_unreference_unlocked(live_obj);
@@ -7386,14 +7414,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	job->requirements = args->requirements;
 +	job->as_nr = P7580_DRV_AS_NR;
 +	job->affinity = drv->jd.shader_present;
-+	job->desc_w4 = 0;
-+	job->desc_w5 = 0;
-+	/* Chain-bit experiment (gpu31-lastjob): snapshot the chain-head
-+	 * descriptor words 4/5 from the mapped BO before submit-sync.
-+	 * Variant B (chain_mode==2) clears descriptor bit0 in the
-+	 * submit-time snapshot consumed at dispatch; the stored BO
-+	 * bytes are patched too (via vmap + submit-sync re-drain),
-+	 * next pointer stays NULL. Mode 0/1 snapshot only. */
++	/* SUBMIT-time descriptor snapshot (gpu31-lastjob, extended
++	 * gpu31-submitsnap): the 8 words at jc, read from the mapped
++	 * BO before submit-sync. Variant B (chain_mode==2) clears
++	 * descriptor bit0 in the snapshot consumed at dispatch; the
++	 * stored BO bytes are patched too (via vmap + submit-sync
++	 * re-drain), next pointer stays NULL. Mode 0/1 snapshot only.
++	 * Stays zero when the snapshot is unavailable (cross-page jc,
++	 * unmapped page, jc outside every submitted BO). */
 +	{
 +		struct p7580_bo *jbo = NULL;
 +		unsigned int bi;
@@ -7414,20 +7442,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			if (idx < jbo->nr_pages && jbo->pages[idx] &&
 +			    poff + 32 <= PAGE_SIZE) {
 +				void *kv;
-+				uint32_t w4, w5;
++				unsigned int wi;
 +				/* Same invalidate the completion path
 +				 * runs, so the snapshot sees CPU bytes. */
 +				p7580_gem_job_done_sync(&jbo->base);
 +				kv = kmap_atomic(jbo->pages[idx]);
-+				w4 = *(uint32_t *)((char *)kv + poff + 16);
-+				w5 = *(uint32_t *)((char *)kv + poff + 20);
-+				if (drv->jd.chain_mode == 2)
++				for (wi = 0; wi < 8; wi++)
++					job->desc[wi] =
++						*(uint32_t *)((char *)kv +
++							poff + wi * 4);
++				if (drv->jd.chain_mode == 2) {
++					job->desc[4] &= ~0x1u;
 +					*(uint32_t *)((char *)kv + poff + 16) =
-+						w4 & ~0x1u;
++						job->desc[4];
++				}
 +				kunmap_atomic(kv);
-+				job->desc_w4 = (drv->jd.chain_mode == 2) ?
-+					(w4 & ~0x1u) : w4;
-+				job->desc_w5 = w5;
 +				if (drv->jd.chain_mode == 2)
 +					p7580_gem_submit_sync(&jbo->base);
 +			}

@@ -121,7 +121,7 @@ static void p7580_job_err_pin(int slot, uint32_t js_status,
 			      uint32_t job_int_stat, uint32_t rawstat,
 			      uint64_t head, uint64_t tail,
 			      unsigned int seqno, uint64_t jc,
-			      uint32_t desc_w4, uint32_t desc_w5,
+			      const uint32_t *sw,
 			      uint32_t cfg,
 			      int (*resolve)(void *priv, char *buf,
 					     size_t len,
@@ -136,11 +136,13 @@ static void p7580_job_err_pin(int slot, uint32_t js_status,
 	char map[256];
 	int mlen = 0;
 
-	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
+	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 		slot, js_status, p7580_js_status_name(js_status),
 		job_int_stat, rawstat,
 		(unsigned long long)head, (unsigned long long)tail,
-		seqno, (unsigned long long)jc, desc_w4, desc_w5, cfg);
+		seqno, (unsigned long long)jc, cfg,
+		sw ? sw[0] : 0, sw ? sw[1] : 0, sw ? sw[2] : 0, sw ? sw[3] : 0,
+		sw ? sw[4] : 0, sw ? sw[5] : 0, sw ? sw[6] : 0, sw ? sw[7] : 0);
 	if (resolve && handles && addrs && sizes && n) {
 		mlen = resolve(resolve_priv, map, sizeof(map),
 			       handles, addrs, sizes, n);
@@ -442,14 +444,15 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 	 * JOBCHAIN_DISAMBIGUATION HW, but kbase still programs the
 	 * CHAIN bit from the atom; mode 1 mirrors that. Gated by the
 	 * chain_mode knob (0 = off, stock 0x83700 behaviour). */
-	if (jd->chain_mode == 1 && (job->desc_w4 & 0x1u))
+	if (jd->chain_mode == 1 && (job->desc[4] & 0x1u))
 		cfg |= P7580_JS_CFG_JOB_CHAIN_FLAG;
 	p7580_js_write(jd, slot, P7580_JS_CONFIG_NEXT, cfg);
 
 	jd->in_flight[slot] = job;
 	/* Last-dispatch snapshot (always, not budget-gated): the ERR /
 	 * timeout / dump paths report the faulting job from here, so
-	 * fault detail survives budget exhaustion. Under hw_lock. */
+	 * fault detail survives budget exhaustion. Under hw_lock. The
+	 * sw[] copy is 8 plain u32 stores, IRQ-safe (no GEM deref). */
 	jd->last.valid = 1;
 	jd->last.slot = (unsigned int)slot;
 	jd->last.seqno = job->seqno;
@@ -457,6 +460,14 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 	jd->last.cfg = cfg;
 	jd->last.as_nr = job->as_nr;
 	jd->last.affinity = job->affinity;
+	jd->last.sw[0] = job->desc[0];
+	jd->last.sw[1] = job->desc[1];
+	jd->last.sw[2] = job->desc[2];
+	jd->last.sw[3] = job->desc[3];
+	jd->last.sw[4] = job->desc[4];
+	jd->last.sw[5] = job->desc[5];
+	jd->last.sw[6] = job->desc[6];
+	jd->last.sw[7] = job->desc[7];
 
 	/* GO. One wmb() before START: the HEAD/AFFINITY/CONFIG writes
 	 * must be visible to the JM before the command latches (same
@@ -479,10 +490,12 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 		jd->trace_left--;
 		rawstat = p7580_readl(jd, P7580_JOB_INT_RAWSTAT);
 		js_status = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_STATUS));
-		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u w4=0x%08x w5=0x%08x chain_mode=%u\n",
+		pr_info("p7580_job: dispatch slot=%d jc=0x%llx cfg=0x%08x as=%u aff=0x%llx seq=%u sw=%08x %08x %08x %08x %08x %08x %08x %08x chain_mode=%u\n",
 			slot, (unsigned long long)job->jc, cfg, job->as_nr,
 			(unsigned long long)job->affinity, job->seqno,
-			job->desc_w4, job->desc_w5, jd->chain_mode);
+			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
+			job->desc[4], job->desc[5], job->desc[6], job->desc[7],
+			jd->chain_mode);
 		pr_info("p7580_job: post-start slot=%d rawstat=0x%08x js_status=0x%08x (%s)\n",
 			slot, rawstat, js_status,
 			p7580_js_status_name(js_status));
@@ -563,7 +576,8 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			uint64_t head, tail;
 			unsigned int seq = 0;
 			uint64_t jc = 0;
-			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
+			const uint32_t *swp = NULL;
+			uint32_t lcfg = 0;
 			const uint32_t *eh = NULL;
 			const uint64_t *ea = NULL;
 			const uint32_t *ez = NULL;
@@ -587,8 +601,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			if (job) {
 				seq = job->seqno;
 				jc = job->jc;
-				dw4 = job->desc_w4;
-				dw5 = job->desc_w5;
+				swp = job->desc;
 				/* gpu31-iova: snapshot stamped at SUBMIT
 				 * while the job owned refs; the resolver
 				 * renders it without touching GEM. */
@@ -600,6 +613,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 				   jd->last.slot == (unsigned int)j) {
 				seq = jd->last.seqno;
 				jc = jd->last.jc;
+				swp = jd->last.sw;
 			}
 			if (jd->last.valid &&
 			    jd->last.slot == (unsigned int)j)
@@ -610,7 +624,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			if (p7580_js_status_is_fault(js_status))
 				p7580_job_err_pin(j, js_status, status,
 						  rawstat, head, tail,
-						  seq, jc, dw4, dw5, lcfg,
+						  seq, jc, swp, lcfg,
 						  jd->iova_resolve,
 						  jd->iova_resolve_priv,
 						  eh, ea, ez, en);
@@ -669,7 +683,8 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			uint64_t head, tail;
 			unsigned int seq = 0;
 			uint64_t jc = 0;
-			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
+			const uint32_t *swp = NULL;
+			uint32_t lcfg = 0;
 			const uint32_t *eh = NULL;
 			const uint64_t *ea = NULL;
 			const uint32_t *ez = NULL;
@@ -686,8 +701,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			if (jd->in_flight[j]) {
 				seq = jd->in_flight[j]->seqno;
 				jc = jd->in_flight[j]->jc;
-				dw4 = jd->in_flight[j]->desc_w4;
-				dw5 = jd->in_flight[j]->desc_w5;
+				swp = jd->in_flight[j]->desc;
 				eh = jd->in_flight[j]->iova_handles;
 				ea = jd->in_flight[j]->iova_addrs;
 				ez = jd->in_flight[j]->iova_sizes;
@@ -696,13 +710,14 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 				   jd->last.slot == (unsigned int)j) {
 				seq = jd->last.seqno;
 				jc = jd->last.jc;
+				swp = jd->last.sw;
 			}
 			if (jd->last.valid &&
 			    jd->last.slot == (unsigned int)j)
 				lcfg = jd->last.cfg;
 			p7580_job_err_pin(j, es, status, rawstat,
 					  head, tail, seq, jc,
-					  dw4, dw5, lcfg,
+					  swp, lcfg,
 					  jd->iova_resolve,
 					  jd->iova_resolve_priv,
 					  eh, ea, ez, en);
@@ -841,13 +856,14 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 		t_hi = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_TAIL_HI));
 		head = ((uint64_t)h_hi << 32) | h_lo;
 		tail = ((uint64_t)t_hi << 32) | t_lo;
-		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
+		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 			slot, status, p7580_js_status_name(status),
 			t_stat, t_raw,
 			(unsigned long long)head, (unsigned long long)tail,
 			job->seqno, (unsigned long long)job->jc,
-			job->desc_w4, job->desc_w5,
-			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0);
+			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0,
+			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
+			job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
 		/* gpu31-iova: same mapping line as the ERR pin (process
 		 * context here, but the hook is IRQ-safe anyway). */
 		if (jd->iova_resolve && job->iova_handles &&
@@ -1260,6 +1276,9 @@ int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 		   last.slot, last.seqno, (unsigned long long)last.jc,
 		   last.cfg, last.as_nr, (unsigned long long)last.affinity,
 		   jd->trace_arm, jd->trace_left, pm ? " dark" : "");
+	seq_printf(m, "sw %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		   last.sw[0], last.sw[1], last.sw[2], last.sw[3],
+		   last.sw[4], last.sw[5], last.sw[6], last.sw[7]);
 	seq_printf(m, "job_int stat=0x%08x rawstat=0x%08x mask=0x%08x js_present=0x%x pgd=0x%llx\n",
 		   job_stat, job_raw, job_mask, jd->js_present,
 		   (unsigned long long)jd->pgd_dma);

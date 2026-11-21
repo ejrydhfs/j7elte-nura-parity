@@ -56,14 +56,18 @@ struct p7580_submit_job {
 					 * (0 = none; validated at SUBMIT,
 					 * installed from sched_job->fence
 					 * during the ioctl) */
-	/* Chain-head descriptor words 4/5 snapshot (gpu31-lastjob):
-	 * stamped at SUBMIT from the mapped descriptor BO (w4 holds
-	 * bit0 + type + index, w5 the dep pair). The dispatch path
-	 * uses w4 bit0 for variant A; the dump/ERR paths print all
-	 * 8 words for the working-vs-faulting discriminator. Zero
-	 * when the submit-time snapshot was unavailable. */
-	uint32_t desc_w4;
-	uint32_t desc_w5;
+	/* SUBMIT-time chain-head descriptor snapshot (gpu31-lastjob,
+	 * extended gpu31-submitsnap): the 8 words at jc, read from the
+	 * mapped descriptor BO before submit-sync (same invalidate the
+	 * completion path runs, so the snapshot sees CPU bytes).
+	 * desc[4] carries bit0 (job_descriptor_size) + type + index
+	 * for the chain_mode/dispatch consumer, desc[5] the dep pair;
+	 * the ERR/TIMEOUT/dispatch/PTEWALK lines print all 8 words
+	 * next to the fault-time bytes for the working-vs-faulting
+	 * discriminator. All zeros when the submit-time snapshot was
+	 * unavailable (cross-page jc, unmapped page, jc outside every
+	 * submitted BO). */
+	uint32_t desc[8];
 	/* gpu31-iova: BO identity snapshot for fault-time mapping dump.
 	 * Stamped at SUBMIT (stable handles + IOVA/size while the job
 	 * owns refs): iova_bo_count entries of {handle, iova, size}.
@@ -130,6 +134,7 @@ struct p7580_job_last {
 	uint32_t cfg;		/* CONFIG_NEXT value actually written */
 	uint32_t as_nr;		/* job->as_nr at dispatch */
 	uint64_t affinity;	/* job->affinity at dispatch */
+	uint32_t sw[8];		/* SUBMIT-time descriptor words */
 };
 #ifdef __KERNEL__
 struct p7580_job_dev {
