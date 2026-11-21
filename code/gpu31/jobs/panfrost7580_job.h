@@ -101,7 +101,20 @@ struct p7580_file_ctx {
 	void *sched_entity[P7580_NUM_JOB_SLOTS];
 	void *syncobj_mgr;		/* backport drm_syncobj_manager */
 };
-
+/* Last-job snapshot: what the ERR pins and the dump knob report. */
+/* Updated (under hw_lock) at every hw_submit dispatch for the next */
+/* OUTCOME print (DONE/ERR/timeout), so the fault register capture */
+/* follows the faulting submit even after the 8-job startup budget */
+/* is exhausted. Plain data: no pointers, no locks, seq_file-safe. */
+struct p7580_job_last {
+	unsigned int valid;	/* 0 until the first dispatch */
+	unsigned int slot;	/* job->slot at dispatch */
+	unsigned int seqno;	/* job->seqno at dispatch */
+	uint64_t jc;		/* GPU address latched to HEAD_NEXT */
+	uint32_t cfg;		/* CONFIG_NEXT value actually written */
+	uint32_t as_nr;		/* job->as_nr at dispatch */
+	uint64_t affinity;	/* job->affinity at dispatch */
+};
 #ifdef __KERNEL__
 struct p7580_job_dev {
 	void __iomem *regs;
@@ -116,9 +129,20 @@ struct p7580_job_dev {
 	uint64_t emit_seqno[P7580_NUM_JOB_SLOTS];
 	/* Job-lifecycle trace budget: decremented (under hw_lock) on each
 	 * dispatch / IRQ / fence-signal print, so the log stays bounded.
-	 * 0 disables tracing; set via the p7580_job_trace module param
-	 * (job.c). Default P7580_JOB_TRACE_DEFAULT (first N jobs only). */
+	 * trace_arm is the re-armable source the trace_arm debugfs knob
+	 * writes: p7580_job_trace_arm() copies trace_arm into trace_left,
+	 * so Main/phone can re-arm tracing at any time (echo N >
+	 * .../p7580/trace_arm). Seed: P7580_JOB_TRACE_DEFAULT. */
 	unsigned int trace_left;
+	unsigned int trace_arm;
+	/* Last dispatch snapshot: rewritten (under hw_lock) at every
+	 * hw_submit, so the ERR/timeout paths always identify the
+	 * faulting job's slot/jc/cfg even after the budget is out. */
+	struct p7580_job_last last;
+	/* debugfs dir handle (drivers/gpu/drm/panfrost/p7580): owned by
+	 * job.c, created at dev_init, removed at dev_fini. Opaque void*
+	 * so this header stays dentry-free under -fsyntax-only. */
+	void *dbg_dir;
 };
 #else
 struct p7580_job_dev {
@@ -149,6 +173,13 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void *regs,
 		       p7580_dma_addr_t pgd_dma);
 #endif
 void p7580_job_dev_fini(struct p7580_job_dev *jd);
+/* Debug knobs (errtrace): re-arm the trace budget (copies N into both
+ * trace_arm and trace_left under hw_lock; N=0 stops tracing). Dump
+ * renders the last-dispatch snapshot + live slot registers into buf
+ * (seq_file show; returns 0, prints "no job yet" when !valid). */
+void p7580_job_trace_arm(struct p7580_job_dev *jd, unsigned int n);
+struct seq_file;
+int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m);
 /* CLEAR + unmask after reset/resume (power held by caller). */
 void p7580_job_dev_rearm(struct p7580_job_dev *jd);
 /* Program HEAD_NEXT/AFFINITY_NEXT/CONFIG_NEXT + COMMAND_NEXT=START.   */
