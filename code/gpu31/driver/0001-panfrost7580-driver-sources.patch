@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,126 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -119,6 +119,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +/* gpu31-iova: register the map/unmap trace budget with the jobs
 + * slice iova_arm knob (submit.c; called at probe/remove). */
 +void p7580_drv_register_iova_trace(unsigned int *budget);
++/* gpu31-iova: fault-time mapping resolver + trace budget shared
++ * with main.c probe (defined in submit.c; non-static for the TU
++ * boundary). */
++int p7580_drv_iova_resolve(void *priv, char *buf, size_t len,
++			   const uint32_t *handles, const uint64_t *addrs,
++			   const uint32_t *sizes, uint32_t n);
++extern unsigned int p7580_iova_trace;
 +
 +#endif /* PANFROST7580_DRV_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
@@ -1423,7 +1430,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,232 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
@@ -1625,6 +1632,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 + * ref-drop leg. */
 +void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count);
 +void p7580_gem_job_done_sync(struct drm_gem_object *obj);
++int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev);
 +void p7580_gem_submit_sync(struct drm_gem_object *obj);
 +void p7580_gem_dma_unbind(struct drm_gem_object *obj);
 +phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
@@ -6241,7 +6249,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * once per fresh bind, unmap once per free-time unbind; the fault
 + * path re-arms via trace_arm like the job trace). Raised by the
 + * debugfs iova_arm knob (jobs slice); 0 stops it. */
-+static unsigned int p7580_iova_trace = 64;
++unsigned int p7580_iova_trace = 64;
 +
 +static unsigned int p7580_drv_run_seq = 0;
 +
@@ -6851,7 +6859,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * the snapshot arrays + snprintf, no GEM dereference, no locks, no
 + * MMIO. Truncates at the buffer end (always NUL-terminated); returns
 + * the full untruncated length so the caller can size its buffer. */
-+static int p7580_drv_iova_resolve(void *priv, char *buf, size_t len,
++int p7580_drv_iova_resolve(void *priv, char *buf, size_t len,
 +				  const uint32_t *handles,
 +				  const uint64_t *addrs,
 +				  const uint32_t *sizes, uint32_t n)
