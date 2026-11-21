@@ -122,6 +122,14 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## GPU memory writes proven; Mesa output still zero (2026-11-20, int19)
+- `--pattern-test` PASS: page pre-filled 0xA5A5A5A5, Zero-fill job executed, **both USER and KERN
+  views read 0x00000000** -> GPU writes memory and the coherency model is correct.
+- Mesa 20.3.5 still yields zero pixels (FPS 690) while submitting many jobs that complete with
+  `js_status=0`. So the defect is Mesa-batch-specific (job types/FBD/heap or dropped batches),
+  not coherency or encoding.
+- DEBUG_READ_BO ioctl (nr 0xCF) live for kernel-side BO inspection; strip before cutover.
+
 ## GPU executes, writes not visible (2026-11-20, int18)
 - int18 has the coherency model (dma_map BIDIR at bind, sync_for_device at submit, sync_for_cpu at
   free_job, unmap at unbind). Jobs still complete cleanly (`js_status=0`, fence signalled) and Mesa
