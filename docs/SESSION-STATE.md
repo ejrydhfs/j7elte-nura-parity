@@ -122,6 +122,13 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Draw jobs fault: INSTR_TYPE_MISMATCH (2026-11-20, int22)
+- Fault diagnostics live (always-on ERR + debugfs `trace_arm`/`dump`).
+- Clear jobs complete; the **draw** job faults:
+  `ERR slot=0 js_status=0x52 (INSTR_TYPE_MISMATCH) head=tail=0x21c5600 jc=0x21c5600`.
+- So the descriptor type at HEAD is not what slot 0 accepts: requirements->slot mapping or the
+  job-type contract is still wrong. Fix in progress (`gpu31-instrtype.md`).
+
 ## GPU renders the clear colour (2026-11-20, int20)
 - int20 fixed slot routing (req==0 chain -> JS1). Both jobs execute with NO_EXCEPTION and
   `egltest` now reads **the correct clear colour** (`RGBA=26,26,102,255` at the corner).
