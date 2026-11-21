@@ -6150,7 +6150,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1313 @@
+@@ -0,0 +1,1470 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6177,7 +6177,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * GEM/MM -> IRQs -> DRM attach. Remove unwinds in reverse.
 + */
 +
-+#include <linux/device.h>
++#include <linux/highmem.h>
++#include <linux/mm.h>
 +#include <linux/dma-mapping.h>
 +#include <linux/err.h>
 +#include <linux/interrupt.h>
@@ -6450,6 +6451,158 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	}
 +}
 +
++/* gpu31-ptewalk: fault-time AS0 page-table walk for the faulting jc.
++ * Bounded, PM-held, process-context only (timedout workqueue before
++ * recover tears state down): walk the 4-level LPAE tables from
++ * drv->mmu.root_dma over at most 4 kmap/kunmap pairs and report the
++ * leaf PTE for jc, then compare it against the owning BO's current
++ * page (BO identity from the faulting job's SUBMIT-time snapshot via
++ * its referenced object pointers). Prints one pr_err line:
++ * leaf phys vs BO page phys + the first 32 descriptor bytes re-read
++ * from the leaf's physical page via kmap in the same handler.
++ * MATCH => GPU-side stale fetch (TLB/cache, not tables);
++ * MISMATCH => page-table/IOVA lifetime bug. Pure CPU reads + the
++ * BO's own dma mapping; never touches the TLB. Skips dark (fails
++ * closed: PM get failed) and never sleeps beyond kmap/kunmap on
++ * lowmem table pages (same discipline as the GEM debug-read leg).
++ * Bounded: one page walk + one 32-B re-read, always. */
++static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
++					    struct p7580_submit_job *job)
++{
++	dma_addr_t cur;
++	unsigned int l;
++	u64 e = 0;
++	u64 jc;
++	unsigned int slot;
++	unsigned int seq;
++	u64 leaf_pte = 0;
++	phys_addr_t leaf_phys = 0;
++	struct drm_gem_object *owner = NULL;
++	struct p7580_bo *owner_bo = NULL;
++	unsigned long owner_iova = 0;
++	unsigned int owner_npages = 0;
++	unsigned int page_idx = 0;
++	unsigned int page_off = 0;
++	phys_addr_t bo_phys = 0;
++	int bo_ok = 0;
++	u32 pw[8];
++	unsigned int wi;
++	int have_bytes = 0;
++
++	if (!drv || !job)
++		return;
++	if (!drv->mmu.root_dma)
++		return;
++	jc = job->jc;
++	slot = (unsigned int)job->slot;
++	seq = job->seqno;
++	if (jc & ~PAGE_MASK)
++		return;
++	cur = drv->mmu.root_dma;
++	for (l = 0; l < 3; l++) {
++		u64 *cpu;
++		struct page *pg;
++		unsigned int shift = 12 + (3 - l) * 9;
++		unsigned int idx = (unsigned int)((jc >> shift) & 0x1FFu);
++
++		pg = pfn_to_page((unsigned long)(cur >> PAGE_SHIFT));
++		cpu = kmap(pg);
++		e = cpu[idx];
++		kunmap(pg);
++		if ((e & 3ULL) != 3ULL) {
++			pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx level=%u UNMAPPED\n",
++			       slot, seq, (unsigned long long)jc, l);
++			return;
++		}
++		cur = (dma_addr_t)(e & ~(u64)0xFFFULL);
++	}
++	{
++		u64 *cpu;
++		struct page *pg;
++		unsigned int idx = (unsigned int)((jc >> 12) & 0x1FFu);
++
++		pg = pfn_to_page((unsigned long)(cur >> PAGE_SHIFT));
++		cpu = kmap(pg);
++		e = cpu[idx];
++		kunmap(pg);
++	}
++	if ((e & 3ULL) != 1ULL) {
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx NOT-LEAF\n",
++		       slot, seq, (unsigned long long)jc,
++		       (unsigned long long)e);
++		return;
++	}
++	leaf_pte = e;
++	leaf_phys = (phys_addr_t)(e & ~(u64)0xFFFULL);
++	/* Find the owning BO: jc inside one submitted BO's IOVA. The
++	 * job's bos[] array holds one referenced pointer per handle
++	 * (F-JT2, stable across close); safe to dereference here in
++	 * process context while the job owns the refs. */
++	if (job->bos && job->bo_count) {
++		unsigned int i;
++
++		for (i = 0; i < job->bo_count; i++) {
++			struct drm_gem_object *o =
++				(struct drm_gem_object *)job->bos[i];
++			struct p7580_bo *b;
++
++			if (!o)
++				continue;
++			b = to_p7580_bo(o);
++			if (b && b->iova_valid && jc >= b->iova &&
++			    jc + 32 <= b->iova + b->base.size) {
++				owner = o;
++				owner_bo = b;
++				break;
++			}
++		}
++	}
++	if (owner && owner_bo) {
++		owner_iova = owner_bo->iova;
++		owner_npages = p7580_bo_npages(owner);
++		page_idx = (unsigned int)((jc - owner_bo->iova) >> PAGE_SHIFT);
++		page_off = (unsigned int)((jc - owner_bo->iova) & (PAGE_SIZE - 1));
++		bo_phys = p7580_bo_dma_addr(owner, page_idx);
++		bo_ok = (bo_phys != 0);
++		/* Assert the alignment contract the dispatch snapshot
++		 * relies on: descriptors are 8-byte aligned and the
++		 * 32-B header never crosses a page (lastjob SUBMIT
++		 * snapshot guards poff + 32 <= PAGE_SIZE). */
++		if (page_off + 32 > PAGE_SIZE) {
++			pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf_phys=0x%llx bo_phys=0x%llx CROSS-PAGE\n",
++			       slot, seq, (unsigned long long)jc,
++			       (unsigned long long)leaf_phys,
++			       (unsigned long long)bo_phys);
++		} else {
++			void *kv;
++			struct page *ppg =
++				pfn_to_page((unsigned long)(leaf_phys >> PAGE_SHIFT));
++
++			kv = kmap(ppg);
++			for (wi = 0; wi < 8; wi++)
++				pw[wi] = ((u32 *)((char *)kv + page_off))[wi];
++			kunmap(ppg);
++			have_bytes = 1;
++		}
++		if (have_bytes) {
++			pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++			       slot, seq, (unsigned long long)jc,
++			       (unsigned long long)leaf_pte,
++			       (unsigned long long)leaf_phys,
++			       (unsigned long long)bo_phys,
++			       (bo_ok && leaf_phys == bo_phys) ? "MATCH" : "MISMATCH",
++			       owner_iova, owner_npages,
++			       pw[0], pw[1], pw[2], pw[3],
++			       pw[4], pw[5], pw[6], pw[7]);
++		}
++	} else {
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx NO-OWNER\n",
++		       slot, seq, (unsigned long long)jc,
++		       (unsigned long long)leaf_pte,
++		       (unsigned long long)leaf_phys);
++	}
++}
++
 +static void p7580_drv_timedout_job(struct drm_sched_job *sched_job)
 +{
 +	struct p7580_submit_job *job = sched_job ? sched_job->owner : NULL;
@@ -6485,6 +6638,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			dma_fence_signal((struct dma_fence *)f);
 +		return;
 +	}
++	/* gpu31-ptewalk: decisive fault-time read. Runs BEFORE recover
++	 * tears state down (p7580_job_timedout -> recover rebinds AS0)
++	 * in the same PM-held window: PT walk vs BO page comparison. */
++	p7580_drv_ptewalk_pin(drv, job);
 +	p7580_job_timedout(&drv->jd, job);
 +	p7580_drv_pm_put(drv);
 +}
