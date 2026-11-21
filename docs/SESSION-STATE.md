@@ -122,6 +122,14 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Zero GPU faults; geometry still missing (2026-11-21, int33)
+- After `job->bo_count` stamping (int32) + multi-in-fence AND-node (int33), the per-frame
+  `INSTR_TYPE_MISMATCH` is **gone**: ERR count 0, 104 job IRQs, jobs DONE, clear colour exact.
+- The triangle is still absent (centre = clear colour), with all fragment jobs reporting success
+  (`sw` layout: header at w4, zeros before — same for working clear jobs).
+- Next: verify the tiler actually wrote a polygon list and whether the fragment FBD consumes it
+  (`gpu31-polylist.md`).
+
 ## Stale-TLB fix landed; one fault remains (2026-11-21, int24)
 - IOVA/TLB lifetime fixed (free-time unmap + reuse fence + overlap detection; `OVERLAP` count 0).
 - The single per-frame `INSTR_TYPE_MISMATCH` persists on the last submit; ERR-MAP shows its
