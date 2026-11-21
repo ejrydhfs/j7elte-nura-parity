@@ -4072,7 +4072,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,715 @@
+@@ -0,0 +1,716 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -6151,7 +6151,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1470 @@
+@@ -0,0 +1,1478 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
