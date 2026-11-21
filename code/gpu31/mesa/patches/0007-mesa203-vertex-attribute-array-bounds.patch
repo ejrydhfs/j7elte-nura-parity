@@ -1,0 +1,49 @@
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-11-21 11:16:50.278758140 -0500
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-11-21 11:16:58.483835441 -0500
+@@ -1106,26 +1106,39 @@
+         struct panfrost_shader_state *vs = panfrost_get_shader_state(ctx, PIPE_SHADER_VERTEX);
+ 
+         /* Worst case: everything is NPOT, which is only possible if instancing
+-         * is enabled. Otherwise single record is gauranteed */
++         * is enabled. Otherwise single record is gauranteed.  Two extra
++         * records are reserved for the synthesised gl_VertexID and
++         * gl_InstanceID descriptors written below: the emitter writes BOTH
++         * whenever attribute_count >= PAN_VERTEX_ID (16), while
++         * attribute_count is only PAN_VERTEX_ID + 1 (17) for a shader that
++         * reads gl_VertexID alone, so an array sized attribute_count would
++         * take the PAN_INSTANCE_ID store out of bounds and corrupt the next
++         * pool allocation (the viewport descriptor).  The arrays are also
++         * zeroed: the hardware walks `attribute_count` descriptors, and an
++         * index the shader does not source must not decode as a random
++         * buffer/format pair. */
++        unsigned specials = 2;
++        unsigned buffer_slots =
++                (vs->attribute_count + specials) *
++                (ctx->instance_count > 1 ? 2 : 1);
+         struct panfrost_ptr S = panfrost_pool_alloc_aligned(&batch->pool,
+-                        MALI_ATTRIBUTE_BUFFER_LENGTH * (vs->attribute_count + 1) *
+-                        (ctx->instance_count > 1 ? 2 : 1),
++                        MALI_ATTRIBUTE_BUFFER_LENGTH * buffer_slots,
+                         MALI_ATTRIBUTE_BUFFER_LENGTH * 2);
+ 
+         struct panfrost_ptr T = panfrost_pool_alloc_aligned(&batch->pool,
+-                        MALI_ATTRIBUTE_LENGTH * vs->attribute_count,
++                        MALI_ATTRIBUTE_LENGTH * (vs->attribute_count + specials),
+                         MALI_ATTRIBUTE_LENGTH);
+ 
+         struct mali_attribute_buffer_packed *bufs =
+                 (struct mali_attribute_buffer_packed *) S.cpu;
+ 
+-        /* Determine (n + 1)'th index to suppress prefetch on Bifrost */
+-        unsigned last = vs->attribute_count * ((ctx->instance_count > 1) ? 2 : 1);
+-        memset(bufs + last, 0, sizeof(*bufs));
++        memset(bufs, 0, MALI_ATTRIBUTE_BUFFER_LENGTH * buffer_slots);
+ 
+         struct mali_attribute_packed *out =
+                 (struct mali_attribute_packed *) T.cpu;
+ 
++        memset(out, 0, MALI_ATTRIBUTE_LENGTH * (vs->attribute_count + specials));
++
+         unsigned attrib_to_buffer[PIPE_MAX_ATTRIBS] = { 0 };
+         unsigned k = 0;
+ 

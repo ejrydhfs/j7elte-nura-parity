@@ -1,0 +1,485 @@
+diff --git a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
+index d2f3f95..1e3c192 100644
+--- a/drivers/gpu/drm/panfrost/panfrost7580_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c
+@@ -621,13 +621,23 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
+ 			/* ERR alongside DONE: always pin (never budgeted).
+ 			 * JS_STATUS can latch a fault code even when the
+ 			 * DONE bit also set (short chain / sticky bit). */
+-			if (p7580_js_status_is_fault(js_status))
++			if (p7580_js_status_is_fault(js_status)) {
++				/* gpu31-vertexjob: latch the descriptor
++				 * the JM was executing (JS_HEAD), not the
++				 * chain head in jc. The vertex job of a
++				 * chain sits below jc; the process-context
++				 * walk must target head to decode it. */
++				if (job) {
++					job->fault_head = head;
++					job->fault_status = js_status;
++				}
+ 				p7580_job_err_pin(j, js_status, status,
+ 						  rawstat, head, tail,
+ 						  seq, jc, swp, lcfg,
+ 						  jd->iova_resolve,
+ 						  jd->iova_resolve_priv,
+ 						  eh, ea, ez, en);
++			}
+ 			if (jd->trace_left) {
+ 				jd->trace_left--;
+ 				pr_info("p7580_job: irq slot=%d stat=0x%08x js_status=0x%08x (%s) has_job=%d\n",
+@@ -715,6 +725,10 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
+ 			if (jd->last.valid &&
+ 			    jd->last.slot == (unsigned int)j)
+ 				lcfg = jd->last.cfg;
++			if (jd->in_flight[j]) {
++				jd->in_flight[j]->fault_head = head;
++				jd->in_flight[j]->fault_status = es;
++			}
+ 			p7580_job_err_pin(j, es, status, rawstat,
+ 					  head, tail, seq, jc,
+ 					  swp, lcfg,
+@@ -856,6 +870,11 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
+ 		t_hi = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_TAIL_HI));
+ 		head = ((uint64_t)h_hi << 32) | h_lo;
+ 		tail = ((uint64_t)t_hi << 32) | t_lo;
++		/* gpu31-vertexjob: the walk that follows runs in process
++		 * context and needs the descriptor the JM was stuck on,
++		 * which is JS_HEAD and not necessarily the chain head. */
++		job->fault_head = head;
++		job->fault_status = status;
+ 		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+ 			slot, status, p7580_js_status_name(status),
+ 			t_stat, t_raw,
+diff --git a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
+index 514e378..09a3459 100644
+--- a/drivers/gpu/drm/panfrost/panfrost7580_job.h
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h
+@@ -113,6 +113,21 @@ struct p7580_submit_job {
+ 	 * p7580_job_free releases the array. NULL when the job
+ 	 * references no BOs. */
+ 	void **bos;
++
++	/* Fault-target stamp (gpu31-vertexjob): JS_HEAD read at the
++	 * fault verdict, i.e. the descriptor the JM was executing when
++	 * it raised JS_STATUS. It is NOT jc whenever the fault sits in
++	 * a chain member other than the head -- the vertex/tiler jobs
++	 * are allocated before the WRITE_VALUE job that the ioctl names
++	 * in jc, so they live at LOWER pool offsets (head < jc).
++	 * p7580_drv_ptewalk_pin walks/dumps this address, not jc; the
++	 * earlier jc-only dump never covered the faulting VERTEX job.
++	 * fault_status is the JS_STATUS code latched at the same
++	 * instant (0x51/0x52 => shader instruction decode, i.e. the
++	 * suspect is the state->shader ISA fetch, not the job header).
++	 * 0 in fault_head = never stamped (no fault seen). */
++	uint64_t fault_head;
++	uint32_t fault_status;
+ };
+ 
+ /* Per-file submit context: one sched entity per slot. */
+diff --git a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
+index ad44a40..4527fac 100644
+--- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c
++++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
+@@ -316,7 +316,221 @@ static struct dma_fence *p7580_drv_run_job(struct drm_sched_job *sched_job)
+ 	}
+ }
+ 
+-/* gpu31-ptewalk: fault-time AS0 page-table walk for the faulting jc.
++/* gpu31-vertexjob: fault-target decode of a Midgard COMPUTE_JOB.
++ *
++ * Evidence that motivated it (gpu31-microdraw.md): every shape faults
++ * with 0x51 INSTR_INVALID_ENC / 0x52 INSTR_TYPE_MISMATCH at the
++ * JS_HEAD descriptor, which for the draw chain is the VERTEX job
++ * (MALI_COMPUTE_JOB, 192 B, type 5). Those two JS_STATUS codes are
++ * shader-instruction decode errors (mali_midg_regmap.h:459-466), so
++ * the offending datum cannot be a job-header word: the only pointer
++ * the vertex core dereferences to fetch instructions is
++ * DRAW.State (+0x78) -> Renderer State (64 B) ->
++ * Renderer State.Shader.Shader (word 0/1, low nibble = first bundle
++ * tag) -> ISA. This decoder prints that chain, together with the
++ * submit-time BO snapshot membership of each pointer, so a dmesg
++ * capture alone decides: (a) state/ISA not in the submit set
++ * (own=MISS) => mapping gap; (b) state/ISA reachable and the ISA
++ * words legal => ISA content/tag; (c) state==NULL => no meta.
++ *
++ * Read-only: the BO snapshot (or the live list, under bo_lock with a
++ * ref taken while linked) is kmap'd page by page. No TLB access, no
++ * sleeps, at most three short reads. Process context only (the
++ * timedout workqueue, same window as p7580_drv_ptewalk_pin).
++ */
++#define P7580_VJ_WORDS	48u
++
++static noinline unsigned int
++p7580_vj_read(struct p7580_drv *drv, struct p7580_submit_job *job,
++	      u64 iova, u32 *out, unsigned int n,
++	      u64 *bo_iova, size_t *bo_size, const char **how)
++{
++	struct drm_gem_object *obj = NULL;
++	struct p7580_bo *bo = NULL;
++	unsigned int got = 0;
++	int live = 0;
++
++	*how = "SNAP";
++	if (job && job->bos && job->bo_count) {
++		unsigned int i;
++
++		for (i = 0; i < job->bo_count; i++) {
++			struct drm_gem_object *o =
++				(struct drm_gem_object *)job->bos[i];
++			struct p7580_bo *b;
++
++			if (!o)
++				continue;
++			b = to_p7580_bo(o);
++			if (b && b->iova_valid && iova >= b->iova &&
++			    iova + 4 <= b->iova + b->base.size) {
++				obj = o;
++				bo = b;
++				break;
++			}
++		}
++	}
++	if (!bo) {
++		struct p7580_drv_bo *le;
++
++		*how = "LIVE";
++		mutex_lock(&drv->bo_lock);
++		list_for_each_entry(le, &drv->bo_list, node) {
++			if (iova >= le->iova && iova + 4 <= le->iova + le->size) {
++				drm_gem_object_reference(le->obj);
++				obj = le->obj;
++				live = 1;
++				break;
++			}
++		}
++		mutex_unlock(&drv->bo_lock);
++		if (!obj) {
++			*how = "MISS";
++			return 0;
++		}
++		bo = to_p7580_bo(obj);
++	}
++	*bo_iova = bo->iova;
++	*bo_size = bo->base.size;
++	while (got < n) {
++		u64 cur = iova + (u64)got * 4;
++		unsigned int idx, poff, take, i;
++		phys_addr_t phys;
++		struct page *pg;
++		void *kv;
++
++		if (cur < bo->iova || cur >= bo->iova + bo->base.size)
++			break;
++		idx = (unsigned int)((cur - bo->iova) >> PAGE_SHIFT);
++		poff = (unsigned int)((cur - bo->iova) & (PAGE_SIZE - 1));
++		if (idx >= p7580_bo_npages(obj))
++			break;
++		phys = p7580_bo_dma_addr(obj, idx);
++		if (!phys)
++			break;
++		take = (unsigned int)((PAGE_SIZE - poff) >> 2);
++		if (take > n - got)
++			take = n - got;
++		pg = pfn_to_page((unsigned long)(phys >> PAGE_SHIFT));
++		kv = kmap(pg);
++		for (i = 0; i < take; i++)
++			out[got + i] = ((u32 *)((char *)kv + poff))[i];
++		kunmap(pg);
++		got += take;
++	}
++	if (live)
++		drm_gem_object_unreference_unlocked(obj);
++	return got;
++}
++
++/* Job-type names (Mali "Job Type" enum, midgard.xml). */
++static inline const char *p7580_vj_type_name(u32 t)
++{
++	switch (t) {
++	case 1: return "NULL";
++	case 2: return "WRITE_VALUE";
++	case 3: return "CACHE_FLUSH";
++	case 4: return "COMPUTE";
++	case 5: return "VERTEX";
++	case 7: return "TILER";
++	case 8: return "FUSED";
++	case 9: return "FRAGMENT";
++	default: return "RESERVED";
++	}
++}
++
++static noinline void
++p7580_drv_vertexjob_pin(struct p7580_drv *drv,
++			struct p7580_submit_job *job, u64 head)
++{
++	const char *how;
++	u64 bo_iova = 0, bo2_iova = 0;
++	size_t bo_size = 0, bo2_size = 0;
++	u32 jw[P7580_VJ_WORDS];
++	u32 meta[8];
++	u64 state, shader, isa;
++	u32 type;
++	unsigned int got, mgot;
++
++	got = p7580_vj_read(drv, job, head, jw, P7580_VJ_WORDS,
++			    &bo_iova, &bo_size, &how);
++	if (got < 8) {
++		pr_err("p7580_job: HEADTYPE head=0x%llx own=%s got=%u (descriptor unreadable)\n",
++		       (unsigned long long)head, how, got);
++		return;
++	}
++	type = (jw[4] >> 1) & 0x7Fu;
++	pr_err("p7580_job: HEADTYPE head=0x%llx own=%s bo=0x%llx/0x%zx type=%u %s is64=%u idx=%u dep=%u,%u next=0x%llx js_status=0x%02x\n",
++	       (unsigned long long)head, how,
++	       (unsigned long long)bo_iova, bo_size, type,
++	       p7580_vj_type_name(type), jw[4] & 1u, jw[4] >> 16,
++	       jw[5] & 0xFFFFu, jw[5] >> 16,
++	       (unsigned long long)(((u64)jw[7] << 32) | jw[6]),
++	       job ? job->fault_status : 0);
++	if (type != 5)
++		return;
++
++	/* MALI_COMPUTE_JOB: Header@0 Invocation@32 Parameters@40
++	 * Draw@64 (MALI_DRAW, 128 B). Parameter word 10 = job_task_split
++	 * (bits 26:29; 5 = vertex). Draw word n lives at jw[16 + n]. */
++	pr_err("p7580_job: VDRAW head=0x%llx split=%u inst=%u off=%u flags=%08x inv=%08x/%08x pos=0x%llx ubo=0x%llx tex=0x%llx smp=0x%llx push=0x%llx\n",
++	       (unsigned long long)head, (jw[10] >> 26) & 0xFu,
++	       (jw[16] >> 16) & 0xFFu, jw[17], jw[16],
++	       jw[8], jw[9],
++	       (unsigned long long)(((u64)jw[21] << 32) | jw[20]),
++	       (unsigned long long)(((u64)jw[23] << 32) | jw[22]),
++	       (unsigned long long)(((u64)jw[25] << 32) | jw[24]),
++	       (unsigned long long)(((u64)jw[27] << 32) | jw[26]),
++	       (unsigned long long)(((u64)jw[29] << 32) | jw[28]));
++
++	state = ((u64)jw[31] << 32) | jw[30];
++	pr_err("p7580_job: VDRAW2 head=0x%llx state=0x%llx attrbuf=0x%llx attr=0x%llx varbuf=0x%llx vary=0x%llx vp=0x%llx tls=0x%llx\n",
++	       (unsigned long long)head, (unsigned long long)state,
++	       (unsigned long long)(((u64)jw[33] << 32) | jw[32]),
++	       (unsigned long long)(((u64)jw[35] << 32) | jw[34]),
++	       (unsigned long long)(((u64)jw[37] << 32) | jw[36]),
++	       (unsigned long long)(((u64)jw[39] << 32) | jw[38]),
++	       (unsigned long long)(((u64)jw[41] << 32) | jw[40]),
++	       (unsigned long long)(((u64)jw[45] << 32) | jw[44]));
++
++	if (!state) {
++		pr_err("p7580_job: VMETA head=0x%llx state=NULL (no shader meta; INSTR_* cannot come from an ISA fetch)\n",
++		       (unsigned long long)head);
++		return;
++	}
++	mgot = p7580_vj_read(drv, job, state, meta, 8,
++			     &bo2_iova, &bo2_size, &how);
++	if (mgot < 4) {
++		pr_err("p7580_job: VMETA head=0x%llx state=0x%llx own=%s bo=0x%llx/0x%zx got=%u (meta unreadable)\n",
++		       (unsigned long long)head, (unsigned long long)state,
++		       how, (unsigned long long)bo2_iova, bo2_size, mgot);
++		return;
++	}
++	shader = ((u64)meta[1] << 32) | meta[0];
++	pr_err("p7580_job: VMETA head=0x%llx state=0x%llx own=%s bo=0x%llx/0x%zx shader=0x%llx tag=%llu samp=%u tex=%u attr=%u vary=%u props=%08x\n",
++	       (unsigned long long)head, (unsigned long long)state,
++	       how, (unsigned long long)bo2_iova, bo2_size,
++	       (unsigned long long)shader,
++	       (unsigned long long)(shader & 0xFu),
++	       meta[2] & 0xFFFFu, meta[2] >> 16,
++	       meta[3] & 0xFFFFu, meta[3] >> 16, meta[4]);
++	if (!shader) {
++		pr_err("p7580_job: VISA head=0x%llx shader=NULL (no ISA pointer)\n",
++		       (unsigned long long)head);
++		return;
++	}
++	isa = shader & ~0xFULL;
++	mgot = p7580_vj_read(drv, job, isa, meta, 8,
++			     &bo2_iova, &bo2_size, &how);
++	pr_err("p7580_job: VISA head=0x%llx shader=0x%llx isa=0x%llx own=%s bo=0x%llx/0x%zx got=%u w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++	       (unsigned long long)head, (unsigned long long)shader,
++	       (unsigned long long)isa, how,
++	       (unsigned long long)bo2_iova, bo2_size, mgot,
++	       meta[0], meta[1], meta[2], meta[3],
++	       meta[4], meta[5], meta[6], meta[7]);
++}
++
++/* gpu31-ptewalk: fault-time AS0 page-table walk for the faulting descriptor.
+  * Bounded, PM-held, process-context only (timedout workqueue before
+  * recover tears state down): walk the 4-level LPAE tables from
+  * drv->mmu.root_dma over at most 4 kmap/kunmap pairs and report the
+@@ -338,6 +552,7 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 	unsigned int l;
+ 	u64 e = 0;
+ 	u64 jc;
++	u64 target;
+ 	u64 jc_page;
+ 	unsigned int slot;
+ 	unsigned int seq;
+@@ -368,9 +583,21 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 	if (!drv->mmu.root_dma)
+ 		return;
+ 	jc = job->jc;
++	/* gpu31-vertexjob: walk and dump the descriptor the JM was
++	 * executing (JS_HEAD), not the chain head named in jc. In a
++	 * Midgard draw chain the vertex (=head of the executable
++	 * portion) and tiler jobs are pool-allocated BEFORE the
++	 * WRITE_VALUE job, so head < jc. The jc-only dump could never
++	 * see the faulting VERTEX job. */
++	target = job->fault_head ? job->fault_head : jc;
+ 	slot = (unsigned int)job->slot;
+ 	seq = job->seqno;
+-	jc_page = jc & PAGE_MASK;
++	pr_err("p7580_job: TARGET slot=%d seq=%u jc=0x%llx head=0x%llx walk=0x%llx js_status=0x%02x\n",
++	       slot, seq, (unsigned long long)jc,
++	       (unsigned long long)job->fault_head,
++	       (unsigned long long)target, job->fault_status);
++	p7580_drv_vertexjob_pin(drv, job, target);
++	jc_page = target & PAGE_MASK;
+ 	cur = drv->mmu.root_dma;
+ 	for (l = 0; l < 3; l++) {
+ 		u64 *cpu;
+@@ -383,8 +610,8 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 		e = cpu[idx];
+ 		kunmap(pg);
+ 		if ((e & 3ULL) != 3ULL) {
+-			pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx level=%u UNMAPPED\n",
+-			       slot, seq, (unsigned long long)jc, l);
++			pr_err("p7580_job: PTEWALK slot=%d seq=%u at=0x%llx level=%u UNMAPPED\n",
++			       slot, seq, (unsigned long long)target, l);
+ 			return;
+ 		}
+ 		cur = (dma_addr_t)(e & ~(u64)0xFFFULL);
+@@ -400,22 +627,23 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 		kunmap(pg);
+ 	}
+ 	if ((e & 3ULL) != 1ULL) {
+-		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx NOT-LEAF\n",
+-		       slot, seq, (unsigned long long)jc,
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u at=0x%llx leaf=0x%llx NOT-LEAF\n",
++		       slot, seq, (unsigned long long)target,
+ 		       (unsigned long long)e);
+ 		return;
+ 	}
+ 	leaf_pte = e;
+ 	leaf_phys = (phys_addr_t)(e & ~(u64)0xFFFULL);
+-	/* Owner resolution, two views. (1) SUBMIT-time snapshot: jc
++	/* Owner resolution, two views. (1) SUBMIT-time snapshot: target
+ 	 * inside one submitted BO's IOVA. The job's bos[] array holds
+ 	 * one referenced pointer per handle (F-JT2, stable across
+ 	 * close); safe to dereference here in process context while
+ 	 * the job owns the refs. (2) Live view: scan drv->bo_list
+ 	 * under bo_lock for an IOVA range containing jc, taking a GEM
+ 	 * ref while linked. Snapshot-miss + live-hit (int29 NO-OWNER
+-	 * with jc inside an ERR-MAP range) means a stale snapshot,
+-	 * not an unmapped jc; miss + miss means genuinely unowned. */
++	 * with the address inside an ERR-MAP range) means a stale
++	 * snapshot, not an unmapped address; miss + miss means
++	 * genuinely unowned. */
+ 	if (job->bos && job->bo_count) {
+ 		unsigned int i;
+ 
+@@ -427,8 +655,8 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 			if (!o)
+ 				continue;
+ 			b = to_p7580_bo(o);
+-			if (b && b->iova_valid && jc >= b->iova &&
+-			    jc + 32 <= b->iova + b->base.size) {
++			if (b && b->iova_valid && target >= b->iova &&
++			    target + 32 <= b->iova + b->base.size) {
+ 				owner = o;
+ 				owner_bo = b;
+ 				snap_iova = b->iova;
+@@ -442,7 +670,8 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 		struct p7580_drv_bo *le;
+ 
+ 		list_for_each_entry(le, &drv->bo_list, node) {
+-			if (jc >= le->iova && jc + 32 <= le->iova + le->size) {
++			if (target >= le->iova &&
++			    target + 32 <= le->iova + le->size) {
+ 				drm_gem_object_reference(le->obj);
+ 				live_obj = le->obj;
+ 				live_iova = le->iova;
+@@ -464,26 +693,29 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 	if (owner && owner_bo) {
+ 		owner_iova = owner_bo->iova;
+ 		owner_npages = p7580_bo_npages(owner);
+-		page_idx = (unsigned int)((jc - owner_bo->iova) >> PAGE_SHIFT);
+-		page_off = (unsigned int)((jc - owner_bo->iova) & (PAGE_SIZE - 1));
++		page_idx = (unsigned int)((target - owner_bo->iova) >>
++					  PAGE_SHIFT);
++		page_off = (unsigned int)((target - owner_bo->iova) &
++					  (PAGE_SIZE - 1));
+ 		bo_phys = p7580_bo_dma_addr(owner, page_idx);
+ 		bo_ok = (bo_phys != 0);
+ 	} else {
+-		page_off = (unsigned int)(jc & (PAGE_SIZE - 1));
++		page_off = (unsigned int)(target & (PAGE_SIZE - 1));
+ 	}
+ 	/* Unconditional GPU-view dump (gpu31-jddecode): 128 words
+ 	 * (512 B) at leaf_phys + page_off, re-read from the leaf's
+ 	 * physical page via kmap in the same handler: the 32-B header
+ 	 * (w0..w7), the fragment payload (bounds + framebuffer pointer,
+ 	 * w8..w15) and the following 448 B of pool bytes. Runs even
+-	 * with NO-OWNER (page_off is then the jc offset within its
+-	 * page). The JD body (64-B FRAGMENT_JOB) never crosses a page
+-	 * (pool allocs are 64-B aligned); if the 512-B window would
+-	 * cross, the in-page prefix is dumped and the line is marked
+-	 * JD-TRUNC (word count in jd_words). */
++	 * with NO-OWNER (page_off is then the target offset within its
++	 * page). gpu31-vertexjob: the window starts at JS_HEAD, so it
++	 * covers the faulting VERTEX job (192-B COMPUTE_JOB) as well as
++	 * a fragment job; the header type in word 4 decides which.
++	 * If the 512-B window would cross, the in-page prefix is dumped
++	 * and the word count (jd_words) bounds the line. */
+ 	if (page_off + 32 > PAGE_SIZE) {
+-		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf_phys=0x%llx bo_phys=0x%llx CROSS-PAGE snap=0x%llx/0x%zx live=0x%llx/0x%zx\n",
+-		       slot, seq, (unsigned long long)jc,
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u at=0x%llx leaf_phys=0x%llx bo_phys=0x%llx CROSS-PAGE snap=0x%llx/0x%zx live=0x%llx/0x%zx\n",
++		       slot, seq, (unsigned long long)target,
+ 		       (unsigned long long)leaf_phys,
+ 		       (unsigned long long)bo_phys,
+ 		       (unsigned long long)snap_iova, snap_size,
+@@ -507,28 +739,28 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 			pw[wi] = 0;
+ 		kunmap(ppg);
+ 		have_bytes = 1;
+-		pr_err("p7580_job: JDBODY slot=%d seq=%u jc=0x%llx words=%u %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-		       slot, seq, (unsigned long long)jc, jd_words,
++		pr_err("p7580_job: JDBODY slot=%d seq=%u at=0x%llx words=%u %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)target, jd_words,
+ 		       pw[0], pw[1], pw[2], pw[3],
+ 		       pw[4], pw[5], pw[6], pw[7],
+ 		       pw[8], pw[9], pw[10], pw[11],
+ 		       pw[12], pw[13], pw[14], pw[15]);
+-		pr_err("p7580_job: JDBODY slot=%d seq=%u jc=0x%llx +64 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-		       slot, seq, (unsigned long long)jc,
++		pr_err("p7580_job: JDBODY slot=%d seq=%u at=0x%llx +64 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)target,
+ 		       pw[16], pw[17], pw[18], pw[19],
+ 		       pw[20], pw[21], pw[22], pw[23],
+ 		       pw[24], pw[25], pw[26], pw[27],
+ 		       pw[28], pw[29], pw[30], pw[31]);
+-		pr_err("p7580_job: JDBODY slot=%d seq=%u jc=0x%llx +128 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-		       slot, seq, (unsigned long long)jc,
++		pr_err("p7580_job: JDBODY slot=%d seq=%u at=0x%llx +128 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)target,
+ 		       pw[32], pw[33], pw[34], pw[35],
+ 		       pw[36], pw[37], pw[38], pw[39],
+ 		       pw[40], pw[41], pw[42], pw[43],
+ 		       pw[44], pw[45], pw[46], pw[47]);
+ 	}
+ 	if (have_bytes && owner && owner_bo) {
+-		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s snap=0x%llx/0x%zx live=0x%llx/0x%zx iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+-		       slot, seq, (unsigned long long)jc,
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u at=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s snap=0x%llx/0x%zx live=0x%llx/0x%zx iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)target,
+ 		       (unsigned long long)leaf_pte,
+ 		       (unsigned long long)leaf_phys,
+ 		       (unsigned long long)bo_phys,
+@@ -541,8 +773,8 @@ static noinline void p7580_drv_ptewalk_pin(struct p7580_drv *drv,
+ 		       job->desc[0], job->desc[1], job->desc[2], job->desc[3],
+ 		       job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
+ 	} else {
+-		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx NO-OWNER snap=0x%llx/0x%zx live=0x%llx/0x%zx w=%08x %08x %08x %08x %08x %08x %08x %08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+-		       slot, seq, (unsigned long long)jc,
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u at=0x%llx leaf=0x%llx leaf_phys=0x%llx NO-OWNER snap=0x%llx/0x%zx live=0x%llx/0x%zx w=%08x %08x %08x %08x %08x %08x %08x %08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)target,
+ 		       (unsigned long long)leaf_pte,
+ 		       (unsigned long long)leaf_phys,
+ 		       (unsigned long long)snap_iova, snap_size,
