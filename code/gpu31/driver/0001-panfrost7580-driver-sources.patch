@@ -6175,7 +6175,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1547 @@
+@@ -0,0 +1,1594 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6520,7 +6520,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	unsigned int page_off = 0;
 +	phys_addr_t bo_phys = 0;
 +	int bo_ok = 0;
-+	u32 pw[8];
++	u32 pw[128];
 +	unsigned int wi;
 +	int have_bytes = 0;
 +
@@ -6634,13 +6634,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	} else {
 +		page_off = (unsigned int)(jc & (PAGE_SIZE - 1));
 +	}
-+	/* Unconditional GPU-view dump: the 8 descriptor words at
-+	 * leaf_phys + page_off, re-read from the leaf's physical page
-+	 * via kmap in the same handler. Runs even with NO-OWNER
-+	 * (page_off is then the jc offset within its page). Asserts
-+	 * the alignment contract the dispatch snapshot relies on:
-+	 * descriptors are 8-byte aligned and the 32-B header never
-+	 * crosses a page. */
++	/* Unconditional GPU-view dump (gpu31-jddecode): 128 words
++	 * (512 B) at leaf_phys + page_off, re-read from the leaf's
++	 * physical page via kmap in the same handler: the 32-B header
++	 * (w0..w7), the fragment payload (bounds + framebuffer pointer,
++	 * w8..w15) and the following 448 B of pool bytes. Runs even
++	 * with NO-OWNER (page_off is then the jc offset within its
++	 * page). The JD body (64-B FRAGMENT_JOB) never crosses a page
++	 * (pool allocs are 64-B aligned); if the 512-B window would
++	 * cross, the in-page prefix is dumped and the line is marked
++	 * JD-TRUNC (word count in jd_words). */
 +	if (page_off + 32 > PAGE_SIZE) {
 +		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf_phys=0x%llx bo_phys=0x%llx CROSS-PAGE snap=0x%llx/0x%zx live=0x%llx/0x%zx\n",
 +		       slot, seq, (unsigned long long)jc,
@@ -6655,12 +6658,36 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		void *kv;
 +		struct page *ppg =
 +			pfn_to_page((unsigned long)(leaf_phys >> PAGE_SHIFT));
++		unsigned int jd_words =
++			(PAGE_SIZE - page_off) >> 2;
 +
++		if (jd_words > 128)
++			jd_words = 128;
 +		kv = kmap(ppg);
-+		for (wi = 0; wi < 8; wi++)
++		for (wi = 0; wi < jd_words; wi++)
 +			pw[wi] = ((u32 *)((char *)kv + page_off))[wi];
++		for (; wi < 128; wi++)
++			pw[wi] = 0;
 +		kunmap(ppg);
 +		have_bytes = 1;
++		pr_err("p7580_job: JDBODY slot=%d seq=%u jc=0x%llx words=%u %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)jc, jd_words,
++		       pw[0], pw[1], pw[2], pw[3],
++		       pw[4], pw[5], pw[6], pw[7],
++		       pw[8], pw[9], pw[10], pw[11],
++		       pw[12], pw[13], pw[14], pw[15]);
++		pr_err("p7580_job: JDBODY slot=%d seq=%u jc=0x%llx +64 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)jc,
++		       pw[16], pw[17], pw[18], pw[19],
++		       pw[20], pw[21], pw[22], pw[23],
++		       pw[24], pw[25], pw[26], pw[27],
++		       pw[28], pw[29], pw[30], pw[31]);
++		pr_err("p7580_job: JDBODY slot=%d seq=%u jc=0x%llx +128 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)jc,
++		       pw[32], pw[33], pw[34], pw[35],
++		       pw[36], pw[37], pw[38], pw[39],
++		       pw[40], pw[41], pw[42], pw[43],
++		       pw[44], pw[45], pw[46], pw[47]);
 +	}
 +	if (have_bytes && owner && owner_bo) {
 +		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s snap=0x%llx/0x%zx live=0x%llx/0x%zx iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
@@ -7415,26 +7442,38 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	job->as_nr = P7580_DRV_AS_NR;
 +	job->affinity = drv->jd.shader_present;
 +	/* SUBMIT-time descriptor snapshot (gpu31-lastjob, extended
-+	 * gpu31-submitsnap): the 8 words at jc, read from the mapped
-+	 * BO before submit-sync. Variant B (chain_mode==2) clears
-+	 * descriptor bit0 in the snapshot consumed at dispatch; the
-+	 * stored BO bytes are patched too (via vmap + submit-sync
-+	 * re-drain), next pointer stays NULL. Mode 0/1 snapshot only.
-+	 * Stays zero when the snapshot is unavailable (cross-page jc,
-+	 * unmapped page, jc outside every submitted BO). */
++	 * gpu31-submitsnap, corrected gpu31-jddecode): the 8 words at
++	 * jc, read from the mapped BO before submit-sync. Owner lookup
++	 * uses the live drv->bo_list (same scan the fault-time PTEWALK
++	 * pin uses) instead of the submit-local objs[]/iova_valid view:
++	 * the PTEWALK live scan demonstrably hits (live= range) on
++	 * jobs whose objs[]-based snapshot missed (snap=0x0/0x0), so
++	 * the snapshot now resolves the same way the fault path does.
++	 * Variant B (chain_mode==2) clears descriptor bit0 in the
++	 * snapshot consumed at dispatch; the stored BO bytes are
++	 * patched too (via vmap + submit-sync re-drain), next pointer
++	 * stays NULL. Mode 0/1 snapshot only. Stays zero when the
++	 * snapshot is unavailable (cross-page jc, unmapped page, jc
++	 * outside every bound BO, or BO pages unavailable). */
 +	{
 +		struct p7580_bo *jbo = NULL;
-+		unsigned int bi;
-+		for (bi = 0; bi < nr; bi++) {
-+			struct p7580_bo *c = to_p7580_bo(objs[bi]);
-+			/* jc must lie inside one submitted BO's IOVA */
-+			if (c && c->iova_valid &&
-+			    args->jc >= c->iova &&
-+			    args->jc + 32 <= c->iova + c->base.size) {
-+				jbo = c;
-+				break;
++		struct drm_gem_object *jobj = NULL;
++		mutex_lock(&drv->bo_lock);
++		{
++			struct p7580_drv_bo *le;
++
++			list_for_each_entry(le, &drv->bo_list, node) {
++				if (args->jc >= le->iova &&
++				    args->jc + 32 <= le->iova + le->size) {
++					drm_gem_object_reference(le->obj);
++					jobj = le->obj;
++					break;
++				}
 +			}
 +		}
++		mutex_unlock(&drv->bo_lock);
++		if (jobj)
++			jbo = to_p7580_bo(jobj);
 +		if (jbo && jbo->pages) {
 +			uint32_t off = (uint32_t)(args->jc - jbo->iova);
 +			unsigned int idx = off >> PAGE_SHIFT;
@@ -7461,6 +7500,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +					p7580_gem_submit_sync(&jbo->base);
 +			}
 +		}
++		if (jobj)
++			drm_gem_object_unreference_unlocked(jobj);
 +	}
 +	/* F-JT1 stash: SUBMIT-time sched_job->fence is still NULL, so
 +	 * validate the handle now (-ENOENT preserved) and let the
@@ -7479,7 +7520,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	}
 +	/* F-JT2 own: transfer one lookup ref per BO onto the job so
 +	 * free_job can retire HIGHMEM SHMEM pages without a
-+	 * file/handle lookup (stable across close; no locks). */
++	 * file/handle lookup (stable across close; no locks).
++	 * gpu31-jddecode: stamp bo_count here — every consumer of
++	 * bos[] (submit snapshot owner check, PTEWALK snapshot scan,
++	 * pre-signal sync, excl publish, free_job unref) keys off
++	 * bo_count, and without this stamp all of them silently
++	 * no-op (sw stayed zero, excl never published). */
 +	if (nr) {
 +		job->bos = kcalloc(nr, sizeof(*job->bos), GFP_KERNEL);
 +		if (!job->bos) {
@@ -7489,6 +7535,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		}
 +		for (i = 0; i < nr; i++)
 +			job->bos[i] = objs[i];
++		job->bo_count = nr;
 +	}
 +	/* gpu31-iova: BO identity snapshot for the ERR-pin mapping dump.
 +	 * Stamped at SUBMIT while the job owns refs (stable handles +

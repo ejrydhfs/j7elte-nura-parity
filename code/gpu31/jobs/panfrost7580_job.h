@@ -89,7 +89,12 @@ struct p7580_submit_job {
 	uint32_t in_fence_count;
 	/* BO reservation set (file-private handles + resv pointers). */
 	uint32_t *bo_handles;
-	uint32_t bo_count;
+	uint32_t bo_count;		/* valid entries in bo_handles AND bos[].
+					 * Driver stamps this when it transfers
+					 * the lookup refs onto bos[] (F-JT2);
+					 * every consumer (PTEWALK snapshot,
+					 * pre-signal sync, excl publish,
+					 * free_job unref) keys off it. */
 	/* Dispatch context stamped at SUBMIT (probenumeric): the async
 	 * run_job/timedout_job/free_job workers must NOT re-derive the
 	 * file state from the entity pointer (container_of(ent, ...,
