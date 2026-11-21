@@ -54,6 +54,19 @@ static void mgpu_as_write(struct mgpu *m, uint32_t off, uint32_t val)
 	m->regs[(MGPU_AS_BASE + off) >> 2] = val;
 }
 
+/* Mock of p7580_gem_job_bos_pre_signal_sync (gpu31-coherency-race):
+ * the completion invalidate that must run BEFORE the fence signals.
+ * Sets cpu_visible on the job's BO so a post-fence CPU read observes
+ * GPU bytes. IRQ-safe by construction (plain stores, no locks). */
+static void mgpu_job_bos_pre_signal_sync(struct mgpu *m, int bo)
+{
+	if (!m || bo < 0 || bo >= (int)MGPU_MAX_BOS)
+		return;
+	if (!m->bos[bo].used)
+		return;
+	m->bos[bo].cpu_visible = 1;
+}
+
 void mgpu_init(struct mgpu *m)
 {
 	int i;
@@ -66,6 +79,7 @@ void mgpu_init(struct mgpu *m)
 		m->bos[i].used = 0;
 		m->bos[i].busy = 0;
 		m->bos[i].map_idx = -1;
+		m->bos[i].cpu_visible = 1; /* idle: CPU view current */
 	}
 	for (i = 0; i < (int)P7580_JM_MAX_SLOTS; i++) {
 		m->jobs[i].active = 0;
@@ -187,6 +201,7 @@ int mgpu_bo_create(struct mgpu *m, uint32_t size, unsigned int prot,
 	m->bos[mi].prot = prot;
 	m->bos[mi].busy = 0;
 	m->bos[mi].map_idx = -1;
+	m->bos[mi].cpu_visible = 1; /* freshly allocated: CPU view current */
 	for (i = 0; i < (int)MGPU_MAX_MAPS; i++) {
 		if (m->maps[i].used && m->maps[i].iova == va) {
 			m->bos[mi].map_idx = i;
@@ -331,9 +346,17 @@ void mgpu_step_ms(struct mgpu *m, uint64_t ms)
 				      (uint32_t)(j->jc >> 32));
 			m->regs[MGPU_MMU_INT_STAT >> 2] |= MGPU_MMU_PF(0);
 		} else {
-			/* DONE: slot idles, fence source asserted. */
+			/* DONE: slot idles, fence source asserted.
+			 * The device wrote DRAM here: the CPU alias goes
+			 * stale (cpu_visible = 0) until the completion
+			 * invalidate runs. isr_demux models the fixed
+			 * driver order (invalidate BEFORE signal), so a
+			 * post-fence read observes GPU bytes. */
 			mgpu_reg_write(m, mgpu_js_reg(s, P7580_JS_COMMAND_NEXT),
 				       0);
+			if (j->bo >= 0 && j->bo < (int)MGPU_MAX_BOS &&
+			    m->bos[j->bo].used)
+				m->bos[j->bo].cpu_visible = 0;
 			bit = P7580_JOB_DONE_BIT(s);
 			m->regs[P7580_JOB_INT_RAWSTAT >> 2] |= bit;
 			m->regs[P7580_JOB_INT_STAT >> 2] |= bit;
@@ -367,6 +390,12 @@ void mgpu_isr_demux(struct mgpu *m)
 		if (status & P7580_JOB_DONE_BIT(j)) {
 			jb = &m->jobs[j];
 			if (jb->active && jb->slot == j && !jb->will_fault) {
+				/* Fixed driver order (gpu31-coherency-race):
+				 * completion invalidate BEFORE the fence
+				 * signals, so signal implies visible. This
+				 * models p7580_gem_job_bos_pre_signal_sync
+				 * in p7580_job_irq. */
+				mgpu_job_bos_pre_signal_sync(m, jb->bo);
 				jb->fence.signaled = 1;
 				jb->fence.err = 0;
 				if (jb->bo >= 0)
@@ -451,8 +480,11 @@ int mgpu_recover(struct mgpu *m, int fault_slot, uint32_t status)
 	mgpu_as_write(m, MGPU_AS_FAULTSTATUS, 0);
 	m->regs[MGPU_MMU_INT_STAT >> 2] = 0;
 
-	/* 5. The faulting job's waiters must not hang: -EIO. */
+	/* 5. The faulting job's waiters must not hang: -EIO.
+	 * Sync-before-signal here too (recovery path of the
+	 * coherency-race fix): a partial batch write stays visible. */
 	if (m->jobs[fault_slot].active) {
+		mgpu_job_bos_pre_signal_sync(m, m->jobs[fault_slot].bo);
 		m->jobs[fault_slot].fence.signaled = 1;
 		m->jobs[fault_slot].fence.err = -MGPU_EIO;
 		if (m->jobs[fault_slot].bo >= 0)

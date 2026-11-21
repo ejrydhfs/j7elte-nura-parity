@@ -84,11 +84,14 @@ struct p7580_submit_job {
 	 * as ran=N. Proves call order even if a print is lost. */
 	unsigned int run_seq;
 	/* Owned BO object pointers for the completion retire path
-	 * (F-JT2): SUBMIT stores one referenced pointer per handle
-	 * here (opaque void* so this header stays drm-free); the
-	 * driver's free_job walks them with p7580_gem_job_done_sync
-	 * and drops the refs before p7580_job_free releases the
-	 * array. NULL when the job references no BOs. */
+	 * (F-JT2 + gpu31-coherency-race): SUBMIT stores one referenced
+	 * pointer per handle here (opaque void* so this header stays
+	 * drm-free); the IRQ handler pre-signal-syncs them with
+	 * p7580_gem_job_bos_pre_signal_sync before the fence signals,
+	 * and the driver's free_job walks them with
+	 * p7580_gem_job_done_sync and drops the refs before
+	 * p7580_job_free releases the array. NULL when the job
+	 * references no BOs. */
 	void **bos;
 };
 

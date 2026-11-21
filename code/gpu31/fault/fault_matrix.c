@@ -3,7 +3,8 @@
  * fault_matrix.c - host fault-injection matrix for the T720 panfrost
  * port (jobs fault path + MMU decode + reset recovery).
  *
- * Runs the 12-case matrix (F1..F12, see docs/reports/gpu31-fault.md)
+ * Runs the 13-case matrix (F1..F13, see docs/reports/gpu31-fault.md;
+ * F13 = gpu31-coherency-race signal-implies-visible)
  * against pf7580_mock_gpu.c and the pure-C job-manager header, with
  * virtual time: the 5 s job timeout (P7580_JOB_TIMEOUT_MS) and 3 s
  * reset bound (P7580_RESET_TIMEOUT_MS) are stepped in milliseconds of
@@ -426,7 +427,7 @@ static void f12_reg_contract(void)
 	CHECK(P7580_JOB_TIMEOUT_MS == 5000u);
 	CHECK(P7580_RESET_TIMEOUT_MS == 3000u);
 	CHECK(P7580_JM_MAX_SLOTS == 3u);
-	CHECK(PF7580_FAULT_NCASES == 12u);
+	CHECK(PF7580_FAULT_NCASES == 13u);
 	/* Fault-VA round trip through FAULTADDR_HI/LO. */
 	CHECK(mgpu_submit(&m, 0, va, -1) == 0);
 	mgpu_step_ms(&m, 10);
@@ -443,6 +444,68 @@ static void f12_reg_contract(void)
 	CHECK(mgpu_recover(&m, 0, 0x5Au) == 0);
 }
 
+/* F13 (gpu31-coherency-race): fence signal implies CPU-visible.
+ * Models the fixed driver order: the completion invalidate
+ * (p7580_gem_job_bos_pre_signal_sync) runs in the IRQ demux BEFORE
+ * dma_fence_signal, and on the recovery path before the -EIO signal.
+ * The mock GPU write clears cpu_visible at dispatch-complete time;
+ * the mock demux/recover set it before signalling. So:
+ *  (a) DONE path: after wait_done (fence signalled), the BO reads
+ *      visible -- signal without a preceding invalidate would leave
+ *      stale == the mesa-render USER-stale/KERN-zero signature.
+ *  (b) fault path: after recover (fence signalled -EIO), the BO is
+ *      still visible (partial writes not torn by the reset).
+ * A regression that moves the invalidate after the signal (or drops
+ * it on one path) fails exactly one of these CHECKs. */
+static void f13_signal_implies_visible(void)
+{
+	struct mgpu m;
+	uint32_t h;
+	uint64_t va;
+	int bi, i;
+
+	CASE("F13", "signal implies CPU-visible (pre-signal invalidate)");
+	/* (a) DONE path. */
+	mgpu_init(&m);
+	CHECK(mgpu_bo_create(&m, 4096, PF7580_F_PROT_RD | PF7580_F_PROT_WR,
+			     &h, &va) == 0);
+	bi = -1;
+	for (i = 0; i < (int)MGPU_MAX_BOS; i++) {
+		if (m.bos[i].used && m.bos[i].handle == h) {
+			bi = i;
+			break;
+		}
+	}
+	CHECK(bi >= 0);
+	CHECK(m.bos[bi].cpu_visible == 1); /* fresh: nothing stale */
+	CHECK(mgpu_submit(&m, 1, va, (int)h) == 0);
+	CHECK(wait_done(&m, 1, P7580_JOB_TIMEOUT_MS));
+	mgpu_isr_demux(&m);
+	CHECK(mgpu_fence_signaled(&m, 1));
+	CHECK(m.bos[bi].cpu_visible == 1); /* signal => visible */
+	CHECK(mgpu_bo_free(&m, h) == 0);
+	/* (b) fault path: faulted batch still visible after recover. */
+	mgpu_init(&m);
+	CHECK(mgpu_bo_create(&m, 4096, PF7580_F_PROT_RD | PF7580_F_PROT_WR,
+			     &h, &va) == 0);
+	bi = -1;
+	for (i = 0; i < (int)MGPU_MAX_BOS; i++) {
+		if (m.bos[i].used && m.bos[i].handle == h) {
+			bi = i;
+			break;
+		}
+	}
+	CHECK(bi >= 0);
+	m.force_fault[0] = 0x5A; /* ADDRESS_RANGE_FAULT */
+	CHECK(mgpu_submit(&m, 0, va, (int)h) == 0);
+	mgpu_step_ms(&m, 10);
+	mgpu_isr_demux(&m);
+	CHECK(mgpu_recover(&m, 0, 0x5Au) == 0);
+	CHECK(m.jobs[0].fence.signaled && m.jobs[0].fence.err == -MGPU_EIO);
+	CHECK(m.bos[bi].cpu_visible == 1); /* recover signal => visible */
+	CHECK(mgpu_bo_free(&m, h) == 0);
+}
+
 int main(void)
 {
 	f1_valid_done();
@@ -457,6 +520,7 @@ int main(void)
 	f10_perm_fault();
 	f11_decode_table();
 	f12_reg_contract();
+	f13_signal_implies_visible();
 
 	if (fails == 0)
 		printf("fault_matrix: %d/%d PASS\n", ran, ran);

@@ -1,6 +1,6 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-20 19:18:35.156637348 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-20 20:30:09.944264265 -0500
 @@ -0,0 +1,107 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -111,8 +111,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +#endif /* PANFROST7580_DRV_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-20 19:18:35.158981126 -0500
-@@ -0,0 +1,1213 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-20 20:30:09.946559993 -0500
+@@ -0,0 +1,1263 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -222,11 +222,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +/*    DMA_BIDIRECTIONAL) drains CPU lines to the point the GPU reads   */
 +/*    (PoC/RAM). The GPU PTW tables already follow this                */
 +/*    (p7580_sync_pt: sync after every table write).                   */
-+/*  - COMPLETION (GPU -> CPU): after the job fence signals,           */
++/*  - COMPLETION (GPU -> CPU): BEFORE the job fence signals,           */
 +/*    dma_sync_single_for_cpu(dev, dma, PAGE_SIZE,                     */
 +/*    DMA_BIDIRECTIONAL) invalidates CPU lines for the range the GPU  */
-+/*    wrote, so the next CPU read (kmap/vmap/mmap fault) misses to     */
-+/*    DRAM and observes GPU bytes.                                     */
++/*    wrote, so a userspace wait returning implies visible data and   */
++/*    the next CPU read (kmap/vmap/mmap fault) misses to DRAM and     */
++/*    observes GPU bytes. gpu31-coherency-race: the old order ran the  */
++/*    invalidate after the signal (free_job) and was racy.            */
 +/*                                                                     */
 +/* Why not flush_dcache_page(): on arm64 it only clears PG_dcache_clean  */
 +/* (flush.c: flush_dcache_page is a flag clear for the icache-alias    */
@@ -244,14 +246,58 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +/* its pages while GPU-bound (built at bind, torn down at unbind,      */
 +/* DMA_BIDIRECTIONAL so the same mapping serves job upload and         */
 +/* writeback; SKIP_CPU_SYNC is never set). sync_for_device runs at     */
-+/* SUBMIT (before the job is queued) and sync_for_cpu at completion    */
-+/* (after the fence signals, in free_job context: no MMIO, no sleeps,  */
++/* SUBMIT (before the job is queued) and sync_for_cpu runs BEFORE the   */
++/* fence signals (pre-signal helper in IRQ/timedout/recover context,   */
++/* plus a belt-and-braces repeat in free_job: no MMIO, no sleeps,      */
 +/* no locks — same constraints as the old hook). dma_addr per page is  */
 +/* cached in the BO (identity on this tree is asserted, not assumed:   */
 +/* a non-identity dma_addr is carried verbatim, so sync still hits the */
 +/* right bus address; PTEs must come from p7580_bo_dma_addr, never     */
 +/* from page_to_phys directly).                                        */
 +/* ------------------------------------------------------------------ */
++/* Pre-signal completion invalidate (gpu31-coherency-race): walk the
++ * job's owned BO pointers and run p7580_gem_job_done_sync on each
++ * (dma_sync_single_for_cpu per bound SHMEM page; CMA/imported and
++ * never-bound BOs no-op inside). The caller holds one ref per
++ * pointer (SUBMIT transfers the lookup refs onto job->bos), so the
++ * objects cannot vanish mid-walk; this helper takes no refs and
++ * drops none.
++ *
++ * Context contract: safe wherever dma_sync_single_for_cpu is safe.
++ * That path is cache maintenance plus a cheap swiotlb identity
++ * check: on this tree __swiotlb_sync_single_for_cpu is
++ * __dma_unmap_area (dcache-line dc ops + dsb, no locks, no MMIO,
++ * no sleeps, no allocations) followed by swiotlb_sync_single_for_cpu
++ * (direct-DRAM fast path: identity mapping -> dma_mark_clean only;
++ * the spinlocked bounce-copy leg runs only for real swiotlb bounce
++ * buffers, which streaming dma_map_page never produces here).
++ * dma-debug is compiled out on the j7elte defconfig
++ * (# CONFIG_DMA_API_DEBUG is not set), so debug_dma_sync_* is a
++ * global_disable-gated no-op. Safe under IRQ-off spinlock and inside
++ * dma_fence callbacks.
++ *
++ * Why locked-region / fence-callback safe: the BO list (job->bos,
++ * bo_count) is private to the retiring job, the per-BO dma_addrs /
++ * sync_dev are stable while GPU-bound (set at bind, cleared only at
++ * unbind/free, both ordered after fence retirement), and the walk
++ * touches no scheduler/resv/syncobj state. A NULL entry is skipped;
++ * NULL job/bos is a no-op. */
++void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count)
++{
++	unsigned int i;
++
++	if (!bos || !bo_count)
++		return;
++	for (i = 0; i < bo_count; i++) {
++		struct drm_gem_object *obj =
++			(struct drm_gem_object *)bos[i];
++
++		if (!obj)
++			continue;
++		p7580_gem_job_done_sync(obj);
++	}
++}
++
 +void p7580_gem_job_done_sync(struct drm_gem_object *obj)
 +{
 +	struct p7580_bo *bo = to_p7580_bo(obj);
@@ -270,12 +316,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	}
 +}
 +/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
-+ * readback. Guardrail: reuse the exact free_job maintenance -- call
-+ * p7580_gem_job_done_sync first (dma_sync_single_for_cpu per bound
-+ * SHMEM page), then read one u32 via the kernel linear map
-+ * (kmap_atomic single-arg on this !HIGHMEM arm64 tree). Never-bound
-+ * CMA/imported follow job_done_sync's no-op rules; unmapped pages
-+ * fail ENOENT. No MMIO, no sleeps, no locks. */
++ * readback. Guardrail: reuse the completion maintenance -- call
++ * p7580_gem_job_done_sync first (same invalidate the pre-signal IRQ
++ * path runs; dma_sync_single_for_cpu per bound SHMEM page), then read
++ * one u32 via the kernel linear map (kmap_atomic single-arg on this
++ * !HIGHMEM arm64 tree). Never-bound CMA/imported follow
++ * job_done_sync's no-op rules; unmapped pages fail ENOENT. No MMIO,
++ * no sleeps, no locks. */
 +int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
 +			      uint32_t *out)
 +{
@@ -686,7 +733,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +/*    lock/encode helpers in code/gpu31/mmu/pf7580_as.h).               */
 +/*  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills     */
 +/*    descriptors/payloads, before queueing.                            */
-+/*  - completion: p7580_gem_job_done_sync(obj) per BO in free_job.      */
++/*  - completion: p7580_gem_job_bos_pre_signal_sync(bos, n) in the IRQ  */
++/*    handler before dma_fence_signal (and on the timedout/recover      */
++/*    paths before their signals), then p7580_gem_job_done_sync(obj)    */
++/*    per BO in free_job as the belt-and-braces ref-drop leg.          */
 +/*  - unmap: p7580_mmu_unmap(mmu, bo->iova + idx*PAGE_SIZE) per page,   */
 +/*    then invalidate the same range; p7580_gem_dma_unbind(obj); the    */
 +/*    caller frees child tables with p7580_mmu_free_table after the    */
@@ -1328,8 +1378,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-20 19:18:35.161152467 -0500
-@@ -0,0 +1,212 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-20 20:30:09.948748726 -0500
+@@ -0,0 +1,223 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
@@ -1518,7 +1568,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 + * completion invalidates CPU lines (sync_for_cpu) so the next CPU
 + * read sees GPU bytes; unbind tears the mapping down. CMA/imported
 + * BOs are no-ops everywhere. job_done_sync runs in free_job context
-+ * (no MMIO, no sleeps, no locks). PTEs must come from p7580_bo_dma_addr. */
++ * (no MMIO, no sleeps, no locks); the pre-signal wrapper below runs
++ * the same maintenance in IRQ / fence-callback context before the
++ * fence signals. PTEs must come from p7580_bo_dma_addr. */
++/* Pre-signal variant of the completion invalidate (gpu31-coherency-race):
++ * runs job_done_sync on each owned BO WITHOUT dropping refs. Called with
++ * the job's bos/bo_count (opaque void so this header stays drm-free)
++ * BEFORE the done-fence is signalled, so a userspace wait returning
++ * implies visible data. Same IRQ-off-spinlock / fence-callback safety
++ * as job_done_sync (cache maintenance only, no MMIO/sleeps/locks).
++ * free_job keeps its post-signal job_done_sync + unref walk as the
++ * ref-drop leg. */
++void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count);
 +void p7580_gem_job_done_sync(struct drm_gem_object *obj);
 +int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev);
 +void p7580_gem_submit_sync(struct drm_gem_object *obj);
@@ -1526,9 +1587,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
 +/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
 + * readback of a BO page after completion. Reuses p7580_gem_job_done_sync
-+ * (same dma_sync_for_cpu path as free_job) then reads one u32 via kmap.
-+ * No new maintenance implementation; CMA/imported-never-bound BOs follow
-+ * the same no-op rules as job_done_sync. offset is a byte offset. */
++ * (same invalidate the pre-signal IRQ path runs) then reads one u32 via
++ * kmap. No new maintenance implementation; CMA/imported-never-bound BOs
++ * follow the same no-op rules as job_done_sync. offset is a byte offset. */
 +int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
 +			      uint32_t *out);
 +struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
@@ -1544,7 +1605,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +#endif /* PANFROST7580_GEM_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-20 19:18:35.163304742 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-20 20:30:09.951018403 -0500
 @@ -0,0 +1,372 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -1835,10 +1896,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +	return 0;
 +}
 +/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side BO
-+ * word readback after completion. Same maintenance as free_job
-+ * (p7580_gem_debug_read_word calls p7580_gem_job_done_sync), so the
-+ * kernel view cannot reproduce the userspace-alias ambiguity. Plain
-+ * static enable: always on while the ticket is open; the cutover
++ * word readback after completion. Same maintenance as the pre-signal
++ * IRQ path (p7580_gem_debug_read_word calls p7580_gem_job_done_sync),
++ * so the kernel view cannot reproduce the userspace-alias ambiguity.
++ * Plain static enable: always on while the ticket is open; the cutover
 + * deletes this function + its 0xCF route. No MMIO, no sleeps. */
 +struct p7580_debug_read_bo {
 +	uint32_t handle;
@@ -1920,7 +1981,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-20 19:18:35.165329488 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-20 20:30:09.953393819 -0500
 @@ -0,0 +1,52 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -1966,7 +2027,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 + * word readback after completion. Routed via the syncobj fops
 + * dispatcher (nr 0xCF), NOT the six-ioctl driver table. Takes a
 + * handle + byte offset, returns the u32 at that offset after the
-+ * same dma_sync_for_cpu maintenance free_job runs. */
++ * same completion invalidate the pre-signal IRQ path runs. */
 +int panfrost_debug_read_bo(struct drm_device *dev, void *data,
 +			   struct drm_file *file_priv);
 +
@@ -1976,7 +2037,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 +#endif /* PANFROST7580_IOCTL_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-20 19:18:35.167367294 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-20 20:30:09.955616774 -0500
 @@ -0,0 +1,258 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -2238,8 +2299,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#endif /* PANFROST7580_JM_HW_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 19:18:35.169499385 -0500
-@@ -0,0 +1,851 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-20 20:30:09.957713177 -0500
+@@ -0,0 +1,894 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -2300,6 +2361,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +
 +#include "panfrost7580_job.h"
 +#include "panfrost7580_mmu.h"
++
++/* GEM completion invalidate (gem/panfrost7580_gem.c): pre-signal walk
++ * over the job's owned BO pointers. Declared here (not via gem.h) so
++ * this TU stays decoupled from the GEM BO struct layout; the linker
++ * resolves it inside the panfrost7580 module. Takes opaque void**
++ * (job->bos) + count; no refs taken or dropped. IRQ-safe. */
++void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count);
 +
 +/* ------------------------------------------------------------------ */
 +/* Bounded job-lifecycle tracing (jobtrace ticket).                    */
@@ -2605,21 +2673,26 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +}
 +/* ------------------------------------------------------------------ */
 +/* IRQ handler: demux JOB_INT_STAT per slot. IRQ context: no sleeps,  */
-+/* no mutexes, only spinlock + fence signal + JOB_INT_CLEAR.          */
-+/*                                                                    */
-+/* DONE(j): signal job->done_fence (wakes sched retirement + any     */
-+/*   WAIT_BO waiters); clear in_flight under hw_lock.                 */
++/* no mutexes, only spinlock + cache maintenance + fence signal +     */
++/* JOB_INT_CLEAR.                                                      */
++/*                                                                     */
++/* DONE(j): invalidate the job's BOs (pre-signal sync), then signal   */
++/*   job->done_fence (wakes sched retirement + any WAIT_BO waiters);  */
++/*   clear in_flight under hw_lock. A userspace wait returning thus   */
++/*   implies visible data (gpu31-coherency-race): the CPU invalidate   */
++/*   that used to run in free_job now runs here, before the signal.   */
 +/* ERR(j): freeze the chain with COMMAND_NEXT=NOP (kbase/panfrost     */
 +/*   shape) so a faulted job cannot re-issue; the timeout/recovery   */
 +/*   path (process context) reads STATUS/HEAD/TAIL and resets. Here  */
 +/*   just CLEAR the sticky bit(s) so the line deasserts.              */
-+/*                                                                    */
++/*                                                                     */
 +/* Completion condition (jobabi §4/§7): IRQ fires iff the slot's DONE */
 +/* or ERR bit is set in JOB_INT_STAT (masked view of RAWSTAT). The   */
 +/* dispatched job completes when this handler observes               */
 +/* STAT & MK_JS_MASK(slot) with the DONE bit set, clears the slot    */
-+/* bit(s), and dma_fence_signal()s the in-flight fence -- the 5 s    */
-+/* timeout (timedout_job -> recover) only fires when no IRQ arrives. */
++/* bit(s), syncs the BOs, and dma_fence_signal()s the in-flight      */
++/* fence -- the 5 s timeout (timedout_job -> recover) only fires     */
++/* when no IRQ arrives.                                               */
 +/* ------------------------------------------------------------------ */
 +
 +int p7580_job_irq(int irq, struct p7580_job_dev *jd)
@@ -2686,6 +2759,23 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			}
 +			spin_unlock_irqrestore(&jd->hw_lock, flags);
 +
++			/* Coherency-race fix: invalidate the job's BOs BEFORE
++			 * the fence signals, so any waiter woken by the
++			 * signal (WAIT_BO dma_resv_wait, syncobj WAIT,
++			 * sched finish_cb) observes GPU-written bytes.
++			 * p7580_gem_job_bos_pre_signal_sync walks
++			 * job->bos/bo_count with dma_sync_single_for_cpu per
++			 * bound SHMEM page (no MMIO, no sleeps, no locks:
++			 * dcache-line ops + dsb only, IRQ-safe; the swiotlb
++			 * leg is the identity fast path). free_job keeps a
++			 * second (post-signal) job_done_sync + unref walk --
++			 * belt and braces for waiters that attach after the
++			 * free (mmap/CPU reads), and for paths where the
++			 * IRQ never fires (recover signals instead; see
++			 * timedout/recover below). */
++			if (job && job->bo_count && job->bos)
++				p7580_gem_job_bos_pre_signal_sync(job->bos,
++								  job->bo_count);
 +			if (job && job->done_fence) {
 +				sig = dma_fence_signal((struct dma_fence *)job->done_fence); /* 0001 */
 +				/* Bounded fence-signal trace: 0 = first
@@ -2811,13 +2901,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +
 +	/* Bounded-completion guarantee: recovery signals the job latched in
 +	 * in_flight[slot], which may differ from this timed-out job (see
-+	 * above). If ours is still pending, signal it here so its
-+	 * finish_cb/syncobj/WAIT_BO waiters wake within one timeout plus
-+	 * one recovery instead of hanging forever. Idempotent: the IRQ or
-+	 * a concurrent recover may have signaled it first. */
++	 * above). If ours is still pending, sync its BOs first, then signal
++	 * it here so its finish_cb/syncobj/WAIT_BO waiters wake within one
++	 * timeout plus one recovery instead of hanging forever, and with
++	 * visible data (same pre-signal order as the IRQ DONE path).
++	 * Idempotent: the IRQ or a concurrent recover may have signaled it
++	 * first. Process context here, but the helper is IRQ-safe anyway. */
 +	f = (struct dma_fence *)job->done_fence;
-+	if (f && !dma_fence_is_signaled(f)) /* 0001 */
++	if (f && !dma_fence_is_signaled(f)) { /* 0001 */
++		if (job->bo_count && job->bos)
++			p7580_gem_job_bos_pre_signal_sync(job->bos,
++							  job->bo_count);
 +		dma_fence_signal(f); /* 0001 */
++	}
 +}
 +/* ------------------------------------------------------------------ */
 +/* SUBMIT ioctl body. Steps (mirrors v5.2 panfrost_job_push, adapted  */
@@ -3082,19 +3178,27 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +
 +	/* 5. fault accounting (F-JOB4): signal exactly once so waiters  */
 +	/* do not hang. Skip an already-signaled fence: the IRQ won the */
-+	/* race and the job completed. */
++	/* race and the job completed (its pre-signal sync already ran). */
++	/* Sync-before-signal here too: a faulted batch may still have */
++	/* completed some BO writes before faulting, and waiters must */
++	/* not observe torn/stale lines just because the retire path */
++	/* was recovery instead of DONE. */
 +	if (fault_job && fault_job->done_fence &&
 +	    !dma_fence_is_signaled( /* 0001 */
-+		    (struct dma_fence *)fault_job->done_fence))
++		    (struct dma_fence *)fault_job->done_fence)) {
++		if (fault_job->bo_count && fault_job->bos)
++			p7580_gem_job_bos_pre_signal_sync(fault_job->bos,
++							  fault_job->bo_count);
 +		dma_fence_signal( /* 0001 */
 +			(struct dma_fence *)fault_job->done_fence);
++	}
 +	(void)status;
 +	return ret;
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 19:18:35.171576232 -0500
-@@ -0,0 +1,179 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-20 20:30:09.959635747 -0500
+@@ -0,0 +1,182 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -3181,11 +3285,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	 * as ran=N. Proves call order even if a print is lost. */
 +	unsigned int run_seq;
 +	/* Owned BO object pointers for the completion retire path
-+	 * (F-JT2): SUBMIT stores one referenced pointer per handle
-+	 * here (opaque void* so this header stays drm-free); the
-+	 * driver's free_job walks them with p7580_gem_job_done_sync
-+	 * and drops the refs before p7580_job_free releases the
-+	 * array. NULL when the job references no BOs. */
++	 * (F-JT2 + gpu31-coherency-race): SUBMIT stores one referenced
++	 * pointer per handle here (opaque void* so this header stays
++	 * drm-free); the IRQ handler pre-signal-syncs them with
++	 * p7580_gem_job_bos_pre_signal_sync before the fence signals,
++	 * and the driver's free_job walks them with
++	 * p7580_gem_job_done_sync and drops the refs before
++	 * p7580_job_free releases the array. NULL when the job
++	 * references no BOs. */
 +	void **bos;
 +};
 +
@@ -3276,7 +3383,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +#endif /* PANFROST7580_JOB_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-20 19:18:35.173758539 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-20 20:30:09.961737668 -0500
 @@ -0,0 +1,682 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -3962,7 +4069,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +MODULE_ALIAS("platform:panfrost7580");
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-20 19:18:35.175983029 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-20 20:30:09.963837912 -0500
 @@ -0,0 +1,447 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -4413,7 +4520,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-20 19:18:35.178043603 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-20 20:30:09.966148097 -0500
 @@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -4588,7 +4695,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/d
 +#endif /* PANFROST7580_MMU_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b/drivers/gpu/drm/panfrost/panfrost7580_power.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-20 19:18:35.180116190 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-20 20:30:09.968297719 -0500
 @@ -0,0 +1,524 @@
 +/*
 + * panfrost7580_power.c - PM / clock / reset sequencing for Mali-T720
@@ -5116,7 +5223,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b/drivers/gpu/drm/panfrost/panfrost7580_power.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-20 19:18:35.182234382 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-20 20:30:09.970450134 -0500
 @@ -0,0 +1,201 @@
 +/*
 + * panfrost7580_power.h - PM / clock / reset sequencing for Mali-T720
@@ -5321,7 +5428,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 +#endif /* PANFROST7580_POWER_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-20 19:18:35.184232100 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-20 20:30:09.972527541 -0500
 @@ -0,0 +1,995 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -6320,7 +6427,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-20 19:18:35.186274097 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-20 20:30:09.974664102 -0500
 @@ -0,0 +1,848 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -7172,7 +7279,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +#endif
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-20 19:18:35.188469394 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-20 20:30:09.976781248 -0500
 @@ -0,0 +1,70 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -7246,7 +7353,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
 +#endif /* PANFROST7580_SYNCOBJ_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drivers/gpu/drm/panfrost/panfrost_drm.h
 --- a/drivers/gpu/drm/panfrost/panfrost_drm.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-20 19:18:35.190565237 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-20 20:30:09.979125376 -0500
 @@ -0,0 +1,155 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
@@ -7405,7 +7512,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drive
 +#endif /* _PANFROST_DRM_H_ */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/drivers/gpu/drm/panfrost/pf7580_devfreq.c
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-20 19:18:35.192551851 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-20 20:30:09.981234979 -0500
 @@ -0,0 +1,355 @@
 +/*
 + * pf7580_devfreq.c - panfrost devfreq/DVFS for Mali-T720 on 3.10.108.
@@ -7764,7 +7871,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/dri
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.h b/drivers/gpu/drm/panfrost/pf7580_devfreq.h
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-20 19:18:35.194775083 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-20 20:30:09.983453324 -0500
 @@ -0,0 +1,251 @@
 +/*
 + * pf7580_devfreq.h - panfrost devfreq/DVFS for Mali-T720 (Exynos 7580,

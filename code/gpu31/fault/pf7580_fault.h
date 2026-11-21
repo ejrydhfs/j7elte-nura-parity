@@ -35,10 +35,12 @@
 #include "panfrost7580_jm_hw.h"
 
 /* ------------------------------------------------------------------ */
-/* Matrix case IDs (F1..F12, see fault_matrix.c and gpu31-fault.md).   */
+/* Matrix case IDs (F1..F13, see fault_matrix.c and gpu31-fault.md).   */
+/* F13 is the gpu31-coherency-race order case: fence signal implies   */
+/* CPU-visible.                                                        */
 /* ------------------------------------------------------------------ */
 
-#define PF7580_FAULT_NCASES	12u
+#define PF7580_FAULT_NCASES	13u
 
 /* BO/IOMMU permission bits: same values as P7580_PROT_* in
  * iommu/panfrost7580_mmu.h:115-118 (kept local so this stays host-C). */

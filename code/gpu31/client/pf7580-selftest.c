@@ -22,8 +22,9 @@
  *                 0xA5A5A5A5. SUBMIT (req=0 -> JS0), fence-wait the
  *                 out_sync, then compare word 0 in BOTH views:
  *                 userspace re-mmap AND the DEBUG_READ_BO kernel
- *                 readback (same sync_for_cpu as free_job). PASS (both
- *                 zero) proves the GPU wrote the page. Kernel-zero +
+ *                 readback (same completion invalidate the pre-signal
+ *                 IRQ path runs). PASS (both zero) proves the GPU wrote
+ *                 the page. Kernel-zero +
  *                 user-0xA5 = stale CPU alias (visibility bug); both
  *                 0xA5 + fence signalled = GPU never wrote
  *                 (encoding/slot); +JS_STATUS fault = bad job/VA.
@@ -1010,7 +1011,7 @@ static int run_pattern_test(const char *path)
 	       got, PF7580_PATTERN_PREFILL,
 	       got == 0 ? "ZERO" : "STALE");
 	/* Kernel-side view: same page via the debug readback (same
-	 * dma_sync_for_cpu maintenance the free_job path runs). */
+	 * completion invalidate the pre-signal IRQ path runs). */
 	{
 		uint32_t kv = 0xdeadbeef;
 		int krc = pf7580_debug_read_bo(dev, rh, 0, &kv);

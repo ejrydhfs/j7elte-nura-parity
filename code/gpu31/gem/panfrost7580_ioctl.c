@@ -287,10 +287,10 @@ int panfrost_ioctl_wait_bo(struct drm_device *dev, void *data,
 	return 0;
 }
 /* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side BO
- * word readback after completion. Same maintenance as free_job
- * (p7580_gem_debug_read_word calls p7580_gem_job_done_sync), so the
- * kernel view cannot reproduce the userspace-alias ambiguity. Plain
- * static enable: always on while the ticket is open; the cutover
+ * word readback after completion. Same maintenance as the pre-signal
+ * IRQ path (p7580_gem_debug_read_word calls p7580_gem_job_done_sync),
+ * so the kernel view cannot reproduce the userspace-alias ambiguity.
+ * Plain static enable: always on while the ticket is open; the cutover
  * deletes this function + its 0xCF route. No MMIO, no sleeps. */
 struct p7580_debug_read_bo {
 	uint32_t handle;

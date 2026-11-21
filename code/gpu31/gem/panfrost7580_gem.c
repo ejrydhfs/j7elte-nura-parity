@@ -107,11 +107,13 @@ struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj)
 /*    DMA_BIDIRECTIONAL) drains CPU lines to the point the GPU reads   */
 /*    (PoC/RAM). The GPU PTW tables already follow this                */
 /*    (p7580_sync_pt: sync after every table write).                   */
-/*  - COMPLETION (GPU -> CPU): after the job fence signals,           */
+/*  - COMPLETION (GPU -> CPU): BEFORE the job fence signals,           */
 /*    dma_sync_single_for_cpu(dev, dma, PAGE_SIZE,                     */
 /*    DMA_BIDIRECTIONAL) invalidates CPU lines for the range the GPU  */
-/*    wrote, so the next CPU read (kmap/vmap/mmap fault) misses to     */
-/*    DRAM and observes GPU bytes.                                     */
+/*    wrote, so a userspace wait returning implies visible data and   */
+/*    the next CPU read (kmap/vmap/mmap fault) misses to DRAM and     */
+/*    observes GPU bytes. gpu31-coherency-race: the old order ran the  */
+/*    invalidate after the signal (free_job) and was racy.            */
 /*                                                                     */
 /* Why not flush_dcache_page(): on arm64 it only clears PG_dcache_clean  */
 /* (flush.c: flush_dcache_page is a flag clear for the icache-alias    */
@@ -129,14 +131,58 @@ struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj)
 /* its pages while GPU-bound (built at bind, torn down at unbind,      */
 /* DMA_BIDIRECTIONAL so the same mapping serves job upload and         */
 /* writeback; SKIP_CPU_SYNC is never set). sync_for_device runs at     */
-/* SUBMIT (before the job is queued) and sync_for_cpu at completion    */
-/* (after the fence signals, in free_job context: no MMIO, no sleeps,  */
+/* SUBMIT (before the job is queued) and sync_for_cpu runs BEFORE the   */
+/* fence signals (pre-signal helper in IRQ/timedout/recover context,   */
+/* plus a belt-and-braces repeat in free_job: no MMIO, no sleeps,      */
 /* no locks — same constraints as the old hook). dma_addr per page is  */
 /* cached in the BO (identity on this tree is asserted, not assumed:   */
 /* a non-identity dma_addr is carried verbatim, so sync still hits the */
 /* right bus address; PTEs must come from p7580_bo_dma_addr, never     */
 /* from page_to_phys directly).                                        */
 /* ------------------------------------------------------------------ */
+/* Pre-signal completion invalidate (gpu31-coherency-race): walk the
+ * job's owned BO pointers and run p7580_gem_job_done_sync on each
+ * (dma_sync_single_for_cpu per bound SHMEM page; CMA/imported and
+ * never-bound BOs no-op inside). The caller holds one ref per
+ * pointer (SUBMIT transfers the lookup refs onto job->bos), so the
+ * objects cannot vanish mid-walk; this helper takes no refs and
+ * drops none.
+ *
+ * Context contract: safe wherever dma_sync_single_for_cpu is safe.
+ * That path is cache maintenance plus a cheap swiotlb identity
+ * check: on this tree __swiotlb_sync_single_for_cpu is
+ * __dma_unmap_area (dcache-line dc ops + dsb, no locks, no MMIO,
+ * no sleeps, no allocations) followed by swiotlb_sync_single_for_cpu
+ * (direct-DRAM fast path: identity mapping -> dma_mark_clean only;
+ * the spinlocked bounce-copy leg runs only for real swiotlb bounce
+ * buffers, which streaming dma_map_page never produces here).
+ * dma-debug is compiled out on the j7elte defconfig
+ * (# CONFIG_DMA_API_DEBUG is not set), so debug_dma_sync_* is a
+ * global_disable-gated no-op. Safe under IRQ-off spinlock and inside
+ * dma_fence callbacks.
+ *
+ * Why locked-region / fence-callback safe: the BO list (job->bos,
+ * bo_count) is private to the retiring job, the per-BO dma_addrs /
+ * sync_dev are stable while GPU-bound (set at bind, cleared only at
+ * unbind/free, both ordered after fence retirement), and the walk
+ * touches no scheduler/resv/syncobj state. A NULL entry is skipped;
+ * NULL job/bos is a no-op. */
+void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count)
+{
+	unsigned int i;
+
+	if (!bos || !bo_count)
+		return;
+	for (i = 0; i < bo_count; i++) {
+		struct drm_gem_object *obj =
+			(struct drm_gem_object *)bos[i];
+
+		if (!obj)
+			continue;
+		p7580_gem_job_done_sync(obj);
+	}
+}
+
 void p7580_gem_job_done_sync(struct drm_gem_object *obj)
 {
 	struct p7580_bo *bo = to_p7580_bo(obj);
@@ -155,12 +201,13 @@ void p7580_gem_job_done_sync(struct drm_gem_object *obj)
 	}
 }
 /* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
- * readback. Guardrail: reuse the exact free_job maintenance -- call
- * p7580_gem_job_done_sync first (dma_sync_single_for_cpu per bound
- * SHMEM page), then read one u32 via the kernel linear map
- * (kmap_atomic single-arg on this !HIGHMEM arm64 tree). Never-bound
- * CMA/imported follow job_done_sync's no-op rules; unmapped pages
- * fail ENOENT. No MMIO, no sleeps, no locks. */
+ * readback. Guardrail: reuse the completion maintenance -- call
+ * p7580_gem_job_done_sync first (same invalidate the pre-signal IRQ
+ * path runs; dma_sync_single_for_cpu per bound SHMEM page), then read
+ * one u32 via the kernel linear map (kmap_atomic single-arg on this
+ * !HIGHMEM arm64 tree). Never-bound CMA/imported follow
+ * job_done_sync's no-op rules; unmapped pages fail ENOENT. No MMIO,
+ * no sleeps, no locks. */
 int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
 			      uint32_t *out)
 {
@@ -571,7 +618,10 @@ err_bo:
 /*    lock/encode helpers in code/gpu31/mmu/pf7580_as.h).               */
 /*  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills     */
 /*    descriptors/payloads, before queueing.                            */
-/*  - completion: p7580_gem_job_done_sync(obj) per BO in free_job.      */
+/*  - completion: p7580_gem_job_bos_pre_signal_sync(bos, n) in the IRQ  */
+/*    handler before dma_fence_signal (and on the timedout/recover      */
+/*    paths before their signals), then p7580_gem_job_done_sync(obj)    */
+/*    per BO in free_job as the belt-and-braces ref-drop leg.          */
 /*  - unmap: p7580_mmu_unmap(mmu, bo->iova + idx*PAGE_SIZE) per page,   */
 /*    then invalidate the same range; p7580_gem_dma_unbind(obj); the    */
 /*    caller frees child tables with p7580_mmu_free_table after the    */

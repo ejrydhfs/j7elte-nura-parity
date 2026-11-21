@@ -59,6 +59,13 @@
 #include "panfrost7580_job.h"
 #include "panfrost7580_mmu.h"
 
+/* GEM completion invalidate (gem/panfrost7580_gem.c): pre-signal walk
+ * over the job's owned BO pointers. Declared here (not via gem.h) so
+ * this TU stays decoupled from the GEM BO struct layout; the linker
+ * resolves it inside the panfrost7580 module. Takes opaque void**
+ * (job->bos) + count; no refs taken or dropped. IRQ-safe. */
+void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count);
+
 /* ------------------------------------------------------------------ */
 /* Bounded job-lifecycle tracing (jobtrace ticket).                    */
 /*                                                                     */
@@ -363,21 +370,26 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 }
 /* ------------------------------------------------------------------ */
 /* IRQ handler: demux JOB_INT_STAT per slot. IRQ context: no sleeps,  */
-/* no mutexes, only spinlock + fence signal + JOB_INT_CLEAR.          */
-/*                                                                    */
-/* DONE(j): signal job->done_fence (wakes sched retirement + any     */
-/*   WAIT_BO waiters); clear in_flight under hw_lock.                 */
+/* no mutexes, only spinlock + cache maintenance + fence signal +     */
+/* JOB_INT_CLEAR.                                                      */
+/*                                                                     */
+/* DONE(j): invalidate the job's BOs (pre-signal sync), then signal   */
+/*   job->done_fence (wakes sched retirement + any WAIT_BO waiters);  */
+/*   clear in_flight under hw_lock. A userspace wait returning thus   */
+/*   implies visible data (gpu31-coherency-race): the CPU invalidate   */
+/*   that used to run in free_job now runs here, before the signal.   */
 /* ERR(j): freeze the chain with COMMAND_NEXT=NOP (kbase/panfrost     */
 /*   shape) so a faulted job cannot re-issue; the timeout/recovery   */
 /*   path (process context) reads STATUS/HEAD/TAIL and resets. Here  */
 /*   just CLEAR the sticky bit(s) so the line deasserts.              */
-/*                                                                    */
+/*                                                                     */
 /* Completion condition (jobabi §4/§7): IRQ fires iff the slot's DONE */
 /* or ERR bit is set in JOB_INT_STAT (masked view of RAWSTAT). The   */
 /* dispatched job completes when this handler observes               */
 /* STAT & MK_JS_MASK(slot) with the DONE bit set, clears the slot    */
-/* bit(s), and dma_fence_signal()s the in-flight fence -- the 5 s    */
-/* timeout (timedout_job -> recover) only fires when no IRQ arrives. */
+/* bit(s), syncs the BOs, and dma_fence_signal()s the in-flight      */
+/* fence -- the 5 s timeout (timedout_job -> recover) only fires     */
+/* when no IRQ arrives.                                               */
 /* ------------------------------------------------------------------ */
 
 int p7580_job_irq(int irq, struct p7580_job_dev *jd)
@@ -444,6 +456,23 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			}
 			spin_unlock_irqrestore(&jd->hw_lock, flags);
 
+			/* Coherency-race fix: invalidate the job's BOs BEFORE
+			 * the fence signals, so any waiter woken by the
+			 * signal (WAIT_BO dma_resv_wait, syncobj WAIT,
+			 * sched finish_cb) observes GPU-written bytes.
+			 * p7580_gem_job_bos_pre_signal_sync walks
+			 * job->bos/bo_count with dma_sync_single_for_cpu per
+			 * bound SHMEM page (no MMIO, no sleeps, no locks:
+			 * dcache-line ops + dsb only, IRQ-safe; the swiotlb
+			 * leg is the identity fast path). free_job keeps a
+			 * second (post-signal) job_done_sync + unref walk --
+			 * belt and braces for waiters that attach after the
+			 * free (mmap/CPU reads), and for paths where the
+			 * IRQ never fires (recover signals instead; see
+			 * timedout/recover below). */
+			if (job && job->bo_count && job->bos)
+				p7580_gem_job_bos_pre_signal_sync(job->bos,
+								  job->bo_count);
 			if (job && job->done_fence) {
 				sig = dma_fence_signal((struct dma_fence *)job->done_fence); /* 0001 */
 				/* Bounded fence-signal trace: 0 = first
@@ -569,13 +598,19 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 
 	/* Bounded-completion guarantee: recovery signals the job latched in
 	 * in_flight[slot], which may differ from this timed-out job (see
-	 * above). If ours is still pending, signal it here so its
-	 * finish_cb/syncobj/WAIT_BO waiters wake within one timeout plus
-	 * one recovery instead of hanging forever. Idempotent: the IRQ or
-	 * a concurrent recover may have signaled it first. */
+	 * above). If ours is still pending, sync its BOs first, then signal
+	 * it here so its finish_cb/syncobj/WAIT_BO waiters wake within one
+	 * timeout plus one recovery instead of hanging forever, and with
+	 * visible data (same pre-signal order as the IRQ DONE path).
+	 * Idempotent: the IRQ or a concurrent recover may have signaled it
+	 * first. Process context here, but the helper is IRQ-safe anyway. */
 	f = (struct dma_fence *)job->done_fence;
-	if (f && !dma_fence_is_signaled(f)) /* 0001 */
+	if (f && !dma_fence_is_signaled(f)) { /* 0001 */
+		if (job->bo_count && job->bos)
+			p7580_gem_job_bos_pre_signal_sync(job->bos,
+							  job->bo_count);
 		dma_fence_signal(f); /* 0001 */
+	}
 }
 /* ------------------------------------------------------------------ */
 /* SUBMIT ioctl body. Steps (mirrors v5.2 panfrost_job_push, adapted  */
@@ -840,12 +875,20 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 
 	/* 5. fault accounting (F-JOB4): signal exactly once so waiters  */
 	/* do not hang. Skip an already-signaled fence: the IRQ won the */
-	/* race and the job completed. */
+	/* race and the job completed (its pre-signal sync already ran). */
+	/* Sync-before-signal here too: a faulted batch may still have */
+	/* completed some BO writes before faulting, and waiters must */
+	/* not observe torn/stale lines just because the retire path */
+	/* was recovery instead of DONE. */
 	if (fault_job && fault_job->done_fence &&
 	    !dma_fence_is_signaled( /* 0001 */
-		    (struct dma_fence *)fault_job->done_fence))
+		    (struct dma_fence *)fault_job->done_fence)) {
+		if (fault_job->bo_count && fault_job->bos)
+			p7580_gem_job_bos_pre_signal_sync(fault_job->bos,
+							  fault_job->bo_count);
 		dma_fence_signal( /* 0001 */
 			(struct dma_fence *)fault_job->done_fence);
+	}
 	(void)status;
 	return ret;
 }

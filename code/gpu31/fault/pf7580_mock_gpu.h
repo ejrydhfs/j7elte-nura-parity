@@ -91,6 +91,15 @@ struct mgpu_bo {
 	unsigned int prot;
 	int busy;	/* in-flight job references */
 	int map_idx;	/* index into maps[], -1 when unmapped */
+	/* Host model of the COHERENCY_NONE CPU alias
+	 * (gpu31-coherency-race): cpu_visible = 0 means the CPU holds
+	 * stale lines (GPU bytes not yet invalidated into view);
+	 * cpu_visible = 1 means a completion invalidate ran and a
+	 * post-fence CPU read observes GPU bytes. The mock GPU write
+	 * clears it (device wrote DRAM, CPU alias stale); the mock
+	 * completion invalidate sets it (dma_sync_for_cpu modelled).
+	 * F13 asserts signal implies visible. */
+	int cpu_visible;
 };
 
 struct mgpu_fence {

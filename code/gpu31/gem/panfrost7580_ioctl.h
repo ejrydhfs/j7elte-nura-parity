@@ -42,7 +42,7 @@ int panfrost_ioctl_get_bo_offset(struct drm_device *dev, void *data,
  * word readback after completion. Routed via the syncobj fops
  * dispatcher (nr 0xCF), NOT the six-ioctl driver table. Takes a
  * handle + byte offset, returns the u32 at that offset after the
- * same dma_sync_for_cpu maintenance free_job runs. */
+ * same completion invalidate the pre-signal IRQ path runs. */
 int panfrost_debug_read_bo(struct drm_device *dev, void *data,
 			   struct drm_file *file_priv);
 
