@@ -104,30 +104,50 @@ void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count);
  * -fsyntax-only / -c checks compile this file standalone without it.
  * Runtime tuning is the jd->trace_left budget (seeded from this). */
 #define P7580_JOB_TRACE_DEFAULT	8u
-
 static unsigned int p7580_job_trace = P7580_JOB_TRACE_DEFAULT;
 
-/* Always-on ERR line: prints regardless of trace_left. Call with the
- * slot's JS_STATUS plus the latched JOB_INT/stat views so the fault
- * code (CONFIG vs TILE_RANGE vs ADDRESS_RANGE vs OUT_OF_MEMORY, ...) is
- * decidable from a single dmesg line. pr_err: faults are errors, not
- * informational bring-up. HEAD/TAIL read by the caller under hw_lock
- * (one 64-bit each) and passed in to keep this helper lock-agnostic. */
+/* Always-on ERR line (+ optional ERR-MAP): prints regardless of
+ * trace_left. HEAD/TAIL are read by the caller under hw_lock and
+ * passed in to keep this helper lock-agnostic. gpu31-iova: when the
+ * faulting job carried a BO snapshot the driver-registered resolver
+ * hook renders it into a second pr_err line (recycled-IOVA alias
+ * decidable from dmesg alone); NULL hook/snapshot keeps the
+ * historic single-line form. */
 static void p7580_job_err_pin(int slot, uint32_t js_status,
 			      uint32_t job_int_stat, uint32_t rawstat,
 			      uint64_t head, uint64_t tail,
 			      unsigned int seqno, uint64_t jc,
 			      uint32_t desc_w4, uint32_t desc_w5,
-			      uint32_t cfg)
+			      uint32_t cfg,
+			      int (*resolve)(void *priv, char *buf,
+					     size_t len,
+					     const uint32_t *handles,
+					     const uint64_t *addrs,
+					     const uint32_t *sizes, uint32_t n),
+			      void *resolve_priv,
+			      const uint32_t *handles,
+			      const uint64_t *addrs,
+			      const uint32_t *sizes, uint32_t n)
 {
+	char map[256];
+	int mlen = 0;
+
 	pr_err("p7580_job: ERR slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx w4=0x%08x w5=0x%08x cfg=0x%08x\n",
 		slot, js_status, p7580_js_status_name(js_status),
 		job_int_stat, rawstat,
 		(unsigned long long)head, (unsigned long long)tail,
 		seqno, (unsigned long long)jc, desc_w4, desc_w5, cfg);
+	if (resolve && handles && addrs && sizes && n) {
+		mlen = resolve(resolve_priv, map, sizeof(map),
+			       handles, addrs, sizes, n);
+		if (mlen > 0) {
+			map[sizeof(map) - 1] = '\0';
+			pr_err("p7580_job: ERR-MAP slot=%d seq=%u nbos=%u %s\n",
+				slot, seqno, n, map);
+		}
+	}
 }
-/* ------------------------------------------------------------------ */
-/* Register access                                                    */
+
 /* ------------------------------------------------------------------ */
 
 static inline void p7580_writel(struct p7580_job_dev *jd, uint32_t reg,
@@ -139,6 +159,29 @@ static inline void p7580_writel(struct p7580_job_dev *jd, uint32_t reg,
 static inline uint32_t p7580_readl(struct p7580_job_dev *jd, uint32_t reg)
 {
 	return readl(jd->regs + reg);
+}
+/* gpu31-iova: fault-time mapping resolver registration (process
+ * context, before faults). The driver registers a hook that renders
+ * the faulting job's {handle,iova,size} snapshot into the ERR pin;
+ * the hook runs in IRQ context (no GEM dereference, no sleeping
+ * locks, no MMIO - the jobs slice never dereferences GEM objects
+ * itself). NULL fn clears. Under hw_lock (same lock as the ERR
+ * legs, so registration races no in-flight pin). */
+void p7580_job_set_iova_resolver(struct p7580_job_dev *jd,
+				 int (*fn)(void *priv, char *buf, size_t len,
+					   const uint32_t *handles,
+					   const uint64_t *addrs,
+					   const uint32_t *sizes, uint32_t n),
+				 void *priv)
+{
+	unsigned long flags;
+
+	if (!jd)
+		return;
+	spin_lock_irqsave(&jd->hw_lock, flags);
+	jd->iova_resolve = fn;
+	jd->iova_resolve_priv = priv;
+	spin_unlock_irqrestore(&jd->hw_lock, flags);
 }
 
 static inline void p7580_js_write(struct p7580_job_dev *jd, int slot,
@@ -519,6 +562,10 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			unsigned int seq = 0;
 			uint64_t jc = 0;
 			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
+			const uint32_t *eh = NULL;
+			const uint64_t *ea = NULL;
+			const uint32_t *ez = NULL;
+			uint32_t en = 0;
 
 			spin_lock_irqsave(&jd->hw_lock, flags);
 			job = jd->in_flight[j];
@@ -540,6 +587,13 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 				jc = job->jc;
 				dw4 = job->desc_w4;
 				dw5 = job->desc_w5;
+				/* gpu31-iova: snapshot stamped at SUBMIT
+				 * while the job owned refs; the resolver
+				 * renders it without touching GEM. */
+				eh = job->iova_handles;
+				ea = job->iova_addrs;
+				ez = job->iova_sizes;
+				en = job->iova_bo_count;
 			} else if (jd->last.valid &&
 				   jd->last.slot == (unsigned int)j) {
 				seq = jd->last.seqno;
@@ -554,7 +608,10 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			if (p7580_js_status_is_fault(js_status))
 				p7580_job_err_pin(j, js_status, status,
 						  rawstat, head, tail,
-						  seq, jc, dw4, dw5, lcfg);
+						  seq, jc, dw4, dw5, lcfg,
+						  jd->iova_resolve,
+						  jd->iova_resolve_priv,
+						  eh, ea, ez, en);
 			if (jd->trace_left) {
 				jd->trace_left--;
 				pr_info("p7580_job: irq slot=%d stat=0x%08x js_status=0x%08x (%s) has_job=%d\n",
@@ -611,6 +668,10 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			unsigned int seq = 0;
 			uint64_t jc = 0;
 			uint32_t dw4 = 0, dw5 = 0, lcfg = 0;
+			const uint32_t *eh = NULL;
+			const uint64_t *ea = NULL;
+			const uint32_t *ez = NULL;
+			uint32_t en = 0;
 
 			spin_lock_irqsave(&jd->hw_lock, flags);
 			es = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_STATUS));
@@ -625,6 +686,10 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 				jc = jd->in_flight[j]->jc;
 				dw4 = jd->in_flight[j]->desc_w4;
 				dw5 = jd->in_flight[j]->desc_w5;
+				eh = jd->in_flight[j]->iova_handles;
+				ea = jd->in_flight[j]->iova_addrs;
+				ez = jd->in_flight[j]->iova_sizes;
+				en = jd->in_flight[j]->iova_bo_count;
 			} else if (jd->last.valid &&
 				   jd->last.slot == (unsigned int)j) {
 				seq = jd->last.seqno;
@@ -635,7 +700,10 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 				lcfg = jd->last.cfg;
 			p7580_job_err_pin(j, es, status, rawstat,
 					  head, tail, seq, jc,
-					  dw4, dw5, lcfg);
+					  dw4, dw5, lcfg,
+					  jd->iova_resolve,
+					  jd->iova_resolve_priv,
+					  eh, ea, ez, en);
 			if (jd->trace_left) {
 				jd->trace_left--;
 				pr_info("p7580_job: irq-err slot=%d stat=0x%08x js_status=0x%08x (%s)\n",
@@ -700,6 +768,15 @@ void p7580_job_free(struct p7580_submit_job *job)
 	}
 	kfree(job->bos);
 	kfree(job->bo_handles);
+	kfree(job->iova_handles);
+	kfree(job->iova_addrs);
+	kfree(job->iova_sizes);
+	job->bos = NULL;
+	job->bo_handles = NULL;
+	job->iova_handles = NULL;
+	job->iova_addrs = NULL;
+	job->iova_sizes = NULL;
+	job->iova_bo_count = 0;
 	kfree(job);
 }
 /*
@@ -756,6 +833,23 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 			job->seqno, (unsigned long long)job->jc,
 			job->desc_w4, job->desc_w5,
 			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0);
+		/* gpu31-iova: same mapping line as the ERR pin (process
+		 * context here, but the hook is IRQ-safe anyway). */
+		if (jd->iova_resolve && job->iova_handles &&
+		    job->iova_addrs && job->iova_sizes &&
+		    job->iova_bo_count) {
+			char tmap[256];
+			int tlen = jd->iova_resolve(
+				jd->iova_resolve_priv, tmap, sizeof(tmap),
+				job->iova_handles, job->iova_addrs,
+				job->iova_sizes, job->iova_bo_count);
+			if (tlen > 0) {
+				tmap[sizeof(tmap) - 1] = '\0';
+				pr_err("p7580_job: ERR-MAP slot=%d seq=%u nbos=%u %s\n",
+					slot, job->seqno,
+					job->iova_bo_count, tmap);
+			}
+		}
 	}
 	p7580_job_recover(jd, slot, status);
 
@@ -1197,6 +1291,40 @@ static int p7580_job_trace_set(void *data, u64 val)
 DEFINE_SIMPLE_ATTRIBUTE(p7580_job_trace_fops, p7580_job_trace_get,
 			p7580_job_trace_set, "%llu\n");
 
+/* gpu31-iova: re-armable budget for the driver's map/unmap trace
+ * (p7580_iova_trace in submit.c). Same shape as trace_arm: write N
+ * re-arms, 0 stops. Registered by the driver (owns the counter);
+ * the jobs slice only owns the fops + registration helper so the
+ * knob appears beside trace_arm in the same debugfs dir. NULL-safe:
+ * get returns 0/empty when no counter is registered yet. */
+static unsigned int *p7580_job_iova_budget;
+
+static int p7580_job_iova_arm_get(void *data, u64 *val)
+{
+	(void)data;
+	if (!val)
+		return -EINVAL;
+	*val = p7580_job_iova_budget ? *p7580_job_iova_budget : 0;
+	return 0;
+}
+
+static int p7580_job_iova_arm_set(void *data, u64 val)
+{
+	(void)data;
+	if (p7580_job_iova_budget)
+		*p7580_job_iova_budget = (unsigned int)val;
+	pr_info("p7580_job: iova trace re-armed to %llu\n", val);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(p7580_job_iova_arm_fops, p7580_job_iova_arm_get,
+			p7580_job_iova_arm_set, "%llu\n");
+
+void p7580_job_register_iova_budget(unsigned int *budget)
+{
+	p7580_job_iova_budget = budget;
+}
+
 static int p7580_job_chain_get(void *data, u64 *val)
 {
 	struct p7580_job_dev *jd = data;
@@ -1251,6 +1379,11 @@ static void p7580_job_debugfs_init(struct p7580_job_dev *jd)
 				&p7580_job_trace_fops);
 	if (IS_ERR_OR_NULL(f))
 		pr_info("p7580_job: trace_arm knob unavailable\n");
+	/* gpu31-iova: re-arms the driver map/unmap trace budget. */
+	f = debugfs_create_file("iova_arm", 0600, dir, jd,
+				&p7580_job_iova_arm_fops);
+	if (IS_ERR_OR_NULL(f))
+		pr_info("p7580_job: iova_arm knob unavailable\n");
 	f = debugfs_create_file("chain_mode", 0600, dir, jd,
 				&p7580_job_chain_fops);
 	if (IS_ERR_OR_NULL(f))

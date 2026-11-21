@@ -64,7 +64,15 @@ struct p7580_submit_job {
 	 * when the submit-time snapshot was unavailable. */
 	uint32_t desc_w4;
 	uint32_t desc_w5;
-
+	/* gpu31-iova: BO identity snapshot for fault-time mapping dump.
+	 * Stamped at SUBMIT (stable handles + IOVA/size while the job
+	 * owns refs): iova_bo_count entries of {handle, iova, size}.
+	 * The ERR pin walks them via the driver's resolver hook (no
+	 * GEM dereference in IRQ context). */
+	uint32_t *iova_handles;
+	uint64_t *iova_addrs;
+	uint32_t *iova_sizes;
+	uint32_t iova_bo_count;
 	/* Fences. done_fence owns the run_job ref and is signaled by the
 	 * JOB_INT handler (or the fault-recovery path, F-JOB4);
 	 * render_done_fence is a non-owning alias of the same fence
@@ -74,7 +82,6 @@ struct p7580_submit_job {
 	void *render_done_fence;
 	void **in_fences;
 	uint32_t in_fence_count;
-
 	/* BO reservation set (file-private handles + resv pointers). */
 	uint32_t *bo_handles;
 	uint32_t bo_count;
@@ -154,9 +161,9 @@ struct p7580_job_dev {
 	/* PM device + get/put hooks (driver-owned) so the dump path can
 	 * take a runtime-PM ref before touching JOB_INT/JS registers:
 	 * without it a dump read while autosuspended hits a dark bus
-	 * (external abort). Opaque void*/int-returning hooks so this
-	 * header stays device/PM-free under -fsyntax-only. Wired by
-	 * p7580_job_dev_init. */
+	 * (external abort). Opaque void pointer plus int-returning
+	 * hooks, so this header stays device/PM-free under
+	 * -fsyntax-only. Wired by p7580_job_dev_init. */
 	void *pm_dev;
 	int (*pm_get)(void *dev);
 	void (*pm_put)(void *dev);
@@ -169,6 +176,14 @@ struct p7580_job_dev {
 	 * knob below; defaults to 0. Plain data, no locks beyond the
 	 * hw_lock writers already hold on the dispatch path. */
 	unsigned int chain_mode;
+	/* gpu31-iova: fault-time mapping resolver (ERR-pin dump).
+	 * Registered by the driver at probe; runs in IRQ context
+	 * (snapshot arrays only: no GEM dereference, no sleeping
+	 * locks, no MMIO). NULL when unregistered. */
+	int (*iova_resolve)(void *priv, char *buf, size_t len,
+			    const uint32_t *handles, const uint64_t *addrs,
+			    const uint32_t *sizes, uint32_t n);
+	void *iova_resolve_priv;
 };
 #else
 struct p7580_job_dev {
@@ -205,6 +220,10 @@ void p7580_job_dev_fini(struct p7580_job_dev *jd);
  * renders the last-dispatch snapshot + live slot registers into buf
  * (seq_file show; returns 0, prints "no job yet" when !valid). */
 void p7580_job_trace_arm(struct p7580_job_dev *jd, unsigned int n);
+/* gpu31-iova: map/unmap trace budget knob (iova_arm). The counter
+ * lives in the driver (submit.c); this registers its address so the
+ * debugfs write path can re-arm it. NULL unregisters. */
+void p7580_job_register_iova_budget(unsigned int *budget);
 /* Chain-bit experiment knob (gpu31-lastjob): write 0/1/2 selects the
  * variant (0 off, 1 = A set cfg CHAIN flag on desc-bit0, 2 = B clear
  * desc bit0 via the driver's pre-submit word patch). Applied on the
@@ -238,6 +257,20 @@ int p7580_job_submit(struct p7580_job_dev *jd, struct p7580_file_ctx *fctx,
 /* Fault recovery: stop slots, GPU soft reset, resume (non-IRQ ctx). */
 int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 		      uint32_t status);
+
+/* gpu31-iova: fault-time mapping resolver. The driver registers a hook
+ * (+priv) that the ERR pin calls in IRQ context to render the faulting
+ * job's {handle,iova,size} snapshot (stamped at SUBMIT) into the pin
+ * line; NULL hook (or NULL job snapshot) prints the jc-only form. The
+ * hook must be IRQ-safe: no GEM dereference, no locks that sleep, no
+ * MMIO - the driver resolves from its bo_list snapshot. Process
+ * context (dump_show) may reuse the same hook with a bigger buffer. */
+void p7580_job_set_iova_resolver(struct p7580_job_dev *jd,
+				 int (*fn)(void *priv, char *buf, size_t len,
+					   const uint32_t *handles,
+					   const uint64_t *addrs,
+					   const uint32_t *sizes, uint32_t n),
+				 void *priv);
 
 /* Idle check for suspend/close paths. */
 int p7580_job_is_idle(struct p7580_job_dev *jd);

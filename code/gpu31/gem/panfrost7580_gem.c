@@ -290,6 +290,21 @@ void p7580_gem_submit_sync(struct drm_gem_object *obj)
 	}
 }
 
+/* gpu31-iova (stale-TLB lifetime fix): free-time GPU unmap.
+ * p7580_gem_free_object calls p7580_gem_gpu_unmap (driver snapshot,
+ * submit.c: PM-held TLB invalidate + bo_list unlink + ref drop)
+ * BEFORE iova_free returns the range and before pages are released.
+ * p7580_gem_mmu_register_notify is a link-compat no-op (an earlier
+ * draft registered a callback; the landed design links directly so
+ * GEM never dereferences driver state). */
+void p7580_gem_mmu_register_notify(void (*fn)(void *, struct drm_gem_object *,
+					      unsigned long, unsigned int),
+				   void *priv)
+{
+	(void)fn;
+	(void)priv;
+}
+
 /* Unbind: tear down the bind-time DMA mapping (MMU-unmap/teardown     */
 /* path, file-close, free). Safe on unbound BOs. */
 void p7580_gem_dma_unbind(struct drm_gem_object *obj)
@@ -666,13 +681,29 @@ int p7580_gem_create_with_handle(struct p7580_dev *gd,
 	return 0;
 }
 
-/* Driver .gem_free_object hook (runs with dev->struct_mutex held,
- * from drm_gem_object_free). Never sleeps, never fails. */
+/* Forward: frees one live BO's GPU mapping before its IOVA is
+ * recycled (p7580_gem_free_object below). Defined in the driver
+ * snapshot (submit.c, PM-held TLB invalidate + bo_list drop); the
+ * linker resolves it inside panfrost7580. Keeps this TU decoupled
+ * from drv/mmu structs (same opaque-void discipline as the
+ * pre-signal-sync helper above). */
+void p7580_gem_gpu_unmap(struct drm_gem_object *obj);
 void p7580_gem_free_object(struct drm_gem_object *obj)
 {
 	struct p7580_bo *bo = to_p7580_bo(obj);
 	struct p7580_dev *gd;
 	struct drm_device *dev = obj->dev;
+
+	/* gpu31-iova: unmap GPU PTEs + flush TLB BEFORE the IOVA is
+	 * reusable. p7580_gem_gpu_unmap walks the driver's bo_list
+	 * entry: leaf-clear (CPU-side, PM-safe), PM-held TLB
+	 * invalidate, bo_list unlink + ref drop, DMA unbind. After
+	 * this the IOVA range is unmapped everywhere; iova_free
+	 * below only then returns it to the allocator. Never-bound
+	 * BOs (never on bo_list) no-op inside; their DMA mapping is
+	 * still torn down here (existing leg below is then a no-op).
+	 * Notifier-hook variant removed: direct link instead. */
+	p7580_gem_gpu_unmap(obj);
 
 	gd = dev->dev_private;
 	if (gd)

@@ -199,10 +199,17 @@ phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
  * ref-drop leg. */
 void p7580_gem_job_bos_pre_signal_sync(void **bos, unsigned int bo_count);
 void p7580_gem_job_done_sync(struct drm_gem_object *obj);
-int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev);
 void p7580_gem_submit_sync(struct drm_gem_object *obj);
 void p7580_gem_dma_unbind(struct drm_gem_object *obj);
 phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
+/* gpu31-iova: free-time GPU unmap (driver snapshot, submit.c).
+ * Called from p7580_gem_free_object before iova_free; clears the
+ * BO's leaf PTEs + PM-held TLB invalidate + bo_list unlink + DMA
+ * unbind. Never-bound BOs no-op. Register hook is link-compat. */
+void p7580_gem_gpu_unmap(struct drm_gem_object *obj);
+void p7580_gem_mmu_register_notify(void (*fn)(void *, struct drm_gem_object *,
+					      unsigned long, unsigned int),
+				   void *priv);
 /* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
  * readback of a BO page after completion. Reuses p7580_gem_job_done_sync
  * (same invalidate the pre-signal IRQ path runs) then reads one u32 via
