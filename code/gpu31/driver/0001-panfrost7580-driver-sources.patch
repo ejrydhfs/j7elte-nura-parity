@@ -6151,7 +6151,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1478 @@
+@@ -0,0 +1,1487 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6493,6 +6493,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	unsigned int wi;
 +	int have_bytes = 0;
 +
++	pr_err("p7580_job: TMD-WALKER drv=%lu job=%lu\n",
++	       (unsigned long)drv, (unsigned long)job);
 +	if (!drv || !job)
 +		return;
 +	if (!drv->mmu.root_dma)
@@ -6615,6 +6617,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	struct p7580_drv *drv = job ?
 +		(struct p7580_drv *)job->drv_priv : NULL;
 +	void *f;
++	int pmraw;
 +
 +	if (!drv && df)
 +		drv = df->drv;
@@ -6636,7 +6639,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * is safe dark. p7580_job_timedout already signals the job's own
 +	 * fence on the same terms after recovery; this covers the dark
 +	 * early-return so both exits retire. */
-+	if (p7580_drv_pm_get(drv) < 0) {
++	pmraw = p7580_drv_pm_get(drv);
++	pr_err("p7580_job: TMD-ENTER sched_job=%lu job=%lu drv=%lu pmraw=%d\n",
++	       (unsigned long)sched_job, (unsigned long)job,
++	       (unsigned long)drv, pmraw);
++	if (pmraw < 0) {
 +		f = job ? job->done_fence : NULL;
 +		if (f && !dma_fence_is_signaled((struct dma_fence *)f))
 +			dma_fence_signal((struct dma_fence *)f);
@@ -6645,6 +6652,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	/* gpu31-ptewalk: decisive fault-time read. Runs BEFORE recover
 +	 * tears state down (p7580_job_timedout -> recover rebinds AS0)
 +	 * in the same PM-held window: PT walk vs BO page comparison. */
++	pr_err("p7580_job: TMD-PREWALK job=%lu drv=%lu\n",
++	       (unsigned long)job, (unsigned long)drv);
 +	p7580_drv_ptewalk_pin(drv, job);
 +	p7580_job_timedout(&drv->jd, job);
 +	p7580_drv_pm_put(drv);
