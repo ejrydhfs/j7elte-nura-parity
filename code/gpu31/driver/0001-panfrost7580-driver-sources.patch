@@ -6000,6 +6000,36 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +				drm_syncobj_put(s);
 +			}
 +		}
++		/* gpu31-instrtype: publish this job's fence as the exclusive
++		 * (write) fence on every submitted BO. Later submits of the
++		 * same BOs take it as an implicit sched dependency at queue
++		 * time (get_excl leg), which serialises batches sharing
++		 * pool/scratch/heap BOs. Without this, two live batches can
++		 * write the same pool BO concurrently while Mesa recycles
++		 * it (IOVA-identical submits), and the GPU reads a torn
++		 * chain/FBD -> INSTR_TYPE_MISMATCH/DATA_INVALID_FAULT on
++		 * the victim slot. Locking: the 0002 shim locks resv->lock
++		 * inside add_excl (never take it here: same
++		 * SUBMIT-DEADLOCK rule as the get_excl leg). Fences that
++		 * retire in the same dispatch batch still share the older
++		 * excl until this stamp lands; deps are taken on the
++		 * latest *unsignaled* fence, so a retired excl does not
++		 * gate. */
++		if (!IS_ERR(fence) && fence) {
++			struct p7580_submit_job *rj = job;
++			uint32_t k;
++
++			for (k = 0; k < rj->bo_count; k++) {
++				struct drm_gem_object *o =
++					(struct drm_gem_object *)rj->bos[k];
++
++				if (!o)
++					continue;
++				dma_resv_add_excl_fence(
++					&to_p7580_bo(o)->resv,
++					fence);
++			}
++		}
 +		p7580_drv_pm_put(drv);
 +		return fence;
 +	}

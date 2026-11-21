@@ -122,12 +122,15 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
-## Draw jobs fault: INSTR_TYPE_MISMATCH (2026-11-20, int22)
+## Draw jobs fault: INSTR_TYPE_MISMATCH (2026-11-20, int22; diagnosed 2026-11-21)
 - Fault diagnostics live (always-on ERR + debugfs `trace_arm`/`dump`).
-- Clear jobs complete; the **draw** job faults:
-  `ERR slot=0 js_status=0x52 (INSTR_TYPE_MISMATCH) head=tail=0x21c5600 jc=0x21c5600`.
-- So the descriptor type at HEAD is not what slot 0 accepts: requirements->slot mapping or the
-  job-type contract is still wrong. Fix in progress (`gpu31-instrtype.md`).
+- The **last draw** faults: `ERR slot=0 js_status=0x52/0x58 head=tail=jc seq=121`
+  (1 of 122 submits; 60 identical earlier pairs DONE both slots; code varies run to run).
+- Slot mapping is CORRECT (type-9 FRAGMENT `req=FS` -> JS0; chain `req=0` -> JS1, both DONE x60).
+  Root cause: the driver never publishes excl fences (`dma_resv_add_excl_fence` has no
+  producer), so the implicit same-BO dependency is dead and recycled pool-BO batches race;
+  the GPU fetches a torn chain/FBD. Fix: dispatch-time excl publish in driver 0001
+  (`gpu31-instrtype.md` §4). Rebuild + flash pending (int23).
 
 ## GPU renders the clear colour (2026-11-20, int20)
 - int20 fixed slot routing (req==0 chain -> JS1). Both jobs execute with NO_EXCEPTION and
