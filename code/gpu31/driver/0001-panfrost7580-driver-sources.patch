@@ -4516,8 +4516,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +
 +/* PM wrappers for the jobs-slice dump path (void-arg, device-direct):
 + * the jobs slice never includes pm_runtime.h; these live in the driver
-+ * TU where pm_runtime is available. get returns 0 when MMIO is allowed,
-+ * nonzero dark; put drops the ref. */
++ * TU where pm_runtime is available. get returns 0 when MMIO is allowed
++ * (pm_runtime_get_sync's 1 = already active is normalised to 0),
++ * negative errno dark; put drops the ref. */
 +static int p7580_job_pm_get_void(void *dev)
 +{
 +	int ret;
@@ -6380,8 +6381,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			job->seqno, slot, sched_job->slot,
 +			(unsigned long long)job->jc, (unsigned long)job);
 +	}
-+	if (p7580_drv_pm_get(drv)) {
-+		/* ST-PMGET (fail): dark block, job failed closed. */
++	if (p7580_drv_pm_get(drv) < 0) {
++		/* ST-PMGET (fail): dark block (negative errno only;
++		 * pm_runtime_get_sync returns 1 when already active,
++		 * which the helper normalises to 0 = powered), job
++		 * failed closed. */
 +		if (p7580_sched_trace) {
 +			p7580_sched_trace--;
 +			pr_info("p7580_sched: pm_get FAIL seq=%u slot=%d\n",
@@ -6632,7 +6636,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * is safe dark. p7580_job_timedout already signals the job's own
 +	 * fence on the same terms after recovery; this covers the dark
 +	 * early-return so both exits retire. */
-+	if (p7580_drv_pm_get(drv)) {
++	if (p7580_drv_pm_get(drv) < 0) {
 +		f = job ? job->done_fence : NULL;
 +		if (f && !dma_fence_is_signaled((struct dma_fence *)f))
 +			dma_fence_signal((struct dma_fence *)f);
@@ -6768,8 +6772,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +/* Power guard (F-SUB1). Every MMIO site in this file runs under a
 + * p7580_drv_pm_get/put pair; the get fails closed (caller must touch
 + * no register afterwards). pm_runtime_get_sync may return 1 (already
-+ * active) or 0 (resumed now): both mean powered. Only a negative
-+ * errno means dark. */
++ * active) or 0 (resumed now): both mean powered, and this helper
++ * normalises both to 0. Only a negative errno means dark, and only
++ * then does the caller take the dark path (all callers test
++ * `< 0`, never truthiness, so 1 can never take the dark early-return).
++ * Returns 0 powered, negative errno dark. */
 +int p7580_drv_pm_get(struct p7580_drv *drv)
 +{
 +	int ret;
@@ -6785,6 +6792,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		pm_runtime_put_noidle(drv->dev);
 +		return ret;
 +	}
++	/* Normalise pm_runtime_get_sync's 1 (already active) to 0:
++	 * 0 and 1 both mean powered. */
 +	return 0;
 +}
 +
@@ -7613,7 +7622,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	{
 +		int ret = p7580_drv_pm_get(drv);
 +
-+		if (ret)
++		if (ret < 0)
 +			return ret;
 +		ret = p7580_drv_submit(drv, dev, file_priv, &staged);
 +		p7580_drv_pm_put(drv);

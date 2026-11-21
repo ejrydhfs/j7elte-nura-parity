@@ -113,17 +113,41 @@ static void run_t1(void)
 
 /* ------------------------------------------------------------------ */
 /* T2: pm_runtime_get_sync error aborts before dispatch.               */
+/* T8: pm_runtime_get_sync 1 (already active) is powered, not dark.    */
+/*                                                                     */
+/* The helper p7580_drv_pm_get() normalises the raw get_sync result:   */
+/* 1 (already active) and 0 (resumed now) both become 0 = powered;     */
+/* only a negative errno means dark. Every submit.c caller tests       */
+/* `< 0` (run_job, timedout_job, ioctl override, teardown_hold), so    */
+/* a raw 1 can never take the dark early-return (which would skip      */
+/* recovery and, on the timedout path, the PTEWALK probe).             */
 /* ------------------------------------------------------------------ */
+
+/* Raw-result model: mirrors pm_runtime_get_sync semantics (1 = already
+ * active, 0 = resumed, negative = resume failed). */
+static int model_pm_get(int raw_ret, int *put_noidle)
+{
+	int ret;
+
+	ret = raw_ret;	/* pm_runtime_get_sync(drv->dev) */
+	if (ret < 0) {
+		/* pm_runtime_put_noidle(drv->dev); */
+		(*put_noidle)++;
+		return ret;
+	}
+	/* Normalise: 0 and 1 both mean powered. */
+	return 0;
+}
 
 static int model_submit(int pm_ret, int *dispatched, int *put_noidle)
 {
 	int ret;
 
+	(void)put_noidle;	/* failed get balances itself; no put owed */
 	/* Fixed override shape (submit.c): */
-	ret = pm_ret;	/* pm_runtime_get_sync(drv->dev) */
+	ret = pm_ret;	/* p7580_drv_pm_get(drv): 0 powered, <0 dark */
 	if (ret < 0) {
-		/* pm_runtime_put_noidle(drv->dev); */
-		(*put_noidle)++;
+		/* no p7580_drv_pm_put: the failed get balanced itself */
 		return ret;
 	}
 	/* p7580_drv_submit(...): MMU-map + HEAD/START programming. */
@@ -140,7 +164,7 @@ static void run_t2(void)
 	rc = model_submit(-5 /* -EIO */, &dispatched, &put_noidle);
 	CHECK(rc == -5);
 	CHECK(dispatched == 0);	/* nothing programmed on dark GPU */
-	CHECK(put_noidle == 1);	/* usage count balanced */
+	CHECK(put_noidle == 0);	/* failed get balanced itself, no put */
 
 	dispatched = 0;
 	put_noidle = 0;
@@ -148,6 +172,50 @@ static void run_t2(void)
 	CHECK(rc == 0);
 	CHECK(dispatched == 1);
 	CHECK(put_noidle == 0);
+}
+
+/* run_job/timedout_job shape after the fix: the dark early-return is
+ * taken only when the helper returns < 0. A raw get_sync 1 flows
+ * through model_pm_get to 0 (powered) and must NOT take it. */
+static int model_worker_dark(int helper_ret)
+{
+	if (helper_ret < 0)
+		return 1;	/* dark early-return: signal fence, skip MMIO */
+	return 0;	/* powered: run recovery / PTEWALK probe */
+}
+
+static void run_t8(void)
+{
+	int put_noidle, helper;
+	int dispatched;
+
+	/* get_sync 1 (already active) -> helper 0 -> success path. */
+	put_noidle = 0;
+	helper = model_pm_get(1, &put_noidle);
+	CHECK(helper == 0);
+	CHECK(put_noidle == 0);
+	CHECK(model_worker_dark(helper) == 0);	/* recovery + PTEWALK run */
+
+	dispatched = 0;
+	put_noidle = 0;
+	helper = model_submit(model_pm_get(1, &put_noidle),
+			      &dispatched, &put_noidle);
+	CHECK(helper == 0);
+	CHECK(dispatched == 1);
+
+	/* get_sync 0 (resumed now) -> helper 0 -> success path. */
+	put_noidle = 0;
+	helper = model_pm_get(0, &put_noidle);
+	CHECK(helper == 0);
+	CHECK(put_noidle == 0);
+	CHECK(model_worker_dark(helper) == 0);
+
+	/* get_sync -EIO -> helper -EIO -> dark path, balanced. */
+	put_noidle = 0;
+	helper = model_pm_get(-5 /* -EIO */, &put_noidle);
+	CHECK(helper == -5);
+	CHECK(put_noidle == 1);
+	CHECK(model_worker_dark(helper) == 1);	/* fence signals, no MMIO */
 }
 
 /* ------------------------------------------------------------------ */
@@ -309,6 +377,7 @@ int main(void)
 	run_t5();
 	run_t6();
 	run_t7();
+	run_t8();
 
 	if (fails == 0)
 		printf("submit_fix_test: all checks passed\n");
