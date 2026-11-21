@@ -9,14 +9,17 @@ reuse fence, landed), `gpu31-armfence.md` (arm-time fence, landed),
 `gpu31-lastjob.md` (descriptor dump: CPU view == kernel view, valid
 FRAGMENT bytes), `gpu31-integration26.md` (int26 build, pending).
 
-+> Fix 2026-11-21 (G31_PteWalkFix): the `if (jc & ~PAGE_MASK) return`
-+> guard silently dropped every non-page-aligned job (faulting
-+> `jc=0x21c5600`, off 0x600). Walker now uses `jc_page = jc & PAGE_MASK`
-+> for all four table indexes; prints keep the full `jc`, re-read keeps
-+> `page_off`, existing `page_off + 32 <= PAGE_SIZE` bound unchanged.
-+> Verified: hunk 1487/1487, `git apply --check` clean, `-fsyntax-only`
-+> clean vs real 3.10.108 headers + 0001-0004 shims. Hand to integrator
-+> for int29.
+> Fix 2026-11-21 (G31_PteWalkBytes): NO-OWNER could not decide the case —
+> the owner lookup used only the job's SUBMIT-time `bos[]` snapshot, and
+> the 8-word GPU-view dump ran only when an owner existed. Walker now
+> also scans the live `drv->bo_list` (under `bo_lock`, GEM ref while
+> linked) for an IOVA range containing `jc`, falls back to the live BO
+> for MATCH/MISMATCH, prints both `snap=` and `live=` ranges on every
+> line, and always re-reads the 8 words from `leaf_phys + page_off`
+> (even NO-OWNER; `page_off` is then the in-page jc offset).
+> Verified: hunk 1542/1542, `git apply --check` clean, GNU patch
+> dry-run + apply clean, walker braces balanced. Hand to integrator
+> for int30.
 +
 ## 0. Defect (silicon, unchanged through int25)
 

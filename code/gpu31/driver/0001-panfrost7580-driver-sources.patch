@@ -6151,7 +6151,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1487 @@
+@@ -0,0 +1,1542 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6484,6 +6484,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	phys_addr_t leaf_phys = 0;
 +	struct drm_gem_object *owner = NULL;
 +	struct p7580_bo *owner_bo = NULL;
++	struct drm_gem_object *live_obj = NULL;
++	struct p7580_bo *live_bo = NULL;
++	u64 live_iova = 0;
++	size_t live_size = 0;
++	u64 snap_iova = 0;
++	size_t snap_size = 0;
 +	unsigned long owner_iova = 0;
 +	unsigned int owner_npages = 0;
 +	unsigned int page_idx = 0;
@@ -6540,10 +6546,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	}
 +	leaf_pte = e;
 +	leaf_phys = (phys_addr_t)(e & ~(u64)0xFFFULL);
-+	/* Find the owning BO: jc inside one submitted BO's IOVA. The
-+	 * job's bos[] array holds one referenced pointer per handle
-+	 * (F-JT2, stable across close); safe to dereference here in
-+	 * process context while the job owns the refs. */
++	/* Owner resolution, two views. (1) SUBMIT-time snapshot: jc
++	 * inside one submitted BO's IOVA. The job's bos[] array holds
++	 * one referenced pointer per handle (F-JT2, stable across
++	 * close); safe to dereference here in process context while
++	 * the job owns the refs. (2) Live view: scan drv->bo_list
++	 * under bo_lock for an IOVA range containing jc, taking a GEM
++	 * ref while linked. Snapshot-miss + live-hit (int29 NO-OWNER
++	 * with jc inside an ERR-MAP range) means a stale snapshot,
++	 * not an unmapped jc; miss + miss means genuinely unowned. */
 +	if (job->bos && job->bo_count) {
 +		unsigned int i;
 +
@@ -6559,9 +6570,35 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			    jc + 32 <= b->iova + b->base.size) {
 +				owner = o;
 +				owner_bo = b;
++				snap_iova = b->iova;
++				snap_size = b->base.size;
 +				break;
 +			}
 +		}
++	}
++	mutex_lock(&drv->bo_lock);
++	{
++		struct p7580_drv_bo *le;
++
++		list_for_each_entry(le, &drv->bo_list, node) {
++			if (jc >= le->iova && jc + 32 <= le->iova + le->size) {
++				drm_gem_object_reference(le->obj);
++				live_obj = le->obj;
++				live_iova = le->iova;
++				live_size = le->size;
++				break;
++			}
++		}
++	}
++	mutex_unlock(&drv->bo_lock);
++	if (live_obj)
++		live_bo = to_p7580_bo(live_obj);
++	/* Fall back to the live owner when the snapshot missed, so the
++	 * MATCH/MISMATCH comparison still runs against the BO that is
++	 * actually bound at fault time. */
++	if (!owner && live_bo) {
++		owner = live_obj;
++		owner_bo = live_bo;
 +	}
 +	if (owner && owner_bo) {
 +		owner_iova = owner_bo->iova;
@@ -6570,43 +6607,61 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		page_off = (unsigned int)((jc - owner_bo->iova) & (PAGE_SIZE - 1));
 +		bo_phys = p7580_bo_dma_addr(owner, page_idx);
 +		bo_ok = (bo_phys != 0);
-+		/* Assert the alignment contract the dispatch snapshot
-+		 * relies on: descriptors are 8-byte aligned and the
-+		 * 32-B header never crosses a page (lastjob SUBMIT
-+		 * snapshot guards poff + 32 <= PAGE_SIZE). */
-+		if (page_off + 32 > PAGE_SIZE) {
-+			pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf_phys=0x%llx bo_phys=0x%llx CROSS-PAGE\n",
-+			       slot, seq, (unsigned long long)jc,
-+			       (unsigned long long)leaf_phys,
-+			       (unsigned long long)bo_phys);
-+		} else {
-+			void *kv;
-+			struct page *ppg =
-+				pfn_to_page((unsigned long)(leaf_phys >> PAGE_SHIFT));
-+
-+			kv = kmap(ppg);
-+			for (wi = 0; wi < 8; wi++)
-+				pw[wi] = ((u32 *)((char *)kv + page_off))[wi];
-+			kunmap(ppg);
-+			have_bytes = 1;
-+		}
-+		if (have_bytes) {
-+			pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
-+			       slot, seq, (unsigned long long)jc,
-+			       (unsigned long long)leaf_pte,
-+			       (unsigned long long)leaf_phys,
-+			       (unsigned long long)bo_phys,
-+			       (bo_ok && leaf_phys == bo_phys) ? "MATCH" : "MISMATCH",
-+			       owner_iova, owner_npages,
-+			       pw[0], pw[1], pw[2], pw[3],
-+			       pw[4], pw[5], pw[6], pw[7]);
-+		}
 +	} else {
-+		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx NO-OWNER\n",
++		page_off = (unsigned int)(jc & (PAGE_SIZE - 1));
++	}
++	/* Unconditional GPU-view dump: the 8 descriptor words at
++	 * leaf_phys + page_off, re-read from the leaf's physical page
++	 * via kmap in the same handler. Runs even with NO-OWNER
++	 * (page_off is then the jc offset within its page). Asserts
++	 * the alignment contract the dispatch snapshot relies on:
++	 * descriptors are 8-byte aligned and the 32-B header never
++	 * crosses a page. */
++	if (page_off + 32 > PAGE_SIZE) {
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf_phys=0x%llx bo_phys=0x%llx CROSS-PAGE snap=0x%llx/0x%zx live=0x%llx/0x%zx\n",
++		       slot, seq, (unsigned long long)jc,
++		       (unsigned long long)leaf_phys,
++		       (unsigned long long)bo_phys,
++		       (unsigned long long)snap_iova, snap_size,
++		       (unsigned long long)live_iova, live_size);
++		if (live_obj)
++			drm_gem_object_unreference_unlocked(live_obj);
++		return;
++	} else {
++		void *kv;
++		struct page *ppg =
++			pfn_to_page((unsigned long)(leaf_phys >> PAGE_SHIFT));
++
++		kv = kmap(ppg);
++		for (wi = 0; wi < 8; wi++)
++			pw[wi] = ((u32 *)((char *)kv + page_off))[wi];
++		kunmap(ppg);
++		have_bytes = 1;
++	}
++	if (have_bytes && owner && owner_bo) {
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx bo_phys=0x%llx %s snap=0x%llx/0x%zx live=0x%llx/0x%zx iova=0x%lx npages=%u w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 +		       slot, seq, (unsigned long long)jc,
 +		       (unsigned long long)leaf_pte,
-+		       (unsigned long long)leaf_phys);
++		       (unsigned long long)leaf_phys,
++		       (unsigned long long)bo_phys,
++		       (bo_ok && leaf_phys == bo_phys) ? "MATCH" : "MISMATCH",
++		       (unsigned long long)snap_iova, snap_size,
++		       (unsigned long long)live_iova, live_size,
++		       owner_iova, owner_npages,
++		       pw[0], pw[1], pw[2], pw[3],
++		       pw[4], pw[5], pw[6], pw[7]);
++	} else {
++		pr_err("p7580_job: PTEWALK slot=%d seq=%u jc=0x%llx leaf=0x%llx leaf_phys=0x%llx NO-OWNER snap=0x%llx/0x%zx live=0x%llx/0x%zx w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       slot, seq, (unsigned long long)jc,
++		       (unsigned long long)leaf_pte,
++		       (unsigned long long)leaf_phys,
++		       (unsigned long long)snap_iova, snap_size,
++		       (unsigned long long)live_iova, live_size,
++		       pw[0], pw[1], pw[2], pw[3],
++		       pw[4], pw[5], pw[6], pw[7]);
 +	}
++	if (live_obj)
++		drm_gem_object_unreference_unlocked(live_obj);
 +}
 +
 +static void p7580_drv_timedout_job(struct drm_sched_job *sched_job)
