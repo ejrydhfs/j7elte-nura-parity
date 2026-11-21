@@ -122,6 +122,15 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Stale-TLB fix landed; one fault remains (2026-11-21, int24)
+- IOVA/TLB lifetime fixed (free-time unmap + reuse fence + overlap detection; `OVERLAP` count 0).
+- The single per-frame `INSTR_TYPE_MISMATCH` persists on the last submit; ERR-MAP shows its
+  `jc` inside a valid 64 KiB BO, descriptor type 9 with legal bytes.
+- Root cause now traced to fence timing: the shim only assigns `sched_job->fence` inside
+  `run_job`, so at SUBMIT the out_sync is empty and Mesa recycles the batch BO while the GPU
+  is still reading it. Fix in progress: arm-time fence (mainline semantics) installed on
+  out_sync during the ioctl and signalled by completion.
+
 ## Draw jobs fault: INSTR_TYPE_MISMATCH (2026-11-20, int22; diagnosed 2026-11-21)
 - Fault diagnostics live (always-on ERR + debugfs `trace_arm`/`dump`).
 - The **last draw** faults: `ERR slot=0 js_status=0x52/0x58 head=tail=jc seq=121`
