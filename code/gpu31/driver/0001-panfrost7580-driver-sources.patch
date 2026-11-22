@@ -143,7 +143,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1295 @@
+@@ -0,0 +1,1387 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -243,23 +243,62 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +/*      buffer/combining buffer until drained.                         */
 +/*  (c) the GPU port: reads/writes DRAM, bypassing the CPU caches.     */
 +/*                                                                     */
-+/* Correct discipline is the stock non-coherent DMA-API order, per     */
-+/* page, with the device pointer carried so the backend can pick the   */
-+/* swiotlb vs direct path (arm64 3.10: non-coherent swiotlb ops;       */
-+/* dma_map == cache maintenance):                                     */
++/* gpu31-cachedir: the DIRECTION argument of the sync call is what      */
++/* selects the cache op, and exactly one of the two ops is legal at    */
++/* each point in a BO's life. arm64 3.10 backend (dma-mapping.c +       */
++/* cache.S, verified in-tree):                                         */
 +/*                                                                     */
-+/*  - SUBMIT (CPU -> GPU): CPU writes the descriptor/payloads into     */
-+/*    (a)/(b), then dma_sync_single_for_device(dev, dma, PAGE_SIZE,    */
-+/*    DMA_BIDIRECTIONAL) drains CPU lines to the point the GPU reads   */
-+/*    (PoC/RAM). The GPU PTW tables already follow this                */
-+/*    (p7580_sync_pt: sync after every table write).                   */
-+/*  - COMPLETION (GPU -> CPU): BEFORE the job fence signals,           */
-+/*    dma_sync_single_for_cpu(dev, dma, PAGE_SIZE,                     */
-+/*    DMA_BIDIRECTIONAL) invalidates CPU lines for the range the GPU  */
-+/*    wrote, so a userspace wait returning implies visible data and   */
-+/*    the next CPU read (kmap/vmap/mmap fault) misses to DRAM and     */
-+/*    observes GPU bytes. gpu31-coherency-race: the old order ran the  */
-+/*    invalidate after the signal (free_job) and was racy.            */
++/*   dma_sync_single_for_device(dir) -> __dma_map_area(dir)            */
++/*       DMA_TO_DEVICE, DMA_BIDIRECTIONAL -> __dma_clean_range         */
++/*                                            (writeback: DIRTY->DRAM) */
++/*       DMA_FROM_DEVICE                 -> __dma_inv_range (DISCARD)  */
++/*   dma_sync_single_for_cpu(dir)    -> __dma_unmap_area(dir)          */
++/*       DMA_TO_DEVICE                   -> no op                      */
++/*       DMA_FROM_DEVICE, BIDIRECTIONAL  -> __dma_inv_range (DISCARD)  */
++/*   dma_unmap_page(dir)             -> __dma_unmap_area(dir)          */
++/*                                                                     */
++/* The rule that bites: an INVALIDATE THROWS DIRTY LINES AWAY. A       */
++/* dirty line is the only copy of the bytes the CPU just wrote, so a   */
++/* CPU-filled range must be CLEANED before anything invalidates it;    */
++/* "invalidate for freshness" without a preceding clean silently       */
++/* reverts the buffer to its older DRAM contents (the "shader BO      */
++/* reads back as zeros" signature). Conversely a read that must see    */
++/* device or WC-written bytes needs the invalidate, because the        */
++/* kernel linear alias (a) may still hold stale CLEAN lines from an    */
++/* earlier read of the same page. Hence the only safe compound op for  */
++/* "read what the CPU/GPU just produced" is CLEAN-THEN-INVALIDATE.     */
++/* Ordering table (implementation: the two helpers below):              */
++/*                                                                     */
++/*  1. CREATE + CPU FILL: userspace WC writes (b) go straight to DRAM  */
++/*     (no cache lines); kernel-side fills (kmap/vmap) dirty (a).      */
++/*  2. BIND (first map_bo, before the AS0 walk):                       */
++/*     dma_map_page(..., DMA_BIDIRECTIONAL) = clean of (a); PTEs come  */
++/*     from p7580_bo_dma_addr so the GPU and the CPU sync address the  */
++/*     same bus range.                                                 */
++/*  3. SUBMIT (CPU -> GPU): p7580_gem_clean_for_device() =             */
++/*     sync_for_device(DMA_TO_DEVICE) = CLEAN ONLY. It must never      */
++/*     discard; it runs after the CPU filled the descriptors/payloads  */
++/*     and before the job is queued. Its trailing dsb also drains the  */
++/*     submitting thread's WC store buffer (alias b), so "CPU wrote    */
++/*     it" implies "DRAM has it before the doorbell".                  */
++/*  4. SNAPSHOT / DUMP READ (kernel reads BO bytes for a trace):       */
++/*     p7580_gem_invalidate_for_cpu() = clean THEN invalidate, so the  */
++/*     kmap read misses stale (a) lines and sees DRAM, without losing  */
++/*     a dirty line. Before gpu31-cachedir the snapshot called the     */
++/*     bare invalidate -- wrong direction for a CPU-filled JD body.    */
++/*  5. COMPLETION (GPU -> CPU): same clean-then-invalidate, run        */
++/*     BEFORE the job fence signals (pre-signal helper in              */
++/*     IRQ/timedout/recover context) plus a belt-and-braces repeat in  */
++/*     free_job after it: no MMIO, no sleeps, no locks. The clean is   */
++/*     what makes the following invalidate safe when a CPU write       */
++/*     raced the job; the invalidate is what makes GPU-written bytes   */
++/*     visible to the next CPU read.                                   */
++/*  6. UNMAP / UNBIND: clean, then dma_unmap_page(BIDIRECTIONAL)       */
++/*     (which invalidates), so a final CPU write is written back and   */
++/*     no stale line outlives the mapping.                             */
++/*                                                                     */
++/* The GPU PTW tables follow the same discipline for their own writes  */
++/* (p7580_sync_pt: sync after every table write).                     */
 +/*                                                                     */
 +/* Why not flush_dcache_page(): on arm64 it only clears PG_dcache_clean  */
 +/* (flush.c: flush_dcache_page is a flag clear for the icache-alias    */
@@ -276,16 +315,75 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +/* them). A BO additionally holds one bind-time DMA mapping covering   */
 +/* its pages while GPU-bound (built at bind, torn down at unbind,      */
 +/* DMA_BIDIRECTIONAL so the same mapping serves job upload and         */
-+/* writeback; SKIP_CPU_SYNC is never set). sync_for_device runs at     */
-+/* SUBMIT (before the job is queued) and sync_for_cpu runs BEFORE the   */
-+/* fence signals (pre-signal helper in IRQ/timedout/recover context,   */
-+/* plus a belt-and-braces repeat in free_job: no MMIO, no sleeps,      */
-+/* no locks — same constraints as the old hook). dma_addr per page is  */
++/* writeback; SKIP_CPU_SYNC is never set). sync_for_device(TO_DEVICE)   */
++/* = clean runs at SUBMIT (before the job is queued); the              */
++/* clean-then-invalidate pair runs BEFORE the fence signals            */
++/* (pre-signal helper in IRQ/timedout/recover context, plus a          */
++/* belt-and-braces repeat in free_job: no MMIO, no sleeps, no locks -- */
++/* same constraints as the old hook). dma_addr per page is             */
 +/* cached in the BO (identity on this tree is asserted, not assumed:   */
 +/* a non-identity dma_addr is carried verbatim, so sync still hits the */
 +/* right bus address; PTEs must come from p7580_bo_dma_addr, never     */
 +/* from page_to_phys directly).                                        */
 +/* ------------------------------------------------------------------ */
++/* Shared page walk for the per-page DMA sync helpers below.       */
++/* Guard: only bound SHMEM BOs have dma_addrs/sync_dev; CMA       */
++/* (dma_alloc_attrs coherent) and imported BOs have neither and   */
++/* therefore need no CPU-side maintenance.                        */
++static int p7580_bo_sync_ready(struct p7580_bo *bo)
++{
++	return bo->backing == P7580_BO_SHMEM && bo->pages &&
++	       bo->sync_dev && bo->dma_addrs;
++}
++
++/* One direction over every mapped page. NOTE the directions: they are */
++/* NOT cosmetic. DMA_TO_DEVICE = clean (writeback, keeps dirty data),  */
++/* DMA_FROM_DEVICE = invalidate (discards lines, refreshes from DRAM). */
++static void p7580_bo_sync_pages(struct p7580_bo *bo, int toward_device)
++{
++	unsigned int i;
++
++	for (i = 0; i < bo->nr_pages; i++) {
++		if (!bo->pages[i])
++			continue;
++		if (toward_device)
++			dma_sync_single_for_device(bo->sync_dev,
++						   bo->dma_addrs[i], PAGE_SIZE,
++						   DMA_TO_DEVICE);
++		else
++			dma_sync_single_for_cpu(bo->sync_dev,
++						bo->dma_addrs[i], PAGE_SIZE,
++						DMA_FROM_DEVICE);
++	}
++}
++
++/* CLEAN (CPU -> device): write back CPU-dirty lines so the GPU reads */
++/* the bytes the CPU just wrote. Never discards; safe on a range the  */
++/* CPU owns. This is the SUBMIT-side and pre-invalidate op.          */
++void p7580_gem_clean_for_device(struct drm_gem_object *obj)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++
++	if (!obj || !p7580_bo_sync_ready(bo))
++		return;
++	p7580_bo_sync_pages(bo, 1);
++}
++
++/* CLEAN-THEN-INVALIDATE (device -> CPU): the only safe way to make a  */
++/* CPU read observe DRAM. The clean must come first: an invalidate    */
++/* discards dirty lines, i.e. the CPU's un-written-back bytes. Order  */
++/* is asserted by the host model test (gem/cachedir_model.c) and by   */
++/* the gpu31-cachedir ordering table in this file's header.           */
++void p7580_gem_invalidate_for_cpu(struct drm_gem_object *obj)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++
++	if (!obj || !p7580_bo_sync_ready(bo))
++		return;
++	p7580_bo_sync_pages(bo, 1);	/* write back dirty lines first */
++	p7580_bo_sync_pages(bo, 0);	/* now drop lines: next read hits DRAM */
++}
++
 +/* Pre-signal completion invalidate (gpu31-coherency-race): walk the
 + * job's owned BO pointers and run p7580_gem_job_done_sync on each
 + * (dma_sync_single_for_cpu per bound SHMEM page; CMA/imported and
@@ -331,29 +429,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +
 +void p7580_gem_job_done_sync(struct drm_gem_object *obj)
 +{
-+	struct p7580_bo *bo = to_p7580_bo(obj);
-+	unsigned int i;
-+
-+	/* CMA (dma_alloc_attrs coherent) never needs CPU-side sync. */
-+	if (bo->backing != P7580_BO_SHMEM || !bo->pages)
++	if (!obj)
 +		return;
-+	if (!bo->sync_dev || !bo->dma_addrs)
-+		return;
-+	for (i = 0; i < bo->nr_pages; i++) {
-+		if (!bo->pages[i])
-+			continue;
-+		dma_sync_single_for_cpu(bo->sync_dev, bo->dma_addrs[i],
-+					PAGE_SIZE, DMA_BIDIRECTIONAL);
-+	}
++	/* gpu31-cachedir: completion = clean-then-invalidate. The old
++	 * bare dma_sync_single_for_cpu(BIDIRECTIONAL) invalidated
++	 * without writing back CPU-dirty lines first; anything the CPU
++	 * filled after the last submit clean was silently discarded
++	 * here. The clean is a no-op when no line is dirty. */
++	p7580_gem_invalidate_for_cpu(obj);
 +}
 +/* DEBUG-ONLY (gpu31-gpuwrite, strip before cutover): kernel-side word
 + * readback. Guardrail: reuse the completion maintenance -- call
-+ * p7580_gem_job_done_sync first (same invalidate the pre-signal IRQ
-+ * path runs; dma_sync_single_for_cpu per bound SHMEM page), then read
-+ * one u32 via the kernel linear map (kmap_atomic single-arg on this
-+ * !HIGHMEM arm64 tree). Never-bound CMA/imported follow
-+ * job_done_sync's no-op rules; unmapped pages fail ENOENT. No MMIO,
-+ * no sleeps, no locks. */
++ * p7580_gem_job_done_sync first (clean-then-invalidate per bound
++ * SHMEM page, gpu31-cachedir), then read one u32 via the kernel
++ * linear map (kmap_atomic single-arg on this !HIGHMEM arm64 tree).
++ * Without the invalidate the cached linear alias could serve stale
++ * lines from an earlier read; without the clean a dirty CPU line
++ * would be dropped. Never-bound CMA/imported follow job_done_sync's
++ * no-op rules; unmapped pages fail ENOENT. No MMIO, no sleeps, no
++ * locks. */
 +int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
 +			      uint32_t *out)
 +{
@@ -417,23 +511,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	return 0;
 +}
 +
-+/* SUBMIT-side drain: push CPU-written bytes to the point the GPU      */
-+/* reads. Runs after the CPU fills descriptors/payloads and before    */
-+/* the job is queued (fence not yet armed). Unbound BOs are a no-op.  */
++/* SUBMIT-side drain (CPU -> GPU): CLEAN ONLY. Runs after the CPU    */
++/* fills descriptors/payloads and before the job is queued (fence    */
++/* not yet armed). Clean, never invalidate: the BO body is the CPU's */
++/* output at this point, so discarding lines would hand the GPU the  */
++/* previous contents. The trailing dsb of __dma_clean_range also     */
++/* drains the submitting thread's WC store buffer (userspace writes  */
++/* go through the MT_NORMAL_NC mmap), so DRAM holds the bytes before */
++/* the doorbell rings. Unbound BOs are a no-op.                      */
 +void p7580_gem_submit_sync(struct drm_gem_object *obj)
 +{
-+	struct p7580_bo *bo = to_p7580_bo(obj);
-+	unsigned int i;
-+
-+	if (bo->backing != P7580_BO_SHMEM || !bo->pages || !bo->sync_dev ||
-+	    !bo->dma_addrs)
-+		return;
-+	for (i = 0; i < bo->nr_pages; i++) {
-+		if (!bo->pages[i])
-+			continue;
-+		dma_sync_single_for_device(bo->sync_dev, bo->dma_addrs[i],
-+					   PAGE_SIZE, DMA_BIDIRECTIONAL);
-+	}
++	p7580_gem_clean_for_device(obj);
 +}
 +
 +/* gpu31-iova (stale-TLB lifetime fix): free-time GPU unmap.
@@ -452,7 +540,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +}
 +
 +/* Unbind: tear down the bind-time DMA mapping (MMU-unmap/teardown     */
-+/* path, file-close, free). Safe on unbound BOs. */
++/* path, file-close, free). Safe on unbound BOs. gpu31-cachedir: clean */
++/* first -- dma_unmap_page(DMA_BIDIRECTIONAL) invalidates (cache.S      */
++/* __dma_unmap_area: dir != TO_DEVICE -> __dma_inv_range), which would   */
++/* discard a final CPU write that never went through a submit clean.    */
++/* Order: clean (writeback) -> unmap+invalidate (no stale line left).   */
 +void p7580_gem_dma_unbind(struct drm_gem_object *obj)
 +{
 +	struct p7580_bo *bo = to_p7580_bo(obj);
@@ -460,6 +552,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +
 +	if (!bo->dma_addrs || !bo->sync_dev)
 +		return;
++	p7580_gem_clean_for_device(obj);
 +	for (i = 0; i < bo->nr_pages; i++)
 +		dma_unmap_page(bo->sync_dev, bo->dma_addrs[i], PAGE_SIZE,
 +			       DMA_BIDIRECTIONAL);
@@ -1438,11 +1531,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	dma_buf_put(dma_buf);
 +	return ERR_PTR(ret);
 +}
-+
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,247 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
@@ -1616,24 +1708,40 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 + *    mmu/pf7580_as.h). PTEs MUST come from p7580_bo_dma_addr (the
 + *    bind-time bus address), never page_to_phys/sg_phys directly.
 + *  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills
-+ *    descriptors/payloads, before queueing (drains CPU lines to the
-+ *    point the GPU reads).
-+ *  - completion: p7580_gem_job_done_sync(obj) per BO in free_job
-+ *    (invalidates CPU lines so reads see GPU bytes).
++ *    descriptors/payloads, before queueing. This is a CLEAN
++ *    (sync_for_device, DMA_TO_DEVICE): writeback only, never an
++ *    invalidate (gpu31-cachedir).
++ *  - completion: p7580_gem_job_done_sync(obj) per BO in free_job and
++ *    in the pre-signal IRQ path: CLEAN-THEN-INVALIDATE, so GPU bytes
++ *    become visible to the next CPU read and a CPU write that raced
++ *    the job is written back instead of dropped.
++ *  - snapshot/dump read: p7580_gem_invalidate_for_cpu(obj) = the same
++ *    clean-then-invalidate pair (an invalidate alone would drop dirty
++ *    lines; it is needed to drop the alias's stale clean lines).
 + *  - unbind/free: p7580_mmu_unmap per page + invalidate, then
-+ *    p7580_gem_dma_unbind(obj) before pages are released. */
++ *    p7580_gem_dma_unbind(obj) (clean, then unmap+invalidate) before
++ *    pages are released. */
 +unsigned int p7580_bo_npages(struct drm_gem_object *obj);
 +phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
 +			       unsigned int idx, int *ok);
-+/* COHERENCY_NONE data sync (gpu31-coherency): per-page DMA-API order.
-+ * Bind maps the SHMEM pages (dma_map_page, BIDIRECTIONAL) and caches
-+ * the bus addresses; SUBMIT drains CPU writes (sync_for_device);
-+ * completion invalidates CPU lines (sync_for_cpu) so the next CPU
-+ * read sees GPU bytes; unbind tears the mapping down. CMA/imported
-+ * BOs are no-ops everywhere. job_done_sync runs in free_job context
-+ * (no MMIO, no sleeps, no locks); the pre-signal wrapper below runs
-+ * the same maintenance in IRQ / fence-callback context before the
-+ * fence signals. PTEs must come from p7580_bo_dma_addr. */
++/* COHERENCY_NONE data sync (gpu31-coherency + gpu31-cachedir): per-page
++ * DMA-API order with direction-correct cache ops. Bind maps the SHMEM
++ * pages (dma_map_page, BIDIRECTIONAL = clean) and caches the bus
++ * addresses; SUBMIT cleans CPU writes (sync_for_device, TO_DEVICE);
++ * completion and every snapshot/dump read run clean-then-invalidate
++ * (invalidate_for_cpu) so the next CPU read sees DRAM bytes; unbind
++ * cleans, then unmaps (which invalidates). CMA/imported BOs are no-ops
++ * everywhere. job_done_sync runs in free_job context (no MMIO, no
++ * sleeps, no locks); the pre-signal wrapper below runs the same
++ * maintenance in IRQ / fence-callback context before the fence
++ * signals. PTEs must come from p7580_bo_dma_addr. */
++/* Direction-correct helpers (gpu31-cachedir). clean_for_device =
++ * dma_sync_single_for_device(DMA_TO_DEVICE) per bound page (writeback).
++ * invalidate_for_cpu = the same clean, THEN
++ * dma_sync_single_for_cpu(DMA_FROM_DEVICE) (discard); the order is the
++ * contract, not an implementation detail. */
++void p7580_gem_clean_for_device(struct drm_gem_object *obj);
++void p7580_gem_invalidate_for_cpu(struct drm_gem_object *obj);
 +/* Pre-signal variant of the completion invalidate (gpu31-coherency-race):
 + * runs job_done_sync on each owned BO WITHOUT dropping refs. Called with
 + * the job's bos/bo_count (opaque void so this header stays drm-free)
@@ -1674,7 +1782,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +					      struct dma_buf *dma_buf);
 +
 +#endif /* PANFROST7580_GEM_H */
-+
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-21 00:00:00.000000000 -0500
@@ -2372,7 +2479,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1439 @@
+@@ -0,0 +1,1442 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -3016,15 +3123,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			 * signal (WAIT_BO dma_resv_wait, syncobj WAIT,
 +			 * sched finish_cb) observes GPU-written bytes.
 +			 * p7580_gem_job_bos_pre_signal_sync walks
-+			 * job->bos/bo_count with dma_sync_single_for_cpu per
-+			 * bound SHMEM page (no MMIO, no sleeps, no locks:
-+			 * dcache-line ops + dsb only, IRQ-safe; the swiotlb
-+			 * leg is the identity fast path). free_job keeps a
-+			 * second (post-signal) job_done_sync + unref walk --
-+			 * belt and braces for waiters that attach after the
-+			 * free (mmap/CPU reads), and for paths where the
-+			 * IRQ never fires (recover signals instead; see
-+			 * timedout/recover below). */
++			 * job->bos/bo_count with the clean-then-invalidate
++			 * pair per bound SHMEM page (gpu31-cachedir: clean
++			 * = sync_for_device(TO_DEVICE), then invalidate =
++			 * sync_for_cpu(FROM_DEVICE); no MMIO, no sleeps,
++			 * no locks: dcache-line ops + dsb only, IRQ-safe;
++			 * the swiotlb leg is the identity fast path).
++			 * free_job keeps a second (post-signal)
++			 * job_done_sync + unref walk -- belt and braces for
++			 * waiters that attach after the free (mmap/CPU
++			 * reads), and for paths where the IRQ never fires
++			 * (recover signals instead; see timedout/recover
++			 * below). */
 +			if (job && job->bo_count && job->bos)
 +				p7580_gem_job_bos_pre_signal_sync(job->bos,
 +								  job->bo_count);
@@ -6187,7 +6297,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1695 @@
+@@ -0,0 +1,1716 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6690,6 +6800,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +		if (jd_words > 128)
 +			jd_words = 128;
++		/* gpu31-cachedir: this is a kernel READ of BO bytes.
++		 * Clean-then-invalidate the owner BO when the leaf really
++		 * points at it, so the dump shows DRAM (CPU WC writes /
++		 * GPU bytes) instead of a stale cached line and loses no
++		 * dirty line. NO-OWNER/MISMATCH pages are not BO pages
++		 * and are read as-is. */
++		if (owner && bo_ok && leaf_phys == bo_phys)
++			p7580_gem_invalidate_for_cpu(owner);
 +		kv = kmap(ppg);
 +		for (wi = 0; wi < jd_words; wi++)
 +			pw[wi] = ((u32 *)((char *)kv + page_off))[wi];
@@ -7453,10 +7571,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			ret = p7580_drv_map_bo(drv, obj);
 +			if (ret)
 +				goto err_objs;
-+			/* gpu31-coherency: CPU fills descriptors/payloads
-+			 * before SUBMIT (ioctl copy / mmap writes); drain
-+			 * those lines to the point the GPU reads now that
-+			 * the BO is bound. Before the job is queued. */
++			/* gpu31-coherency + gpu31-cachedir: CPU fills
++			 * descriptors/payloads before SUBMIT (ioctl copy
++			 * / mmap writes); CLEAN (writeback, never
++			 * invalidate) those lines to the point the GPU
++			 * reads now that the BO is bound, and before
++			 * anything else can invalidate the range.
++			 * Before the job is queued. */
 +			p7580_gem_submit_sync(obj);
 +		}
 +	}
@@ -7521,9 +7642,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			    poff + 32 <= PAGE_SIZE) {
 +				void *kv;
 +				unsigned int wi;
-+				/* Same invalidate the completion path
-+				 * runs, so the snapshot sees CPU bytes. */
-+				p7580_gem_job_done_sync(&jbo->base);
++				/* gpu31-cachedir: snapshot read =
++				 * CLEAN-THEN-INVALIDATE, not a bare
++				 * invalidate. The clean writes back
++				 * any dirty line the CPU put in the
++				 * kernel alias (kmap/vmap fills); the
++				 * invalidate drops the alias's stale
++				 * CLEAN lines so the bytes below come
++				 * from DRAM (userspace WC writes land
++				 * there directly). A bare invalidate
++				 * here discarded CPU-filled JD bytes
++				 * -- wrong direction for a buffer the
++				 * CPU just wrote. */
++				p7580_gem_invalidate_for_cpu(&jbo->base);
 +				kv = kmap_atomic(jbo->pages[idx]);
 +				for (wi = 0; wi < 8; wi++)
 +					job->desc[wi] =

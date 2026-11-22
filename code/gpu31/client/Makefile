@@ -38,6 +38,7 @@ SELFTEST := build/pf7580-selftest
 
 AARCH64_LIB := build-aarch64/libpf7580.a
 AARCH64_WDARM := build-aarch64/wdarm
+AARCH64_SELFTEST := build-aarch64/pf7580-selftest
 
 
 .PHONY: all lib check check-aarch64 clean

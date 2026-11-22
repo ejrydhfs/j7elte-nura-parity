@@ -1167,12 +1167,290 @@ static int run_pattern_test(const char *path)
 	return 1;
 }
 
+/* gpu31-cachedir device test: CPU-filled BO survives a job that reads it.
+ *
+ * Shape (the ticket's ask, no GL needed): a 4 KiB BO carries BOTH the
+ * job descriptor (32-B WRITE_VALUE/Zero header at offset 0, so the GPU
+ * is guaranteed to FETCH the page) and a 96-B shader-ISA-shaped pattern
+ * at offset 0x100 (shader tag byte 5 in word 0, like a real Midgard ISA
+ * header), plus a page-wide deterministic fill. A second 4 KiB BO is
+ * the write target (pre-filled 0xA5A5A5A5): the GPU zeroing word 0 there
+ * proves the job actually ran, hence that the GPU really read the first
+ * page.
+ *
+ * After the out_sync fence retires, compare every 32-bit word of the
+ * shader BO against a pre-submit snapshot in BOTH views: the userspace
+ * WC mapping and the kernel view (DEBUG_READ_BO 0xCF ->
+ * p7580_gem_debug_read_word -> clean-then-invalidate + kmap read).
+ * PASS = the CPU's bytes are intact in both views and the target was
+ * zeroed. A mismatch is the "ISA BO reads back as zeros" failure mode;
+ * the exact word and both values are printed.
+ *
+ * Why this is the cache-direction test: the page sits in the submit BO
+ * list (it is the jc BO), so the pre-signal/completion maintenance and
+ * the submit snapshot run on it. Under the pre-fix order (bare
+ * invalidate) a dirty kernel-alias line on that page would be discarded
+ * here; under the fixed order (clean-then-invalidate) it survives. */
+#define PF7580_CD_ISA_OFF	0x100u
+#define PF7580_CD_ISA_LEN	96u
+#define PF7580_CD_ISA_WORD0	0xc87a9835u	/* tag 5 in the low nibble */
+
+static uint32_t pf7580_cd_fill(unsigned int i)
+{
+	/* Deterministic, non-repeating-across-words pattern. */
+	uint32_t v = 0x9e3779b9u * (i + 1u) + 0x7f4a7c15u;
+
+	return v ? v : 0xdeadbeefu;
+}
+
+static int run_cachedir_test(const char *path)
+{
+	struct pf7580_dev *dev;
+	char err[256] = "";
+	uint64_t prod = 0, job_map = 0, res_map = 0;
+	uint64_t job_gpu = 0, res_gpu = 0;
+	uint32_t jh = 0, rh = 0, out_sync = 0;
+	uint32_t bos[2];
+	unsigned char *jp = NULL, *rp = NULL;
+	uint32_t *snap = NULL;
+	uint32_t *w;
+	struct pf7580_submit_args sa;
+	struct timespec now, t0, t1;
+	int64_t deadline_ns;
+	long elapsed_ms;
+	unsigned int i, bad_user = 0, bad_kern = 0, kern_read = 0;
+	uint32_t bad_u_word = 0, bad_u_got = 0, bad_u_want = 0;
+	uint32_t res0 = 0xdeadbeefu;
+	int rc;
+
+	printf("-- pf7580 cachedir-test (CPU-filled BO vs read-only submit) on %s --\n",
+	       path);
+	rc = pf7580_open(path, &dev, err, sizeof(err));
+	if (rc) {
+		printf("cachedir-test %s unavailable: %s\n", path, err);
+		return 2;
+	}
+	printf("open: OK (fd=%d mock=%d)\n", pf7580_fd(dev),
+	       pf7580_is_mock(dev));
+	rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &prod);
+	if (rc || prod != PF7580_T720_PROD_ID) {
+		printf("GET_PARAM: FAIL rc=%d (%s) prod=0x%" PRIx64 "\n",
+		       rc, pf7580_strerror(rc), prod);
+		pf7580_close(dev);
+		return 1;
+	}
+	rc = pf7580_create_bo(dev, 4096, &jh, &job_gpu);
+	if (rc || !jh || !job_gpu) {
+		printf("CREATE_BO(job): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_close(dev);
+		return 1;
+	}
+	rc = pf7580_create_bo(dev, 4096, &rh, &res_gpu);
+	if (rc || !rh || !res_gpu) {
+		printf("CREATE_BO(result): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_close(dev);
+		return 1;
+	}
+	rc = pf7580_mmap_bo(dev, jh, &job_map);
+	if (rc) {
+		printf("MMAP_BO(job): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_close(dev);
+		return 1;
+	}
+	rc = pf7580_mmap_bo(dev, rh, &res_map);
+	if (rc) {
+		printf("MMAP_BO(result): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		pf7580_close(dev);
+		return 1;
+	}
+	jp = pf7580_cpu_map(dev, jh, job_map, 4096);
+	rp = pf7580_cpu_map(dev, rh, res_map, 4096);
+	if (!jp || !rp) {
+		printf("FAIL cpu map (job=%p result=%p) errno=%d (%s)\n",
+		       (void *)jp, (void *)rp, pf7580_cpu_map_errno,
+		       strerror(pf7580_cpu_map_errno));
+		if (jp)
+			pf7580_cpu_unmap(dev, jp, 4096);
+		if (rp)
+			pf7580_cpu_unmap(dev, rp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+	snap = malloc(4096);
+	if (!snap) {
+		printf("FAIL malloc snapshot\n");
+		pf7580_cpu_unmap(dev, jp, 4096);
+		pf7580_cpu_unmap(dev, rp, 4096);
+		pf7580_close(dev);
+		return 1;
+	}
+
+	/* CPU FILL: descriptor + ISA-shaped pattern + page-wide fill.	*/
+	memset(jp, 0, 4096);
+	w = (uint32_t *)jp;
+	w[4] = (1u << 0) | (2u << 1);		/* WRITE_VALUE, from-zero */
+	w[8] = (uint32_t)(res_gpu & 0xffffffffu);
+	w[9] = (uint32_t)(res_gpu >> 32);
+	w[10] = 3u;				/* Zero (v4/v5 genxml) */
+	for (i = 0; i < 4096u / 4u; i++) {
+		if (i >= (PF7580_CD_ISA_OFF >> 2) &&
+		    i < ((PF7580_CD_ISA_OFF + PF7580_CD_ISA_LEN) >> 2))
+			continue;		/* ISA block written below */
+		if (i < 16u)
+			continue;		/* JD header written above */
+		w[i] = pf7580_cd_fill(i);
+	}
+	w[PF7580_CD_ISA_OFF >> 2] = PF7580_CD_ISA_WORD0;
+	for (i = 1; i < PF7580_CD_ISA_LEN / 4u; i++)
+		w[(PF7580_CD_ISA_OFF >> 2) + i] = pf7580_cd_fill(1000u + i);
+	for (i = 0; i < 4096u / 4u; i++)
+		((uint32_t *)rp)[i] = PF7580_PATTERN_PREFILL;
+	memcpy(snap, jp, 4096);
+	/* Order the WC stores against the syscall below (the submit ioctl
+	 * is also the point where the driver cleans the range). */
+	__sync_synchronize();
+	printf("FILL: job BO h=%u gpu=0x%" PRIx64 " isa[0]=0x%08x result h=%u gpu=0x%" PRIx64 "\n",
+	       jh, job_gpu, w[PF7580_CD_ISA_OFF >> 2], rh, res_gpu);
+
+	rc = pf7580_syncobj_create(dev, 0, &out_sync);
+	if (rc || !out_sync) {
+		printf("SYNCOBJ-CREATE: FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		goto fail;
+	}
+	bos[0] = jh;
+	bos[1] = rh;
+	memset(&sa, 0, sizeof(sa));
+	sa.jc = job_gpu;		/* JD at offset 0 of the job BO */
+	sa.bo_handles = bos;
+	sa.bo_handle_count = 2;
+	sa.requirements = 0;		/* -> JS0 */
+	sa.out_sync = out_sync;
+	printf("SUBMIT: jc=0x%" PRIx64 " bos=[%u,%u] out_sync=%u...\n",
+	       job_gpu, jh, rh, out_sync);
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_submit(dev, &sa);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("SUBMIT: rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (rc) {
+		printf("CACHEDIR-TEST: FAILED (submit rejected; see dmesg)\n");
+		pf7580_syncobj_destroy(dev, out_sync);
+		goto fail;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
+		now.tv_nsec + 8000000000LL;
+	printf("SYNCOBJ-WAIT: waiting out_sync=%u (+8s abs)...\n", out_sync);
+	fflush(stdout);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	rc = pf7580_syncobj_wait(dev, &out_sync, 1, deadline_ns, 0, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	printf("SYNCOBJ-WAIT(+8s abs): rc=%d (%s) elapsed=%ld ms\n", rc,
+	       pf7580_strerror(rc), elapsed_ms);
+	if (rc) {
+		printf("CACHEDIR-TEST: FAILED (fence wait failed; dark GPU? see dmesg)\n");
+		pf7580_syncobj_destroy(dev, out_sync);
+		goto fail;
+	}
+	pf7580_syncobj_destroy(dev, out_sync);
+	out_sync = 0;
+	(void)pf7580_debug_read_bo(dev, rh, 0, &res0);
+	printf("RESULT: word0=0x%08x (prefill 0x%08x) %s\n", res0,
+	       PF7580_PATTERN_PREFILL,
+	       res0 == 0 ? "ZERO (job ran)" : "NOT-ZERO (job did not write)");
+
+	/* USER view: every word of the shader BO must still match.
+	 * Word 0 is GPU-owned on Midgard: the hardware writes the
+	 * next/done word back at JD[0] (observed 0x00000001 on T720),
+	 * so it is reported separately, not counted as corruption. */
+	for (i = 1; i < 4096u / 4u; i++) {
+		if (w[i] != snap[i]) {
+			if (!bad_user) {
+				bad_u_word = i;
+				bad_u_got = w[i];
+				bad_u_want = snap[i];
+			}
+			bad_user++;
+		}
+	}
+	printf("USER: %u/%u words intact%s", 1023u - bad_user, 1023u,
+	       bad_user ? " ->" : "\n");
+	if (bad_user)
+		printf(" w[%u]=0x%08x want 0x%08x (%u bad)\n",
+		       bad_u_word, bad_u_got, bad_u_want, bad_user);
+	printf("JD0: 0x%08x (CPU wrote 0x00000000; the GPU's next/done writeback)\n",
+	       w[0]);
+
+	/* KERNEL view over the JD header (word 0 excluded: GPU-owned)
+	 * + the 96-B ISA block. */
+	for (i = 1; i < 8u; i++) {
+		uint32_t kv = 0;
+
+		if (pf7580_debug_read_bo(dev, jh, i * 4u, &kv))
+			continue;
+		kern_read++;
+		if (kv != snap[i])
+			bad_kern++;
+	}
+	for (i = 0; i < PF7580_CD_ISA_LEN / 4u; i++) {
+		uint32_t kv = 0;
+
+		if (pf7580_debug_read_bo(dev, jh,
+					 PF7580_CD_ISA_OFF + i * 4u, &kv))
+			continue;
+		kern_read++;
+		if (kv != ((uint32_t *)((char *)snap +
+					PF7580_CD_ISA_OFF))[i])
+			bad_kern++;
+	}
+	printf("KERN: %u/%u words read, %u mismatched\n", kern_read - bad_kern,
+	       kern_read, bad_kern);
+
+	pf7580_cpu_unmap(dev, jp, 4096);
+	pf7580_cpu_unmap(dev, rp, 4096);
+	free(snap);
+	pf7580_close(dev);
+
+	if (!bad_user && !bad_kern && res0 == 0) {
+		printf("CACHEDIR-TEST: PASS (CPU-filled BO intact in both views, job ran)\n");
+		return 0;
+	}
+	if (bad_user && !bad_kern)
+		printf("HINT: user view lost words, kernel view intact = userspace WC mapping/BO lifetime, not kernel cache ops.\n");
+	else if (!bad_user && bad_kern)
+		printf("HINT: user view intact, kernel view stale = missing kernel invalidate (alias (a)).\n");
+	else if (bad_user && bad_kern)
+		printf("HINT: both views changed = the BO body itself was overwritten (DMA direction / page reuse), not a read-side alias.\n");
+	else
+		printf("HINT: data intact but the job did not write; check dmesg JS_STATUS for a fault.\n");
+	printf("CACHEDIR-TEST: FAILED\n");
+	return 1;
+
+fail:
+	free(snap);
+	pf7580_cpu_unmap(dev, jp, 4096);
+	pf7580_cpu_unmap(dev, rp, 4096);
+	pf7580_close(dev);
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	const char *devpath = getenv("PF7580_DEVICE");
 	const char *probeonly = NULL;
 	const char *submittest = NULL;
 	const char *patterntest = NULL;
+	const char *cachedirtest = NULL;
 	int i;
 
 	/* Unbuffered: on HW a hang must leave partial output behind. */
@@ -1194,6 +1472,10 @@ int main(int argc, char **argv)
 			patterntest = argv[++i];
 		} else if (!strncmp(argv[i], "--pattern-test=", 15)) {
 			patterntest = argv[i] + 15;
+		} else if (!strcmp(argv[i], "--cachedir-test") && i + 1 < argc) {
+			cachedirtest = argv[++i];
+		} else if (!strncmp(argv[i], "--cachedir-test=", 16)) {
+			cachedirtest = argv[i] + 16;
 		} else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			devpath = argv[++i];
 		} else if (!strncmp(argv[i], "--device=", 9)) {
@@ -1210,6 +1492,8 @@ int main(int argc, char **argv)
 		return run_submit_test(submittest);
 	if (patterntest)
 		return run_pattern_test(patterntest);
+	if (cachedirtest)
+		return run_cachedir_test(cachedirtest);
 	if (devpath)
 		return run_device(devpath);
 	return run_mock_suite();

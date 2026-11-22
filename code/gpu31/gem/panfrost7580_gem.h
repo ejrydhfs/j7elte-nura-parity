@@ -171,24 +171,40 @@ long p7580_gem_wait(struct drm_device *dev, struct drm_file *file_priv,
  *    mmu/pf7580_as.h). PTEs MUST come from p7580_bo_dma_addr (the
  *    bind-time bus address), never page_to_phys/sg_phys directly.
  *  - submit: p7580_gem_submit_sync(obj) per BO after the CPU fills
- *    descriptors/payloads, before queueing (drains CPU lines to the
- *    point the GPU reads).
- *  - completion: p7580_gem_job_done_sync(obj) per BO in free_job
- *    (invalidates CPU lines so reads see GPU bytes).
+ *    descriptors/payloads, before queueing. This is a CLEAN
+ *    (sync_for_device, DMA_TO_DEVICE): writeback only, never an
+ *    invalidate (gpu31-cachedir).
+ *  - completion: p7580_gem_job_done_sync(obj) per BO in free_job and
+ *    in the pre-signal IRQ path: CLEAN-THEN-INVALIDATE, so GPU bytes
+ *    become visible to the next CPU read and a CPU write that raced
+ *    the job is written back instead of dropped.
+ *  - snapshot/dump read: p7580_gem_invalidate_for_cpu(obj) = the same
+ *    clean-then-invalidate pair (an invalidate alone would drop dirty
+ *    lines; it is needed to drop the alias's stale clean lines).
  *  - unbind/free: p7580_mmu_unmap per page + invalidate, then
- *    p7580_gem_dma_unbind(obj) before pages are released. */
+ *    p7580_gem_dma_unbind(obj) (clean, then unmap+invalidate) before
+ *    pages are released. */
 unsigned int p7580_bo_npages(struct drm_gem_object *obj);
 phys_addr_t p7580_bo_page_phys(struct drm_gem_object *obj,
 			       unsigned int idx, int *ok);
-/* COHERENCY_NONE data sync (gpu31-coherency): per-page DMA-API order.
- * Bind maps the SHMEM pages (dma_map_page, BIDIRECTIONAL) and caches
- * the bus addresses; SUBMIT drains CPU writes (sync_for_device);
- * completion invalidates CPU lines (sync_for_cpu) so the next CPU
- * read sees GPU bytes; unbind tears the mapping down. CMA/imported
- * BOs are no-ops everywhere. job_done_sync runs in free_job context
- * (no MMIO, no sleeps, no locks); the pre-signal wrapper below runs
- * the same maintenance in IRQ / fence-callback context before the
- * fence signals. PTEs must come from p7580_bo_dma_addr. */
+/* COHERENCY_NONE data sync (gpu31-coherency + gpu31-cachedir): per-page
+ * DMA-API order with direction-correct cache ops. Bind maps the SHMEM
+ * pages (dma_map_page, BIDIRECTIONAL = clean) and caches the bus
+ * addresses; SUBMIT cleans CPU writes (sync_for_device, TO_DEVICE);
+ * completion and every snapshot/dump read run clean-then-invalidate
+ * (invalidate_for_cpu) so the next CPU read sees DRAM bytes; unbind
+ * cleans, then unmaps (which invalidates). CMA/imported BOs are no-ops
+ * everywhere. job_done_sync runs in free_job context (no MMIO, no
+ * sleeps, no locks); the pre-signal wrapper below runs the same
+ * maintenance in IRQ / fence-callback context before the fence
+ * signals. PTEs must come from p7580_bo_dma_addr. */
+/* Direction-correct helpers (gpu31-cachedir). clean_for_device =
+ * dma_sync_single_for_device(DMA_TO_DEVICE) per bound page (writeback).
+ * invalidate_for_cpu = the same clean, THEN
+ * dma_sync_single_for_cpu(DMA_FROM_DEVICE) (discard); the order is the
+ * contract, not an implementation detail. */
+void p7580_gem_clean_for_device(struct drm_gem_object *obj);
+void p7580_gem_invalidate_for_cpu(struct drm_gem_object *obj);
 /* Pre-signal variant of the completion invalidate (gpu31-coherency-race):
  * runs job_done_sync on each owned BO WITHOUT dropping refs. Called with
  * the job's bos/bo_count (opaque void so this header stays drm-free)
@@ -202,6 +218,7 @@ void p7580_gem_job_done_sync(struct drm_gem_object *obj);
 int p7580_gem_dma_bind(struct drm_gem_object *obj, struct device *dev);
 void p7580_gem_submit_sync(struct drm_gem_object *obj);
 void p7580_gem_dma_unbind(struct drm_gem_object *obj);
+phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
 /* gpu31-iova: free-time GPU unmap (driver snapshot, submit.c).
  * Called from p7580_gem_free_object before iova_free; clears the
  * BO's leaf PTEs + PM-held TLB invalidate + bo_list unlink + DMA
