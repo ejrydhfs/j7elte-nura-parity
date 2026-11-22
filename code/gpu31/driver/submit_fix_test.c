@@ -36,10 +36,16 @@
  *     the earlier (tiler) fence win over the newer FS fence; WAIT_BO
  *     then reported a BO busy-in-GPU as idle. The fix publishes only at
  *     SUBMIT, under serial_lock (publish order == submit order).
+ *  T11 WAIT_BO result mapping (gpu31-storm58): dma_resv_wait_timeout()
+ *     0 means "budget ran out", so the ioctl must return -ETIMEDOUT for
+ *     it (v5.2 contract). The old handler returned 0 for both 0 and >0,
+ *     so the non-blocking poll Mesa's BO-cache fetch uses always said
+ *     "ready" for a BO an in-flight batch still owned.
  *
  * Build: cc -Wall -Wextra -o submit_fix_test submit_fix_test.c
  *        && ./submit_fix_test
  */
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -524,6 +530,35 @@ static void run_t10(void)
 	CHECK(resv.excl->signaled);		/* BO "idle" with fs live */
 }
 
+/* ------------------------------------------------------------------ */
+/* T11 WAIT_BO result mapping (gpu31-storm58).                         */
+/*                                                                    */
+/* dma_resv_wait_timeout(): >0 idle (jiffies left), 0 budget ran out,  */
+/* <0 error. v5.2 panfrost_wait_bo's ioctl maps 0 to -ETIMEDOUT; the   */
+/* old handler mapped only <0 and returned 0 for 0 as well -- so the   */
+/* non-blocking poll Mesa's BO-cache fetch uses ("bo_wait(bo, 0)")     */
+/* always answered "ready" and cached BOs were handed back while an    */
+/* in-flight batch still owned them.                                   */
+/* ------------------------------------------------------------------ */
+
+static int model_wait_bo_ioctl(long wait_ret)
+{
+	if (wait_ret == 0)
+		return -ETIMEDOUT;	/* pending at the deadline */
+	if (wait_ret < 0)
+		return (int)wait_ret;
+	return 0;			/* >0: idle, jiffies left */
+}
+
+static void run_t11(void)
+{
+	CHECK(model_wait_bo_ioctl(0) == -ETIMEDOUT);	/* busy */
+	CHECK(model_wait_bo_ioctl(1) == 0);		/* idle */
+	CHECK(model_wait_bo_ioctl(250) == 0);		/* idle */
+	CHECK(model_wait_bo_ioctl(-EINTR) == -EINTR);	/* error */
+
+}
+
 int main(void)
 {
 	run_t1();
@@ -536,6 +571,7 @@ int main(void)
 	run_t8();
 	run_t9();
 	run_t10();
+	run_t11();
 
 	if (fails == 0)
 		printf("submit_fix_test: all checks passed\n");
