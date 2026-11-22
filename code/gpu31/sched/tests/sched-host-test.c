@@ -680,6 +680,12 @@ static void test_fault_kick_timeout(void)
 	CHECK_EQ((long)j->timeout_work.delay, 0L);
 	/* NULL job / cleared entity are no-ops, never a deref. */
 	drm_sched_job_kick_timeout(NULL);
+	/* Run the kicked work as the ordered wq would: the timeout path
+	 * calls timedout_job, which signals the fence (recovery), so the
+	 * pending submit retires without waiting the 5 s budget. */
+	CHECK(!dma_fence_is_signaled(j->fence));
+	j->timeout_work.work.fn(&j->timeout_work.work);
+	CHECK(dma_fence_is_signaled(j->fence));
 	dma_fence_signal(j->fence);
 	j->finish_work.fn(&j->finish_work);
 	drm_sched_entity_fini(&sched, &e);
