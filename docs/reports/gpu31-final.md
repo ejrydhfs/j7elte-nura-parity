@@ -163,3 +163,11 @@ reported 512²/readback "timeouts" are fault-recovery latency, not FBD type
 - Long runs still fault: 300-frame no-readback = 55 ERR/TIMEOUT and 17.6 fps (0x58 DATA_INVALID_FAULT,
   0x41 POWER_FAULT). First fault's descriptor had word0 (exception_status)=1 on a 4 KiB pool BO —
   origin under investigation (`gpu31-firstfault.md`).
+
+## int41 (2026-11-22) — stable GPU, 155 fps sustained
+- Descriptor hygiene (words 0..3 zeroed in shadows) removed the long-run fault storm:
+  **3 x 300 frames with 0 ERR / 0 TIMEOUT / 0 RECOVER at ~155 fps** (256², glFinish/frame).
+- `RENDER_OK` (clear + red triangle) still holds; 512² readback 0 faults (12.4 fps, CPU detile bound).
+- `serialize_fs=1` is harmful (34 faults + "did not idle"): default stays 0.
+- Residual: occasional silent hang (`js_status=0x08`, no IRQ) costs the 5 s sched timeout; a
+  dispatch watchdog slice is in flight (`gpu31-watchdog.md`).
