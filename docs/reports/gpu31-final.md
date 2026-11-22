@@ -155,3 +155,11 @@ reported 512²/readback "timeouts" are fault-recovery latency, not FBD type
 - No-readback bench (glFinish/frame, 256², 300 frames): **141 fps** (7 ms/frame) vs llvmpipe ~1000 fps.
 - Per-frame `glReadPixels` still faults the fragment job: `POWER_FAULT 0x41` (36/36 at 256², 19/19 at 512²);
   the clean ordering is `glFinish()` **before** readback (verified at 512²). Tracked in `gpu31-readback.md`.
+
+## int40 (2026-11-22) — power-recovery fix; long runs still fault
+- Cores-off busy guard + power-cycle recovery landed: `recover-done ... cycle=1 ... intmask=0x00070007`,
+  zero "did not idle" warnings, no wedges requiring power cycles.
+- Short runs are clean: 256² readback 51 fps / 0 ERR; 512² readback 11.6 fps / 0 ERR; `RENDER_OK`.
+- Long runs still fault: 300-frame no-readback = 55 ERR/TIMEOUT and 17.6 fps (0x58 DATA_INVALID_FAULT,
+  0x41 POWER_FAULT). First fault's descriptor had word0 (exception_status)=1 on a 4 KiB pool BO —
+  origin under investigation (`gpu31-firstfault.md`).
