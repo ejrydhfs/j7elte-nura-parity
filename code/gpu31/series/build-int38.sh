@@ -1922,10 +1922,16 @@ note "== int38 chainsplit gate: PASS (walk+isolate+shadow, per-node queue on one
 # 6x. defectb gates (9dd7542 gpu31-defectb: clean+invalidate each SHMEM
 # page at allocation). Source order inside the per-page loop (page get ->
 # flush -> pages[i] = page), then the compiled proof: exactly one
-# __flush_dcache_area call in gem.o, in the symbol that carries the single
-# shmem_read_mapping_page call, after it; U ref in the object, T def in
-# System.map, and the same single call site in the linked vmlinux (not
-# only in the unlinked object). FAIL (exit 1, scratch kept) on any
+# __flush_dcache_area call reloc in gem.o, in the symbol that carries the
+# single shmem page-get call (shmem_read_mapping_page is the inline that
+# emits shmem_read_mapping_page_gfp), and the pages[i] = page store
+# immediately follows the flush. -O2 lays the loop out as
+# head(page get) -> success edge -> flush block -> store -> i++ -> head,
+# so the flush can sit at a LOWER address than the read: the gate proves
+# the pair is the loop body (adjacent call sites) and the store follows
+# the flush, not that addresses ascend. Then U ref in the object, T def in
+# System.map, and the same single call site + store in the linked vmlinux
+# (not only in the unlinked object). FAIL (exit 1, scratch kept) on any
 # disagreement.
 note "== int38 gate: defectb shmem flush present =="
 [ "$(grep -c '__flush_dcache_area(page_address(page), PAGE_SIZE);' "$GEMC")" = 1 ] \
@@ -1944,7 +1950,8 @@ note "applied gem.c shmem loop: page-get=$SI_READ flush=$SI_FLUSH store=$SI_STOR
 [ "$(grep -c '^+[[:space:]]*__flush_dcache_area(page_address(page), PAGE_SIZE);$' "$DRV1")" = 1 ] \
 	|| gate_fail "driver 0001 must carry exactly one +__flush_dcache_area line, got $(grep -c '^+[[:space:]]*__flush_dcache_area(page_address(page), PAGE_SIZE);$' "$DRV1")"
 note "driver 0001 mirror: $(grep -c '^+[[:space:]]*__flush_dcache_area(page_address(page), PAGE_SIZE);$' "$DRV1") flush line"
-# object: one call reloc, in the shmem page-get symbol, after the read.
+# object: one call reloc, in the shmem page-get symbol, and the store to
+# the pages array immediately after the flush (the loop body).
 aarch64-linux-gnu-nm "$GEM_O" | grep -q ' U __flush_dcache_area$' \
 	|| gate_fail "gem.o does not reference __flush_dcache_area (arm64 flusher not linked in)"
 [ "$(aarch64-linux-gnu-objdump -dr "$GEM_O" | grep -c 'R_AARCH64_CALL26[[:space:]]*__flush_dcache_area')" = 1 ] \
@@ -1953,7 +1960,7 @@ GEMDIS=$(aarch64-linux-gnu-objdump -dr "$GEM_O")
 SHMFUNC=$(printf '%s\n' "$GEMDIS" | awk '
 	/^[0-9a-f]+ <.*>:$/ { f=$2 }
 	/R_AARCH64_CALL26[[:space:]]*shmem_read_mapping_page/ { sub(/^</,"",f); sub(/>:$/,"",f); print f; exit }')
-[ -n "$SHMFUNC" ] || gate_fail "no shmem_read_mapping_page call site in gem.o"
+[ -n "$SHMFUNC" ] || gate_fail "no shmem page-get call site in gem.o"
 FLUSH_FUNC=$(printf '%s\n' "$GEMDIS" | awk '
 	/^[0-9a-f]+ <.*>:$/ { f=$2 }
 	/R_AARCH64_CALL26[[:space:]]*__flush_dcache_area/ { sub(/^</,"",f); sub(/>:$/,"",f); print f; exit }')
@@ -1963,13 +1970,18 @@ FDIS=$(printf '%s\n' "$GEMDIS" | awk -v h="<$SHMFUNC>:" '
 	/^[0-9a-f]+ </ { if (p) exit; if ($2==h) p=1 }
 	p { print }')
 [ "$(printf '%s\n' "$FDIS" | grep -c 'R_AARCH64_CALL26[[:space:]]*shmem_read_mapping_page')" = 1 ] \
-	|| gate_fail "$SHMFUNC must carry exactly 1 shmem_read_mapping_page call"
+	|| gate_fail "$SHMFUNC must carry exactly 1 shmem page-get call"
 FO_READ=$(printf '%s\n' "$FDIS" | grep -n 'R_AARCH64_CALL26[[:space:]]*shmem_read_mapping_page' | cut -d: -f1)
 FO_FLUSH=$(printf '%s\n' "$FDIS" | grep -n 'R_AARCH64_CALL26[[:space:]]*__flush_dcache_area' | cut -d: -f1)
-[ -n "$FO_FLUSH" ] && [ "$FO_READ" -lt "$FO_FLUSH" ] \
-	|| gate_fail "object order is not page-get -> flush in $SHMFUNC (read=$FO_READ flush=$FO_FLUSH)"
-printf '%s\n' "$FDIS" | grep -E 'R_AARCH64_CALL26[[:space:]]*(shmem_read_mapping_page|__flush_dcache_area)' | tee -a "$EVID"
-note "object: $SHMFUNC page-get reloc line $FO_READ, flush reloc line $FO_FLUSH"
+[ -n "$FO_FLUSH" ] || gate_fail "no flush reloc in $SHMFUNC"
+FO_D=$((FO_FLUSH - FO_READ)); FO_AD=${FO_D#-}
+[ "$FO_AD" -le 12 ] \
+	|| gate_fail "flush is not adjacent to the page get in $SHMFUNC (page-get line $FO_READ, flush line $FO_FLUSH)"
+printf '%s\n' "$FDIS" | sed -n "$((FO_FLUSH-1)),$((FO_FLUSH+6))p" | tee -a "$EVID"
+printf '%s\n' "$FDIS" | sed -n "$((FO_FLUSH+1)),$((FO_FLUSH+6))p" \
+	| grep -q 'str.*\[x[0-9]*, x[0-9]*, lsl #3\]' \
+	|| gate_fail "flush is not immediately followed by the pages[i] = page store in $SHMFUNC"
+note "object: $SHMFUNC page-get reloc line $FO_READ, flush reloc line $FO_FLUSH, pages[i] store follows the flush"
 # linked kernel: the flusher is defined once and the same call site
 # survives the link (vmlinux is the Image's source).
 [ "$(grep -c ' [Tt] __flush_dcache_area$' System.map)" = 1 ] \
@@ -1978,7 +1990,7 @@ grep ' __flush_dcache_area$' System.map | tee -a "$EVID"
 VMLF=""
 for cand in $(aarch64-linux-gnu-nm vmlinux | awk -v s="$SHMFUNC" '$2 ~ /[tT]/ && index($3, s) == 1 { print $3 }'); do
 	if aarch64-linux-gnu-objdump -d --disassemble="$cand" vmlinux \
-		| grep -q 'bl.*<shmem_read_mapping_page>'; then
+		| grep -q 'bl.*<shmem_read_mapping_page'; then
 		VMLF=$cand
 		break
 	fi
@@ -1987,15 +1999,20 @@ done
 VDIS=$(aarch64-linux-gnu-objdump -d --disassemble="$VMLF" vmlinux)
 [ "$(printf '%s\n' "$VDIS" | grep -c 'bl.*<__flush_dcache_area>')" = 1 ] \
 	|| gate_fail "linked vmlinux $VMLF must call __flush_dcache_area exactly once, got $(printf '%s\n' "$VDIS" | grep -c 'bl.*<__flush_dcache_area>')"
-[ "$(printf '%s\n' "$VDIS" | grep -c 'bl.*<shmem_read_mapping_page>')" = 1 ] \
-	|| gate_fail "linked vmlinux $VMLF must carry exactly 1 shmem_read_mapping_page call"
-VR=$(printf '%s\n' "$VDIS" | grep -n 'bl.*<shmem_read_mapping_page>' | cut -d: -f1)
+[ "$(printf '%s\n' "$VDIS" | grep -c 'bl.*<shmem_read_mapping_page')" = 1 ] \
+	|| gate_fail "linked vmlinux $VMLF must carry exactly 1 shmem page-get call"
+VR=$(printf '%s\n' "$VDIS" | grep -n 'bl.*<shmem_read_mapping_page' | cut -d: -f1)
 VF=$(printf '%s\n' "$VDIS" | grep -n 'bl.*<__flush_dcache_area>' | cut -d: -f1)
-[ -n "$VR" ] && [ -n "$VF" ] && [ "$VR" -lt "$VF" ] \
-	|| gate_fail "linked vmlinux call order is not page-get -> flush ($VR/$VF)"
-printf '%s\n' "$VDIS" | grep -E 'bl.*<(shmem_read_mapping_page|__flush_dcache_area)>' | tee -a "$EVID"
-note "linked vmlinux: $VMLF page-get line $VR, flush line $VF"
-note "== int38 defectb gate: PASS (every shmem page get is followed by __flush_dcache_area(page_address(page), PAGE_SIZE) in tree, gem.o reloc order and linked vmlinux; driver 0001 mirror) =="
+[ -n "$VR" ] && [ -n "$VF" ] || gate_fail "linked vmlinux $VMLF lost a call site (page-get=$VR flush=$VF)"
+VD=$((VF - VR)); VAD=${VD#-}
+[ "$VAD" -le 12 ] \
+	|| gate_fail "linked vmlinux flush is not adjacent to the page get in $VMLF (page-get line $VR, flush line $VF)"
+printf '%s\n' "$VDIS" | sed -n "$((VF-1)),$((VF+6))p" | tee -a "$EVID"
+printf '%s\n' "$VDIS" | sed -n "$((VF+1)),$((VF+6))p" \
+	| grep -q 'str.*\[x[0-9]*, x[0-9]*, lsl #3\]' \
+	|| gate_fail "linked vmlinux flush is not immediately followed by the pages[i] = page store in $VMLF"
+note "linked vmlinux: $VMLF page-get line $VR, flush line $VF, pages[i] store follows the flush"
+note "== int38 defectb gate: PASS (each shmem page get is paired with __flush_dcache_area(page_address(page), PAGE_SIZE) inside the per-page loop and the pages[i] = page store follows it, in tree, gem.o and linked vmlinux; driver 0001 mirror) =="
 
 # 6y. chainsplit length pin (742dc52): the VERTEX (COMPUTE_JOB)
 # aggregate is MALI_COMPUTE_JOB_LENGTH 192 B (32 header + Invocation 8 +
