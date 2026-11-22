@@ -365,6 +365,27 @@ void drm_sched_job_arm(struct drm_sched_job *job)
 EXPORT_SYMBOL(drm_sched_job_arm);
 
 /**
+ * drm_sched_job_kick_timeout - run this job's timeout/recovery now.
+ * @job: job whose slot reported a fault.
+ *
+ * The driver's IRQ fault path calls this instead of leaving the fence
+ * unsignalled until the per-entity retry budget expires: the timeout
+ * work is re-armed at delay 0 on the same ordered workqueue the pump
+ * runs on, so recovery (which signals the fence and retires the job)
+ * executes in order and in process context milliseconds after the
+ * fault, not after the full timeout. Safe from hard IRQ context
+ * (mod_delayed_work); a job whose fence already signalled is skipped
+ * by drm_sched_job_timeout.
+ */
+void drm_sched_job_kick_timeout(struct drm_sched_job *job)
+{
+	if (!job || !job->entity || !job->entity->wq)
+		return;
+	mod_delayed_work(job->entity->wq, &job->timeout_work, 0);
+}
+EXPORT_SYMBOL(drm_sched_job_kick_timeout);
+
+/**
  * struct drm_sched_dep_and - compound wait-all dependency node.
  *
  * Built when a second DISTINCT unsignaled fence arrives for a job that

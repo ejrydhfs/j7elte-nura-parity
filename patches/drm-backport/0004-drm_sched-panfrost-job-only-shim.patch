@@ -4,9 +4,9 @@ Date: Thu, 19 Nov 2026 12:00:00 -0500
 Subject: [PATCH 0004/5] drm_sched panfrost-job-only shim
 
 ---
- drivers/gpu/drm/drm_sched.c  | 1032 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- drivers/gpu/drm/drm_sched.h  | 269 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 1301 insertions(+)
+ drivers/gpu/drm/drm_sched.c | 1053 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_sched.h | 273 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 1326 insertions(+)
  create mode 100644 drivers/gpu/drm/drm_sched.c
  create mode 100644 drivers/gpu/drm/drm_sched.h
 
@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/drivers/gpu/drm/drm_sched.c
-@@ -0,0 +1,1032 @@
+@@ -0,0 +1,1053 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * drm_sched panfrost-job-only shim implementation (Nura 3.10.108).
@@ -381,6 +381,27 @@ index 0000000..0000000
 +	job->fence = fence;
 +}
 +EXPORT_SYMBOL(drm_sched_job_arm);
++
++/**
++ * drm_sched_job_kick_timeout - run this job's timeout/recovery now.
++ * @job: job whose slot reported a fault.
++ *
++ * The driver's IRQ fault path calls this instead of leaving the fence
++ * unsignalled until the per-entity retry budget expires: the timeout
++ * work is re-armed at delay 0 on the same ordered workqueue the pump
++ * runs on, so recovery (which signals the fence and retires the job)
++ * executes in order and in process context milliseconds after the
++ * fault, not after the full timeout. Safe from hard IRQ context
++ * (mod_delayed_work); a job whose fence already signalled is skipped
++ * by drm_sched_job_timeout.
++ */
++void drm_sched_job_kick_timeout(struct drm_sched_job *job)
++{
++	if (!job || !job->entity || !job->entity->wq)
++		return;
++	mod_delayed_work(job->entity->wq, &job->timeout_work, 0);
++}
++EXPORT_SYMBOL(drm_sched_job_kick_timeout);
 +
 +/**
 + * struct drm_sched_dep_and - compound wait-all dependency node.
@@ -1053,7 +1074,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/drivers/gpu/drm/drm_sched.h
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,273 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * drm_sched panfrost-job-only scheduler shim for Nura 3.10.108.
@@ -1318,6 +1339,10 @@ index 0000000..0000000
 + * ERR_PTR return leaves fence == NULL). The driver installs this fence
 + * on out_sync during the ioctl; run_job must return this same fence. */
 +void drm_sched_job_arm(struct drm_sched_job *job);
++/* Fault latency: queue this job's timeout/recovery now (delay 0) instead
++ * of waiting entity->timeout. Called from the driver's IRQ fault path;
++ * no-op for a NULL job/entity/wq. */
++void drm_sched_job_kick_timeout(struct drm_sched_job *job);
 +int drm_sched_job_add_dependency(struct drm_sched_job *job,
 +				 struct dma_fence *fence);
 +int drm_sched_job_submit(struct drm_sched_job *job);

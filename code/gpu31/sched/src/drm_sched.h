@@ -262,6 +262,10 @@ void drm_sched_job_cleanup(struct drm_sched_job *job);
  * ERR_PTR return leaves fence == NULL). The driver installs this fence
  * on out_sync during the ioctl; run_job must return this same fence. */
 void drm_sched_job_arm(struct drm_sched_job *job);
+/* Fault latency: queue this job's timeout/recovery now (delay 0) instead
+ * of waiting entity->timeout. Called from the driver's IRQ fault path;
+ * no-op for a NULL job/entity/wq. */
+void drm_sched_job_kick_timeout(struct drm_sched_job *job);
 int drm_sched_job_add_dependency(struct drm_sched_job *job,
 				 struct dma_fence *fence);
 int drm_sched_job_submit(struct drm_sched_job *job);

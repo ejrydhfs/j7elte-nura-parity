@@ -2883,7 +2883,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1442 @@
+@@ -0,0 +1,1459 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -3568,6 +3568,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			 * budget-gated startup detail. */
 +			unsigned long flags;
 +			uint32_t es;
++			struct p7580_submit_job *fault_job;
 +			uint32_t head_lo, head_hi, tail_lo, tail_hi;
 +			uint64_t head, tail;
 +			unsigned int seq = 0;
@@ -3580,6 +3581,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			uint32_t en = 0;
 +
 +			spin_lock_irqsave(&jd->hw_lock, flags);
++			fault_job = jd->in_flight[j];
 +			es = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_STATUS));
 +			head_lo = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_HEAD_LO));
 +			head_hi = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_HEAD_HI));
@@ -3617,6 +3619,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +					p7580_js_status_name(es));
 +			}
 +			spin_unlock_irqrestore(&jd->hw_lock, flags);
++			/* Latency fix (gpu31-latency): before this kick the
++			 * faulted job's fence was only signalled by the 5 s
++			 * sched timeout (timedout_job -> recover), so one
++			 * fault stalled the frame for the whole retry
++			 * budget (a 300-frame bench showed 28 fps instead
++			 * of 290 from two such stalls). Queue the job's
++			 * timeout work at delay 0: recovery still runs in
++			 * workqueue context on the same ordered wq (FIFO
++			 * order preserved) and still signals the fence, but
++			 * within milliseconds. A job whose fence already
++			 * signalled is skipped by drm_sched_job_timeout. */
++			if (fault_job && fault_job->sched_job)
++				drm_sched_job_kick_timeout(
++					(struct drm_sched_job *)
++						fault_job->sched_job);
 +		}
 +		status &= ~m;
 +	}
@@ -4329,7 +4346,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,313 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -4431,6 +4448,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	 * p7580_drv_file / struct p7580_drv. */
 +	void *file_priv;
 +	void *drv_priv;
++	/* Opaque owning drm_sched_job: the IRQ fault leg kicks this job's
++	 * timeout/recovery work immediately through the 0004 shim instead
++	 * of leaving the fence unsignalled for the full retry budget. */
++	void *sched_job;
 +	/* Monotonic run_job entry count (probenumeric): incremented as
 +	 * the first statement of p7580_drv_run_job, printed by free_job
 +	 * as ran=N. Proves call order even if a print is lost. */
@@ -4456,6 +4477,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	void *chain_shadow;
 +	uint32_t chain_pos;
 +	uint32_t chain_len;
++	/* gpu31-latency: 1 only for the node whose fence is the split's
++	 * externally published fence (the last queued node; a one-node
++	 * submit is its own last). run_job stamps BO exclusivity only for
++	 * that node: SUBMIT already published the same last_fence on every
++	 * BO before returning, and an intermediate node's own fence must
++	 * not overwrite it (a WAIT_BO in that window would otherwise wait
++	 * for the wrong, earlier node and map a BO the tiler is about to
++	 * write). */
++	unsigned int publish_excl;
 +};
 +
 +/* Per-file submit context: one sched entity per slot. */
@@ -6712,7 +6742,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1969 @@
+@@ -0,0 +1,2006 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -7008,34 +7038,38 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		/* Non-owning alias for the legacy out_sync leg. */
 +		job->render_done_fence = fence;
 +
-+		/* gpu31-instrtype: publish this job's fence as the exclusive
-+		 * (write) fence on every submitted BO. Later submits of the
-+		 * same BOs take it as an implicit sched dependency at queue
-+		 * time (get_excl leg), which serialises batches sharing
-+		 * pool/scratch/heap BOs. Without this, two live batches can
-+		 * write the same pool BO concurrently while Mesa recycles
-+		 * it (IOVA-identical submits), and the GPU reads a torn
-+		 * chain/FBD -> INSTR_TYPE_MISMATCH/DATA_INVALID_FAULT on
-+		 * the victim slot. Locking: the 0002 shim locks resv->lock
-+		 * inside add_excl (never take it here: same
-+		 * SUBMIT-DEADLOCK rule as the get_excl leg). Fences that
-+		 * retire in the same dispatch batch still share the older
-+		 * excl until this stamp lands; deps are taken on the
-+		 * latest *unsignaled* fence, so a retired excl does not
-+		 * gate. */
++		/* gpu31-instrtype (retargeted by gpu31-latency): publish
++		 * this job's fence as the exclusive (write) fence on every
++		 * submitted BO -- only for the node that owns the split's
++		 * published fence (publish_excl: the last queued node; a
++		 * one-node submit is its own last). SUBMIT already stamped
++		 * that same last_fence on every BO before returning, so
++		 * this is the late/legacy copy for the published node;
++		 * intermediate nodes must NOT overwrite it with their own
++		 * fence, or a WAIT_BO in the dispatch window would wait
++		 * for the earlier node and map a BO the tiler/fragment is
++		 * about to write. Later submits of the same BOs still take
++		 * the fence as an implicit sched dependency at queue time
++		 * (get_excl leg), which serialises batches sharing
++		 * pool/scratch/heap BOs. Locking: the 0002 shim locks
++		 * resv->lock inside add_excl (never take it here: same
++		 * SUBMIT-DEADLOCK rule as the get_excl leg). */
 +		{
 +			struct p7580_submit_job *rj = job;
 +			uint32_t k;
 +
-+			for (k = 0; k < rj->bo_count; k++) {
-+				struct drm_gem_object *o =
-+					(struct drm_gem_object *)rj->bos[k];
++			if (rj->publish_excl) {
++				for (k = 0; k < rj->bo_count; k++) {
++					struct drm_gem_object *o =
++						(struct drm_gem_object *)
++							rj->bos[k];
 +
-+				if (!o)
-+					continue;
-+				dma_resv_add_excl_fence(
-+					&to_p7580_bo(o)->resv,
-+					fence);
++					if (!o)
++						continue;
++					dma_resv_add_excl_fence(
++						&to_p7580_bo(o)->resv,
++						fence);
++				}
 +			}
 +		}
 +		p7580_drv_pm_put(drv);
@@ -8152,6 +8186,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	memcpy(job->desc, hdr, sizeof(job->desc));
 +	if (pos + 1 == s->nodes)
 +		job->out_sync = s->out_sync;
++	/* Only the split's published fence owns BO exclusivity (see the
++	 * field comment); SUBMIT stamps it on every BO before returning. */
++	job->publish_excl = (pos + 1 == s->nodes);
 +
 +	/* Per-job BO references (gpu31-chainsplit): every split node owns
 +	 * its own set, so free_job retires each node's sync + refs in
@@ -8200,6 +8237,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		goto err_sched;
 +	}
 +	sched_job->slot = s->slot;
++	/* Fault-latency kick target (gpu31-latency): the IRQ fault leg
++	 * needs the owning sched job to re-arm its timeout work at delay
++	 * 0. Stored only after the ops/entity validation above so the
++	 * IRQ never dereferences a half-initialized pairing. */
++	job->sched_job = sched_job;
 +	drm_sched_job_arm(sched_job);
 +	if (sched_job->fence) {
 +		fence_ref = sched_job->fence;
@@ -8551,6 +8593,31 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +				dma_fence_put(last_fence);
 +			last_fence = fence;
 +			queued++;
++		}
++
++		/* gpu31-latency (MFBD hand-off): publish the split's final
++		 * fence on every submitted BO before the ioctl returns.
++		 * run_job's excl stamp happens only after the async pump
++		 * dispatches, so a WAIT_BO issued right after SUBMIT (Mesa
++		 * readback: flush_batches then panfrost_bo_wait on the
++		 * render target) saw the previous submit's fence and
++		 * mapped a BO the GPU was about to write -> fragment
++		 * DATA_INVALID_FAULT, whose recovery cost the 5 s timeout.
++		 * This is the same last_fence installed on out_sync and
++		 * published as serial_prev, so waiters observe the whole
++		 * split and later submits gate on it at queue time. The
++		 * resv lock is taken inside add_excl (never here: same
++		 * SUBMIT-DEADLOCK rule as the get_excl leg); arm failure
++		 * (NULL fence) or an empty queue publishes nothing. */
++		if (queued && last_fence) {
++			for (i = 0; i < nr; i++) {
++				struct drm_gem_object *o = objs[i];
++
++				if (!o)
++					continue;
++				dma_resv_add_excl_fence(
++					&to_p7580_bo(o)->resv, last_fence);
++			}
 +		}
 +
 +		/* One out-fence for the whole split: install on the last

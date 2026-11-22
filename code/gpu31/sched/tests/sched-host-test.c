@@ -654,6 +654,38 @@ static void test_timeout_push_ready(void)
 	(void)drain_wq;
 }
 
+/* gpu31-latency: the IRQ fault leg kicks the job's timeout work at
+ * delay 0 instead of waiting entity->timeout (5 s on silicon). Pin the
+ * shim contract: the kick re-arms an unarmed job, keeps an armed one
+ * armed at 0, and tolerates NULL. */
+static void test_fault_kick_timeout(void)
+{
+	struct drm_sched sched;
+	struct drm_sched_entity e;
+	struct drm_sched_job *j;
+
+	memset(&sched, 0, sizeof(sched));
+	CHECK_EQ(drm_sched_init(&sched, &sched_ops_ok, 500, "kick"), 0);
+	CHECK_EQ(drm_sched_entity_init(&e, &sched), 0);
+	j = drm_sched_job_alloc(&e, &sched_ops_ok, NULL);
+	CHECK(j != NULL);
+	drm_sched_job_arm(j);
+	CHECK_EQ(j->timeout_work.armed, 0);
+	drm_sched_job_kick_timeout(j);
+	CHECK_EQ(j->timeout_work.armed, 1);
+	CHECK_EQ((long)j->timeout_work.delay, 0L);
+	/* Second kick (IRQ re-entry / racing fault bits) keeps delay 0. */
+	drm_sched_job_kick_timeout(j);
+	CHECK_EQ(j->timeout_work.armed, 1);
+	CHECK_EQ((long)j->timeout_work.delay, 0L);
+	/* NULL job / cleared entity are no-ops, never a deref. */
+	drm_sched_job_kick_timeout(NULL);
+	dma_fence_signal(j->fence);
+	j->finish_work.fn(&j->finish_work);
+	drm_sched_entity_fini(&sched, &e);
+	drm_sched_fini(&sched);
+}
+
 /* ------------------------------------------------------------------ */
 /* close-fix tests: mock-GPU ordering repro (no HW, single-threaded).    */
 /* The int7 node hung in CLOSE with a dispatched-but-unretired job:      */
@@ -1685,6 +1717,7 @@ int main(void)
 	test_dep_gating();
 	test_errptr_frees_job();
 	test_timeout_push_ready();
+	test_fault_kick_timeout();
 	test_close_idle();
 	test_close_rearm();
 	test_close_queued();

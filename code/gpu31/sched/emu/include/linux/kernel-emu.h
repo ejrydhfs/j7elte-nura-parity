@@ -187,6 +187,21 @@ static inline int queue_delayed_work(struct workqueue_struct *wq,
 	w->work.pending = 1;
 	return 0;
 }
+/* mod_delayed_work(): re-arm an already-pending timer or queue a new
+ * one, at the caller's delay. Host emu: remember whether the work was
+ * already armed (kernel return contract) and mark it pending. */
+static inline bool mod_delayed_work(struct workqueue_struct *wq,
+				    struct delayed_work *w,
+				    unsigned long delay)
+{
+	int was_armed = w->armed;
+
+	(void)wq;
+	w->armed = 1;
+	w->delay = delay;
+	w->work.pending = 1;
+	return was_armed ? true : false;
+}
 static inline void cancel_delayed_work_sync(struct delayed_work *w)
 {
 	w->armed = 0;
