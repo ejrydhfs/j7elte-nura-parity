@@ -364,15 +364,23 @@ int44's gate 6ae scopes the new mapping to the
 wrong); `ioctl.o` shows `bl p7580_gem_wait` followed by
 `mov w1, #0xffffff92` (-ETIMEDOUT) in the next slot.
 
-int44 is flashed and boots (`3.10.108 #37 17:29:16`). The first
-acceptance attempt produced **no valid datum**: the flash reboot landed
-at 22:31:38 in the middle of section A (runs 1-4 straddle the old and new
-image; runs 7-10 hit a booting system with 0.1-0.9 s walls and no BENCH
+int44 is flashed and boots (`3.10.108 #37 17:29:16`; phone
+`dmesg`/`ls` run on UTC while the banner is build-time EST, so the
+22:31:38 UTC reboot = 17:31:38 EST, i.e. the flash reboot right after
+the 17:29:25 EST Image). The first acceptance attempt produced **no valid
+datum**: that reboot landed in the middle of section A (runs 1-4
+straddle the old and new image; runs 7-10 hit a booting system with
+0.1-0.9 s walls and no BENCH
 line), and after that boot the phone was in boot-time memory pressure
 (shmem 1.2 GB unevictable, load 12.8 with Xorg/fbwin in D, 23+
 lowmemorykiller kills, rootfs 96 % full): every `gfdemo` launch was
 SIGKILLed within 0.1-0.3 s even at 3 frames, and sshd closed most
-sessions right after the session-open. Device work was stopped (Main);
+sessions right after the session-open. The kill is the LMK, not an
+int44-induced abort: the WAIT_BO mapping can only surface through an
+ioctl return (a Mesa error print and a normal nonzero exit), whereas the
+observed termination is SIGKILL with `lowmemorykiller` /
+`... Killing 'Xorg' ...` lines in dmesg (grep count 23 within the first
+two minutes of that boot). Device work was stopped (Main);
 acceptance re-runs on the next boot with `storm58/accept44.sh`.
 
 Acceptance command (Main runs it on the flashed image), `ev_arm=1`, the
