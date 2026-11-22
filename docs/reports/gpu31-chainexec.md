@@ -24,8 +24,9 @@ header, dependency, slot, flush-bit, or primitive error. Setting
 nothing (measured with the same probe). Userspace chain splitting/duplication —
 the only way to put a submit boundary (and thus `START_FLUSH_CLEAN_INV`)
 between the VS and the tiler — faults JS1 with `JS_STATUS 0x41 POWER_FAULT` on
-int36, so the split/flush variants must be implemented in the driver and tested
-on the next image. The independent FS-ISA page defect (Defect B) still blocks
+int36 (and the same one-shot duplicate issued from Mesa’s own submit path also
+fails to complete), so the split/flush variants must be implemented in the
+driver and tested on the next image. The independent FS-ISA page defect (Defect B) still blocks
 pixels as soon as the tiler does bin.
 
 ## 0. TL;DR
@@ -63,9 +64,12 @@ pixels as soon as the tiler does bin.
    a submit boundary, i.e. splitting the chain. Two userspace implementations
    (header-rewriting split, and verbatim re-submit of the same chain) both fault
    JS1 immediately with `JS_STATUS 0x41 POWER_FAULT` (`out_sync=0` and
-   `out_sync!=0`, with and without `in_sync`), while Mesa’s own submission of
-   the same bytes is DONE. The split knob must live in `p7580_drv_submit` and be
-   tested on the next image; the required design is in §7.
+   `out_sync!=0`, with and without `in_sync`), while Mesa’s own first submission
+   of the same bytes is DONE. A one-shot duplicate issued from Mesa’s own
+   submit path (diagnostic `PAN_CHAIN_DOUBLE`) also never completes (watchdog
+   reset), so this is not an artefact of the preload hook. The split knob must
+   live in `p7580_drv_submit` and be tested on the next image; the required
+   design is in §7.
 7. **Pixels** stay clear. Once the tiler does bin (prefill experiments), the
    fragment job invokes the FS and the independent FS-ISA zero-page defect
    (Defect B) faults `0x52`; with 60 batches each fault stalls the batch ~5 s and
@@ -310,12 +314,23 @@ Both were expected to be safe (identical bytes / valid deps). Measured instead:
 * The split’s part 2 (`WRITE_VALUE → TILER`, tiler `dep2=2`) behaves the same
   way; it never produced a completed tiler fence.
 
-Conclusion: userspace chain splitting/re-submission is **not viable on int36**;
-it faults at the JM level independently of the bytes. The variants must be
-implemented in the driver (`p7580_drv_submit`), where the split can be issued
-as two real submits with the driver’s own fences, and measured on the next
-image. This is a kernel item, not a Mesa item: Mesa already emits a legal chain
-that the JM executes (both jobs DONE, tiler provably runs).
+To rule out an artefact of the preload hook, the same one-shot duplicate was
+also added to the diagnostic Mesa (`PAN_CHAIN_DOUBLE`, inside
+`panfrost_batch_submit_jobs()` right after the first chain ioctl). It behaves
+the same: the run that normally finishes in ~3 s was still in flight when the
+watchdog reset the phone (~120 s). The dmesg of that run was lost with the
+reset, so the explicit `POWER_FAULT` evidence remains the hook-side runs above,
+but the failure is not hook-specific. A split necessarily contains such a
+re-submit, so it is not expected to work from userspace/Mesa either
+`[INFERENCE]`.
+
+Conclusion: userspace/Mesa chain splitting or re-submission is **not viable on
+int36**; the extra chain submit fails at the JM level independently of the
+bytes. The variants must be implemented in the driver (`p7580_drv_submit`),
+where the split can be issued as two real submits with the driver's own fences,
+and measured on the next image. This is a kernel item, not a Mesa item: Mesa
+already emits a legal chain that the JM executes (both jobs DONE, tiler
+provably runs).
 
 ## 7. Remaining cause and the next measurement
 
@@ -365,7 +380,8 @@ bins present today the FS `0x52` fault stalls each batch ~5 s (§0.7).
 | same, `chain_mode=1` | prefill | VS triangle | **1** (CPU triangle) | n/a | 0 |
 | `PC2_PREFILL_BIG`, no fragment | prefill big CPU triangle | — | — | n/a | 0 |
 | `PC2_PREFILL_BIG` + FS reupload, fragment allowed | bins exist | — | (bins) [INFERENCE] | no readback; watchdog reboot before output [INFERENCE: each fragment FS `0x52` stalls ~5 s] | not captured (reboot) |
-| `PC2_COPY0` / `PC2_DOUBLE` / `PC2_SPLIT` | extra submits | — | — | — | `0x41 POWER_FAULT` on JS1, then all slots fault |
+| `PC2_COPY0` / `PC2_DOUBLE` / `PC2_SPLIT` | extra submits from the hook | — | — | — | `0x41 POWER_FAULT` on JS1, then all slots fault |
+| Mesa `PAN_CHAIN_DOUBLE` (diagnostic build) | one extra chain submit from `panfrost_batch_submit_jobs` | — | — | — | run did not complete; watchdog reset (~120 s) [log lost with the reset] |
 
 Every scan line quoted above is preserved on the device in
 `/data/chainexec/scan_ctrl3.txt`, `scan_prefill3.txt`, `scan_ch1_pre.txt`,
@@ -412,6 +428,7 @@ seconds. Use
   decode (pre-existing), `PC2_ZEROPOS`, `PC2_PREFILL[_BIG]`, `PC2_POLLSCAN` +
   `PC2_SCANLOG`, `PC2_REFUSE_FRAG`, and the rejected `PC2_COPY0/DOUBLE/SPLIT`
   experiments (all off by default; no effect on the default census path).
-* This report. Device-only: `/data/chainexec/scan_*.txt`, the Mesa diag build,
-  `/data/polylist/run.sh`, `/data/wdarm`. No kernel/Mesa change was made by
-  this ticket; the split knob is a next-image driver item (§7).
+* This report. Device-only: `/data/chainexec/scan_*.txt`, the Mesa diag build
+  (now also carrying the env-gated `PAN_CHAIN_DOUBLE` resubmit probe in
+  `pan_job.c`), `/data/polylist/run.sh`, `/data/wdarm`. No kernel change was
+  made by this ticket; the split knob is a next-image driver item (§7).
