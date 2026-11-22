@@ -6,8 +6,10 @@ Date: 2026-11-22 (device clock). Owner: G31_FirstFault. Device: int40
 `/data/mesabuild/mesa20`), driver 0001 only. All device work as root over
 ssh under `flock /tmp/gpsdev.lock`; plain runs (never
 `PAN_MESA_DEBUG=sync|trace`), **no reboot, no unbind**. Status: measurement
-complete, driver change drafted (see §7) but **not built, not in patch 0001,
-not flashed** — acceptance (0 ERR / 300 frames on silicon) is NOT met yet.
+complete; **fix folded into driver 0001 (see §7), host checks green, silicon
+acceptance pending the int41 flash** (Main builds/flashes; acceptance is the
+same: `ev_arm=1`, 300 frames at `serialize_fs=0`, then 3 × 300 at
+`serialize_fs=1` → `ERR=0`, `TIMEOUT=0`).
 
 ## 0. Verdict
 
@@ -181,14 +183,18 @@ always costs a burst.
    (`serial_prev`), and the shim's pump "gates only the FIFO head on
    dep_fence". The `serialize_fs` A/B (§7) decides this with one boot.
 
-## 7. Driver change drafted (NOT built, NOT flashed)
+## 7. Driver change (folded into 0001; silicon acceptance pending int41 flash)
 
-Scratch tree (editable copy of driver 0001):
-`/run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7k/gpu31/firstfault/t/`
-(patch 0001 applied there; **patch 0001 itself has not been regenerated**, so
-the repo state is unchanged).
+`code/gpu31/driver/0001-panfrost7580-driver-sources.patch` now carries the
+change (sha256 `cfa4f59fbbbc4bfd1f2653f7d0a995a3acd36e6caee32ae88fac89aa47d01a82`);
+the regenerated patch applies to a pristine tree and reproduces the edited
+sources byte-for-byte (`diff -r` clean), and every new-file hunk declares the
+exact '+' line count (the int40 truncation gate). All four knobs default to
+inert (`ev_arm=0`, `serialize_fs=0`, no dumper registered until probe wires
+it), so an unarmed boot behaves exactly as int40 apart from the recovery
+rule below and the hygiene zeroing.
 
-Implemented there:
+Landed:
 1. **Event ring** (`struct p7580_ev ev[128]`, `p7580_job_ev`) in RAM, no
    printk on the hot path, recording START (armed: JS_STATUS before,
    `COMMAND_NEXT` readback after, JS_STATUS after, previous in-flight
@@ -216,11 +222,30 @@ Implemented there:
    stays 0. One boot tests the ordering hypothesis: 300 frames at 0
    (expected: fault + dump) and at 1 (expected: 0 ERR).
 
-## 8. Next steps (blocked on a build+flash, which Main owns)
+## 8. Host checks already run (this ticket)
 
-1. `git apply --check` the regenerated 0001, build the Image with
-   `code/gpu31/series/build-int41.sh` (copy of int40, driver 0001 changed),
-   run `make -C code/gpu31/driver check`, and hand the image to Main to flash.
+* `make -C code/gpu31/driver check`: `submit_fix_test: all checks passed`,
+  `chainsplit_test: all checks passed`. **T9 rewritten** to pin the new rule
+  (a full power-on for *every* recovery status when the hook is wired,
+  including the silent 0x08 that used to skip it; none when unwired; AS0 +
+  JOB_INT re-arm always), and **T1 extended** to pin the descriptor hygiene
+  (words 0..3 are JM outputs: `isolate()` leaves them, the shadow copy
+  zeroes them).
+* `make -C code/gpu31/jobs check`: `job_test: all checks passed` (the new
+  `src_jc` field and the opaque-layout header branch still compile clean).
+* Kernel syntax/object check of the touched files against the real 3.10.108
+  headers with the 0001–0004 shims staged
+  (`STAGE=…/firstfault/stage aarch64-linux-gnu-gcc -std=gnu89 -c`):
+  `panfrost7580_job.c`, `panfrost7580_submit.c`, `panfrost7580_main.c`
+  → rc 0, 0 `error:`, 0 warnings in our files. (main.c needs
+  `-DDRIVER_RENDER_ONLY` from the kms Mode-B patch in this standalone
+  invocation; the Image build applies it for real.)
+* One 3.10 API fix found by that check: `ktime_get_ns()` does not exist in
+  3.10 → `ktime_to_ns(ktime_get())`.
+
+## 9. Next steps (build + flash owned by Main)
+
+1. Build the Image (`build-int41.sh`, driver 0001 = this commit), flash, then:
 2. On the flashed image: `dmesg -c`, `echo 1 > …/p7580/ev_arm`, then
    300 frames 256² no-readback; expect exactly one `PAGEDUMP`/`EVRING`
    capture at the first fault, with `serialize_fs=0`.

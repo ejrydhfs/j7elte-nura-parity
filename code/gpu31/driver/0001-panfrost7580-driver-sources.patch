@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,143 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -138,6 +138,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +			   const uint32_t *handles, const uint64_t *addrs,
 +			   const uint32_t *sizes, uint32_t n);
 +extern unsigned int p7580_iova_trace;
++/* gpu31-firstfault: first-fault descriptor-page dumper registered for
++ * the jobs slice (submit.c). Process context only (GEM resolve + kmap
++ * + clean-then-invalidate read); prints one 4 KiB page as 16 lines of
++ * 16 words, one line per 256-byte job slot. */
++int p7580_drv_desc_dump(void *priv, uint64_t gpu, const char *tag);
 +
 +#endif /* PANFROST7580_DRV_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
@@ -2897,7 +2902,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1531 @@
+@@ -0,0 +1,1834 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -2953,6 +2958,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +#include <linux/debugfs.h>
 +#include <linux/seq_file.h>
 +#include <linux/uaccess.h>
++#include <linux/ktime.h>
++#include <linux/string.h>
 +
 +/* At integration these resolve to the landed backport files:
 + *  drivers/base/{dma-fence,dma-resv}.{c,h} (0001/0002) and
@@ -3050,6 +3057,165 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			map[sizeof(map) - 1] = '\0';
 +			pr_err("p7580_job: ERR-MAP slot=%d seq=%u nbos=%u %s\n",
 +				slot, seqno, n, map);
++		}
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* gpu31-firstfault: event ring + one-shot first-fault dump.          */
++/*                                                                    */
++/* Why a ring instead of printk: the long-run fault appears after a   */
++/* random number of clean frames (one in ~1-3 x 300-frame runs) and   */
++/* the serial console makes every traced dispatch ~10 ms, which both  */
++/* perturbs the race and overflows the dmesg ring (measured: the      */
++/* first 5 s of a faulting run were dropped). A 128-entry RAM ring    */
++/* costs a few stores per event and is dumped exactly once, with the  */
++/* descriptor pages, at the first fault or timeout.                   */
++/* ------------------------------------------------------------------ */
++static const char *p7580_ev_name(unsigned int kind)
++{
++	switch (kind) {
++	case P7580_EV_START:
++		return "start";
++	case P7580_EV_DONE:
++		return "done";
++	case P7580_EV_ERR:
++		return "err";
++	case P7580_EV_TIMEOUT:
++		return "timeout";
++	case P7580_EV_RECOVER:
++		return "recover";
++	case P7580_EV_SUSPEND:
++		return "suspend";
++	case P7580_EV_SUSPEND_BUSY:
++		return "suspend-busy";
++	case P7580_EV_RESUME:
++		return "resume";
++	case P7580_EV_CYCLE:
++		return "cycle";
++	case P7580_EV_DUMP:
++		return "dump";
++	default:
++		return "?";
++	}
++}
++
++void p7580_job_ev(struct p7580_job_dev *jd, unsigned int kind, int slot,
++		  uint32_t seq, uint64_t jc, uint32_t a, uint32_t b,
++		  uint32_t c)
++{
++	struct p7580_ev *e;
++	unsigned long flags;
++
++	if (!jd || !jd->ev_arm)
++		return;
++	spin_lock_irqsave(&jd->hw_lock, flags);
++	e = &jd->ev[jd->ev_head & (P7580_EV_MAX - 1u)];
++	/* 3.10 has no ktime_get_ns(): convert explicitly. */
++	e->ns = (uint64_t)ktime_to_ns(ktime_get());
++	e->jc = jc;
++	e->kind = kind;
++	e->slot = (uint32_t)slot;
++	e->seq = seq;
++	e->a = a;
++	e->b = b;
++	e->c = c;
++	jd->ev_head++;
++	spin_unlock_irqrestore(&jd->hw_lock, flags);
++}
++
++void p7580_job_ev_arm(struct p7580_job_dev *jd, unsigned int on)
++{
++	unsigned long flags;
++
++	if (!jd)
++		return;
++	spin_lock_irqsave(&jd->hw_lock, flags);
++	jd->ev_head = 0;
++	jd->ev_arm = on ? 1u : 0u;
++	jd->ev_dumped = 0;
++	memset(jd->ev, 0, sizeof(jd->ev));
++	spin_unlock_irqrestore(&jd->hw_lock, flags);
++}
++
++void p7580_job_set_desc_dump(struct p7580_job_dev *jd,
++			     int (*fn)(void *priv, uint64_t gpu,
++				       const char *tag), void *priv)
++{
++	unsigned long flags;
++
++	if (!jd)
++		return;
++	spin_lock_irqsave(&jd->hw_lock, flags);
++	jd->desc_dump = fn;
++	jd->desc_dump_priv = priv;
++	spin_unlock_irqrestore(&jd->hw_lock, flags);
++}
++
++/* Dump the ring (oldest first) and the pages that decide the fault:
++ * the dispatched descriptor's page, the live (Mesa) page it was copied
++ * from when the job ran from a shadow, the page holding the fragment
++ * framebuffer pointer from the inline payload (SFBD + tiler descriptor
++ * live there), and the first page of any >= 1 MiB BO in the job's
++ * submit snapshot (the Mesa tiler heap: producer/consumer handshake
++ * state). Process context (timeout work): the dumper may sleep. */
++void p7580_job_first_fault(struct p7580_job_dev *jd,
++			   struct p7580_submit_job *job, uint32_t status)
++{
++	unsigned int i, n, start;
++	uint64_t t0 = 0;
++
++	if (!jd || !jd->ev_arm || jd->ev_dumped)
++		return;
++	jd->ev_dumped = 1;
++
++	n = jd->ev_head < P7580_EV_MAX ? jd->ev_head : P7580_EV_MAX;
++	start = jd->ev_head - n;
++	pr_err("p7580_job: EVRING begin head=%u n=%u status=0x%08x jc=0x%llx seq=%u src=0x%llx\n",
++	       jd->ev_head, n, status,
++	       job ? (unsigned long long)job->jc : 0ull,
++	       job ? job->seqno : 0u,
++	       job ? (unsigned long long)job->src_jc : 0ull);
++	for (i = 0; i < n; i++) {
++		const struct p7580_ev *e =
++			&jd->ev[(start + i) & (P7580_EV_MAX - 1u)];
++
++		if (!t0)
++			t0 = e->ns;
++		pr_err("p7580_job: EV %-12s dt=%8llu us slot=%u seq=%u jc=0x%llx a=%08x b=%08x c=%08x\n",
++		       p7580_ev_name(e->kind),
++		       (unsigned long long)((e->ns - t0) / 1000ull),
++		       e->slot, e->seq, (unsigned long long)e->jc,
++		       e->a, e->b, e->c);
++	}
++	pr_err("p7580_job: EVRING end\n");
++
++	if (!jd->desc_dump)
++		return;
++	if (job) {
++		jd->desc_dump(jd->desc_dump_priv, job->jc, "jc");
++		if (job->src_jc && job->src_jc != job->jc)
++			jd->desc_dump(jd->desc_dump_priv, job->src_jc, "src");
++		/* Fragment job: payload word 2 (+32+8) is the framebuffer
++		 * (SFBD) and the SFBD's tiler descriptor names the polygon
++		 * list + heap. Dump the page it points into. */
++		if (((job->desc[4] >> 1) & 0x7fu) == 9u && job->desc[10])
++			jd->desc_dump(jd->desc_dump_priv,
++				      (uint64_t)job->desc[10], "fbd");
++		/* Tiler heap candidate: the largest BO in the snapshot. */
++		if (job->iova_addrs && job->iova_sizes) {
++			unsigned int best = 0;
++			uint32_t bsz = 0;
++
++			for (i = 0; i < job->iova_bo_count; i++) {
++				if (job->iova_sizes[i] > bsz) {
++					bsz = job->iova_sizes[i];
++					best = i;
++				}
++			}
++			if (bsz >= 0x100000u)
++				jd->desc_dump(jd->desc_dump_priv,
++					      job->iova_addrs[best], "heap");
 +		}
 +	}
 +}
@@ -3240,6 +3406,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	jd->last.valid = 0;
 +	jd->dbg_dir = NULL;
 +	jd->chain_mode = 0;
++	/* gpu31-firstfault defaults: ring disarmed, no page dumper order
++	 * (wired at probe), FS keeps its own entity. Everything new is
++	 * inert until the ev_arm / serialize_fs knobs are written. */
++	jd->ev_head = 0;
++	jd->ev_arm = 0;
++	jd->ev_dumped = 0;
++	jd->desc_dump = NULL;
++	jd->desc_dump_priv = NULL;
++	jd->serialize_fs = 0;
 +	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 +		jd->in_flight[i] = NULL;
 +		mask |= P7580_MK_JS_MASK(i);
@@ -3337,6 +3512,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	int slot = job->slot;
 +	uint32_t lo = (uint32_t)(job->jc & 0xFFFFFFFFu);
 +	uint32_t hi = (uint32_t)(job->jc >> 32);
++	/* gpu31-firstfault: armed probe values (JS_STATUS before START,
++	 * COMMAND_NEXT / JS_STATUS right after) + the in-flight slot
++	 * occupant seen before this dispatch (a non-NULL previous job
++	 * here would mean a double dispatch on one slot). */
++	uint32_t st_pre = 0, cmd_post = 0, st_post = 0;
++	struct p7580_submit_job *prev = NULL;
++	int armed = jd->ev_arm;
 +
 +	/* COMMAND_NEXT must be free: a stuck slot means recovery, not a
 +	 * second submit on top. */
@@ -3344,6 +3526,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		return;
 +
 +	spin_lock_irqsave(&jd->hw_lock, flags);
++
++	if (armed) {
++		prev = jd->in_flight[slot];
++		st_pre = p7580_js_read(jd, slot, P7580_JS_STATUS);
++	}
 +
 +	p7580_js_write(jd, slot, P7580_JS_HEAD_NEXT_LO, lo);
 +	p7580_js_write(jd, slot, P7580_JS_HEAD_NEXT_HI, hi);
@@ -3391,6 +3578,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	 * device-store barrier on this weakly-ordered SoC). */
 +	wmb();
 +	p7580_js_write(jd, slot, P7580_JS_COMMAND_NEXT, P7580_JS_CMD_START);
++	if (armed) {
++		cmd_post = p7580_js_read(jd, slot, P7580_JS_COMMAND_NEXT);
++		st_post = p7580_js_read(jd, slot, P7580_JS_STATUS);
++	}
 +	/* One-shot RAWSTAT/JS_STATUS snapshot right after START (numeric,
 +	 * unconditional for the first 8 dispatches only, then silent):
 +	 * proves whether the slot latched the command or faulted
@@ -3418,6 +3609,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	}
 +
 +	spin_unlock_irqrestore(&jd->hw_lock, flags);
++
++	/* gpu31-firstfault: ring the dispatch outside hw_lock (the ring
++	 * takes it). a = JS_STATUS before START (bit31 = the slot was
++	 * still occupied by a previous job when this START was written),
++	 * b = COMMAND_NEXT readback (0 = the JM consumed the START),
++	 * c = JS_STATUS right after (0x08 = not latched yet). */
++	if (armed)
++		p7580_job_ev(jd, P7580_EV_START, slot, job->seqno, job->jc,
++			     st_pre | (prev ? 0x80000000u : 0u),
++			     cmd_post, st_post);
 +}
 +/* ------------------------------------------------------------------ */
 +/* IRQ handler: demux JOB_INT_STAT per slot. IRQ context: no sleeps,  */
@@ -3552,6 +3753,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +					job != NULL);
 +			}
 +			spin_unlock_irqrestore(&jd->hw_lock, flags);
++			/* gpu31-firstfault: ring the completion (outside
++			 * hw_lock). a = JS_STATUS at DONE, b = the STAT |
++			 * RAWSTAT bits that demuxed here. */
++			p7580_job_ev(jd, P7580_EV_DONE, j, seq, jc, js_status,
++				     status | rawstat, 0);
 +			/* Coherency-race fix: invalidate the job's BOs BEFORE
 +			 * the fence signals, so any waiter woken by the
 +			 * signal (WAIT_BO dma_resv_wait, syncobj WAIT,
@@ -3649,6 +3855,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +					p7580_js_status_name(es));
 +			}
 +			spin_unlock_irqrestore(&jd->hw_lock, flags);
++			/* gpu31-firstfault: ring the fault and request the
++			 * one-shot page dump. The dump needs process
++			 * context (GEM resolve + kmap), so it rides the
++			 * timeout work this ERR leg queues below: that
++			 * work sees jd->ev_dumped == 0 and dumps before
++			 * recovery mutates anything. */
++			p7580_job_ev(jd, P7580_EV_ERR, j, seq, jc, es,
++				     status | rawstat, 0);
 +			/* Latency fix (gpu31-latency): before this kick the
 +			 * faulted job's fence was only signalled by the 5 s
 +			 * sched timeout (timedout_job -> recover), so one
@@ -3773,6 +3987,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		return;
 +
 +	status = p7580_js_read(jd, slot, P7580_JS_STATUS);
++	/* gpu31-firstfault: one-shot ring + descriptor-page dump BEFORE
++	 * recover() touches the slots. Arrives here either from the 5 s
++	 * sched timeout (silent job) or from the ERR leg's delay-0 kick
++	 * (a real JS_STATUS fault), so both signatures are covered by
++	 * the same capture. */
++	p7580_job_ev(jd, P7580_EV_TIMEOUT, slot, job->seqno, job->jc,
++		     status, 0, 0);
++	p7580_job_first_fault(jd, job, status);
 +	/* Always-on timeout line (never budgeted): slot + JS_STATUS +
 +	 * JOB_INT views + HEAD/TAIL + last-dispatch jc, so a silent
 +	 * slot (no IRQ at all) is still diagnosable after the budget
@@ -4057,6 +4279,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +{
 +	int i, ret = 0;
 +	int cycled = 0;
++	int do_cycle;
 +	unsigned long end;
 +	struct p7580_submit_job *fault_job = NULL;
 +
@@ -4097,37 +4320,47 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		}
 +	}
 +
-+	/* 3. GPU reset. Prefer SOFT; HARD if RAWSTAT never completes. */
-+	p7580_writel(jd, P7580_GPU_CMD, P7580_GPU_CMD_SOFT_RESET);
-+	end = jiffies + msecs_to_jiffies(P7580_RESET_TIMEOUT_MS);
-+	while (!(p7580_readl(jd, P7580_GPU_INT_RAWSTAT) &
-+		 P7580_GPU_IRQ_RESET_COMPLETED)) {
-+		if (time_after(jiffies, end)) {
-+			p7580_writel(jd, P7580_GPU_CMD,
-+				     P7580_GPU_CMD_HARD_RESET);
-+			break;
++	/* 3. GPU reset. A GPU-level SOFT/HARD reset clears the JM's job
++	 * state but NOT the "the block lost power with work queued"
++	 * condition: measured on int40, the very next START after the
++	 * soft reset latched JS_STATUS POWER_FAULT (0x41) on the other
++	 * slot within 1 ms, every time (gpu31-firstfault). The core power
++	 * cycle below performs the reset as part of a complete power-on,
++	 * so take that path whenever it is wired: reset + cores + JM
++	 * state then match a cold power-up, and no latch survives.
++	 * Fall back to the plain reset only when the hook is missing. */
++	do_cycle = (jd->power_cycle && jd->pm_dev) ? 1 : 0;
++	if (!do_cycle) {
++		p7580_writel(jd, P7580_GPU_CMD, P7580_GPU_CMD_SOFT_RESET);
++		end = jiffies + msecs_to_jiffies(P7580_RESET_TIMEOUT_MS);
++		while (!(p7580_readl(jd, P7580_GPU_INT_RAWSTAT) &
++			 P7580_GPU_IRQ_RESET_COMPLETED)) {
++			if (time_after(jiffies, end)) {
++				p7580_writel(jd, P7580_GPU_CMD,
++					     P7580_GPU_CMD_HARD_RESET);
++				break;
++			}
++			msleep(1);
 +		}
-+		msleep(1);
++		p7580_writel(jd, P7580_GPU_INT_CLEAR,
++			     P7580_GPU_IRQ_RESET_COMPLETED);
 +	}
-+	p7580_writel(jd, P7580_GPU_INT_CLEAR, P7580_GPU_IRQ_RESET_COMPLETED);
 +
-+	/* 4. Clear a latched JM fault (gpu31-readback). A POWER_FAULT
-+	 * (0x41) latch means the slot was powered down with work queued;
-+	 * the GPU-level SOFT/HARD reset above does NOT clear it, and while
-+	 * it is set every following job on that slot reports 0x41 again
-+	 * (measured: one fault turned into 36 ERR/36 TIMEOUT for the rest
-+	 * of the process, while the next process was clean because the
-+	 * block had been power-cycled in between). Cycle the cores, then
-+	 * reprogram AS0 and re-arm below, exactly as after resume. The
-+	 * caller holds a live runtime-PM ref, so the domain stays up. */
-+	if (jd->power_cycle && jd->pm_dev &&
-+	    (status == P7580_JS_STATUS_POWER_FAULT ||
-+	     p7580_job_slots_latched_fault(jd))) {
++	/* 4. Complete core power cycle (gpu31-readback + gpu31-firstfault).
++	 * Cycle on every recovery, not only on a latched 0x41: a plain
++	 * soft reset leaves the JM reporting POWER_FAULT for the next job
++	 * on either slot (measured), which turned one fault into a
++	 * fragment-0x58 / chain-0x41 / power-cycle storm for the rest of
++	 * the process. The caller holds a live runtime-PM ref, so the
++	 * domain stays up. */
++	if (do_cycle) {
 +		int crc = jd->power_cycle(jd->pm_dev);
 +
 +		cycled = 1;
 +		if (crc)
 +			pr_err("p7580_job: recover-cycle FAIL rc=%d\n", crc);
++		p7580_job_ev(jd, P7580_EV_CYCLE, fault_slot, 0, 0,
++			     (uint32_t)crc, 0, 0);
 +	}
 +
 +	/* 5. re-arm the slot IRQs the handler demuxes. Order mirrors
@@ -4154,6 +4387,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	       p7580_readl(jd, P7580_JOB_INT_MASK), ret);
 +
 +	mutex_unlock(&jd->reset_lock);
++	/* gpu31-firstfault: one ring record per recovery so the dump
++	 * shows the cascade (or its absence) with timestamps. */
++	p7580_job_ev(jd, P7580_EV_RECOVER, fault_slot,
++		     fault_job ? fault_job->seqno : 0,
++		     fault_job ? fault_job->jc : 0,
++		     status, (uint32_t)cycled, (uint32_t)ret);
 +
 +	/* 5. fault accounting (F-JOB4): signal exactly once so waiters  */
 +	/* do not hang. Skip an already-signaled fence: the IRQ won the */
@@ -4274,6 +4513,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	seq_printf(m, "job_int stat=0x%08x rawstat=0x%08x mask=0x%08x js_present=0x%x pgd=0x%llx\n",
 +		   job_stat, job_raw, job_mask, jd->js_present,
 +		   (unsigned long long)jd->pgd_dma);
++	seq_printf(m, "faultdbg ev_arm=%u ev_head=%u ev_dumped=%u serialize_fs=%u\n",
++		   jd->ev_arm, jd->ev_head, jd->ev_dumped, jd->serialize_fs);
 +	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 +		uint32_t st, h_lo, h_hi, t_lo, t_hi;
 +		uint64_t head, tail;
@@ -4372,6 +4613,63 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +DEFINE_SIMPLE_ATTRIBUTE(p7580_job_chain_fops, p7580_job_chain_get,
 +			p7580_job_chain_set_k, "%llu\n");
 +
++/* gpu31-firstfault knobs.
++ * ev_arm: write 1 to reset the event ring, arm the per-dispatch MMIO
++ *   probes and enable the one-shot first-fault dump; write 0 to
++ *   disarm. Read: 1 = armed, 0 = off.
++ * serialize_fs: write 1 to queue FS (slot 0) submits on the chain
++ *   slot's entity, so the fragment job is ordered behind the tiler by
++ *   one FIFO; 0 keeps the per-slot entities. Runtime A/B, no rebuild. */
++static int p7580_job_ev_arm_get(void *data, u64 *val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd || !val)
++		return -EINVAL;
++	*val = jd->ev_arm;
++	return 0;
++}
++
++static int p7580_job_ev_arm_set(void *data, u64 val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd)
++		return -EINVAL;
++	p7580_job_ev_arm(jd, (unsigned int)val);
++	pr_info("p7580_job: ev_arm=%d (ring %u entries, dump one-shot)\n",
++		jd->ev_arm, P7580_EV_MAX);
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(p7580_job_ev_arm_fops, p7580_job_ev_arm_get,
++			p7580_job_ev_arm_set, "%llu\n");
++
++static int p7580_job_serialize_fs_get(void *data, u64 *val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd || !val)
++		return -EINVAL;
++	*val = jd->serialize_fs;
++	return 0;
++}
++
++static int p7580_job_serialize_fs_set(void *data, u64 val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd)
++		return -EINVAL;
++	jd->serialize_fs = val ? 1u : 0u;
++	pr_info("p7580_job: serialize_fs=%u\n", jd->serialize_fs);
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(p7580_job_serialize_fs_fops,
++			p7580_job_serialize_fs_get,
++			p7580_job_serialize_fs_set, "%llu\n");
++
 +static int p7580_job_dump_show_seq(struct seq_file *m, void *v)
 +{
 +	struct p7580_job_dev *jd = m->private;
@@ -4416,6 +4714,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +				&p7580_job_chain_fops);
 +	if (IS_ERR_OR_NULL(f))
 +		pr_info("p7580_job: chain_mode knob unavailable\n");
++	/* gpu31-firstfault: event ring + first-fault page dump arm. */
++	f = debugfs_create_file("ev_arm", 0600, dir, jd,
++				&p7580_job_ev_arm_fops);
++	if (IS_ERR_OR_NULL(f))
++		pr_info("p7580_job: ev_arm knob unavailable\n");
++	/* gpu31-firstfault: FS-after-chain ordering A/B. */
++	f = debugfs_create_file("serialize_fs", 0600, dir, jd,
++				&p7580_job_serialize_fs_fops);
++	if (IS_ERR_OR_NULL(f))
++		pr_info("p7580_job: serialize_fs knob unavailable\n");
 +	f = debugfs_create_file("dump", 0400, dir, jd,
 +				&p7580_job_dump_fops);
 +	if (IS_ERR_OR_NULL(f))
@@ -4432,7 +4740,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,411 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -4483,6 +4791,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	/* Routing + HW program. */
 +	int slot;			/* 0..2, from requirements */
 +	uint64_t jc;			/* GPU address of job descriptor */
++	/* gpu31-firstfault: the live descriptor this job's shadow copy
++	 * was taken from (the chain node's original GPU address), or 0
++	 * when the dispatched jc IS the original descriptor. The
++	 * fault-time page dump prints both pages so the shadow copy and
++	 * the Mesa page can be compared word for word. */
++	uint64_t src_jc;
 +	uint32_t requirements;		/* PANFROST_JD_REQ_* */
 +	uint32_t as_nr;			/* address space bound to slot */
 +	uint64_t affinity;		/* shader-present mask */
@@ -4580,6 +4894,42 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	void *sched_entity[P7580_NUM_JOB_SLOTS];
 +	void *syncobj_mgr;		/* backport drm_syncobj_manager */
 +};
++/* ------------------------------------------------------------------ */
++/* gpu31-firstfault: in-memory job-event ring.                        */
++/*                                                                    */
++/* The long-run fault is rare (one frame in tens/hundreds) and the    */
++/* serial console cannot carry a per-dispatch trace without perturbing*/
++/* the timing that triggers it. So the dispatch, IRQ, timeout,        */
++/* recovery and runtime-PM events are recorded into a fixed ring in   */
++/* RAM (a few stores, no printk, no MMIO unless the ring is armed)    */
++/* and dumped once, with the descriptor pages, at the first fault.    */
++/* all-zero jc/a/b/c rings are still useful: they show the ordering.  */
++/* ------------------------------------------------------------------ */
++#define P7580_EV_MAX	128u
++enum p7580_ev_kind {
++	P7580_EV_START = 1,	/* hw_submit: a=status pre, b=cmd post,
++				 * c=status post (armed: MMIO probed) */
++	P7580_EV_DONE,		/* IRQ DONE: a=js_status, b=int bits */
++	P7580_EV_ERR,		/* IRQ ERR: a=js_status, b=int bits */
++	P7580_EV_TIMEOUT,	/* timedout: a=js_status */
++	P7580_EV_RECOVER,	/* recover: a=latched, b=cycled, c=rc */
++	P7580_EV_SUSPEND,	/* runtime suspend accepted */
++	P7580_EV_SUSPEND_BUSY,	/* runtime suspend refused (-EBUSY) */
++	P7580_EV_RESUME,	/* runtime resume */
++	P7580_EV_CYCLE,		/* power cycle completed: a=rc */
++	P7580_EV_DUMP,		/* ring dump marker */
++};
++struct p7580_ev {
++	uint64_t ns;		/* ktime_get() at record time */
++	uint64_t jc;
++	uint32_t kind;		/* enum p7580_ev_kind */
++	uint32_t slot;
++	uint32_t seq;
++	uint32_t a;
++	uint32_t b;
++	uint32_t c;
++};
++
 +/* Last-job snapshot: what the ERR pins and the dump knob report. */
 +/* Updated (under hw_lock) at every hw_submit dispatch for the next */
 +/* OUTCOME print (DONE/ERR/timeout), so the fault register capture */
@@ -4659,6 +5009,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +			    const uint32_t *handles, const uint64_t *addrs,
 +			    const uint32_t *sizes, uint32_t n);
 +	void *iova_resolve_priv;
++	/* gpu31-firstfault: event ring + first-fault dump (declarations
++	 * above). ev_arm is set by the ev_arm debugfs knob; it enables
++	 * the per-dispatch MMIO probes (status/command) AND the one-shot
++	 * ring + page dump at the first fault/timeout. ev_dumped makes
++	 * the dump one-shot (re-arm with a new ev_arm write). */
++	struct p7580_ev ev[P7580_EV_MAX];
++	unsigned int ev_head;
++	unsigned int ev_arm;
++	unsigned int ev_dumped;
++	/* gpu31-firstfault: descriptor-page dumper (driver-owned, process
++	 * context only: resolves the IOVA to a BO and kmaps it). The jobs
++	 * slice never dereferences GEM; NULL when unwired. */
++	int (*desc_dump)(void *priv, uint64_t gpu, const char *tag);
++	void *desc_dump_priv;
++	/* gpu31-firstfault: 1 = queue the FS (slot 0) submit on the
++	 * chain slot's entity so it is strictly ordered behind the
++	 * tiler by one FIFO instead of relying on the cross-entity
++	 * dependency alone. Runtime A/B knob (serialize_fs). */
++	unsigned int serialize_fs;
 +};
 +#else
 +struct p7580_job_dev {
@@ -4764,11 +5133,29 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +/* Idle check for suspend/close paths. */
 +int p7580_job_is_idle(struct p7580_job_dev *jd);
 +
++/* gpu31-firstfault: event ring + first-fault descriptor-page dump.
++ * p7580_job_ev() appends one record (IRQ-safe: one spinlock, no MMIO,
++ * no printk); kind is enum p7580_ev_kind. p7580_job_ev_arm() resets
++ * the ring and arms/disarms the per-dispatch MMIO probes and the
++ * one-shot dump. p7580_job_set_desc_dump() registers the driver's
++ * page dumper (process context). p7580_job_first_fault() is called by
++ * the timeout/fault paths with the faulting job and dumps ring + pages
++ * once per arm. */
++void p7580_job_ev(struct p7580_job_dev *jd, unsigned int kind, int slot,
++		  uint32_t seq, uint64_t jc, uint32_t a, uint32_t b,
++		  uint32_t c);
++void p7580_job_ev_arm(struct p7580_job_dev *jd, unsigned int on);
++void p7580_job_set_desc_dump(struct p7580_job_dev *jd,
++			     int (*fn)(void *priv, uint64_t gpu,
++				       const char *tag), void *priv);
++void p7580_job_first_fault(struct p7580_job_dev *jd,
++			   struct p7580_submit_job *job, uint32_t status);
++
 +#endif /* PANFROST7580_JOB_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,751 @@
+@@ -0,0 +1,754 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -5366,6 +5753,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	 * job's SUBMIT-time snapshot; IRQ-safe (no GEM deref). */
 +	p7580_job_set_iova_resolver(&drv->jd, p7580_drv_iova_resolve,
 +				     drv);
++	/* gpu31-firstfault: first-fault descriptor/SFBD/tiler-heap page
++	 * dumper (process-context only; armed per run by ev_arm). */
++	p7580_job_set_desc_dump(&drv->jd, p7580_drv_desc_dump, drv);
 +	p7580_drv_register_iova_trace(&p7580_iova_trace);
 +	ret = p7580_drv_sched_ensure();
 +	if (ret)
@@ -6971,7 +7361,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,2006 @@
+@@ -0,0 +1,2103 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -8036,6 +8426,58 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	df->job_dev = NULL;
 +}
 +
++/* gpu31-firstfault: dump one 4 KiB GPU page (all 16 256-byte job
++ * slots) of the memory a job descriptor, framebuffer descriptor or
++ * tiler-heap header lives in. Registered on the jobs slice as the
++ * first-fault dumper (process context only: it resolves the IOVA to a
++ * BO, takes a ref and kmaps; the caller is the sched timeout work).
++ * The read is clean-then-invalidate (p7580_drv_gpu_read), so the dump
++ * shows what the GPU sees, not a stale CPU line. */
++#define P7580_PAGE_DUMP_LEN	4096u
++
++/* Defined below with the chain-split helpers. */
++static int p7580_drv_gpu_read(struct p7580_drv *drv, uint64_t gpu,
++			      void *dst, size_t len);
++
++int p7580_drv_desc_dump(void *priv, uint64_t gpu, const char *tag)
++{
++	struct p7580_drv *drv = priv;
++	uint32_t *buf;
++	uint64_t base;
++	unsigned int i;
++	int ret;
++
++	if (!drv || !tag)
++		return -EINVAL;
++	base = gpu & ~(uint64_t)(P7580_PAGE_DUMP_LEN - 1u);
++	buf = kmalloc(P7580_PAGE_DUMP_LEN, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	ret = p7580_drv_gpu_read(drv, base, buf, P7580_PAGE_DUMP_LEN);
++	if (ret) {
++		pr_err("p7580_job: PAGEDUMP %s gpu=0x%llx rc=%d (unmapped)\n",
++		       tag, (unsigned long long)gpu, ret);
++		kfree(buf);
++		return ret;
++	}
++	pr_err("p7580_job: PAGEDUMP %s gpu=0x%llx page=0x%llx off=0x%llx\n",
++	       tag, (unsigned long long)gpu, (unsigned long long)base,
++	       (unsigned long long)(gpu - base));
++	for (i = 0; i < P7580_PAGE_DUMP_LEN / 4u / 16u; i++) {
++		const uint32_t *q = buf + i * 16u;
++
++		/* 16 words per line == one 256-byte descriptor slot per
++		 * line, so word 0 of each line is that slot's
++		 * exception_status (hardware-written). */
++		pr_err("p7580_job: PAGE %s slot%02u +%03x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       tag, i, (unsigned int)(i * 256u),
++		       q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
++		       q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
++	}
++	kfree(buf);
++	return 0;
++}
++
 +/* gpu31-iova: IRQ-safe fault-time mapping resolver (registered on
 + * struct p7580_job_dev at probe). Renders the faulting job's SUBMIT-
 + * time {handle,iova,size} snapshot as "h<H>=0x<IOVA>/0x<SZ> ..." into
@@ -8375,6 +8817,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	unsigned int nf;
 +	struct p7580_chain_shadow *shadow;
 +	unsigned int nodes;
++	/* gpu31-firstfault: the live (Mesa) chain-node addresses the
++	 * shadows were copied from, so the fault-time page dump can show
++	 * both pages. NULL when no shadow was allocated (the dispatched
++	 * jc is the original). */
++	const uint64_t *src;
 +};
 +
 +/* Build one sched job for chain node `pos` and queue it on the slot    */
@@ -8406,6 +8853,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	job->file_priv = s->df;
 +	job->drv_priv = s->drv;
 +	job->jc = jc;
++	job->src_jc = (s->src && s->shadow) ? s->src[pos] : 0;
 +	job->requirements = s->requirements;
 +	job->as_nr = P7580_DRV_AS_NR;
 +	job->affinity = s->drv->jd.shader_present;
@@ -8592,6 +9040,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	if (ret)
 +		return ret;
 +	entity = &df->entity[slot];
++	/* gpu31-firstfault: serialize_fs queues the FS (slot 0) submit on
++	 * the chain slot's entity, so the fragment job is ordered behind
++	 * the tiler by one FIFO instead of by a cross-entity shim
++	 * dependency alone. The hardware slot stays job->slot (0); only
++	 * the queue it rides changes. A/B knob, default 0. */
++	if (slot == 0 && drv->jd.serialize_fs &&
++	    (drv->jd.js_present & (1u << 1)))
++		entity = &df->entity[1];
 +
 +	/* 1. in-fences (referenced; put on every exit path). */
 +	if (args->in_sync_count) {
@@ -8667,6 +9123,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	{
 +		uint32_t hdr[P7580_CHAIN_MAX_JOBS][P7580_CHAIN_HDR_WORDS];
 +		uint64_t jcs[P7580_CHAIN_MAX_JOBS];
++		uint64_t srcjcs[P7580_CHAIN_MAX_JOBS];
 +		struct p7580_chain_shadow *shadow = NULL;
 +		struct p7580_split_ctx sctx;
 +		struct dma_fence *serial_prev = NULL;
@@ -8715,6 +9172,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		need_shadow = nodes > 1 ||
 +			p7580_chain_hdr_dep1(hdr[0]) ||
 +			p7580_chain_hdr_dep2(hdr[0]);
++		/* gpu31-firstfault: words 0..3 are hardware OUTPUT fields
++		 * (exception_status, first_incomplete_task, fault_pointer)
++		 * that Mesa never initialises. A nonzero value left in a
++		 * recycled pool page would otherwise be dispatched
++		 * verbatim; route such a descriptor through the shadow so
++		 * it can be sanitised. */
++		for (ci = 0; ci < nodes && !need_shadow; ci++) {
++			if (hdr[ci][0] | hdr[ci][1] | hdr[ci][2] | hdr[ci][3]) {
++				need_shadow = 1;
++				pr_info("p7580_job: desc-stale nodes=%u pos=%u src=0x%llx w=%08x %08x %08x %08x (shadowed+sanitised)\n",
++					nodes, ci, (unsigned long long)jcs[ci],
++					hdr[ci][0], hdr[ci][1], hdr[ci][2],
++					hdr[ci][3]);
++			}
++		}
 +
 +		if (need_shadow) {
 +			shadow = p7580_drv_shadow_create(drv, dev, nodes);
@@ -8740,6 +9212,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +					goto err_split;
 +				}
 +				p7580_chain_hdr_isolate(jobw, ci);
++				/* gpu31-firstfault: the JM writes the four
++				 * header status words on fault (measured:
++				 * word0=0x00010258, fault_pointer=jc after
++				 * a 0x58). They are outputs: never feed a
++				 * recycled page's leftovers back to the
++				 * hardware. */
++				jobw[0] = 0;
++				jobw[1] = 0;
++				jobw[2] = 0;
++				jobw[3] = 0;
 +				memcpy(hdr[ci], jobw,
 +				       P7580_JOB_DESC_HDR_SIZE);
 +				ret = p7580_drv_shadow_write(shadow->obj,
@@ -8753,6 +9235,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			}
 +			/* Publish every rewritten descriptor to DRAM. */
 +			p7580_gem_submit_sync(shadow->obj);
++			/* Keep the live addresses for the fault dump: jcs[]
++			 * is about to be overwritten with the shadows. */
++			for (ci = 0; ci < nodes; ci++)
++				srcjcs[ci] = jcs[ci];
 +			for (ci = 0; ci < nodes; ci++)
 +				jcs[ci] = shadow->iova +
 +					(uint64_t)ci *
@@ -8802,6 +9288,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		sctx.nf = nf;
 +		sctx.shadow = shadow;
 +		sctx.nodes = nodes;
++		sctx.src = shadow ? srcjcs : NULL;
 +
 +		for (ci = 0; ci < nodes; ci++) {
 +			struct dma_fence *prev =

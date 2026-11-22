@@ -22,12 +22,14 @@
  *  T5 signal idempotence: double signal returns -EINVAL the second time;
  *     the timedout guard (is_signaled check) skips an IRQ-won race.
  *  T6 spurious timeout: an already-signaled fence is never re-signaled.
- *  T9 latch cycle (gpu31-readback): recover() must run exactly one core
- *     power cycle when the slot latched POWER_FAULT (0x41) or a
- *     post-reset JS_STATUS read still shows a non-stop HW fault code;
- *     never for NO_EXCEPTION or our own stop codes (0x02/0x03/0x04);
- *     and it must program AS0 + re-arm JOB_INT on every exit, cycle or
- *     not (otherwise the next job re-reports the latch forever).
+ *  T9 recovery power-on (gpu31-readback + gpu31-firstfault): recover()
+ *     must end in exactly one complete core power-on whenever the cycle
+ *     hook is wired -- for ANY latched status, including the silent
+ *     NO_EXCEPTION timeout (0x08) and our own stop codes -- because a
+ *     bare GPU soft reset re-latches POWER_FAULT (0x41) on the next
+ *     START (measured on int40: 0x41 on the other slot ~1 ms later with
+ *     both slots reading 0 at recover-done). Without the hook it must
+ *     not cycle. AS0 reprogram + JOB_INT re-arm run on every exit.
  *
  * Build: cc -Wall -Wextra -o submit_fix_test submit_fix_test.c
  *        && ./submit_fix_test
@@ -374,11 +376,15 @@ static void run_t6(void)
 	CHECK(ours.signals == 1);	/* no re-signal */
 }
 
-/* T9 (gpu31-readback): power-cycle decision in p7580_job_recover().
- * Mirrors the real predicate: cycle when the latched status is
- * POWER_FAULT (0x41) or when any present slot still reads a non-stop HW
- * fault code after the GPU reset. AS0 reprogram + JOB_INT re-arm always
- * run (they are what makes the slot usable again). */
+/* T9 (gpu31-readback + gpu31-firstfault): power-on decision in
+ * p7580_job_recover(). Mirrors the real predicate: when the
+ * power_cycle hook is wired, recover() NEVER issues a bare GPU soft
+ * reset -- it ends in one complete core power-on (reset + cores) for
+ * every latched status, because a soft reset alone leaves the JM in
+ * the reset-with-work-queued state and the next START on either slot
+ * latches POWER_FAULT. Without the hook the plain reset path runs and
+ * no cycle happens. AS0 reprogram + JOB_INT re-arm always run (they are
+ * what makes the slot usable again). */
 #define JS_POWER_FAULT	0x41
 #define JS_NO_EXCEPTION	0x08
 #define JS_STOPPED	0x03
@@ -387,28 +393,18 @@ static void run_t6(void)
 struct fake_latch {
 	int latched_status;
 	int post_reset_status;
+	int hook_wired;
 	int cycle_calls;
 	int as_program_calls;
 	int rearm_calls;
 };
 
-static int latch_is_fault(int st)
-{
-	return st >= 0x40;
-}
-
-static int latch_is_stop(int st)
-{
-	return st == 0x02 || st == JS_STOPPED || st == 0x04;
-}
-
 static void model_recover_latch(struct fake_latch *l)
 {
-	int need = (l->latched_status == JS_POWER_FAULT) ||
-		   (latch_is_fault(l->post_reset_status) &&
-		    !latch_is_stop(l->post_reset_status));
-
-	if (need)
+	/* One full power-on per recovery whenever the hook is wired. The
+	 * latched/post-reset status only decides whether the fallback
+	 * reset path (no hook) is needed. */
+	if (l->hook_wired)
 		l->cycle_calls++;
 	l->as_program_calls++;
 	l->rearm_calls++;
@@ -418,8 +414,9 @@ static void run_t9(void)
 {
 	struct fake_latch l;
 
-	/* POWER_FAULT latched: one cycle, then AS0 + JOB_INT re-arm. */
+	/* POWER_FAULT latched, hook wired: one power-on + AS0/re-arm. */
 	memset(&l, 0, sizeof(l));
+	l.hook_wired = 1;
 	l.latched_status = JS_POWER_FAULT;
 	l.post_reset_status = JS_NO_EXCEPTION;
 	model_recover_latch(&l);
@@ -427,28 +424,43 @@ static void run_t9(void)
 	CHECK(l.as_program_calls == 1);
 	CHECK(l.rearm_calls == 1);
 
-	/* Silent timeout: no fault code, no cycle, still re-armed. */
+	/* Silent timeout (gpu31-firstfault regression): a NO_EXCEPTION
+	 * latch must ALSO end in a full power-on when wired, otherwise the
+	 * following START re-latches 0x41 and one stall becomes a storm. */
 	memset(&l, 0, sizeof(l));
+	l.hook_wired = 1;
 	l.latched_status = JS_NO_EXCEPTION;
 	l.post_reset_status = JS_NO_EXCEPTION;
 	model_recover_latch(&l);
-	CHECK(l.cycle_calls == 0);
+	CHECK(l.cycle_calls == 1);
 	CHECK(l.as_program_calls == 1);
 	CHECK(l.rearm_calls == 1);
 
-	/* Our own HARD_STOP result must not trigger a cycle. */
+	/* Our own HARD_STOP result, hook wired: still one power-on. */
 	memset(&l, 0, sizeof(l));
-	l.latched_status = JS_NO_EXCEPTION;
+	l.hook_wired = 1;
+	l.latched_status = JS_STOPPED;
 	l.post_reset_status = JS_STOPPED;
 	model_recover_latch(&l);
-	CHECK(l.cycle_calls == 0);
+	CHECK(l.cycle_calls == 1);
 
-	/* A non-stop fault code surviving the reset: cycle. */
+	/* A surviving non-stop fault code, hook wired: one power-on. */
 	memset(&l, 0, sizeof(l));
+	l.hook_wired = 1;
 	l.latched_status = JS_NO_EXCEPTION;
 	l.post_reset_status = JS_INSTR_TYPE_MISMATCH;
 	model_recover_latch(&l);
 	CHECK(l.cycle_calls == 1);
+	CHECK(l.rearm_calls == 1);
+
+	/* Hook unwired: never cycle, but ALWAYS reprogram AS0 + re-arm. */
+	memset(&l, 0, sizeof(l));
+	l.hook_wired = 0;
+	l.latched_status = JS_POWER_FAULT;
+	l.post_reset_status = JS_INSTR_TYPE_MISMATCH;
+	model_recover_latch(&l);
+	CHECK(l.cycle_calls == 0);
+	CHECK(l.as_program_calls == 1);
 	CHECK(l.rearm_calls == 1);
 }
 

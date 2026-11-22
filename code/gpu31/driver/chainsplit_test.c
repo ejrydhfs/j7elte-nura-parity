@@ -112,6 +112,25 @@ static void test_chain_decode(void)
 	CHECK(p7580_chain_hdr_index(t) == 1);
 	CHECK(p7580_chain_hdr_type(t) == P7580_JOB_TYPE_WRITE_VALUE);
 
+	/* gpu31-firstfault hygiene contract: words 0..3 are the JM's
+	 * OUTPUT fields (exception_status, first_incomplete_task,
+	 * fault_pointer). isolate() must leave them alone (it is a pure
+	 * header rewrite) and the submit path zeroes them in the shadow
+	 * copy, so a recycled pool page can never feed a stale status
+	 * back to the hardware. Pin both halves. */
+	memcpy(t, tiler_hdr, sizeof(t));
+	t[0] = 1;		/* stale exception_status (the int39 sign) */
+	t[1] = 0x2;		/* stale first_incomplete_task */
+	t[2] = 0xdeadbeef;	/* stale fault_pointer lo */
+	t[3] = 0xfeedface;	/* stale fault_pointer hi */
+	p7580_chain_hdr_isolate(t, 1);
+	CHECK(t[0] == 1);	/* isolate does not touch outputs ... */
+	CHECK(t[3] == 0xfeedface);
+	t[0] = t[1] = t[2] = t[3] = 0;	/* ... the shadow copy does */
+	CHECK((t[0] | t[1] | t[2] | t[3]) == 0);
+	CHECK(p7580_chain_hdr_index(t) == 2);
+	CHECK(p7580_chain_hdr_type(t) == P7580_JOB_TYPE_TILER);
+
 	/* Shadow slots are 64-byte aligned and never overlap even for the
 	 * largest (192-byte tiler) node. */
 	CHECK(P7580_CHAIN_SLOT_STRIDE >= 192);
