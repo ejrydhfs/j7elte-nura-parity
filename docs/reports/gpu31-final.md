@@ -85,3 +85,26 @@ Net: the descriptor is valid, the tables are correct, and the GPU still reports
 INSTR_TYPE_MISMATCH while executing the fragment job's command stream. Resolving this needs
 genxml-level decoding of the JD body (FBD/shader pointers) against Mesa 20.3's writer — a
 substantially larger effort than the bring-up done here.
+
+## Update 2026-11-22 (int38 staged, device off USB)
+Root causes found since the previous update, all fixed in code:
+
+1. **Vertex-job truncation (chain split)**: `p7580_chain_job_bytes()` returned 96 for a
+   `MALI_COMPUTE_JOB_LENGTH`=192 vertex aggregate, so the split shadow dropped Draw fields
+   from Textures onward (samplers, uniforms, attribute/varying pointers, viewport, FBD).
+   Fixed in 742dc52 (VERTEX/TILER 192, WRITE_VALUE 56, FRAGMENT 64, NULL 32).
+2. **Shader page zeroing (Defect B)**: `shmem_getpage_gfp()` leaves a dirty zero line in the
+   kernel's Normal-WB linear alias; this arm64 tree's `flush_dcache_page()` only clears
+   `PG_dcache_clean`, and the BO VMA is WC, so the CPU's ISA stores reach DRAM while the stale
+   line later evicts over them (whole page zeroed 0-5 ms later; a 2 s pre-sleep prevents it).
+   Fixed in 9dd7542 with `__flush_dcache_area()` after each `shmem_read_mapping_page()`.
+3. **Chain walker** proven correct on a 3-node NULL-job chain (`chain nodes=3`, three splits,
+   `cfg=0x83700`, `next` = w6|w7<<32 with Is64=w4 bit0).
+
+Independent audits: ISA decode shows **no T720-illegal encodings**; the TILER descriptor is
+byte-exact against kbase/Mesa (FBD at 44*4, tiler section at FBD+192, heap/PLS/primitive valid);
+`JS_CONFIG 0x83700` matches kbase r8p0.
+
+Image **int38** (`42d3a160…`, kernel `3bbcc91a…`) contains both fixes and is staged. Flashing and
+the acceptance runs (`--defectb-test`, chain-split trace, polygon census, FS-only matrix) are
+**blocked on physical power-cycle**: the phone is off USB (boot stalls before sshd).
