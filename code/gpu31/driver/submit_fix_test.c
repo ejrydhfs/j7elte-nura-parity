@@ -30,6 +30,12 @@
  *     START (measured on int40: 0x41 on the other slot ~1 ms later with
  *     both slots reading 0 at recover-done). Without the hook it must
  *     not cycle. AS0 reprogram + JOB_INT re-arm run on every exit.
+ *  T10 BO-fence publish order (gpu31-storm58): an exclusive fence
+ *     REPLACES the resv's single excl slot, so the last publisher must
+ *     be the newest submit. The old arm-time re-publish in run_job let
+ *     the earlier (tiler) fence win over the newer FS fence; WAIT_BO
+ *     then reported a BO busy-in-GPU as idle. The fix publishes only at
+ *     SUBMIT, under serial_lock (publish order == submit order).
  *
  * Build: cc -Wall -Wextra -o submit_fix_test submit_fix_test.c
  *        && ./submit_fix_test
@@ -464,6 +470,60 @@ static void run_t9(void)
 	CHECK(l.rearm_calls == 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* T10 BO-fence publish order (gpu31-storm58).                         */
+/*                                                                    */
+/* The resv carries exactly ONE exclusive fence and the 0002 shim's    */
+/* dma_resv_add_excl_fence REPLACES it, so the last writer must be the */
+/* newest submit in serial order. The int42 fragment storm came from   */
+/* the second, asynchronous re-publish in run_job: the draws' last node*/
+/* dispatched after the FS submit had already published its (newer)    */
+/* fence, so the older tiler fence won; WAIT_BO then reported the BO   */
+/* idle while the FS job was still in flight and userspace rewrote the */
+/* descriptor/SFBD page under the GPU. The fixed path publishes only at*/
+/* SUBMIT, under serial_lock, so publish order == submit order.        */
+/* ------------------------------------------------------------------ */
+
+struct fake_resv {
+	struct fake_fence *excl;
+};
+
+static void fake_add_excl(struct fake_resv *r, struct fake_fence *f)
+{
+	r->excl = f;		/* 0002: replace, never chain */
+}
+
+static void run_t10(void)
+{
+	struct fake_fence draws = { 0, 0 }, fs = { 0, 0 };
+	struct fake_resv resv = { NULL };
+
+	/* Fixed order: SUBMIT(draws) publishes the tiler fence, then
+	 * SUBMIT(fs) publishes the newer FS fence; run_job publishes
+	 * nothing. */
+	fake_add_excl(&resv, &draws);
+	fake_add_excl(&resv, &fs);
+	CHECK(resv.excl == &fs);
+
+	/* The tiler finishing must NOT make the BO look idle: the FS job
+	 * still reads it. */
+	draws.signaled = 1;
+	CHECK(resv.excl == &fs);
+	CHECK(!resv.excl->signaled);
+
+	/* Old order: the async run_job of the draws' last node re-publishes
+	 * its own, older fence after SUBMIT(fs). The BO reads idle as soon
+	 * as the tiler retires while the FS job is still in flight. */
+	resv.excl = NULL;
+	draws.signaled = 0;
+	fake_add_excl(&resv, &draws);
+	fake_add_excl(&resv, &fs);
+	fake_add_excl(&resv, &draws);		/* arm-time re-publish */
+	CHECK(resv.excl == &draws);
+	draws.signaled = 1;
+	CHECK(resv.excl->signaled);		/* BO "idle" with fs live */
+}
+
 int main(void)
 {
 	run_t1();
@@ -475,6 +535,7 @@ int main(void)
 	run_t7();
 	run_t8();
 	run_t9();
+	run_t10();
 
 	if (fails == 0)
 		printf("submit_fix_test: all checks passed\n");

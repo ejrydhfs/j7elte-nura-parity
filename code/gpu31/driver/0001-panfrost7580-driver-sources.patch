@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,164 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -66,6 +66,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +	atomic_t pm_ref;		/* live-job runtime-PM refs (see submit.c) */
 +};
 +
++/* gpu31-storm58: bounded BO-age ledger size (see p7580_drv_file). */
++#define P7580_BO_AGE_SLOTS	64u
++
 +/* Per-file state. Leading layout mirrors GEM's struct p7580_file_priv
 + * (mgr, job_fctx, job_dev) so GEM's ioctl helpers work unchanged. */
 +struct p7580_drv_file {
@@ -88,6 +91,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +	 * so a queued-but-never-run job cannot leak. */
 +	struct mutex serial_lock;
 +	struct dma_fence *serial_prev;
++	/* gpu31-storm58: BO-age ledger (diagnostic, bounded, no alloc).
++	 * submit_no counts SUBMIT ioctls on this file; bo_age[] maps a
++	 * 4 KiB-aligned IOVA to the last SUBMIT that referenced it, so a
++	 * fault can answer "was the descriptor page just recycled?": the
++	 * job's jc_age is submit_no - seq of the BO holding jc (1 = the
++	 * previous SUBMIT, 2 = the previous frame's FS submit). A direct
++	 * map: a collision restarts the age instead of chaining. */
++	uint32_t submit_no;
++	struct {
++		uint64_t iova;
++		uint32_t seq;
++	} bo_age[P7580_BO_AGE_SLOTS];
 +};
 +
 +struct p7580_submit;
@@ -2912,7 +2927,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1949 @@
+@@ -0,0 +1,1955 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -3200,11 +3215,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +
 +	n = jd->ev_head < P7580_EV_MAX ? jd->ev_head : P7580_EV_MAX;
 +	start = jd->ev_head - n;
-+	pr_err("p7580_job: EVRING begin head=%u n=%u status=0x%08x jc=0x%llx seq=%u src=0x%llx\n",
++	pr_err("p7580_job: EVRING begin head=%u n=%u status=0x%08x jc=0x%llx seq=%u src=0x%llx fbd=0x%x jc_age=%u\n",
 +	       jd->ev_head, n, status,
 +	       job ? (unsigned long long)job->jc : 0ull,
 +	       job ? job->seqno : 0u,
-+	       job ? (unsigned long long)job->src_jc : 0ull);
++	       job ? (unsigned long long)job->src_jc : 0ull,
++	       job ? job->fbd : 0u,
++	       job ? job->jc_age : 0u);
 +	for (i = 0; i < n; i++) {
 +		const struct p7580_ev *e =
 +			&jd->ev[(start + i) & (P7580_EV_MAX - 1u)];
@@ -3225,12 +3242,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		jd->desc_dump(jd->desc_dump_priv, job->jc, "jc");
 +		if (job->src_jc && job->src_jc != job->jc)
 +			jd->desc_dump(jd->desc_dump_priv, job->src_jc, "src");
-+		/* Fragment job: payload word 2 (+32+8) is the framebuffer
-+		 * (SFBD) and the SFBD's tiler descriptor names the polygon
-+		 * list + heap. Dump the page it points into. */
-+		if (((job->desc[4] >> 1) & 0x7fu) == 9u && job->desc[10])
++		/* Fragment job: payload word 10 (+40) is the framebuffer
++		 * descriptor (SFBD) and the SFBD's tiler section at
++		 * FBD+0xC0 names the polygon list + heap. Dump the page
++		 * the recorded SFBD pointer falls in (the address is
++		 * captured at SUBMIT: desc[] is only 8 words, so reading
++		 * desc[10] here was an out-of-bounds read that produced
++		 * a bogus address on int42). */
++		if (job->fbd)
 +			jd->desc_dump(jd->desc_dump_priv,
-+				      (uint64_t)job->desc[10], "fbd");
++				      (uint64_t)job->fbd, "fbd");
 +		/* Tiler heap candidate: the largest BO in the snapshot. */
 +		if (job->iova_addrs && job->iova_sizes) {
 +			unsigned int best = 0;
@@ -4064,11 +4085,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		t_hi = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_TAIL_HI));
 +		head = ((uint64_t)h_hi << 32) | h_lo;
 +		tail = ((uint64_t)t_hi << 32) | t_lo;
-+		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc_age=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 +			slot, status, p7580_js_status_name(status),
 +			t_stat, t_raw,
 +			(unsigned long long)head, (unsigned long long)tail,
-+			job->seqno, (unsigned long long)job->jc,
++			job->seqno, job->jc_age, (unsigned long long)job->jc,
 +			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0,
 +			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
 +			job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
@@ -4865,7 +4886,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,438 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -5002,15 +5023,20 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	void *chain_shadow;
 +	uint32_t chain_pos;
 +	uint32_t chain_len;
-+	/* gpu31-latency: 1 only for the node whose fence is the split's
-+	 * externally published fence (the last queued node; a one-node
-+	 * submit is its own last). run_job stamps BO exclusivity only for
-+	 * that node: SUBMIT already published the same last_fence on every
-+	 * BO before returning, and an intermediate node's own fence must
-+	 * not overwrite it (a WAIT_BO in that window would otherwise wait
-+	 * for the wrong, earlier node and map a BO the tiler is about to
-+	 * write). */
-+	unsigned int publish_excl;
++	/* gpu31-storm58: first-fault page inputs, captured at SUBMIT.
++	 * fbd is descriptor word 10 for a fragment node (type 9), read
++	 * from the descriptor BO during the chain walk: the one-shot
++	 * dump needs the SFBD address, and desc[] is only 8 words, so
++	 * the old job->desc[10] read was out of bounds (on int42 it
++	 * fed an unrelated pointer into the "fbd" page dump).
++	 * jc_age counts SUBMITs this file made between the last one
++	 * that touched the BO holding jc and this job: 1 means the
++	 * descriptor page was written by the previous SUBMIT, 2 by the
++	 * previous frame's FS submit. A small age at fault time is a
++	 * recycled BO, and if a job is still in flight on it that is
++	 * the storm's userspace-write race. */
++	uint32_t fbd;
++	uint32_t jc_age;
 +};
 +
 +/* Per-file submit context: one sched entity per slot. */
@@ -7512,7 +7538,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,2136 @@
+@@ -0,0 +1,2195 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -7815,40 +7841,20 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		/* Non-owning alias for the legacy out_sync leg. */
 +		job->render_done_fence = fence;
 +
-+		/* gpu31-instrtype (retargeted by gpu31-latency): publish
-+		 * this job's fence as the exclusive (write) fence on every
-+		 * submitted BO -- only for the node that owns the split's
-+		 * published fence (publish_excl: the last queued node; a
-+		 * one-node submit is its own last). SUBMIT already stamped
-+		 * that same last_fence on every BO before returning, so
-+		 * this is the late/legacy copy for the published node;
-+		 * intermediate nodes must NOT overwrite it with their own
-+		 * fence, or a WAIT_BO in the dispatch window would wait
-+		 * for the earlier node and map a BO the tiler/fragment is
-+		 * about to write. Later submits of the same BOs still take
-+		 * the fence as an implicit sched dependency at queue time
-+		 * (get_excl leg), which serialises batches sharing
-+		 * pool/scratch/heap BOs. Locking: the 0002 shim locks
-+		 * resv->lock inside add_excl (never take it here: same
-+		 * SUBMIT-DEADLOCK rule as the get_excl leg). */
-+		{
-+			struct p7580_submit_job *rj = job;
-+			uint32_t k;
-+
-+			if (rj->publish_excl) {
-+				for (k = 0; k < rj->bo_count; k++) {
-+					struct drm_gem_object *o =
-+						(struct drm_gem_object *)
-+							rj->bos[k];
-+
-+					if (!o)
-+						continue;
-+					dma_resv_add_excl_fence(
-+						&to_p7580_bo(o)->resv,
-+						fence);
-+				}
-+			}
-+		}
++		/* gpu31-storm58: BO exclusivity is published at SUBMIT and
++		 * only there. An arm-time re-publish is NOT harmless: the
++		 * resv holds exactly one exclusive fence (the 0002 shim's
++		 * dma_resv_add_excl_fence replaces it), and this path runs
++		 * asynchronously, after a LATER submit of the same BOs may
++		 * already have published a newer fence. The older fence
++		 * then replaced the newer one, so Mesa's BO-cache fetch
++		 * (WAIT_BO with timeout 0) saw the BO idle while the newer
++		 * submit's job was still reading it, and rebuilt the next
++		 * frame into it under the GPU: the int42 fragment 0x58
++		 * storm. SUBMIT publishes the split's final fence in serial
++		 * order (under serial_lock), which is the newest fence the
++		 * BO can carry; the get_excl leg at queue time keeps
++		 * later submits ordered behind it. */
 +		p7580_drv_pm_put(drv);
 +		return fence;
 +	}
@@ -8647,14 +8653,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	pr_err("p7580_job: PAGEDUMP %s gpu=0x%llx page=0x%llx off=0x%llx\n",
 +	       tag, (unsigned long long)gpu, (unsigned long long)base,
 +	       (unsigned long long)(gpu - base));
++	/* One line per 16 words (64 bytes): 64 lines cover the whole
++	 * 4 KiB page. The first form printed only the first 64 bytes of
++	 * every 256-byte job slot, i.e. 1 KiB with wrong offsets, which
++	 * skipped exactly the interesting bytes on int42: the fragment
++	 * SFBD tiler section at page+0x540 and the SFBD-adjacent
++	 * descriptor at +0x5c0. slot is the 256-byte job slot the line
++	 * starts in, off the page offset. */
 +	for (i = 0; i < P7580_PAGE_DUMP_LEN / 4u / 16u; i++) {
 +		const uint32_t *q = buf + i * 16u;
 +
-+		/* 16 words per line == one 256-byte descriptor slot per
-+		 * line, so word 0 of each line is that slot's
-+		 * exception_status (hardware-written). */
-+		pr_err("p7580_job: PAGE %s slot%02u +%03x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-+		       tag, i, (unsigned int)(i * 256u),
++		pr_err("p7580_job: PAGE %s slot%02u off=%03x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		       tag, (unsigned int)(i / 4u), (unsigned int)(i * 64u),
 +		       q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
 +		       q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
 +	}
@@ -9006,7 +9016,30 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * both pages. NULL when no shadow was allocated (the dispatched
 +	 * jc is the original). */
 +	const uint64_t *src;
++	/* gpu31-storm58: per-node SFBD address (descriptor word 10,
++	 * fragment nodes only; 0 elsewhere) and the per-BO age of each
++	 * entry in objs[] (SUBMITs since this file last used that BO). */
++	const uint32_t *fbd;
++	const uint32_t *age;
 +};
++
++/* gpu31-storm58: BO-age ledger (diagnostic). Returns how many SUBMITs
++ * this file made since it last referenced the page at `iova`, then
++ * records `seq` as the newest user. Direct-mapped and bounded; a
++ * collision restarts the age instead of chaining. */
++static uint32_t p7580_drv_bo_age_touch(struct p7580_drv_file *df,
++				       uint64_t iova, uint32_t seq)
++{
++	unsigned int s = (unsigned int)((iova >> 12) &
++					(P7580_BO_AGE_SLOTS - 1u));
++	uint32_t age = 0;
++
++	if (df->bo_age[s].iova == iova && df->bo_age[s].seq)
++		age = seq - df->bo_age[s].seq;
++	df->bo_age[s].iova = iova;
++	df->bo_age[s].seq = seq;
++	return age;
++}
 +
 +/* Build one sched job for chain node `pos` and queue it on the slot    */
 +/* entity. prev is the fence this node must wait for (pos 0: the serial */
@@ -9047,9 +9080,22 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	memcpy(job->desc, hdr, sizeof(job->desc));
 +	if (pos + 1 == s->nodes)
 +		job->out_sync = s->out_sync;
-+	/* Only the split's published fence owns BO exclusivity (see the
-+	 * field comment); SUBMIT stamps it on every BO before returning. */
-+	job->publish_excl = (pos + 1 == s->nodes);
++	/* gpu31-storm58: what the one-shot fault dump needs, captured
++	 * at SUBMIT. fbd is the SFBD pointer the chain walker read from
++	 * this node's live descriptor word 10 (fragment nodes only).
++	 * jc_age is this file's SUBMIT age of the BO holding jc: 1 means
++	 * the previous SUBMIT rewrote that page, 2 the previous frame's
++	 * FS submit -- the "was the descriptor page just recycled"
++	 * number. */
++	job->fbd = s->fbd ? s->fbd[pos] : 0;
++	for (i = 0; i < s->nr; i++) {
++		struct p7580_bo *b = to_p7580_bo(s->objs[i]);
++
++		if (jc >= b->iova && jc - b->iova < b->base.size) {
++			job->jc_age = s->age ? s->age[i] : 0;
++			break;
++		}
++	}
 +
 +	/* Per-job BO references (gpu31-chainsplit): every split node owns
 +	 * its own set, so free_job retires each node's sync + refs in
@@ -9308,6 +9354,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		uint32_t hdr[P7580_CHAIN_MAX_JOBS][P7580_CHAIN_HDR_WORDS];
 +		uint64_t jcs[P7580_CHAIN_MAX_JOBS];
 +		uint64_t srcjcs[P7580_CHAIN_MAX_JOBS];
++		/* gpu31-storm58: live SFBD pointer per fragment node and
++		 * the SUBMIT age of every submitted BO. */
++		uint32_t fbds[P7580_CHAIN_MAX_JOBS];
++		uint32_t ages[P7580_MAX_SUBMIT_BOS];
 +		struct p7580_chain_shadow *shadow = NULL;
 +		struct p7580_split_ctx sctx;
 +		struct dma_fence *serial_prev = NULL;
@@ -9317,6 +9367,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		uint64_t walk = args->jc;
 +
 +		ret = 0;
++
++		/* gpu31-storm58: stamp the age ledger once per SUBMIT so
++		 * every node of this split reads the same "SUBMITs since
++		 * this file last used this BO" number. Bounded (nr is
++		 * capped by P7580_MAX_SUBMIT_BOS), no allocation. */
++		df->submit_no++;
++		for (i = 0; i < nr; i++)
++			ages[i] = p7580_drv_bo_age_touch(
++				df, to_p7580_bo(objs[i])->iova,
++				df->submit_no);
 +
 +		for (;;) {
 +			uint64_t next;
@@ -9331,6 +9391,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +				ret = (int)p7580_submit_err("chain", ret);
 +				goto err_split;
 +			}
++			/* gpu31-storm58: a fragment job (type 9) carries
++			 * the SFBD pointer in payload word 10. Capture it
++			 * here (4 bytes; p7580_drv_gpu_read bounds-checks
++			 * it against the owning BO) so the one-shot fault
++			 * dump can dump the SFBD page without an
++			 * out-of-bounds desc[] read. 0 when unreadable. */
++			fbds[nodes] = 0;
++			if (((hdr[nodes][4] >> 1) & 0x7fu) == 9u)
++				(void)p7580_drv_gpu_read(drv, walk + 40u,
++							 &fbds[nodes],
++							 sizeof(fbds[0]));
 +			/* Only grounded Midgard job aggregates can be
 +			 * isolated into a shadow slot. */
 +			if (!p7580_chain_job_bytes(
@@ -9473,6 +9544,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		sctx.shadow = shadow;
 +		sctx.nodes = nodes;
 +		sctx.src = shadow ? srcjcs : NULL;
++		sctx.fbd = fbds;
++		sctx.age = ages;
 +
 +		for (ci = 0; ci < nodes; ci++) {
 +			struct dma_fence *prev =
@@ -9495,31 +9568,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			queued++;
 +		}
 +
-+		/* gpu31-latency (MFBD hand-off): publish the split's final
-+		 * fence on every submitted BO before the ioctl returns.
-+		 * run_job's excl stamp happens only after the async pump
-+		 * dispatches, so a WAIT_BO issued right after SUBMIT (Mesa
-+		 * readback: flush_batches then panfrost_bo_wait on the
-+		 * render target) saw the previous submit's fence and
-+		 * mapped a BO the GPU was about to write -> fragment
-+		 * DATA_INVALID_FAULT, whose recovery cost a full timeout.
-+		 * This is the same last_fence installed on out_sync and
-+		 * published as serial_prev, so waiters observe the whole
-+		 * split and later submits gate on it at queue time. The
-+		 * resv lock is taken inside add_excl (never here: same
-+		 * SUBMIT-DEADLOCK rule as the get_excl leg); arm failure
-+		 * (NULL fence) or an empty queue publishes nothing. */
-+		if (queued && last_fence) {
-+			for (i = 0; i < nr; i++) {
-+				struct drm_gem_object *o = objs[i];
-+
-+				if (!o)
-+					continue;
-+				dma_resv_add_excl_fence(
-+					&to_p7580_bo(o)->resv, last_fence);
-+			}
-+		}
-+
++		/* gpu31-latency (MFBD hand-off) + gpu31-storm58: the BO
++		 * exclusive-fence publication of the split's final fence
++		 * lives in the serial section below, under serial_lock,
++		 * together with the serial_prev swap. The resv holds ONE
++		 * exclusive fence (0002 add_excl replaces), so the publish
++		 * order must be the file's serial submit order; otherwise
++		 * an older submit's fence can land on a BO after a newer
++		 * one did, a WAIT_BO then reports the BO idle while the
++		 * newer job still uses it, and userspace rewrites it under
++		 * the GPU (int42 fragment storm). The publish still
++		 * happens before the ioctl returns, which is what the
++		 * readback path needs (flush_batches then
++		 * panfrost_bo_wait must see this submit's fence). */
 +		/* One out-fence for the whole split: install on the last
 +		 * queued node's armed fence. On a partial queue failure
 +		 * that is the last node the GPU accepted, so a waiter
@@ -9543,13 +9604,37 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		}
 +
 +		/* Publish the split's final fence as the file serial
-+		 * predecessor (one slot ref). A partial failure publishes
-+		 * the last node that queued, so the next SUBMIT still
-+		 * orders behind everything accepted here. */
++		 * predecessor (one slot ref) AND as the BOs' exclusive
++		 * fence, both under serial_lock. A partial failure
++		 * publishes the last node that queued, so the next SUBMIT
++		 * still orders behind everything accepted here.
++		 *
++		 * gpu31-storm58: the BO stamp must be inside this lock.
++		 * The resv carries a single exclusive fence, so whichever
++		 * SUBMIT publishes last wins; with the stamp outside the
++		 * lock (and a second identical stamp in the async run_job
++		 * path, now removed) an earlier submit's *older* fence could
++		 * overwrite a *newer* one, making WAIT_BO report a BO
++		 * busy-in-GPU as idle; Mesa's BO-cache fetch then reused
++		 * the page and rewrote the descriptor/SFBD of a job still
++		 * in flight. Publishing here makes the last writer the
++		 * last submit in serial order, whose fence dominates every
++		 * earlier submit touching the same BOs. */
 +		if (queued) {
 +			struct dma_fence *old = NULL;
 +
 +			mutex_lock(&df->serial_lock);
++			if (last_fence) {
++				for (i = 0; i < nr; i++) {
++					struct drm_gem_object *o = objs[i];
++
++					if (!o)
++						continue;
++					dma_resv_add_excl_fence(
++						&to_p7580_bo(o)->resv,
++						last_fence);
++				}
++			}
 +			old = df->serial_prev;
 +			df->serial_prev = last_fence;
 +			if (df->serial_prev)
