@@ -255,4 +255,116 @@ static inline int p7580_jc_valid(uint64_t jc)
 	return jc != 0 && (jc & 7u) == 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* gpu31-chainsplit: chain walk + per-node shadow descriptors.        */
+/*                                                                    */
+/* The v5.2 UAPI submits ONE jc: the head of a linked chain. On this  */
+/* part a chained submit is executed by the JM as one slot dispatch   */
+/* (next pointers are transparent transfer); the chain's END_FLUSH_   */
+/* CLEAN_INV therefore runs only once, after the LAST job. The        */
+/* gpu31-chainexec measurement proved the tiler then does not observe */
+/* the vertex shader's stores. The fix is a driver-side split: every  */
+/* chain node becomes its own sched job (its own START, hence its own */
+/* END_FLUSH_CLEAN_INV), serialised by drm_sched dependencies.        */
+/*                                                                    */
+/* A node cannot simply be dispatched with its original header: its   */
+/* next pointer would make the JM keep walking the rest of the chain, */
+/* and its job_index dependencies refer to nodes that are not in this */
+/* dispatch. Each split node is therefore rewritten into a driver-    */
+/* owned shadow descriptor: next = NULL, deps = 0, index = position+1.*/
+/* The payload (inline after the 32-byte header) is copied verbatim;  */
+/* all payload fields are self-contained GPU addresses, so copying is */
+/* safe. Header layout [KT] mali_kbase_defs.h:1689-1712 / midgard.xml: */
+/*   word 4: bit0 Is64, bits1..7 Type, bits8..15 barrier/reserved,     */
+/*           bits16..31 Index                                          */
+/*   word 5: dep1 low16 / dep2 high16                                  */
+/*   words 6..7: next_job (32-bit form uses word 6 only)               */
+/* ------------------------------------------------------------------ */
+#define P7580_CHAIN_MAX_JOBS		16u
+/* Shadow slot stride: 192 B is the largest Midgard job aggregate      */
+/* (Midgard Tiler Job, midgard.xml), padded to one cache-line pair.   */
+#define P7580_CHAIN_SLOT_STRIDE		256u
+#define P7580_CHAIN_HDR_WORDS		8u
+#define P7580_JOB_DESC_HDR_SIZE		32u
+
+/* Grounded job type numerics ([KT] mali_kbase_replay.c:29-34 for       */
+/* 1/5/7/8/9; 2 = WRITE_VALUE from the live chain decode).             */
+#define P7580_JOB_TYPE_NULL		1u
+#define P7580_JOB_TYPE_WRITE_VALUE	2u
+#define P7580_JOB_TYPE_VERTEX		5u
+#define P7580_JOB_TYPE_TILER		7u
+#define P7580_JOB_TYPE_FUSED		8u
+#define P7580_JOB_TYPE_FRAGMENT		9u
+
+/* Total bytes (header + inline payload) a shadow slot must carry.      */
+/* Null 32; Write Value 24 B payload (midgard.xml); Compute/Vertex     */
+/* 96 B (midgard.xml Compute Job: Draw ends at +96); Tiler/Fused 192 B */
+/* (Midgard Tiler Job size=192); Fragment 64 B (32 B header + 32 B     */
+/* payload fields through Tile Enable Map Row Stride).                 */
+static inline unsigned int p7580_chain_job_bytes(uint32_t type)
+{
+	switch (type) {
+	case P7580_JOB_TYPE_NULL:
+		return P7580_JOB_DESC_HDR_SIZE;
+	case P7580_JOB_TYPE_WRITE_VALUE:
+		return 64u;
+	case P7580_JOB_TYPE_VERTEX:
+		return 96u;
+	case P7580_JOB_TYPE_TILER:
+	case P7580_JOB_TYPE_FUSED:
+		return 192u;
+	case P7580_JOB_TYPE_FRAGMENT:
+		return 64u;
+	default:
+		return 0u;
+	}
+}
+
+static inline uint32_t p7580_chain_hdr_is64(const uint32_t w[8])
+{
+	return w[4] & 1u;
+}
+
+static inline uint32_t p7580_chain_hdr_type(const uint32_t w[8])
+{
+	return (w[4] >> 1) & 0x7fu;
+}
+
+static inline uint32_t p7580_chain_hdr_index(const uint32_t w[8])
+{
+	return w[4] >> 16;
+}
+
+/* next_job: Is64 selects the 64-bit union member (words 6+7); both     */
+/* halves are cleared when isolating, so either form terminates.        */
+static inline uint64_t p7580_chain_hdr_next(const uint32_t w[8])
+{
+	if (p7580_chain_hdr_is64(w))
+		return ((uint64_t)w[7] << 32) | w[6];
+	return (uint64_t)w[6];
+}
+
+static inline uint32_t p7580_chain_hdr_dep1(const uint32_t w[8])
+{
+	return w[5] & 0xffffu;
+}
+
+static inline uint32_t p7580_chain_hdr_dep2(const uint32_t w[8])
+{
+	return w[5] >> 16;
+}
+
+/* Turn one chain node into a standalone (single-job) descriptor:      */
+/* clear both dependency indices and the next pointer, and renumber the */
+/* index by its position in the split (1-based) so the JM never sees a */
+/* reference to a job that is not in this dispatch. Type/Is64/barrier  */
+/* survive.                                                            */
+static inline void p7580_chain_hdr_isolate(uint32_t w[8], unsigned int pos)
+{
+	w[4] = (w[4] & 0x0000ffffu) | ((uint32_t)(pos + 1u) << 16);
+	w[5] = 0;
+	w[6] = 0;
+	w[7] = 0;
+}
+
 #endif /* PANFROST7580_JM_HW_H */

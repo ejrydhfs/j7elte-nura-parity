@@ -2487,7 +2487,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,370 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_jm_hw.h - Midgard job-manager hardware interface for the
@@ -2743,6 +2743,118 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +static inline int p7580_jc_valid(uint64_t jc)
 +{
 +	return jc != 0 && (jc & 7u) == 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* gpu31-chainsplit: chain walk + per-node shadow descriptors.        */
++/*                                                                    */
++/* The v5.2 UAPI submits ONE jc: the head of a linked chain. On this  */
++/* part a chained submit is executed by the JM as one slot dispatch   */
++/* (next pointers are transparent transfer); the chain's END_FLUSH_   */
++/* CLEAN_INV therefore runs only once, after the LAST job. The        */
++/* gpu31-chainexec measurement proved the tiler then does not observe */
++/* the vertex shader's stores. The fix is a driver-side split: every  */
++/* chain node becomes its own sched job (its own START, hence its own */
++/* END_FLUSH_CLEAN_INV), serialised by drm_sched dependencies.        */
++/*                                                                    */
++/* A node cannot simply be dispatched with its original header: its   */
++/* next pointer would make the JM keep walking the rest of the chain, */
++/* and its job_index dependencies refer to nodes that are not in this */
++/* dispatch. Each split node is therefore rewritten into a driver-    */
++/* owned shadow descriptor: next = NULL, deps = 0, index = position+1.*/
++/* The payload (inline after the 32-byte header) is copied verbatim;  */
++/* all payload fields are self-contained GPU addresses, so copying is */
++/* safe. Header layout [KT] mali_kbase_defs.h:1689-1712 / midgard.xml: */
++/*   word 4: bit0 Is64, bits1..7 Type, bits8..15 barrier/reserved,     */
++/*           bits16..31 Index                                          */
++/*   word 5: dep1 low16 / dep2 high16                                  */
++/*   words 6..7: next_job (32-bit form uses word 6 only)               */
++/* ------------------------------------------------------------------ */
++#define P7580_CHAIN_MAX_JOBS		16u
++/* Shadow slot stride: 192 B is the largest Midgard job aggregate      */
++/* (Midgard Tiler Job, midgard.xml), padded to one cache-line pair.   */
++#define P7580_CHAIN_SLOT_STRIDE		256u
++#define P7580_CHAIN_HDR_WORDS		8u
++#define P7580_JOB_DESC_HDR_SIZE		32u
++
++/* Grounded job type numerics ([KT] mali_kbase_replay.c:29-34 for       */
++/* 1/5/7/8/9; 2 = WRITE_VALUE from the live chain decode).             */
++#define P7580_JOB_TYPE_NULL		1u
++#define P7580_JOB_TYPE_WRITE_VALUE	2u
++#define P7580_JOB_TYPE_VERTEX		5u
++#define P7580_JOB_TYPE_TILER		7u
++#define P7580_JOB_TYPE_FUSED		8u
++#define P7580_JOB_TYPE_FRAGMENT		9u
++
++/* Total bytes (header + inline payload) a shadow slot must carry.      */
++/* Null 32; Write Value 24 B payload (midgard.xml); Compute/Vertex     */
++/* 96 B (midgard.xml Compute Job: Draw ends at +96); Tiler/Fused 192 B */
++/* (Midgard Tiler Job size=192); Fragment 64 B (32 B header + 32 B     */
++/* payload fields through Tile Enable Map Row Stride).                 */
++static inline unsigned int p7580_chain_job_bytes(uint32_t type)
++{
++	switch (type) {
++	case P7580_JOB_TYPE_NULL:
++		return P7580_JOB_DESC_HDR_SIZE;
++	case P7580_JOB_TYPE_WRITE_VALUE:
++		return 64u;
++	case P7580_JOB_TYPE_VERTEX:
++		return 96u;
++	case P7580_JOB_TYPE_TILER:
++	case P7580_JOB_TYPE_FUSED:
++		return 192u;
++	case P7580_JOB_TYPE_FRAGMENT:
++		return 64u;
++	default:
++		return 0u;
++	}
++}
++
++static inline uint32_t p7580_chain_hdr_is64(const uint32_t w[8])
++{
++	return w[4] & 1u;
++}
++
++static inline uint32_t p7580_chain_hdr_type(const uint32_t w[8])
++{
++	return (w[4] >> 1) & 0x7fu;
++}
++
++static inline uint32_t p7580_chain_hdr_index(const uint32_t w[8])
++{
++	return w[4] >> 16;
++}
++
++/* next_job: Is64 selects the 64-bit union member (words 6+7); both     */
++/* halves are cleared when isolating, so either form terminates.        */
++static inline uint64_t p7580_chain_hdr_next(const uint32_t w[8])
++{
++	if (p7580_chain_hdr_is64(w))
++		return ((uint64_t)w[7] << 32) | w[6];
++	return (uint64_t)w[6];
++}
++
++static inline uint32_t p7580_chain_hdr_dep1(const uint32_t w[8])
++{
++	return w[5] & 0xffffu;
++}
++
++static inline uint32_t p7580_chain_hdr_dep2(const uint32_t w[8])
++{
++	return w[5] >> 16;
++}
++
++/* Turn one chain node into a standalone (single-job) descriptor:      */
++/* clear both dependency indices and the next pointer, and renumber the */
++/* index by its position in the split (1-based) so the JM never sees a */
++/* reference to a job that is not in this dispatch. Type/Is64/barrier  */
++/* survive.                                                            */
++static inline void p7580_chain_hdr_isolate(uint32_t w[8], unsigned int pos)
++{
++	w[4] = (w[4] & 0x0000ffffu) | ((uint32_t)(pos + 1u) << 16);
++	w[5] = 0;
++	w[6] = 0;
++	w[7] = 0;
 +}
 +
 +#endif /* PANFROST7580_JM_HW_H */
@@ -4195,7 +4307,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,300 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -4311,6 +4423,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	 * p7580_job_free releases the array. NULL when the job
 +	 * references no BOs. */
 +	void **bos;
++
++	/* gpu31-chainsplit: driver-owned shadow descriptor BO shared by
++	 * every node of one split chain (opaque; submit.c owns its
++	 * layout and refcount). NULL when this submit ran as a single
++	 * original descriptor (one-node chain with no deps). chain_len
++	 * is the number of nodes the walk found; chain_pos is this
++	 * node's 0-based position in that walk (diagnostics: dmesg
++	 * lines prove the split order). */
++	void *chain_shadow;
++	uint32_t chain_pos;
++	uint32_t chain_len;
 +};
 +
 +/* Per-file submit context: one sched entity per slot. */
@@ -6567,7 +6690,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1728 @@
+@@ -0,0 +1,1965 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -6608,6 +6731,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +#include <linux/pm_runtime.h>
 +#include <linux/uaccess.h>
 +#include <linux/slab.h>
++#include <linux/string.h>
 +
 +#include <drm/drmP.h>
 +#include <drm/drm.h>
@@ -6667,6 +6791,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +static void p7580_drv_job_pm_arm(struct p7580_drv *drv);
 +static void p7580_drv_job_pm_release(struct p7580_drv *drv);
 +
++/* gpu31-chainsplit: driver-owned shadow descriptor shared by the nodes
++ * of one split chain (definition with the split helpers below). free_job
++ * drops this job's reference. */
++struct p7580_chain_shadow;
++static void p7580_drv_shadow_put(struct p7580_chain_shadow *sh);
++
 +/* Scheduler backend ops for the 0004 shim. The sched job owner IS
 + * the submit job; the file state is recovered from the entity. */
 +static struct drm_sched p7580_drv_sched;
@@ -6704,6 +6834,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 + * path re-arms via trace_arm like the job trace). Raised by the
 + * debugfs iova_arm knob (jobs slice); 0 stops it. */
 +unsigned int p7580_iova_trace = 64;
++
++/* gpu31-chainsplit: one line per split submit (head jc, node count,
++ * shadow BO base) for the first 8 SUBMITs; the per-node dispatch lines
++ * already print each shadow jc. */
++static unsigned int p7580_chain_trace = 8;
 +
 +static unsigned int p7580_drv_run_seq = 0;
 +
@@ -7217,6 +7352,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			job->bos[i] = NULL;
 +		}
 +	}
++	/* gpu31-chainsplit: one reference per queued node; the last node
++	 * to retire unmaps the shared shadow descriptor (gpu_unmap also
++	 * unlinks its bo_list entry). Done before the PM release below,
++	 * same lifetime rule as the BO unrefs. */
++	if (job && job->chain_shadow)
++		p7580_drv_shadow_put(
++			(struct p7580_chain_shadow *)job->chain_shadow);
 +	/* ST-RETIRE: finish_work reached free_job (fence already
 +	 * signalled by the 0004 retire path); proves the full
 +	 * queue -> dispatch -> retire chain completed. Numeric (%lu)
@@ -7752,6 +7894,364 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	return 0;
 +}
 +
++/* ------------------------------------------------------------------ */
++/* gpu31-chainsplit: chain walk, shadow descriptors, per-node queue.  */
++/*                                                                    */
++/* The UAPI hands the driver one jc = chain head. A chained dispatch   */
++/* runs to the last next pointer before the slot reports DONE, so the  */
++/* chain's END_FLUSH_CLEAN_INV happens once, after the tiler; the      */
++/* vertex -> tiler handoff is then not visible (gpu31-chainexec). The  */
++/* driver splits the chain: every node is queued as its own sched job  */
++/* on the SAME slot entity, so each START carries the standard         */
++/* p7580_js_config() (START/END_FLUSH_CLEAN_INV) and the nodes are     */
++/* ordered by a drm_sched dependency on the previous node's armed      */
++/* fence. One submitted chain therefore becomes N sched jobs and one   */
++/* out_sync fence: the LAST node's fence covers the whole split.       */
++/*                                                                    */
++/* Each node is dispatched from a driver-owned shadow copy with        */
++/*   - next_job = NULL  (the JM must stop after this node),            */
++/*   - dep1/dep2 = 0    (ordering is enforced by drm_sched now; the    */
++/*                       original indices name nodes that are not in   */
++/*                       this dispatch),                               */
++/*   - index = position + 1 (well-formed standalone chain).            */
++/* The 32-byte header plus the inline payload is copied; every payload */
++/* field is an absolute GPU address, so the copy is relocatable.       */
++/* ------------------------------------------------------------------ */
++
++/* One shadow BO per submitted chain; every split job holds one object */
++/* reference and the last release unmaps it. iova is the GPU base. */
++struct p7580_chain_shadow {
++	struct drm_gem_object *obj;
++	uint64_t iova;
++	atomic_t refs;
++};
++
++/* Locate the live BO covering [gpu, gpu+len) and take a reference. */
++static int p7580_drv_gpu_span(struct p7580_drv *drv, uint64_t gpu,
++			      size_t len, struct drm_gem_object **out,
++			      uint64_t *base)
++{
++	struct p7580_drv_bo *e;
++	int found = 0;
++
++	if (!drv || !out || !base || !len)
++		return -EINVAL;
++	mutex_lock(&drv->bo_lock);
++	list_for_each_entry(e, &drv->bo_list, node) {
++		if (e->size < len || gpu < e->iova)
++			continue;
++		if (gpu - e->iova > e->size - len)
++			continue;
++		drm_gem_object_reference(e->obj);
++		*out = e->obj;
++		*base = e->iova;
++		found = 1;
++		break;
++	}
++	mutex_unlock(&drv->bo_lock);
++	return found ? 0 : -ENOENT;
++}
++
++/* Read len bytes of (already bound) GPU memory at gpu into dst. The   */
++/* read is clean-then-invalidate like the descriptor snapshot: the CPU */
++/* must not observe a stale line the GPU has already overwritten.      */
++static int p7580_drv_gpu_read(struct p7580_drv *drv, uint64_t gpu,
++			      void *dst, size_t len)
++{
++	struct drm_gem_object *obj;
++	struct p7580_bo *bo;
++	uint64_t base = 0;
++	size_t done = 0;
++	int ret;
++
++	ret = p7580_drv_gpu_span(drv, gpu, len, &obj, &base);
++	if (ret)
++		return ret;
++	bo = to_p7580_bo(obj);
++	p7580_gem_invalidate_for_cpu(obj);
++	while (done < len) {
++		uint64_t a = gpu + done;
++		unsigned int idx = (unsigned int)((a - base) >> PAGE_SHIFT);
++		unsigned int off = (unsigned int)(a & (PAGE_SIZE - 1));
++		size_t n = len - done;
++		void *kv;
++
++		if (n > PAGE_SIZE - off)
++			n = PAGE_SIZE - off;
++		if (idx >= bo->nr_pages || !bo->pages[idx]) {
++			ret = -EFAULT;
++			break;
++		}
++		kv = kmap_atomic(bo->pages[idx]);
++		memcpy((char *)dst + done, (char *)kv + off, n);
++		kunmap_atomic(kv);
++		done += n;
++	}
++	drm_gem_object_unreference_unlocked(obj);
++	return ret;
++}
++
++/* Write len bytes into the freshly created shadow BO (SHMEM pages).   */
++static int p7580_drv_shadow_write(struct drm_gem_object *obj, size_t off,
++				  const void *src, size_t len)
++{
++	struct p7580_bo *bo = to_p7580_bo(obj);
++	size_t done = 0;
++
++	while (done < len) {
++		size_t a = off + done;
++		unsigned int idx = (unsigned int)(a >> PAGE_SHIFT);
++		unsigned int poff = (unsigned int)(a & (PAGE_SIZE - 1));
++		size_t n = len - done;
++		void *kv;
++
++		if (n > PAGE_SIZE - poff)
++			n = PAGE_SIZE - poff;
++		if (idx >= bo->nr_pages || !bo->pages[idx])
++			return -EFAULT;
++		kv = kmap_atomic(bo->pages[idx]);
++		memcpy((char *)kv + poff, (const char *)src + done, n);
++		kunmap_atomic(kv);
++		done += n;
++	}
++	return 0;
++}
++
++/* Allocate + map the shadow BO holding `nodes` slots. The returned    */
++/* object carries exactly `nodes` references (one per split job); the  */
++/* create-time reference is job 0's, the rest are taken here.          */
++static struct p7580_chain_shadow *p7580_drv_shadow_create(
++		struct p7580_drv *drv, struct drm_device *dev,
++		unsigned int nodes)
++{
++	struct p7580_chain_shadow *sh;
++	struct drm_gem_object *obj = NULL;
++	size_t size;
++	unsigned int i;
++	int ret;
++
++	if (!nodes || nodes > P7580_CHAIN_MAX_JOBS)
++		return ERR_PTR(-EINVAL);
++	size = (size_t)nodes * P7580_CHAIN_SLOT_STRIDE;
++	sh = kzalloc(sizeof(*sh), GFP_KERNEL);
++	if (!sh)
++		return ERR_PTR(-ENOMEM);
++	ret = p7580_gem_create(&drv->gd, dev, size, P7580_BO_SHMEM, 0,
++			       &obj);
++	if (ret) {
++		kfree(sh);
++		return ERR_PTR(ret);
++	}
++	for (i = 1; i < nodes; i++)
++		drm_gem_object_reference(obj);
++	sh->obj = obj;
++	sh->iova = to_p7580_bo(obj)->iova;
++	atomic_set(&sh->refs, nodes);
++	ret = p7580_drv_map_bo(drv, obj);
++	if (ret) {
++		for (i = 0; i < nodes; i++)
++			drm_gem_object_unreference_unlocked(obj);
++		kfree(sh);
++		return ERR_PTR(ret);
++	}
++	return sh;
++}
++
++/* Drop one split job's reference; the last one unmaps the shadow BO   */
++/* before dropping its final object reference (gpu_unmap unlinks the   */
++/* bo_list entry and invalidates the TLB range).                      */
++static void p7580_drv_shadow_put(struct p7580_chain_shadow *sh)
++{
++	int last;
++
++	if (!sh)
++		return;
++	last = atomic_dec_and_test(&sh->refs);
++	if (last)
++		p7580_gem_gpu_unmap(sh->obj);
++	drm_gem_object_unreference_unlocked(sh->obj);
++	if (last)
++		kfree(sh);
++}
++
++/* Shared context for the per-node build/queue helper. */
++struct p7580_split_ctx {
++	struct p7580_drv *drv;
++	struct drm_device *dev;
++	struct p7580_drv_file *df;
++	struct drm_sched_entity *entity;
++	int slot;
++	uint32_t requirements;
++	uint32_t out_sync;
++	struct drm_gem_object **objs;
++	uint32_t *hsave;
++	unsigned int nr;
++	struct dma_fence **inf;
++	unsigned int nf;
++	struct p7580_chain_shadow *shadow;
++	unsigned int nodes;
++};
++
++/* Build one sched job for chain node `pos` and queue it on the slot    */
++/* entity. prev is the fence this node must wait for (pos 0: the serial */
++/* predecessor; pos > 0: the previous split node's armed fence).        */
++/* External in-fences and BO exclusion fences attach to node 0 only:    */
++/* the split's own chain orders everything after it.                    */
++/* On success *fence_out holds one caller reference to the armed fence  */
++/* (may be NULL if arm failed closed). On failure nothing is queued and */
++/* every reference taken by this helper is dropped.                     */
++static int p7580_drv_split_queue(struct p7580_split_ctx *s,
++				 unsigned int pos, uint64_t jc,
++				 const uint32_t hdr[8],
++				 struct dma_fence *prev,
++				 struct dma_fence **fence_out)
++{
++	struct p7580_submit_job *job;
++	struct drm_sched_job *sched_job = NULL;
++	struct dma_fence *fence_ref = NULL;
++	unsigned int i;
++	int ret;
++
++	*fence_out = NULL;
++	job = kzalloc(sizeof(*job), GFP_KERNEL);
++	if (!job)
++		return -ENOMEM;
++	job->seqno = s->df->next_seqno++;
++	job->slot = s->slot;
++	job->file_priv = s->df;
++	job->drv_priv = s->drv;
++	job->jc = jc;
++	job->requirements = s->requirements;
++	job->as_nr = P7580_DRV_AS_NR;
++	job->affinity = s->drv->jd.shader_present;
++	job->chain_shadow = s->shadow;
++	job->chain_pos = pos;
++	job->chain_len = s->nodes;
++	memcpy(job->desc, hdr, sizeof(job->desc));
++	if (pos + 1 == s->nodes)
++		job->out_sync = s->out_sync;
++
++	/* Per-job BO references (gpu31-chainsplit): every split node owns
++	 * its own set, so free_job retires each node's sync + refs in
++	 * retire order and no job depends on another's lifetime. The
++	 * caller's lookup references stay in objs[] until the whole
++	 * split has been queued. */
++	if (s->nr) {
++		job->bos = kcalloc(s->nr, sizeof(*job->bos), GFP_KERNEL);
++		job->iova_handles = kcalloc(s->nr,
++					    sizeof(*job->iova_handles),
++					    GFP_KERNEL);
++		job->iova_addrs = kcalloc(s->nr,
++					  sizeof(*job->iova_addrs),
++					  GFP_KERNEL);
++		job->iova_sizes = kcalloc(s->nr,
++					  sizeof(*job->iova_sizes),
++					  GFP_KERNEL);
++		if (!job->bos || !job->iova_handles || !job->iova_addrs ||
++		    !job->iova_sizes) {
++			ret = -ENOMEM;
++			goto err_job;
++		}
++		for (i = 0; i < s->nr; i++) {
++			struct p7580_bo *sbo = to_p7580_bo(s->objs[i]);
++
++			drm_gem_object_reference(s->objs[i]);
++			job->bos[i] = s->objs[i];
++			job->iova_handles[i] = s->hsave[i];
++			job->iova_addrs[i] = sbo->iova;
++			job->iova_sizes[i] = (uint32_t)sbo->base.size;
++		}
++		job->bo_count = s->nr;
++		job->iova_bo_count = s->nr;
++	}
++
++	sched_job = drm_sched_job_alloc(s->entity, &p7580_drv_sched_ops,
++					job);
++	if (!sched_job) {
++		ret = -ENOMEM;
++		goto err_job;
++	}
++	if (!s->entity || sched_job->entity != s->entity ||
++	    sched_job->ops != &p7580_drv_sched_ops ||
++	    !sched_job->ops->run_job || !sched_job->ops->alloc_fence) {
++		ret = -EFAULT;
++		goto err_sched;
++	}
++	sched_job->slot = s->slot;
++	drm_sched_job_arm(sched_job);
++	if (sched_job->fence)
++		fence_ref = dma_fence_get(sched_job->fence);
++
++	/* Ordering: this node waits for the previous fence. For pos 0
++	 * that is the per-file serial predecessor; for every later node
++	 * it is the node queued immediately before it, which is what
++	 * gives the split its strict WRITE_VALUE -> VERTEX -> TILER
++	 * order across separate dispatches. */
++	if (prev && prev != sched_job->fence &&
++	    !dma_fence_is_signaled(prev)) {
++		ret = drm_sched_job_add_dependency(sched_job, prev);
++		if (ret)
++			goto err_sched;
++	}
++	if (pos == 0) {
++		for (i = 0; i < s->nf; i++) {
++			if (dma_fence_is_signaled(s->inf[i]))
++				continue;
++			ret = drm_sched_job_add_dependency(sched_job,
++							   s->inf[i]);
++			if (ret)
++				goto err_sched;
++		}
++		for (i = 0; i < s->nr; i++) {
++			struct p7580_bo *bo = to_p7580_bo(s->objs[i]);
++			struct dma_fence *f = dma_resv_get_excl(&bo->resv);
++
++			if (f) {
++				if (!dma_fence_is_signaled(f))
++					ret = drm_sched_job_add_dependency(
++						sched_job, f);
++				dma_fence_put(f);
++				if (ret)
++					goto err_sched;
++			}
++		}
++	}
++
++	/* Per-job runtime-PM lifetime: armed before the job becomes
++	 * visible to the async worker, released in free_job. */
++	p7580_drv_job_pm_arm(s->drv);
++	ret = drm_sched_job_submit(sched_job);
++	if (ret) {
++		p7580_drv_job_pm_release(s->drv);
++		goto err_sched;
++	}
++	if (p7580_sched_trace) {
++		p7580_sched_trace--;
++		pr_info("p7580_sched: split seq=%u pos=%u/%u slot=%d jc=0x%llx rc=0\n",
++			job->seqno, pos, s->nodes - 1, s->slot,
++			(unsigned long long)jc);
++	}
++	*fence_out = fence_ref;
++	return 0;
++
++err_sched:
++	if (fence_ref)
++		dma_fence_put(fence_ref);
++	drm_sched_job_cleanup(sched_job);
++	kfree(sched_job);
++err_job:
++	if (job->bos) {
++		for (i = 0; i < job->bo_count; i++) {
++			if (job->bos[i])
++				drm_gem_object_unreference_unlocked(
++					job->bos[i]);
++		}
++		job->bo_count = 0;
++	}
++	p7580_job_free(job);
++	return ret;
++}
++
 +int p7580_drv_submit(struct p7580_drv *drv, struct drm_device *dev,
 +		     struct drm_file *file_priv,
 +		     const struct p7580_submit *args)
@@ -7760,10 +8260,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	struct drm_gem_object *objs[P7580_MAX_SUBMIT_BOS];
 +	uint32_t hsave[P7580_MAX_SUBMIT_BOS];
 +	struct dma_fence *inf[P7580_MAX_IN_SYNCS];
-+	struct p7580_submit_job *job;
 +	struct drm_sched_entity *entity;
-+	struct drm_sched_job *sched_job;
-+	struct dma_fence *published = NULL;
 +	unsigned int i, nr = 0, nf = 0;
 +	/* gpu31-mmaprefs closure probe: at most 8 ledger lines per
 +	 * submit so the job trace budget is never starved. */
@@ -7865,367 +8362,230 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		}
 +	}
 +
-+	/* 3. job + sched dispatch. */
-+	job = kzalloc(sizeof(*job), GFP_KERNEL);
-+	if (!job) {
-+ret = (int)p7580_submit_err("job", -ENOMEM);
-+		goto err_objs;
-+	}
-+	job->seqno = df->next_seqno++;
-+	job->slot = slot;
-+	/* Probenumeric: stamp the dispatch context on the job so the async
-+	 * workers never re-derive it from the entity pointer (int14: df
-+	 * came back wrong -> ENODEV before ST-RUN). Entity math survives
-+	 * in run_job only as a range-checked fallback. */
-+	job->file_priv = df;
-+	job->drv_priv = drv;
-+	job->run_seq = 0;
-+	job->jc = args->jc;
-+	job->requirements = args->requirements;
-+	job->as_nr = P7580_DRV_AS_NR;
-+	job->affinity = drv->jd.shader_present;
-+	/* SUBMIT-time descriptor snapshot (gpu31-lastjob, extended
-+	 * gpu31-submitsnap, corrected gpu31-jddecode): the 8 words at
-+	 * jc, read from the mapped BO before submit-sync. Owner lookup
-+	 * uses the live drv->bo_list (same scan the fault-time PTEWALK
-+	 * pin uses) instead of the submit-local objs[]/iova_valid view:
-+	 * the PTEWALK live scan demonstrably hits (live= range) on
-+	 * jobs whose objs[]-based snapshot missed (snap=0x0/0x0), so
-+	 * the snapshot now resolves the same way the fault path does.
-+	 * Variant B (chain_mode==2) clears descriptor bit0 in the
-+	 * snapshot consumed at dispatch; the stored BO bytes are
-+	 * patched too (via vmap + submit-sync re-drain), next pointer
-+	 * stays NULL. Mode 0/1 snapshot only. Stays zero when the
-+	 * snapshot is unavailable (cross-page jc, unmapped page, jc
-+	 * outside every bound BO, or BO pages unavailable). */
++	/* 3. gpu31-chainsplit: walk the submitted chain (next pointers)
++	 * and queue one sched job per node on this slot's entity. Each
++	 * node gets its own START, so the standard p7580_js_config()
++	 * (START/END_FLUSH_CLEAN_INV) brackets every stage and the
++	 * vertex->tiler handoff crosses a real submit boundary.
++	 * Ordering is a drm_sched dependency on the previous node; the
++	 * ioctl's out_sync goes on the LAST node's fence only. */
 +	{
-+		struct p7580_bo *jbo = NULL;
-+		struct drm_gem_object *jobj = NULL;
-+		mutex_lock(&drv->bo_lock);
-+		{
-+			struct p7580_drv_bo *le;
++		uint32_t hdr[P7580_CHAIN_MAX_JOBS][P7580_CHAIN_HDR_WORDS];
++		uint64_t jcs[P7580_CHAIN_MAX_JOBS];
++		struct p7580_chain_shadow *shadow = NULL;
++		struct p7580_split_ctx sctx;
++		struct dma_fence *serial_prev = NULL;
++		struct dma_fence *last_fence = NULL;
++		unsigned int nodes = 0, queued = 0, ci;
++		int need_shadow;
++		uint64_t walk = args->jc;
 +
-+			list_for_each_entry(le, &drv->bo_list, node) {
-+				if (args->jc >= le->iova &&
-+				    args->jc + 32 <= le->iova + le->size) {
-+					drm_gem_object_reference(le->obj);
-+					jobj = le->obj;
-+					break;
++		ret = 0;
++
++		for (;;) {
++			uint64_t next;
++
++			if (nodes == P7580_CHAIN_MAX_JOBS) {
++				ret = (int)p7580_submit_err("chain", -E2BIG);
++				goto err_split;
++			}
++			ret = p7580_drv_gpu_read(drv, walk, hdr[nodes],
++						 P7580_JOB_DESC_HDR_SIZE);
++			if (ret) {
++				ret = (int)p7580_submit_err("chain", ret);
++				goto err_split;
++			}
++			/* Only grounded Midgard job aggregates can be
++			 * isolated into a shadow slot. */
++			if (!p7580_chain_job_bytes(
++					p7580_chain_hdr_type(hdr[nodes]))) {
++				ret = (int)p7580_submit_err("chain", -EINVAL);
++				goto err_split;
++			}
++			jcs[nodes] = walk;
++			nodes++;
++			next = p7580_chain_hdr_next(hdr[nodes - 1]);
++			if (!next)
++				break;
++			if (!p7580_jc_valid(next)) {
++				ret = (int)p7580_submit_err("chain", -EINVAL);
++				goto err_split;
++			}
++			walk = next;
++		}
++
++		/* A one-node chain with no dependency indices is already a
++		 * standalone dispatch (Mesa's fragment submit): keep the
++		 * original descriptor and allocate no shadow BO. */
++		need_shadow = nodes > 1 ||
++			p7580_chain_hdr_dep1(hdr[0]) ||
++			p7580_chain_hdr_dep2(hdr[0]);
++
++		if (need_shadow) {
++			shadow = p7580_drv_shadow_create(drv, dev, nodes);
++			if (IS_ERR(shadow)) {
++				ret = (int)p7580_submit_err("chain",
++							    PTR_ERR(shadow));
++				shadow = NULL;
++				goto err_split;
++			}
++			for (ci = 0; ci < nodes; ci++) {
++				uint32_t jobw[48];
++				unsigned int bytes = p7580_chain_job_bytes(
++					p7580_chain_hdr_type(hdr[ci]));
++
++				/* Copy header + inline payload, then
++				 * isolate: next = NULL, deps = 0,
++				 * index = position + 1. */
++				ret = p7580_drv_gpu_read(drv, jcs[ci], jobw,
++							 bytes);
++				if (ret) {
++					ret = (int)p7580_submit_err("chain",
++								    ret);
++					goto err_split;
++				}
++				p7580_chain_hdr_isolate(jobw, ci);
++				memcpy(hdr[ci], jobw,
++				       P7580_JOB_DESC_HDR_SIZE);
++				ret = p7580_drv_shadow_write(shadow->obj,
++					(size_t)ci * P7580_CHAIN_SLOT_STRIDE,
++					jobw, bytes);
++				if (ret) {
++					ret = (int)p7580_submit_err("chain",
++								    ret);
++					goto err_split;
 +				}
 +			}
-+		}
-+		mutex_unlock(&drv->bo_lock);
-+		if (jobj)
-+			jbo = to_p7580_bo(jobj);
-+		if (jbo && jbo->pages) {
-+			uint32_t off = (uint32_t)(args->jc - jbo->iova);
-+			unsigned int idx = off >> PAGE_SHIFT;
-+			unsigned int poff = off & (PAGE_SIZE - 1);
-+			if (idx < jbo->nr_pages && jbo->pages[idx] &&
-+			    poff + 32 <= PAGE_SIZE) {
-+				void *kv;
-+				unsigned int wi;
-+				/* gpu31-cachedir: snapshot read =
-+				 * CLEAN-THEN-INVALIDATE, not a bare
-+				 * invalidate. The clean writes back
-+				 * any dirty line the CPU put in the
-+				 * kernel alias (kmap/vmap fills); the
-+				 * invalidate drops the alias's stale
-+				 * CLEAN lines so the bytes below come
-+				 * from DRAM (userspace WC writes land
-+				 * there directly). A bare invalidate
-+				 * here discarded CPU-filled JD bytes
-+				 * -- wrong direction for a buffer the
-+				 * CPU just wrote. */
-+				p7580_gem_invalidate_for_cpu(&jbo->base);
-+				kv = kmap_atomic(jbo->pages[idx]);
-+				for (wi = 0; wi < 8; wi++)
-+					job->desc[wi] =
-+						*(uint32_t *)((char *)kv +
-+							poff + wi * 4);
-+				if (drv->jd.chain_mode == 2) {
-+					job->desc[4] &= ~0x1u;
-+					*(uint32_t *)((char *)kv + poff + 16) =
-+						job->desc[4];
-+				}
-+				kunmap_atomic(kv);
-+				if (drv->jd.chain_mode == 2)
-+					p7580_gem_submit_sync(&jbo->base);
++			/* Publish every rewritten descriptor to DRAM. */
++			p7580_gem_submit_sync(shadow->obj);
++			for (ci = 0; ci < nodes; ci++)
++				jcs[ci] = shadow->iova +
++					(uint64_t)ci *
++						P7580_CHAIN_SLOT_STRIDE;
++			if (p7580_chain_trace) {
++				p7580_chain_trace--;
++				pr_info("p7580_sched: chain jc=0x%llx nodes=%u shadow=0x%llx stride=%u\n",
++					(unsigned long long)args->jc, nodes,
++					(unsigned long long)shadow->iova,
++					P7580_CHAIN_SLOT_STRIDE);
 +			}
 +		}
-+		if (jobj)
-+			drm_gem_object_unreference_unlocked(jobj);
-+	}
-+	/* F-JT1 stash: SUBMIT-time sched_job->fence is still NULL, so
-+	 * validate the handle now (-ENOENT preserved) and let the
-+	 * async run_job install the real fence on this handle. */
-+	if (args->out_sync) {
-+		struct drm_syncobj *vs =
-+			drm_syncobj_find(&df->mgr, args->out_sync);
 +
-+		if (!vs) {
-+			p7580_job_free(job);
-+ret = (int)p7580_submit_err("out_sync", -ENOENT);
-+			goto err_objs;
++		/* Validate out_sync before anything is queued (-ENOENT
++		 * contract preserved from the single-job path). */
++		if (args->out_sync) {
++			struct drm_syncobj *vs =
++				drm_syncobj_find(&df->mgr, args->out_sync);
++
++			if (!vs) {
++				ret = (int)p7580_submit_err("out_sync",
++							    -ENOENT);
++				goto err_split;
++			}
++			drm_syncobj_put(vs);
 +		}
-+		drm_syncobj_put(vs);
-+		job->out_sync = args->out_sync;
-+	}
-+	/* F-JT2 own: transfer one lookup ref per BO onto the job so
-+	 * free_job can retire HIGHMEM SHMEM pages without a
-+	 * file/handle lookup (stable across close; no locks).
-+	 * gpu31-jddecode: stamp bo_count here — every consumer of
-+	 * bos[] (submit snapshot owner check, PTEWALK snapshot scan,
-+	 * pre-signal sync, excl publish, free_job unref) keys off
-+	 * bo_count, and without this stamp all of them silently
-+	 * no-op (sw stayed zero, excl never published). */
-+	if (nr) {
-+		job->bos = kcalloc(nr, sizeof(*job->bos), GFP_KERNEL);
-+		if (!job->bos) {
-+			p7580_job_free(job);
-+ret = (int)p7580_submit_err("job", -ENOMEM);
-+			goto err_objs;
-+		}
-+		for (i = 0; i < nr; i++)
-+			job->bos[i] = objs[i];
-+		job->bo_count = nr;
-+	}
-+	/* gpu31-iova: BO identity snapshot for the ERR-pin mapping dump.
-+	 * Stamped at SUBMIT while the job owns refs (stable handles +
-+	 * IOVA/size); the ERR pin renders it via the resolver hook (no
-+	 * GEM dereference in IRQ context). Freed in p7580_job_free. */
-+	if (nr) {
-+		job->iova_handles = kcalloc(nr, sizeof(*job->iova_handles),
-+					    GFP_KERNEL);
-+		job->iova_addrs = kcalloc(nr, sizeof(*job->iova_addrs),
-+					  GFP_KERNEL);
-+		job->iova_sizes = kcalloc(nr, sizeof(*job->iova_sizes),
-+					  GFP_KERNEL);
-+		if (!job->iova_handles || !job->iova_addrs ||
-+		    !job->iova_sizes) {
-+			p7580_job_free(job);
-+ret = (int)p7580_submit_err("job", -ENOMEM);
-+			goto err_objs;
-+		}
-+		for (i = 0; i < nr; i++) {
-+			struct p7580_bo *sbo = to_p7580_bo(objs[i]);
 +
-+			job->iova_handles[i] = hsave[i];
-+			job->iova_addrs[i] = sbo->iova;
-+			job->iova_sizes[i] = (uint32_t)sbo->base.size;
-+		}
-+		job->iova_bo_count = nr;
-+	}
-+
-+	sched_job = drm_sched_job_alloc(entity, &p7580_drv_sched_ops, job);
-+	if (!sched_job) {
-+		p7580_job_free(job);
-+ret = (int)p7580_submit_err("job", -ENOMEM);
-+		goto err_objs;
-+	}
-+
-+/* Opsfix call-site guard: the int13 silicon trace showed ST-OPS
-+ * ops=0/run=0 despite this exact call passing
-+ * &p7580_drv_sched_ops. A NULL entity or a store that does not
-+ * round-trip means a stale .o / duplicate shim copy won the link,
-+ * never a real NULL-ops job: fail the ioctl, do not queue. */
-+BUILD_BUG_ON(offsetof(struct drm_sched_job, ops) != 24);
-+if (!entity || sched_job->entity != entity ||
-+    sched_job->ops != &p7580_drv_sched_ops || !sched_job->ops->run_job ||
-+    !sched_job->ops->alloc_fence) {
-+		drm_sched_job_cleanup(sched_job);
-+		p7580_job_free(job);
-+		kfree(sched_job);
-+ret = (int)p7580_submit_err("ops", -EFAULT);
-+		goto err_objs;
-+	}
-+	/* Pumpfix: carry the SUBMIT-chosen slot on the sched job so the
-+	 * async run_job never re-derives it from the entity pointer
-+	 * (container layouts shift the index; int12 derived 0 for a
-+	 * slot-1 submit and bailed before ST-RUN). */
-+	sched_job->slot = slot;
-+	/* Arm-time fence (gpu31-armfence): allocate job->fence BEFORE
-+	 * queueing so the out_sync install below hands Mesa a live
-+	 * fence. Fails closed: NULL fence keeps the old run_job-time
-+	 * NULL-install shape (job still runs; waiters see no fence). */
-+	drm_sched_job_arm(sched_job);
-+
-+	/* Per-file serial chain (gpu31-serialfence): make submits from
-+	 * one file strictly ordered. Attach the previous job's armed
-+	 * fence as an implicit dependency (when it is still unsignaled)
-+	 * and then replace the slot with this job's armed fence. Slot
-+	 * assignment above is untouched (requirements -> slot). The
-+	 * dispatch context (df) is stable here: the ioctl holds the file
-+	 * (driver_priv) across this call, and close drains entities
-+	 * before freeing df (file_fini). Slot replacement happens
-+	 * before queueing so a concurrent SUBMIT serialises on
-+	 * serial_lock and always sees the newest predecessor.
-+	 * Signaled (retired) previous fences are skipped:
-+	 * they impose no ordering and must not accumulate AND leaves.
-+	 * Same-fence submission (should not happen: every SUBMIT arms
-+	 * a fresh fence, but guarded anyway) is skipped by the
-+	 * duplicate check in add_dependency. */
-+	{
-+		struct dma_fence *prev;
-+
-+		/* Borrow the previous fence under the lock; take a
-+		 * temporary ref so it cannot be freed by a concurrent
-+		 * close while add_dependency reads it. The put after
-+		 * the attach balances this get (add_dependency holds
-+		 * its own ref when it gates). */
++		/* Per-file serial predecessor: one temporary ref, used by
++		 * node 0 and released after the attach attempt. */
 +		mutex_lock(&df->serial_lock);
-+		prev = df->serial_prev;
-+		if (prev)
-+			dma_fence_get(prev);
++		serial_prev = df->serial_prev;
++		if (serial_prev)
++			dma_fence_get(serial_prev);
 +		mutex_unlock(&df->serial_lock);
-+		if (prev && prev != sched_job->fence &&
-+		    !dma_fence_is_signaled(prev)) {
-+			ret = drm_sched_job_add_dependency(sched_job, prev);
-+			dma_fence_put(prev);
-+			if (ret) {
-+				ret = (int)p7580_submit_err("dep", ret);
-+				drm_sched_job_cleanup(sched_job);
-+				kfree(sched_job);
-+				goto err_job_bos;
-+			}
-+		} else if (prev) {
-+			dma_fence_put(prev);
-+		}
-+		/* Publish this job's armed fence as the new previous.
-+		 * The slot holds one ref; the job/out_sync path owns
-+		 * the other refs (installed below, released at retire).
-+		 * A NULL armed fence (arm failed closed) clears the
-+		 * chain: the next SUBMIT has no predecessor to wait on. */
-+		published = sched_job->fence;
-+		mutex_lock(&df->serial_lock);
-+		if (df->serial_prev)
-+			dma_fence_put(df->serial_prev);
-+		df->serial_prev = published;
-+		if (df->serial_prev)
-+			dma_fence_get(df->serial_prev);
-+		mutex_unlock(&df->serial_lock);
-+	}
 +
-+	for (i = 0; i < nf; i++) {
-+		if (!dma_fence_is_signaled(inf[i])) {
-+			ret = drm_sched_job_add_dependency(sched_job,
-+							   inf[i]);
-+			if (ret) {
-+				ret = (int)p7580_submit_err("dep", ret);
-+				drm_sched_job_cleanup(sched_job);
-+				kfree(sched_job);
-+				goto err_job_bos;
-+			}
-+		}
-+	}
-+	/* Implicit BO excl fences as deps (unsignaled only). */
-+	for (i = 0; i < nr; i++) {
-+		struct p7580_bo *bo = to_p7580_bo(objs[i]);
-+		struct dma_fence *f;
++		sctx.drv = drv;
++		sctx.dev = dev;
++		sctx.df = df;
++		sctx.entity = entity;
++		sctx.slot = slot;
++		sctx.requirements = args->requirements;
++		sctx.out_sync = args->out_sync;
++		sctx.objs = objs;
++		sctx.hsave = hsave;
++		sctx.nr = nr;
++		sctx.inf = inf;
++		sctx.nf = nf;
++		sctx.shadow = shadow;
++		sctx.nodes = nodes;
 +
-+		/* 0002 get_excl locks resv->lock internally: never take it here
-+		 * (plain non-recursive mutex self-deadlocks the submitter in D
-+		 * state; SUBMIT-DEADLOCK FIX). */
-+		f = dma_resv_get_excl(&bo->resv);
-+		if (f) {
-+			if (!dma_fence_is_signaled(f))
-+				ret = drm_sched_job_add_dependency(sched_job,
-+								   f);
-+			dma_fence_put(f);
++		for (ci = 0; ci < nodes; ci++) {
++			struct dma_fence *prev =
++				ci ? last_fence : serial_prev;
++			struct dma_fence *fence = NULL;
++
++			ret = p7580_drv_split_queue(&sctx, ci, jcs[ci],
++						    hdr[ci], prev, &fence);
++			if (ci == 0 && serial_prev) {
++				dma_fence_put(serial_prev);
++				serial_prev = NULL;
++			}
 +			if (ret) {
-+				ret = (int)p7580_submit_err("dep", ret);
-+				drm_sched_job_cleanup(sched_job);
-+				kfree(sched_job);
-+				goto err_job_bos;
++				ret = (int)p7580_submit_err("queue", ret);
++				break;
++			}
++			if (last_fence)
++				dma_fence_put(last_fence);
++			last_fence = fence;
++			queued++;
++		}
++
++		/* One out-fence for the whole split: install on the last
++		 * queued node's armed fence. On a partial queue failure
++		 * that is the last node the GPU accepted, so a waiter
++		 * still observes the work that did run. */
++		if (queued && args->out_sync && last_fence) {
++			struct drm_syncobj *s =
++				drm_syncobj_find(&df->mgr, args->out_sync);
++
++			if (!s) {
++				ret = (int)p7580_submit_err("out_sync",
++							    -ENOENT);
++			} else {
++				int oret = drm_syncobj_replace_fence(s,
++								     last_fence);
++
++				drm_syncobj_put(s);
++				if (oret)
++					ret = (int)p7580_submit_err(
++						"out_sync", oret);
 +			}
 +		}
-+	}
 +
-+	/* Arm the job-lifetime power hold BEFORE the job is visible
-+	 * to the async worker: from drm_sched_job_submit on, run_job
-+	 * may touch HEAD/START at any moment. The ioctl's synchronous
-+	 * ref (held by our caller) covers the map + queue legs; this
-+	 * second ref covers queue -> retire. Queue failure below never
-+	 * publishes the job, so unwind the arm there. */
-+	p7580_drv_job_pm_arm(drv);
-+	ret = drm_sched_job_submit(sched_job);
-+	/* ST-QUEUE: 0004 accepted (0) or refused (ret) the job. */
-+	if (p7580_sched_trace) {
-+		p7580_sched_trace--;
-+		pr_info("p7580_sched: queued seq=%u slot=%d submit_rc=%d\n",
-+			job->seqno, slot, ret);
-+	}
-+	if (ret) {
-+		ret = (int)p7580_submit_err("queue", ret);
-+		p7580_drv_job_pm_release(drv);
-+		drm_sched_job_cleanup(sched_job);
-+		kfree(sched_job);
-+		goto err_job_bos;
-+	}
++		/* Publish the split's final fence as the file serial
++		 * predecessor (one slot ref). A partial failure publishes
++		 * the last node that queued, so the next SUBMIT still
++		 * orders behind everything accepted here. */
++		if (queued) {
++			struct dma_fence *old = NULL;
 +
-+	/* 4. out-sync install (takes its own ref). The fence is armed
-+	 * above, before queueing: installing it HERE (during the ioctl)
-+	 * is the whole fix -- Mesa holds a live fence at SUBMIT return
-+	 * and cannot recycle the batch BO while the GPU still reads
-+	 * it. Arm-fail-closed: a NULL fence installs nothing (the job
-+	 * still runs). The handle was validated before queueing, so a
-+	 * missing handle here is -ENOENT on a handle closed under us. */
-+	if (args->out_sync) {
-+		struct dma_fence *fence = sched_job->fence;
-+		struct drm_syncobj *s;
-+
-+		s = drm_syncobj_find(&df->mgr, args->out_sync);
-+		if (!s) {
-+ret = (int)p7580_submit_err("out_sync", -ENOENT);
-+			goto err_out;
++			mutex_lock(&df->serial_lock);
++			old = df->serial_prev;
++			df->serial_prev = last_fence;
++			if (df->serial_prev)
++				dma_fence_get(df->serial_prev);
++			mutex_unlock(&df->serial_lock);
++			if (old)
++				dma_fence_put(old);
 +		}
-+		if (fence)
-+			ret = drm_syncobj_replace_fence(s, fence);
-+		drm_syncobj_put(s);
-+		if (ret)
-+			goto err_out;
-+	}
 +
-+	/* Success: the job owns one ref per BO now (job->bos);
-+	 * drop only the in-fence refs here. bo_list holds its own
-+	 * refs from map_bo; free_job drops the job's refs after
-+	 * the completion retire walk. */
-+	for (i = 0; i < nf; i++)
-+		dma_fence_put(inf[i]);
-+	return 0;
-+
-+err_out:
-+	/* Submitted but out-sync failed: the job still runs (and
-+	 * still owns its BO refs); report. */
-+	for (i = 0; i < nf; i++)
-+		dma_fence_put(inf[i]);
-+	return ret;
-+
-+err_job_bos:
-+	/* Roll back the serial chain when this SUBMIT published but
-+	 * never queued (dep/queue failure above): retract the slot ref
-+	 * only if it still points at this job's fence. sched_job is
-+	 * freed below, so compare by the saved pointer, not through
-+	 * it. A concurrent SUBMIT cannot interleave here (one file's
-+	 * ioctls serialise in the caller), but close may have cleared
-+	 * the slot; the check keeps the put balanced either way. */
-+	if (published) {
-+		mutex_lock(&df->serial_lock);
-+		if (df->serial_prev == published) {
-+			dma_fence_put(df->serial_prev);
-+			df->serial_prev = NULL;
++err_split:
++		/* Nodes that never queued still own one shadow reference
++		 * each; queued nodes release theirs in free_job. */
++		if (shadow) {
++			for (ci = queued; ci < nodes; ci++)
++				p7580_drv_shadow_put(shadow);
 +		}
-+		mutex_unlock(&df->serial_lock);
++		if (last_fence)
++			dma_fence_put(last_fence);
++		if (serial_prev)
++			dma_fence_put(serial_prev);
 +	}
-+	/* Job owns one ref per BO (transferred at dispatch) but was
-+	 * never published: p7580_job_free releases the pointer array
-+	 * (canon, no unref — refs are still ours in objs[]). */
-+	p7580_job_free(job);
-+	job = NULL;
-+err_objs:
++
++	/* The ioctl's lookup references and in-fence references are no
++	 * longer needed: each queued node owns its own set, and the
++	 * sched dependency graph owns the external fence references. */
 +	for (i = 0; i < nr; i++)
 +		drm_gem_object_unreference_unlocked(objs[i]);
-+err_inf:
 +	for (i = 0; i < nf; i++)
 +		dma_fence_put(inf[i]);
 +	return ret;

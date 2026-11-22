@@ -118,6 +118,17 @@ struct p7580_submit_job {
 	 * p7580_job_free releases the array. NULL when the job
 	 * references no BOs. */
 	void **bos;
+
+	/* gpu31-chainsplit: driver-owned shadow descriptor BO shared by
+	 * every node of one split chain (opaque; submit.c owns its
+	 * layout and refcount). NULL when this submit ran as a single
+	 * original descriptor (one-node chain with no deps). chain_len
+	 * is the number of nodes the walk found; chain_pos is this
+	 * node's 0-based position in that walk (diagnostics: dmesg
+	 * lines prove the split order). */
+	void *chain_shadow;
+	uint32_t chain_pos;
+	uint32_t chain_len;
 };
 
 /* Per-file submit context: one sched entity per slot. */
