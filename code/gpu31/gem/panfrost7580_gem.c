@@ -17,16 +17,36 @@
  *    attr; NO_KERNEL_MAPPING is ignored by the arm64 backend and
  *    FORCE_CONTIGUOUS is a display-side mistaken carry-over, so neither
  *    is set here).
- *  - CPU mmap is IMMEDIATE (exynos_drm_gem_mmap_buffer /
- *    drm_gem_cma_mmap shape): pgprot_writecombine + dma_mmap_attrs
- *    for CMA (plain WRITE_COMBINE only), remap_pfn_range per page
- *    for SHMEM/imported. Fault-driven vm_insert_mixed cannot work:
- *    drm_gem_mmap() sets VM_PFNMAP and installs driver->gem_vm_ops
- *    itself (EINVAL when that table is NULL); clearing PFNMAP for
- *    VM_MIXEDMAP + swapping in a second ops table breaks the core
- *    contract (mmap -EINVAL, never faults). The fault helper stays
- *    for reference only. WC/cached prot selection is exynos
- *    update_vm_cache_attr shape.
+ *  - CPU mmap is FAULT-DRIVEN for local SHMEM BOs (gpu31-mmaprefs).
+ *    drm_gem_mmap() installs this driver's gem_vm_ops and the
+ *    VM_IO|VM_PFNMAP|VM_DONTEXPAND|VM_DONTDUMP flags; the handler
+ *    clears VM_PFNMAP, sets VM_MIXEDMAP and leaves the faults to
+ *    p7580_gem_fault(), which inserts bo->pages[off] with
+ *    vm_insert_page() -- the udl_gem_mmap/udl_gem_fault shape, the
+ *    in-tree 3.10 precedent (no vm_ops swap, no second ops table; the
+ *    earlier "post-hoc MIXEDMAP breaks the core contract" note was
+ *    the dma_mmap_attrs pgoff -ENXIO of gpu31-mmap2, not the flags).
+ *    vm_insert_page() takes one page reference per PTE
+ *    (insert_page's get_page + page_add_file_rmap) and the mm drops
+ *    it when the PTE goes away, so a page the CPU wrote cannot be
+ *    recycled under a live mapping. The gpu31-shaderbo loss -- the
+ *    whole FS ISA page zeroed by the page allocator while the BO and
+ *    its mapping were live -- is exactly the missing reference of the
+ *    old remap_pfn_range/VM_PFNMAP shape.
+ *    On top of the per-PTE references the mapping itself holds one
+ *    reference per page for as long as any VMA maps the BO
+ *    (p7580_gem_vm_get/p7580_gem_map_pin on the 0->1 VMA, dropped by
+ *    p7580_gem_vm_put/p7580_gem_map_unpin on the 1->0 close), so the
+ *    pages stay put even for the part of the BO that no fault has
+ *    touched yet. VM_DONTCOPY (as the vendor kbase mapping sets, same
+ *    device) keeps fork from duplicating a VMA whose close would
+ *    otherwise release a reference no vm_ops->open ever took -- 3.10
+ *    dup_mmap does not call ->open. CMA keeps the immediate
+ *    dma_mmap_attrs path (WC scanout, dma_alloc-owned memory) and
+ *    imported BOs keep remap_pfn_range over the exporter's live
+ *    attachment (their pages belong to the exporter; bo->sgt pins
+ *    them). WC/cached prot selection is exynos update_vm_cache_attr
+ *    shape.
  *  - WAIT_BO mirrors v5.2 panfrost_wait_bo: dma_resv_wait_timeout on the
  *    embedded 0002 resv (locked inside the shim; no outer lock needed).
  *    Timeout arrives in jiffies (caller converts ns via nsecs_to_jiffies).
@@ -320,11 +340,65 @@ int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
 	if (idx >= bo->nr_pages || !bo->pages || !bo->pages[idx])
 		return -ENOENT;
 	pg = bo->pages[idx];
+	p7580_gem_debug_page_ledger(obj, "0xcf", idx);
 	kv = kmap_atomic(pg);
 	w = *(uint32_t *)((char *)kv + (offset & (PAGE_SIZE - 1)));
 	kunmap_atomic(kv);
 	*out = w;
 	return 0;
+}
+
+/* DEBUG-ONLY (gpu31-mmaprefs closure probe, strip before cutover): the
+ * page ledger the gpu31-shaderbo report §5.1 specifies. One line per
+ * BO page: page_count (all references: page cache + BO + mapping pin +
+ * PTE), page_mapcount (rmap entries = mapped PTEs), the mapping pin
+ * state (vma_refs/map_pinned), the flags that identify WHO owns the
+ * page (uptodate/lru/swapbacked/dirty), the page-cache identity
+ * (page_mapping() + page_index(), so a page that was removed from its
+ * inode and re-added -- or a different page entirely -- is visible by
+ * comparing lines), and the first four words so the ISA content is
+ * visible at the same instant.
+ *
+ * Called from the 0xCF read path (after the completion
+ * clean-then-invalidate, so the words are DRAM truth) and from SUBMIT
+ * per BO after p7580_gem_submit_sync, budgeted by the caller. No MMIO,
+ * no sleeps: kmap_atomic only. How to read the decision fields:
+ *   count == 1                only the page cache holds it (BO ref lost)
+ *   count >= 3, up/lru         both mapping owners intact
+ *   !up / !lru / swapb        page left the page cache (shmem removal)
+ *   mapping=/pgidx= changed   the page was replaced and re-referenced
+ *                             (same index, different inode -> the
+ *                             allocator reused the struct page)
+ *   words gone, same identity content overwritten in place. */
+void p7580_gem_debug_page_ledger(struct drm_gem_object *obj, const char *tag,
+				 unsigned int idx)
+{
+	struct p7580_bo *bo;
+	struct page *pg;
+	uint32_t w[4] = { 0, 0, 0, 0 };
+	void *kv;
+	unsigned int j;
+
+	if (!obj || !tag)
+		return;
+	bo = to_p7580_bo(obj);
+	if (!bo->pages || idx >= bo->nr_pages || !bo->pages[idx])
+		return;
+	pg = bo->pages[idx];
+	kv = kmap_atomic(pg);
+	for (j = 0; j < 4; j++)
+		w[j] = ((uint32_t *)kv)[j];
+	kunmap_atomic(kv);
+	pr_info("p7580_pin: %s obj=%lu iova=0x%llx idx=%u count=%d mapcount=%d vma=%u pin=%u %s%s%s%s mapping=%p pgidx=%lu w=%08x %08x %08x %08x\n",
+		tag, (unsigned long)obj, (unsigned long long)bo->iova, idx,
+		page_count(pg), page_mapcount(pg),
+		bo->vma_refs, bo->map_pinned,
+		PageUptodate(pg) ? "up " : "!up ",
+		PageLRU(pg) ? "lru " : "!lru ",
+		PageSwapBacked(pg) ? "swapb " : "",
+		PageDirty(pg) ? "dirty" : "clean",
+		page_mapping(pg), (unsigned long)page_index(pg),
+		w[0], w[1], w[2], w[3]);
 }
 
 /* Bind: dma_map the SHMEM pages for GPU access (before the AS0        */
@@ -781,6 +855,122 @@ int p7580_gem_create_with_handle(struct p7580_dev *gd,
  * from drv/mmu structs (same opaque-void discipline as the
  * pre-signal-sync helper above). */
 void p7580_gem_gpu_unmap(struct drm_gem_object *obj);
+/* ------------------------------------------------------------------ */
+/* gpu31-mmaprefs: mapping-owned page references                      */
+/*                                                                     */
+/* Two independent references keep a mapped page alive, and they must  */
+/* not be confused:                                                    */
+/*                                                                     */
+/*  (a) PTE reference -- vm_insert_page() (insert_page in mm/memory.c) */
+/*      get_page()s the page and page_add_file_rmap()s it;            */
+/*      zap_pte_range() page_remove_rmap()s and put_page()s it when    */
+/*      the PTE disappears. Owned and released by the mm: never touch  */
+/*      it from here.                                                  */
+/*  (b) mapping reference -- one get_page() per BO page for as long as */
+/*      any VMA maps the BO, put_page()d when the last VMA closes      */
+/*      (p7580_gem_map_pin/unpin below). It covers the pages no fault  */
+/*      has reached yet and survives any single dropped BO reference.  */
+/*                                                                     */
+/* The BO's own reference (p7580_shmem_alloc's shmem_read_mapping_page)*/
+/* is untouched by either.                                             */
+/*                                                                     */
+/* Counting: vma_refs is incremented once per VMA that will be closed  */
+/* once -- the mmap handler (success path) and vm_ops->open (split/    */
+/* mremap copies, __split_vma/copy_vma both call ->open) -- and        */
+/* decremented by our vm_ops->close. drm_gem_vm_open/close use the     */
+/* same take/close symmetry for the GEM reference, so the count        */
+/* reaches zero exactly when the last VMA goes away. Both fields are   */
+/* serialised by dev->struct_mutex (every DRM VMA hook takes it) and   */
+/* the pin loops run inside that critical section, so a 0->1 take and  */
+/* a 1->0 put can never interleave.                                    */
+/* ------------------------------------------------------------------ */
+
+/* Local SHMEM BOs only: the pages are ours (p7580_shmem_alloc). CMA
+ * memory is dma_alloc_attrs-owned (never recycled while allocated) and
+ * imported BOs are the exporter's pages (bo->sgt), so neither needs --
+ * or may take -- a mapping pin here. */
+static int p7580_bo_cpu_mapped(struct p7580_bo *bo)
+{
+	return bo->backing == P7580_BO_SHMEM && bo->pages && !bo->sgt;
+}
+
+static void p7580_gem_map_pin(struct p7580_bo *bo)
+{
+	unsigned int i;
+
+	for (i = 0; i < bo->nr_pages; i++)
+		if (bo->pages[i])
+			get_page(bo->pages[i]);
+	bo->map_pinned = 1;
+}
+
+static void p7580_gem_map_unpin(struct p7580_bo *bo)
+{
+	unsigned int i;
+
+	if (!bo->map_pinned)
+		return;
+	bo->map_pinned = 0;
+	for (i = 0; i < bo->nr_pages; i++)
+		if (bo->pages[i])
+			put_page(bo->pages[i]);
+}
+
+/* Called with dev->struct_mutex held. */
+static void p7580_gem_vm_get(struct p7580_bo *bo)
+{
+	if (bo->vma_refs++ == 0)
+		p7580_gem_map_pin(bo);
+}
+
+/* Called with dev->struct_mutex held. A close without a matching
+ * mmap/open (fork-inherited VMA or a core bug) must NOT release a
+ * reference another VMA still owns, hence the explicit zero guard;
+ * VM_DONTCOPY on our VMAs keeps the 3.10 dup_mmap case out. */
+static void p7580_gem_vm_put(struct p7580_bo *bo)
+{
+	if (!bo->vma_refs) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	if (--bo->vma_refs == 0)
+		p7580_gem_map_unpin(bo);
+}
+
+/* VM hooks: the pin accounting wraps the core's GEM-reference
+ * accounting. drm_gem_vm_open/close take dev->struct_mutex themselves,
+ * so the BO-side critical section is closed before delegating: this
+ * VMA still owns its GEM reference (open takes it inside the core
+ * call; close drops it inside the core call) and therefore pins the
+ * BO across the hand-over. */
+static void p7580_gem_vm_open(struct vm_area_struct *vma)
+{
+	struct drm_gem_object *obj = vma->vm_private_data;
+	struct p7580_bo *bo = to_p7580_bo(obj);
+	struct drm_device *dev = obj->dev;
+
+	if (p7580_bo_cpu_mapped(bo)) {
+		mutex_lock(&dev->struct_mutex);
+		p7580_gem_vm_get(bo);
+		mutex_unlock(&dev->struct_mutex);
+	}
+	drm_gem_vm_open(vma);
+}
+
+static void p7580_gem_vm_close(struct vm_area_struct *vma)
+{
+	struct drm_gem_object *obj = vma->vm_private_data;
+	struct p7580_bo *bo = to_p7580_bo(obj);
+	struct drm_device *dev = obj->dev;
+
+	if (p7580_bo_cpu_mapped(bo)) {
+		mutex_lock(&dev->struct_mutex);
+		p7580_gem_vm_put(bo);
+		mutex_unlock(&dev->struct_mutex);
+	}
+	drm_gem_vm_close(vma);
+}
+
 void p7580_gem_free_object(struct drm_gem_object *obj)
 {
 	struct p7580_bo *bo = to_p7580_bo(obj);
@@ -827,6 +1017,14 @@ void p7580_gem_free_object(struct drm_gem_object *obj)
 	bo->imported_dmabuf = NULL;
 	if (WARN_ON(bo->vmap_count != 0))
 		bo->vmap_count = 0;
+	/* gpu31-mmaprefs: every VMA holds a GEM reference, so a live
+	 * mapping makes this call impossible; a leaked mapping pin
+	 * would otherwise strand page references. Drop what is left
+	 * (WARN because reaching here means the accounting broke). */
+	if (WARN_ON_ONCE(bo->vma_refs != 0))
+		bo->vma_refs = 0;
+	if (WARN_ON_ONCE(bo->map_pinned))
+		p7580_gem_map_unpin(bo);
 
 	if (obj->map_list.map)
 		drm_gem_free_mmap_offset(obj);
@@ -847,7 +1045,9 @@ void p7580_gem_free_object(struct drm_gem_object *obj)
 
 /* exynos convert_to_vm_err_msg, verbatim incl. the -EINTR -> NOPAGE arm
  * (-EAGAIN comes from shmem_getpage while the page is under reclaim and
- * is equally transient, so it joins the retry arm). */
+ * is equally transient, so it joins the retry arm). -EBUSY from
+ * vm_insert_page means the PTE is already installed (raced fault), which
+ * is also a retry/no-op rather than a bus error. */
 static unsigned int p7580_fault_err(int ret)
 {
 	switch (ret) {
@@ -855,6 +1055,7 @@ static unsigned int p7580_fault_err(int ret)
 	case -ERESTARTSYS:
 	case -EINTR:
 	case -EAGAIN:
+	case -EBUSY:
 		return VM_FAULT_NOPAGE;
 	case -ENOMEM:
 		return VM_FAULT_OOM;
@@ -863,6 +1064,26 @@ static unsigned int p7580_fault_err(int ret)
 	}
 }
 
+/* Fault-time PTE install. Two shapes, picked by the VMA flags the
+ * handler installed:
+ *
+ *  - local SHMEM (VM_MIXEDMAP, p7580_gem_mmap): vm_insert_page() of
+ *    bo->pages[off]. insert_page (mm/memory.c) rejects a non-individual
+ *    page (PageAnon), flushes the dcache line, get_page()s the page,
+ *    page_add_file_rmap()s it and set_pte_at()s a NORMAL pte -- so the
+ *    PTE owns a reference the mm releases at zap. -EBUSY means the PTE
+ *    is already present (a raced fault on the same address): the retry
+ *    arm above, no reference taken, no page leaked. The BO page array
+ *    is immutable after create, so the install needs no lock, and
+ *    sleeping is fine here: fault context holds mmap_sem for read,
+ *    which vm_insert_page permits because VM_MIXEDMAP is already set
+ *    (see its BUG_ONs).
+ *
+ *  - CMA / PRIME-imported (still VM_PFNMAP from drm_gem_mmap, mapped
+ *    immediately by p7580_gem_mmap, so normally never faulted):
+ *    vm_insert_pfn() of the CMA page or the attachment page, which is
+ *    the only insert helper legal on a PFNMAP-only VMA (vm_insert_mixed
+ *    BUG_ONs there). */
 static int p7580_map_page(struct p7580_bo *bo, struct vm_area_struct *vma,
 			  unsigned long f_vaddr, pgoff_t page_offset)
 {
@@ -872,6 +1093,14 @@ static int p7580_map_page(struct p7580_bo *bo, struct vm_area_struct *vma,
 
 	if (page_offset >= (bo->base.size >> PAGE_SHIFT))
 		return -EINVAL;
+
+	if (p7580_bo_cpu_mapped(bo)) {
+		struct page *page = bo->pages[page_offset];
+
+		if (!page)
+			return -ENOENT;
+		return vm_insert_page(vma, f_vaddr, page);
+	}
 
 	if (bo->backing == P7580_BO_CMA) {
 		pfn = __phys_to_pfn(bo->cma_paddr) + page_offset;
@@ -888,18 +1117,15 @@ static int p7580_map_page(struct p7580_bo *bo, struct vm_area_struct *vma,
 			return -EINVAL;
 		pfn = __phys_to_pfn(sg_phys(sgl)) + page_offset;
 	} else {
-		struct page *page = bo->pages[page_offset];
-
-		pfn = page_to_pfn(page);
+		return -ENODEV;
 	}
-	return vm_insert_mixed(vma, f_vaddr, pfn);
+	return vm_insert_pfn(vma, f_vaddr, pfn);
 }
 
 int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 	struct drm_gem_object *obj = vma->vm_private_data;
 	struct p7580_bo *bo = to_p7580_bo(obj);
-	struct drm_device *dev = obj->dev;
 	unsigned long f_vaddr;
 	pgoff_t page_offset;
 	int ret;
@@ -908,38 +1134,61 @@ int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 		       vma->vm_start) >> PAGE_SHIFT;
 	f_vaddr = (unsigned long)vmf->virtual_address;
 
-	mutex_lock(&dev->struct_mutex);
+	/* No outer lock: the state this path reads (bo->pages,
+	 * bo->cma_paddr, bo->sgt) is immutable for the BO's lifetime,
+	 * vm_insert_page/vm_insert_pfn take the pte lock themselves, and
+	 * the VMA's GEM reference (drm_gem_vm_open) keeps the BO -- and
+	 * for imported BOs the attachment -- alive across the call. Same
+	 * shape as the udl fault handler; avoids taking struct_mutex in
+	 * fault context at all. */
 	ret = p7580_map_page(bo, vma, f_vaddr, page_offset);
-	mutex_unlock(&dev->struct_mutex);
 	return p7580_fault_err(ret);
 }
 
 /* gem_vm_ops for this driver (exynos shape: fault/open/close from the
  * core). Published to the core as driver->gem_vm_ops in main.c
- * (non-static: referenced from another TU). */
+ * (non-static: referenced from another TU). The open/close hooks are
+ * the pin-accounting wrappers around drm_gem_vm_open/close (see the
+ * gpu31-mmaprefs block above), not raw core helpers: a split (mremap,
+ * partial unmap) calls ->open on the new VMA and ->close on each part,
+ * and the mapping reference must follow that pairing. */
 const struct vm_operations_struct p7580_gem_vm_ops = {
 	.fault = p7580_gem_fault,
-	.open = drm_gem_vm_open,
-	.close = drm_gem_vm_close,
+	.open = p7580_gem_vm_open,
+	.close = p7580_gem_vm_close,
 };
 
 /* Driver .fops mmap (GEM path): resolve the fake offset to the BO via
- * drm_gem_mmap, then map the pages IMMEDIATELY (no fault round trip).
- * Fault-driven vm_insert_mixed cannot work here: drm_gem_mmap() on
- * 3.10 sets VM_PFNMAP|VM_DONTEXPAND, installs driver->gem_vm_ops
- * itself, and rejects VM_MIXEDMAP vmas/-EINVALs when that table is
- * NULL -- clearing PFNMAP/adding MIXEDMAP and swapping in a second
- * ops table after the fact breaks the core's contract (mmap() returns
- * -EINVAL without ever faulting; dmesg silent). The working shape on
- * this tree is exynos_drm_gem_mmap_buffer/drm_gem_cma_mmap:
- * pgprot_writecombine (WC, exynos update_vm_cache_attr shape), then
- * one dma_mmap_attrs() for the CMA page (arm32 arm_dma_mmap backend
- * treats vma->vm_pgoff as the page index into the buffer, so reset it
- * to 0 -- the GEM fake key >> PAGE_SHIFT is NOT a buffer index;
- * exynos mmap_buffer avoids this via a fresh vma at pgoff 0 and
- * drm_gem_cma_mmap via remap_pfn_range which ignores pgoff) or one
- * remap_pfn_range() per SHMEM/imported page with the same prot +
- * size check. KMS dumb mmap keeps its own entry point.
+ * drm_gem_mmap, then set the VMA up for the BO's backing.
+ *
+ *  - CMA (WC scanout): dma_mmap_attrs() immediately, unchanged. The
+ *    arm32 arm_dma_mmap backend treats vma->vm_pgoff as a page index
+ *    into the buffer, so it is reset to 0 first -- the GEM fake key >>
+ *    PAGE_SHIFT is NOT a buffer index (gpu31-mmap2).
+ *  - PRIME-imported BOs: remap_pfn_range() per attachment sg chunk,
+ *    unchanged. The pages belong to the exporter and are pinned by
+ *    bo->sgt / the live dma_buf attachment, so no local reference is
+ *    taken.
+ *  - local SHMEM BOs: NO immediate mapping. The flags drm_gem_mmap()
+ *    installed (VM_IO|VM_PFNMAP|VM_DONTEXPAND|VM_DONTDUMP) are turned
+ *    into the fault-driven VM_MIXEDMAP shape: clear VM_PFNMAP, set
+ *    VM_MIXEDMAP|VM_DONTCOPY, keep the vm_ops the core installed. This
+ *    is verbatim the in-tree udl_gem_mmap() shape
+ *    (drivers/gpu/drm/udl/udl_gem.c) and needs no second ops table.
+ *    Each PTE is installed later by p7580_gem_fault() ->
+ *    vm_insert_page(), which is what gives the mapping real page
+ *    references; on top of that the mapping pins every page of the BO
+ *    for its lifetime (p7580_gem_vm_get) and drops them on the last
+ *    close (p7580_gem_vm_put). VM_DONTCOPY matches the vendor kbase
+ *    user mapping on this device (mali_kbase_mem_linux.c) and keeps a
+ *    fork from duplicating the VMA: dup_mmap does not call ->open, so
+ *    the child's close would release a reference no take ever paired.
+ *
+ * WC default (covers both SHMEM CREATE_BO and CMA scanout), cached
+ * opt-in (exynos update_vm_cache_attr shape). COHERENCY_NONE: WC is
+ * MT_NORMAL_NC, so no CPU cache lines exist to flush on either path;
+ * the GPU PTW side is synced by the driver's map_bo dma_sync
+ * maintenance, not here.
  *
  * Temporary entry/exit pr_info (mmap2 ticket): prints the fake pgoff
  * installed by drm_gem_mmap and the final return code, so silicon
@@ -1022,17 +1271,19 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 		ret = -ENODEV;
 		goto err_close;
 	}
-	for (i = 0; i < npages; i++) {
-		if ((unsigned long)(i + 1) * PAGE_SIZE > vm_size)
-			break;
-		pfn = page_to_pfn(bo->pages[i]);
-		ret = remap_pfn_range(vma, vma->vm_start + (i << PAGE_SHIFT),
-				      pfn, PAGE_SIZE, vma->vm_page_prot);
-		if (ret)
-			goto err_close;
-	}
-	pr_info("p7580_gem_mmap: ok obj_size=0x%zx vm=0x%lx\n",
-		obj->size, vm_size);
+
+	/* Local SHMEM: fault-driven VM_MIXEDMAP (see the comment above).
+	 * Take the mapping reference for the whole BO -- the pages no
+	 * fault touches yet are covered too -- then let the faults
+	 * install PTEs. Serialised by struct_mutex against a concurrent
+	 * last close of another mapping of the same BO. */
+	vma->vm_flags &= ~VM_PFNMAP;
+	vma->vm_flags |= VM_MIXEDMAP | VM_DONTCOPY;
+	mutex_lock(&obj->dev->struct_mutex);
+	p7580_gem_vm_get(bo);
+	mutex_unlock(&obj->dev->struct_mutex);
+	pr_info("p7580_gem_mmap: ok mixedmap obj_size=0x%zx vm=0x%lx npages=%u\n",
+		obj->size, vm_size, npages);
 	return 0;
 
 err_close:

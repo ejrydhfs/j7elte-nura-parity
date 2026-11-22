@@ -17,9 +17,10 @@ POWER ?= ../power
 
 all: check
 
-check: gem_validate cachedir_model
+check: gem_validate cachedir_model maprefs_model
 	./gem_validate
 	./cachedir_model
+	./maprefs_model
 
 gem_validate: gem_validate.c panfrost7580_gem.h
 	$(CC) $(CFLAGS) -o $@ gem_validate.c
@@ -28,6 +29,12 @@ gem_validate: gem_validate.c panfrost7580_gem.h
 # (arm64 3.10 backend semantics; proves clean-before-invalidate).
 cachedir_model: cachedir_model.c
 	$(CC) $(CFLAGS) -o $@ cachedir_model.c
+
+# gpu31-mmaprefs: userspace-mapping page-reference lifetime
+# (reference identities + VMA open/close pairing + the shaderbo
+# closure probes).
+maprefs_model: maprefs_model.c
+	$(CC) $(CFLAGS) -o $@ maprefs_model.c
 
 # Kernel syntax/object check. Needs the 0001-0003 backport headers staged:
 #   STAGE=/tmp/gemstage make stage-shims kcheck kobj
@@ -70,7 +77,7 @@ kobj:
 	@echo "kobj: 3 objects built"
 
 clean:
-	rm -f gem_validate cachedir_model
+	rm -f gem_validate cachedir_model maprefs_model
 	rm -rf /tmp/gemobj
 
 .PHONY: all check stage-shims kcheck kobj clean

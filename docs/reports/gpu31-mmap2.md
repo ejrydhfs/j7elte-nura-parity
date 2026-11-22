@@ -89,3 +89,17 @@ Instrumented client output above is the pre-flash pin.
   `p7580_gem_mmap: enter pgoff=0x100000 … dma_mmap_attrs rc=0 …`,
   then `wait_bo(0) ok` → `DEVICE PATH: PASS`. Next step is
   `wait_bo`/submit (`t_wait`/`t_submit`).
+
+## 6. Follow-up status (gpu31-mmaprefs, 2026-11-21)
+
+The `vma->vm_pgoff = 0` reset and the `drm_gem_mmap()` dispatch this
+ticket established are unchanged and still required. What changed later:
+the SHMEM path no longer maps immediately with `remap_pfn_range` — it is
+fault-driven `VM_MIXEDMAP` + `vm_insert_page` (page references the
+mapping owns; see `docs/reports/gpu31-mmaprefs.md`). The `p7580_gem_mmap`
+entry/exit `pr_info`s are kept; the success line now reads
+`p7580_gem_mmap: ok mixedmap obj_size=… vm=… npages=…` for SHMEM BOs
+(CMA/imported keep their `dma_mmap_attrs`/`remap_pfn_range` shapes and
+their old line). The post-flash assert in §5 stands for the CMA/scanout
+path; for CREATE_BO SHMEM mappings expect the `mixedmap` line and no
+`remap_pfn_range`.

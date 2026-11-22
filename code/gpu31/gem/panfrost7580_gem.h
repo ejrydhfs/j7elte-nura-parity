@@ -111,6 +111,17 @@ struct p7580_bo {
 	 * count mirrors them (p7580_gem_prime_vmap/vunmap). */
 	void *vaddrs[P7580_VMAP_MAX];
 	unsigned int vmap_count;
+	/* gpu31-mmaprefs: userspace-mapping page pins. While at least
+	 * one VMA maps this BO every page carries one extra reference
+	 * (map_pinned) so the page cannot be recycled under a live
+	 * mapping, even for pages no fault has reached yet. vma_refs
+	 * counts the VMAs that will each be closed once (mmap success +
+	 * vm_ops->open, the split/mremap copies); the 1->0 close drops
+	 * the pin. Serialised by dev->struct_mutex in both directions.
+	 * Local SHMEM BOs only: CMA memory is dma_alloc-owned and
+	 * imported pages belong to the exporter (bo->sgt). */
+	unsigned int vma_refs;
+	unsigned int map_pinned;
 	/* COHERENCY_NONE DMA sync state (gpu31-coherency): bind-time
 	 * dma_map of the SHMEM pages for GPU access. dma_addrs[i] is
 	 * the bus address programmed into the GPU PTE (identity on
@@ -234,6 +245,14 @@ void p7580_gem_mmu_register_notify(void (*fn)(void *, struct drm_gem_object *,
  * follow the same no-op rules as job_done_sync. offset is a byte offset. */
 int p7580_gem_debug_read_word(struct drm_gem_object *obj, uint32_t offset,
 			      uint32_t *out);
+/* DEBUG-ONLY (gpu31-mmaprefs, strip before cutover): the page ledger
+ * from the gpu31-shaderbo report §5.1 -- page_count, page_mapcount, the
+ * mapping pin state (vma_refs/map_pinned), PageUptodate/LRU/
+ * SwapBacked/Dirty and the first four words of page idx. Called by the
+ * 0xCF read path ("0xcf") and by SUBMIT per BO after submit-sync
+ * ("sub", caller-budgeted). No MMIO, no sleeps. */
+void p7580_gem_debug_page_ledger(struct drm_gem_object *obj, const char *tag,
+				 unsigned int idx);
 struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj);
 struct drm_gem_object *p7580_gem_prime_import_sg_table(
 		struct drm_device *dev, size_t size, struct sg_table *sgt);

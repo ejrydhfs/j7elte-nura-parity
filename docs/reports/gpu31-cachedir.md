@@ -353,3 +353,16 @@ Reading of this evidence:
 - `code/gpu31/driver/0001-panfrost7580-driver-sources.patch` — regen
   (gem + submit snapshot/dump + job.c comment), applies clean.
 - `docs/reports/gpu31-cachedir.md` — this file.
+
+## 10. Follow-up status (gpu31-mmaprefs, 2026-11-21)
+
+The ordering table and every call site here are unchanged. The one
+adjacent assumption that changed: SHMEM user mappings are no longer
+`remap_pfn_range`/`VM_PFNMAP` — they are fault-driven `VM_MIXEDMAP` with
+`vm_insert_page`, so a mapped page now carries mapping + PTE references
+and cannot be recycled under the mapping. That removes the
+page-lifetime candidate this report's §8.3 left open (BO lifetime / page
+re-allocation), so a cachedir FAIL after the `gpu31-mmaprefs` flash is a
+direction/order bug again, not a recycled page. `--cachedir-test` is
+unchanged and is part of the mmaprefs silicon check
+(`docs/reports/gpu31-mmaprefs.md` §6, step 3).

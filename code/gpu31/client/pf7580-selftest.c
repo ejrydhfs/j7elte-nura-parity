@@ -1167,6 +1167,325 @@ static int run_pattern_test(const char *path)
 	return 1;
 }
 
+/* gpu31-mmaprefs device test: a mapped BO's page survives allocator
+ * churn, and all views agree.
+ *
+ * Shape (no GL needed): a 4 KiB BO carries the job descriptor (32-B
+ * WRITE_VALUE/Zero at offset 0, so the GPU certainly fetches the page),
+ * a 96-B shader-ISA-shaped pattern at 0x100 (tag 5 in word 0, like a
+ * real Midgard ISA header) and a marker at 0x400. The BO is mapped
+ * through userspace (VM_MIXEDMAP fault-driven path) before any of it is
+ * written.
+ *
+ * Then the page is exposed to exactly the window the gpu31-shaderbo
+ * trace fingers: six CREATE_BO/MMAP_BO/mmap/munmap cycles of other
+ * 4 KiB BOs. Pre-fix (remap_pfn_range/VM_PFNMAP, no page references)
+ * that is where the page was zeroed under the live mapping; post-fix
+ * the mapping own its references, so:
+ *   - the original mapping reads every word back unchanged;
+ *   - a SECOND independent mapping of the same BO (the report's magic2
+ *     probe) reads the same bytes;
+ *   - the kernel 0xCF read (clean-then-invalidate + kmap, so DRAM
+ *     truth) agrees, and prints the page ledger;
+ *   - after a real submit whose BO list contains the page, the same
+ *     three views are re-checked (dmesg also gets the SUBMIT-side
+ *     ledger: `p7580_pin: sub ... count>=3 ... w=c87a9835 ...`).
+ * PASS = the ISA words/marker intact in the user view, in the second
+ * mapping and in the kernel view, plus the target zeroed (the job ran).
+ * A mismatch prints the offending offset and both values. */
+#define PF7580_MR_ISA_OFF	0x100u
+#define PF7580_MR_MARK_OFF	0x400u
+#define PF7580_MR_MARK		0xcafe1234u
+#define PF7580_MR_WORD0		0xc87a9835u
+#define PF7580_MR_CHURN		6u
+
+static uint32_t pf7580_mr_fill(unsigned int i)
+{
+	uint32_t v = 0x9e3779b9u * (i + 1u) + 0x7f4a7c15u;
+
+	return v ? v : 0xdeadbeefu;
+}
+
+static void pf7580_mr_pattern(unsigned char *p)
+{
+	uint32_t *w = (uint32_t *)p;
+	unsigned int i;
+
+	for (i = 1; i < 4096u / 4u; i++)
+		w[i] = pf7580_mr_fill(i);
+	w[0] = PF7580_MR_WORD0;
+}
+
+/* Compare the whole page against the pattern; return the first bad
+ * offset or -1 when equal. */
+static int pf7580_mr_check(const unsigned char *p, const unsigned char *want,
+			   const char *what)
+{
+	unsigned int i;
+
+	for (i = 0; i < 4096u / 4u; i++) {
+		uint32_t got = ((const uint32_t *)p)[i];
+		uint32_t exp = ((const uint32_t *)want)[i];
+
+		if (got != exp) {
+			printf("%s: FAIL offset 0x%x got 0x%08x want 0x%08x\n",
+			       what, i * 4u, got, exp);
+			return (int)(i * 4u);
+		}
+	}
+	printf("%s: OK 1024/1024 words intact\n", what);
+	return -1;
+}
+
+static int run_mmaprefs_test(const char *path)
+{
+	struct pf7580_dev *dev;
+	char err[256] = "";
+	uint64_t prod = 0, job_map = 0, res_map = 0, churn_map = 0;
+	uint64_t job_gpu = 0, res_gpu = 0;
+	uint32_t jh = 0, rh = 0, churn_h = 0, out_sync = 0;
+	uint32_t bos[2];
+	unsigned char *jp = NULL, *rp = NULL, *mp = NULL, *curn = NULL;
+	unsigned char *want = NULL;
+	struct pf7580_submit_args sa;
+	struct timespec now;
+	int64_t deadline_ns;
+	uint32_t kv = 0;
+	unsigned int i;
+	int rc, bad;
+
+	printf("-- pf7580 mmaprefs-test (mapping references vs page churn) on %s --\n",
+	       path);
+	rc = pf7580_open(path, &dev, err, sizeof(err));
+	if (rc) {
+		printf("mmaprefs-test %s unavailable: %s\n", path, err);
+		return 2;
+	}
+	printf("open: OK (fd=%d mock=%d)\n", pf7580_fd(dev),
+	       pf7580_is_mock(dev));
+	rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &prod);
+	if (rc || prod != PF7580_T720_PROD_ID) {
+		printf("GET_PARAM: FAIL rc=%d (%s) prod=0x%" PRIx64 "\n",
+		       rc, pf7580_strerror(rc), prod);
+		rc = 1;
+		goto out_close;
+	}
+	printf("GET_PARAM: OK GPU_PROD_ID 0x%" PRIx64 " (T720)\n", prod);
+
+	rc = pf7580_create_bo(dev, 4096, &jh, &job_gpu);
+	if (rc || !jh || !job_gpu) {
+		printf("CREATE_BO(job): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		rc = 1;
+		goto out_close;
+	}
+	rc = pf7580_create_bo(dev, 4096, &rh, &res_gpu);
+	if (rc || !rh || !res_gpu) {
+		printf("CREATE_BO(result): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		rc = 1;
+		goto out_close;
+	}
+	rc = pf7580_mmap_bo(dev, jh, &job_map);
+	if (rc) {
+		printf("MMAP_BO(job): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		rc = 1;
+		goto out_close;
+	}
+	rc = pf7580_mmap_bo(dev, rh, &res_map);
+	if (rc) {
+		printf("MMAP_BO(result): FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		rc = 1;
+		goto out_close;
+	}
+	jp = pf7580_cpu_map(dev, jh, job_map, 4096);
+	if (!jp) {
+		printf("FAIL cpu map job: errno=%d (%s)\n",
+		       pf7580_cpu_map_errno, strerror(pf7580_cpu_map_errno));
+		rc = 1;
+		goto out_close;
+	}
+	rp = pf7580_cpu_map(dev, rh, res_map, 4096);
+	if (!rp) {
+		printf("FAIL cpu map result: errno=%d (%s)\n",
+		       pf7580_cpu_map_errno, strerror(pf7580_cpu_map_errno));
+		rc = 1;
+		goto out_close;
+	}
+	want = malloc(4096);
+	if (!want) {
+		printf("FAIL malloc(snapshot)\n");
+		rc = 1;
+		goto out_close;
+	}
+
+	/* Fill: ISA-shaped page + Zero descriptor + 0x400 marker. */
+	pf7580_mr_pattern(jp);
+	{
+		uint32_t *w = (uint32_t *)jp;
+
+		w[4] = (1u << 0) | (2u << 1);
+		w[8] = (uint32_t)(res_gpu & 0xffffffffu);
+		w[9] = (uint32_t)(res_gpu >> 32);
+		w[10] = 3u;	/* Zero (v4/v5 genxml) */
+		w[11] = 0u;
+		w[12] = 0u;
+		w[13] = 0u;
+		*(uint32_t *)(jp + PF7580_MR_MARK_OFF) = PF7580_MR_MARK;
+	}
+	for (i = 0; i < 4096u / 4u; i++)
+		((uint32_t *)rp)[i] = PF7580_PATTERN_PREFILL;
+	memcpy(want, jp, 4096);
+	printf("DESC: ISA@0x%x w0=0x%08x mark@0x%x=0x%08x jc=0x%" PRIx64
+	       " target=0x%" PRIx64 "\n", PF7580_MR_ISA_OFF,
+	       ((uint32_t *)jp)[PF7580_MR_ISA_OFF / 4], PF7580_MR_MARK_OFF,
+	       PF7580_MR_MARK, job_gpu, res_gpu);
+
+	/* The churn window: six full BO lifecycles of other pages. */
+	for (i = 0; i < PF7580_MR_CHURN; i++) {
+		rc = pf7580_create_bo(dev, 4096, &churn_h, &churn_map);
+		if (rc || !churn_h) {
+			printf("CHURN %u: CREATE_BO FAIL rc=%d (%s)\n", i, rc,
+			       pf7580_strerror(rc));
+			rc = 1;
+			goto out_close;
+		}
+		rc = pf7580_mmap_bo(dev, churn_h, &churn_map);
+		if (rc) {
+			printf("CHURN %u: MMAP_BO FAIL rc=%d (%s)\n", i, rc,
+			       pf7580_strerror(rc));
+			rc = 1;
+			goto out_close;
+		}
+		curn = pf7580_cpu_map(dev, churn_h, churn_map, 4096);
+		if (!curn) {
+			printf("CHURN %u: cpu map FAIL errno=%d (%s)\n", i,
+			       pf7580_cpu_map_errno,
+			       strerror(pf7580_cpu_map_errno));
+			rc = 1;
+			goto out_close;
+		}
+		memset(curn, 0x5a + (int)i, 4096);
+		pf7580_cpu_unmap(dev, curn, 4096);
+		curn = NULL;
+	}
+	printf("CHURN: %u BO create/mmap/unmap cycles done\n", PF7580_MR_CHURN);
+
+	bad = pf7580_mr_check(jp, want, "CHURN-VIEW(user map)");
+	if (bad >= 0) {
+		rc = 1;
+		goto out_close;
+	}
+
+	/* Second, independent mapping of the same BO (report magic2). */
+	mp = pf7580_cpu_map(dev, jh, job_map, 4096);
+	if (!mp) {
+		printf("FAIL second map: errno=%d (%s)\n",
+		       pf7580_cpu_map_errno, strerror(pf7580_cpu_map_errno));
+		rc = 1;
+		goto out_close;
+	}
+	bad = pf7580_mr_check(mp, want, "SECOND-MAP");
+	pf7580_cpu_unmap(dev, mp, 4096);
+	mp = NULL;
+	if (bad >= 0) {
+		rc = 1;
+		goto out_close;
+	}
+
+	/* Kernel view of the page (0xCF: clean-then-invalidate + kmap). */
+	rc = pf7580_debug_read_bo(dev, jh, 0, &kv);
+	if (rc || kv != PF7580_MR_WORD0) {
+		printf("KERN word0: FAIL rc=%d (%s) got 0x%08x want 0x%08x\n",
+		       rc, pf7580_strerror(rc), kv, PF7580_MR_WORD0);
+		rc = 1;
+		goto out_close;
+	}
+	rc = pf7580_debug_read_bo(dev, jh, PF7580_MR_MARK_OFF, &kv);
+	if (rc || kv != PF7580_MR_MARK) {
+		printf("KERN mark: FAIL rc=%d (%s) got 0x%08x want 0x%08x\n",
+		       rc, pf7580_strerror(rc), kv, PF7580_MR_MARK);
+		rc = 1;
+		goto out_close;
+	}
+	printf("KERN-VIEW: OK word0=0x%08x mark=0x%08x\n",
+	       PF7580_MR_WORD0, PF7580_MR_MARK);
+
+	/* Submit so the page goes through SUBMIT's clean + the ledger
+	 * probe, then re-check every view. */
+	rc = pf7580_syncobj_create(dev, 0, &out_sync);
+	if (rc || !out_sync) {
+		printf("SYNCOBJ-CREATE: FAIL rc=%d (%s)\n", rc,
+		       pf7580_strerror(rc));
+		rc = 1;
+		goto out_close;
+	}
+	bos[0] = jh;
+	bos[1] = rh;
+	memset(&sa, 0, sizeof(sa));
+	sa.jc = job_gpu;
+	sa.bo_handles = bos;
+	sa.bo_handle_count = 2;
+	sa.requirements = 0;
+	sa.out_sync = out_sync;
+	rc = pf7580_submit(dev, &sa);
+	printf("SUBMIT: rc=%d (%s)\n", rc, pf7580_strerror(rc));
+	if (rc) {
+		rc = 1;
+		goto out_close;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	deadline_ns = (int64_t)now.tv_sec * 1000000000LL +
+		now.tv_nsec + 8000000000LL;
+	rc = pf7580_syncobj_wait(dev, &out_sync, 1, deadline_ns, 0, NULL);
+	printf("SYNCOBJ-WAIT(+8s abs): rc=%d (%s)\n", rc,
+	       pf7580_strerror(rc));
+	if (rc) {
+		rc = 1;
+		goto out_close;
+	}
+	bad = pf7580_mr_check(jp, want, "POST-SUBMIT-VIEW(user map)");
+	if (bad >= 0) {
+		rc = 1;
+		goto out_close;
+	}
+	rc = pf7580_debug_read_bo(dev, jh, 0, &kv);
+	if (rc || kv != PF7580_MR_WORD0) {
+		printf("POST-SUBMIT KERN: FAIL rc=%d (%s) got 0x%08x\n", rc,
+		       pf7580_strerror(rc), kv);
+		rc = 1;
+		goto out_close;
+	}
+	if (((uint32_t *)rp)[0] != 0u) {
+		printf("TARGET: FAIL word0=0x%08x (expect 0 = job ran)\n",
+		       ((uint32_t *)rp)[0]);
+		rc = 1;
+		goto out_close;
+	}
+	printf("POST-SUBMIT: OK user+kernel ISA intact, target zeroed; dmesg ledger:\n"
+	       "  p7580_pin: 0xcf ... count>=3 mapcount>=1 up ...\n"
+	       "  p7580_pin: sub ... count>=3 ... w=c87a9835 ...\n");
+	rc = 0;
+
+out_close:
+	if (out_sync)
+		pf7580_syncobj_destroy(dev, out_sync);
+	free(want);
+	if (curn)
+		pf7580_cpu_unmap(dev, curn, 4096);
+	if (mp)
+		pf7580_cpu_unmap(dev, mp, 4096);
+	if (rp)
+		pf7580_cpu_unmap(dev, rp, 4096);
+	if (jp)
+		pf7580_cpu_unmap(dev, jp, 4096);
+	pf7580_close(dev);
+	printf("MMAPREFS-TEST: %s\n", rc == 0 ? "PASS" : "FAILED");
+	return rc;
+}
+
 /* gpu31-cachedir device test: CPU-filled BO survives a job that reads it.
  *
  * Shape (the ticket's ask, no GL needed): a 4 KiB BO carries BOTH the
@@ -1451,6 +1770,7 @@ int main(int argc, char **argv)
 	const char *submittest = NULL;
 	const char *patterntest = NULL;
 	const char *cachedirtest = NULL;
+	const char *mmaprefstest = NULL;
 	int i;
 
 	/* Unbuffered: on HW a hang must leave partial output behind. */
@@ -1476,12 +1796,16 @@ int main(int argc, char **argv)
 			cachedirtest = argv[++i];
 		} else if (!strncmp(argv[i], "--cachedir-test=", 16)) {
 			cachedirtest = argv[i] + 16;
+		} else if (!strcmp(argv[i], "--mmaprefs-test") && i + 1 < argc) {
+			mmaprefstest = argv[++i];
+		} else if (!strncmp(argv[i], "--mmaprefs-test=", 16)) {
+			mmaprefstest = argv[i] + 16;
 		} else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			devpath = argv[++i];
 		} else if (!strncmp(argv[i], "--device=", 9)) {
 			devpath = argv[i] + 9;
 		} else {
-			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH] [--submit-test PATH] [--pattern-test PATH]\n",
+			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH] [--submit-test PATH] [--pattern-test PATH] [--cachedir-test PATH] [--mmaprefs-test PATH]\n",
 				argv[0]);
 			return 1;
 		}
@@ -1494,6 +1818,8 @@ int main(int argc, char **argv)
 		return run_pattern_test(patterntest);
 	if (cachedirtest)
 		return run_cachedir_test(cachedirtest);
+	if (mmaprefstest)
+		return run_mmaprefs_test(mmaprefstest);
 	if (devpath)
 		return run_device(devpath);
 	return run_mock_suite();

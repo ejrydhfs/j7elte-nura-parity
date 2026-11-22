@@ -220,6 +220,16 @@ same line identifies by `!up`/`!lru`.
 
 ### 5.2 The fix (driver, needs flash)
 
+**Status: implemented, `docs/reports/gpu31-mmaprefs.md` (2026-11-21).**
+Exactly this shape is now in the driver (`VM_MIXEDMAP` + `vm_insert_page`
+in the fault handler, `put_page` when the last VMA closes, WC prot and
+the clean-then-invalidate discipline untouched), plus the §5.1 ledger as
+`p7580_gem_debug_page_ledger()` at the `0xCF` read and at SUBMIT, and a
+mapping-lifetime client test (`--mmaprefs-test`). It still needs the
+flash: the silicon acceptance below is the one to run, and
+`gpu31-mmaprefs.md` §6 has the exact command lines and the ledger values
+to expect.
+
 Make the user mapping hold the pages itself, so the CPU-written page cannot be
 recycled even if the BO's own reference is lost, and so the mapping is
 coherent with the kernel's view:
@@ -277,11 +287,16 @@ compile → VS mmap).
 
 ## 7. Files / state
 
-- This report only. No kernel/Mesa product change is committed: the fix needs
-  a flash (Main), and the device tree `/data/mesabuild/mesa20` currently
-  carries the diagnostic probes (all env-gated; behaviour unchanged when the
-  variables are unset). `pan_bo.c` / `pan_cmdstream.c` / `pan_assemble.c`
-  there are diagnostic-only.
+- This report only *at the time of the trace*. The fix it specifies is now
+  committed as `gpu31-mmaprefs` (driver gem mmap/fault/close + the §5.1
+  ledger + the `--mmaprefs-test` client mode), still unflashed: see
+  `docs/reports/gpu31-mmaprefs.md`. The device tree
+  `/data/mesabuild/mesa20` currently carries the diagnostic probes (all
+  env-gated; behaviour unchanged when the variables are unset).
+  `pan_bo.c` / `pan_cmdstream.c` / `pan_assemble.c` there are
+  diagnostic-only, and the `PAN_FBD_RECHECK` rewrite is no longer needed
+  once the driver fix is flashed (compare with it off).
 - The `0xCF` debug ioctl, `p7580_drv_submit`'s `ERR-MAP`, and the fault-time
   `PTEWALK`/`JDBODY` are the kernel instruments this trace used; none of them
-  needed a rebuild.
+  needed a rebuild. The `p7580_pin:` ledger lines named in §5.1 exist after
+  the `gpu31-mmaprefs` flash.

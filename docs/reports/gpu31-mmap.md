@@ -35,6 +35,20 @@ the core-installed vma, select the WC prot (exynos
 SHMEM/imported — with a size check. The old fault helper
 (`p7580_gem_fault`/`p7580_map_page`) is kept for reference only.
 
+> **Correction (gpu31-mmap2 + gpu31-mmaprefs, 2026-11-21).** R2's
+> diagnosis was wrong about the flags: clearing `VM_PFNMAP` and setting
+> `VM_MIXEDMAP` after `drm_gem_mmap()` is exactly what the in-tree
+> `udl_gem_mmap()` does, and the fault path works when the core-installed
+> `gem_vm_ops` table is kept (no second table is needed). The actual
+> `-EINVAL`/`-ENXIO` came from `dma_mmap_attrs()` reading the fake
+> `vma->vm_pgoff` as a buffer page index (`gpu31-mmap2.md` §2, fixed by
+> the `vm_pgoff = 0` reset). Because `remap_pfn_range`/`VM_PFNMAP`
+> mappings hold no page reference at all, the immediate shape was
+> reverted to the fault-driven `VM_MIXEDMAP` + `vm_insert_page` one for
+> local SHMEM BOs in `gpu31-mmaprefs.md` (the gpu31-shaderbo page-reuse
+> fix); the CMA and PRIME-imported immediate shapes described above
+> remain.
+
 **R3 (wrong GPU alias, same symptom family): IOVA `drm_mm` units.**
 `p7580_dev_init()` passed raw byte `P7580_IOVA_START/SIZE` to
 `drm_mm_init()`, but `drm_mm` counts **pages** (`node.start` is a
