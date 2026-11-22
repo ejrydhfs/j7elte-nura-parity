@@ -344,6 +344,16 @@ wrong primitive, wrong slot, or missing chain bit. With no prefill the tiler
 therefore bins the buffer’s pre-submit (zero) content and the polygon list is
 256 empty `0xa0000000` lists; with a prefill it bins exactly the prefill.
 
+Mechanism `[INFERENCE]`: the VS stores land in a write-back cache that the
+tiler's read path does not snoop, so the tiler reads the buffer's DRAM content
+as of submit time; the submit-level `END_FLUSH_CLEAN_INV` is what eventually
+makes the VS data visible (which is why the `0xCF` clean+invalidate read after
+the chain shows it). The alternative reading — the tiler executed before the
+VS despite `dep1=1` — produces the same consumption pattern; both readings
+require the same fix (an ordered, cache-maintained submit boundary between the
+two stages), and the next-image experiment below distinguishes them only in
+that a flush-only boundary leaves the order question open if it still fails.
+
 **Fix direction.** Put a real submit boundary with cache clean+invalidate
 between the VS and the tiler, i.e. split the batch’s chain in the driver:
 
