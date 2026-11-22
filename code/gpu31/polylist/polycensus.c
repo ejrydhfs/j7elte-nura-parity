@@ -123,6 +123,7 @@ static uint64_t g_tiler_jc;
 static uint32_t g_tiler_prim, g_tiler_dep;
 static int g_tiler_valid;
 static uint64_t g_pl;
+static uint64_t g_tpos;
 static unsigned census_max = 2;
 static int raw_mode;
 
@@ -353,7 +354,7 @@ static void patch_tiler_varyings(struct pf_submit *s)
 	void *map;
 	int k, j;
 
-	if ((!getenv("PC2_SWAPVARY") && !getenv("PC2_BADPOS") && !getenv("PC2_POINTS") && !getenv("PC2_ZEROPRIM") && !getenv("PC2_CPUPOS") && !getenv("PC2_CPUPOS2") && !getenv("PC2_TILERAFTER") && !getenv("PC2_TILERAFTER2")) || !s->jc)
+	if ((!getenv("PC2_SWAPVARY") && !getenv("PC2_BADPOS") && !getenv("PC2_POINTS") && !getenv("PC2_ZEROPRIM") && !getenv("PC2_CPUPOS") && !getenv("PC2_CPUPOS2") && !getenv("PC2_ZEROPOS") && !getenv("PC2_DOUBLE") && !getenv("PC2_COPY0") && !getenv("PC2_PREFILL") && !getenv("PC2_NOFRAG") && !getenv("PC2_POLLSCAN") && !getenv("PC2_SPLIT") && !getenv("PC2_TILERAFTER") && !getenv("PC2_TILERAFTER2")) || !s->jc)
 		return;
 	if (bo_find(s->jc, &h, &off))
 		return;
@@ -377,6 +378,16 @@ static void patch_tiler_varyings(struct pf_submit *s)
 			break;
 		jw = (uint32_t *)map + ((job - base) >> 2);
 		type = (jw[4] >> 1) & 0xf;
+		if (type == 9 && getenv("PC2_NOFRAG")) {
+			/* Keep the fragment job from invoking any FS
+			 * (the ISA page is intermittently zero): an
+			 * inverted tile range processes no bin, so the
+			 * fragment still fences without consuming the
+			 * polygon list. Diagnostic only. */
+			jw[8] = 0x00010001u;	/* min=(1,1) */
+			jw[9] = 0x00000000u;	/* max=(0,0) */
+			pc2("nofrag: bounds -> empty at jc=0x%llx", (unsigned long long)job);
+		}
 		next = (uint64_t)jw[6] | ((uint64_t)jw[7] << 32);
 		v = (uint64_t)jw[38] | ((uint64_t)jw[39] << 32);
 		if (type == 2) {
@@ -388,6 +399,8 @@ static void patch_tiler_varyings(struct pf_submit *s)
 			pc2("swap: vertex varyings=0x%llx",
 			    (unsigned long long)v);
 		} else if (type == 7) {
+			g_tpos = (uint64_t)jw[20] |
+				 ((uint64_t)jw[21] << 32);
 			pc2("swap: tiler varyings 0x%llx -> 0x%llx",
 			    (unsigned long long)v, (unsigned long long)vs_vary);
 			if (vs_vary) {
@@ -551,6 +564,82 @@ cpupos2_done:
 					munmap(pmap, psize);
 				if (vmap)
 					munmap(vmap, vsize);
+			}
+			if (getenv("PC2_ZEROPOS")) {
+				/* Zero the tiler's position buffer before the
+				 * submit: if the post-fence census still shows
+				 * the three vertices, the chain's VS wrote them
+				 * during this submit (not a stale pool value). */
+				uint64_t pos = (uint64_t)jw[20] |
+					((uint64_t)jw[21] << 32);
+				uint32_t ph, poff, psize = 0;
+				void *pm;
+				int q;
+
+				if (bo_find(pos, &ph, &poff) == 0) {
+					for (q = 0; q < nbos; q++)
+						if (bos[q].handle == ph)
+							psize = bos[q].size;
+					pm = bo_map_rw(ph, psize);
+					if (pm && poff + 64 <= psize) {
+						memset((char *)pm + poff, 0, 64);
+						pc2("zeropos: zeroed 64B at 0x%llx",
+						    (unsigned long long)pos);
+					} else {
+						pc2("zeropos: map/short pos=0x%llx "
+						    "pm=%p poff=0x%x psize=0x%x",
+						    (unsigned long long)pos, pm,
+						    poff, psize);
+					}
+					if (pm)
+						munmap(pm, psize);
+				} else {
+					pc2("zeropos: pos 0x%llx has no BO",
+					    (unsigned long long)pos);
+				}
+			}
+			if (getenv("PC2_PREFILL")) {
+				/* Ordering discriminator: put a known
+				 * triangle in the tiler's position buffer
+				 * before the submit. The chain's VS
+				 * overwrites these bytes; if the tiler
+				 * bins the prefill (corner 2,2 red,
+				 * centre clear) it read the buffer before
+				 * the VS wrote it; if it bins the VS
+				 * triangle (centre red) it read after. */
+				uint64_t pos = (uint64_t)jw[20] |
+					((uint64_t)jw[21] << 32);
+				uint32_t ph, poff, psize = 0;
+				void *pm;
+				int q;
+				float tri[12] = {
+					0.0f, 0.0f, 0.5f, 1.0f,
+					8.0f, 0.0f, 0.5f, 1.0f,
+					0.0f, 8.0f, 0.5f, 1.0f
+				};
+				float big[12] = {
+					20.0f, 140.0f, 0.5f, 1.0f,
+					236.0f, 140.0f, 0.5f, 1.0f,
+					128.0f, 20.0f, 0.5f, 1.0f
+				};
+
+				if (getenv("PC2_PREFILL_BIG"))
+					memcpy(tri, big, sizeof(tri));
+
+				if (bo_find(pos, &ph, &poff) == 0) {
+					for (q = 0; q < nbos; q++)
+						if (bos[q].handle == ph)
+							psize = bos[q].size;
+					pm = bo_map_rw(ph, psize);
+					if (pm && poff + 48 <= psize) {
+						memcpy((char *)pm + poff, tri,
+						       sizeof(tri));
+						pc2("prefill: triangle -> 0x%llx",
+						    (unsigned long long)pos);
+					}
+					if (pm)
+						munmap(pm, psize);
+				}
 			}
 			if (getenv("PC2_ZEROPRIM")) {
 				jw[10] = 0;
@@ -924,6 +1013,8 @@ static void decode_chain(void)
 			    (unsigned long long)vbuf, (unsigned long long)vary,
 			    (unsigned long long)vp);
 			if (type == 7)
+				g_tpos = pos;
+			if (type == 7)
 				pc2("tiler primitive-size @+184: %08x %08x",
 				    w[46], w[47]);
 			if (vp && rd_words(vp, vw, 8) == 0) {
@@ -1064,6 +1155,379 @@ static void run_tiler_after(void)
 	real_ioctl(drv_fd, REQ_SYNCOBJ_DESTROY, &sd);
 }
 
+static void scan_pl(const char *tag);
+
+/* Append a scan line to stderr and, when PC2_SCANLOG names a file,
+ * also to that file (fsync each line) so the result survives a watchdog
+ * reboot triggered by the fragment leg. */
+static void scan_out(const char *fmt, ...)
+{
+	va_list ap;
+	const char *path = getenv("PC2_SCANLOG");
+	FILE *f;
+
+	va_start(ap, fmt);
+	fputs("PC2 ", stderr);
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+	va_end(ap);
+	fflush(stderr);
+	if (!path)
+		return;
+	f = fopen(path, "a");
+	if (!f)
+		return;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	fputc('\n', f);
+	va_end(ap);
+	fflush(f);
+	fsync(fileno(f));
+	fclose(f);
+}
+
+/* Wait (bounded) for the tiler to publish its prologue word
+ * (0xffffffff) and then census the list. This runs right after the
+ * chain submit returns, before Mesa submits the fragment job, so the
+ * fragment leg (whose FS ISA page is intermittently zero) cannot
+ * mask or stall the measurement. */
+static void poll_scan(const char *tag, uint64_t pl)
+{
+	uint32_t h, off, v = 0;
+	int i, waited = 0;
+
+	if (!pl || bo_find(pl, &h, &off)) {
+		scan_out("%s pollscan: pl 0x%llx has no BO", tag,
+			 (unsigned long long)pl);
+		return;
+	}
+	for (i = 0; i < 500; i++) {
+		if (rd32(h, off, &v) || v == 0xffffffffu)
+			break;
+		usleep(1000);
+		waited = i + 1;
+	}
+	scan_out("%s pollscan: prologue=%08x waited=%dms", tag, v, waited);
+	if (g_tpos) {
+		uint32_t pw[8];
+
+		if (rd_words(g_tpos, pw, 8) == 0)
+			scan_out("%s pollscan: pos@0x%llx = %08x %08x %08x %08x "
+			    "%08x %08x %08x %08x", tag,
+			    (unsigned long long)g_tpos, pw[0], pw[1], pw[2],
+			    pw[3], pw[4], pw[5], pw[6], pw[7]);
+		else
+			scan_out("%s pollscan: pos 0x%llx unreadable", tag,
+			    (unsigned long long)g_tpos);
+	}
+	g_pl = pl;
+	scan_pl(tag);
+}
+
+/* Count per-tile polygon-list payload through the kernel 0xCF route.
+ * Empty tiles carry exactly one nonzero word (the 0xa0000000 list
+ * terminator) in the first record; any tile with more nonzero words
+ * than that has a triangle record. Prints tiles_nonempty (= nz>1) and
+ * the total payload words, plus one sample tile. */
+static void scan_pl(const char *tag)
+{
+	uint64_t pl = g_pl, body;
+	unsigned nonempty = 0, payload_words = 0, sample = 0, i, k;
+	uint32_t w[16];
+
+	if (!pl) {
+		scan_out("%s: no polygon-list address captured", tag);
+		return;
+	}
+	if (rd_words(pl, w, 16)) {
+		scan_out("%s: pl 0x%llx unreadable", tag, (unsigned long long)pl);
+		return;
+	}
+	scan_out("%s: pl=0x%llx prologue=%08x %08x %08x %08x %08x %08x %08x %08x",
+	    tag, (unsigned long long)pl, w[0], w[1], w[2], w[3], w[4], w[5],
+	    w[6], w[7]);
+	body = pl + 0x2200;
+	for (i = 0; i < 256; i++) {
+		uint32_t t[8];
+		unsigned nz = 0;
+
+		if (rd_words(body + (uint64_t)i * 0x200, t, 8))
+			break;
+		for (k = 0; k < 8; k++)
+			if (t[k])
+				nz++;
+		if (nz > 1) {
+			nonempty++;
+			payload_words += nz - 1;
+			if (!sample) {
+				sample = 1;
+				scan_out("%s: sample tile%u: %08x %08x %08x %08x "
+				    "%08x %08x %08x %08x", tag, i, t[0], t[1],
+				    t[2], t[3], t[4], t[5], t[6], t[7]);
+				fflush(stderr);
+			}
+		}
+	}
+	scan_out("%s: tiles_nonempty=%u payload_words=%u", tag, nonempty,
+	    payload_words);
+}
+
+/* Re-submit the batch's own (unmodified) job chain a second time and
+ * wait for it: the first run's vertex job has already deposited
+ * gl_Position in the tiler's Draw.Position buffer, so the second run's
+ * tiler has the data in DRAM at submit time regardless of intra-chain
+ * ordering. If the second run bins and the first did not, the defect
+ * is vertex->tiler ordering/visibility inside one chain; if neither
+ * bins, the tiler cannot consume the buffer at all.
+ *
+ * PC2_DOUBLE=N: double up to N chains (0 = every chain of the run).
+ * PC2_SPLIT is the header-rewriting variant above and is mutually
+ * exclusive. Returns 0 when it replaced the original submit, -1 to
+ * fall through. */
+static int double_chain(struct pf_submit *s)
+{
+	static unsigned seen, done, acted;
+	unsigned limit = 1, skip = 0;
+	const char *e = getenv("PC2_DOUBLE");
+	const char *sk = getenv("PC2_DOUBLE_SKIP");
+	struct pf_syncobj_create sc;
+	struct pf_syncobj_destroy sd;
+	struct pf_submit p;
+	int rc, attempt;
+	uint32_t sc1 = 0;
+
+	if (!s || !s->jc || s->out_sync || !s->bo_handles)
+		return -1;
+	if (e)
+		limit = (unsigned)atoi(e);
+	if (sk)
+		skip = (unsigned)atoi(sk);
+	if (skip && seen++ < skip)
+		return -1;
+	if (limit && done >= limit)
+		return -1;
+	if (acted)
+		return -1;
+	acted = 1;
+	if (!g_pl)
+		return -1;
+	if (getenv("PC2_COPY0")) {
+		/* Control: one verbatim copy of the chain with out_sync=0
+		 * (the shape Mesa's own chain submit uses), then let the
+		 * original submit run too. Distinguishes "extra chain
+		 * submit" from "chain submit with an out-sync fence". */
+		struct pf_submit q;
+
+		done = 1;
+		pc2("copy0: acting on chain #%u (skip=%u)", seen, skip);
+		memset(&q, 0, sizeof(q));
+		q.jc = s->jc;
+		q.bo_handles = s->bo_handles;
+		q.bo_handle_count = s->bo_handle_count;
+		q.in_syncs = s->in_syncs;
+		q.in_sync_count = s->in_sync_count;
+		rc = real_ioctl(drv_fd, REQ_SUBMIT, &q);
+		pc2("copy0: chain jc=0x%llx out_sync=0 rc=%d in=%u",
+		    (unsigned long long)s->jc, rc ? -errno : 0,
+		    q.in_sync_count);
+		return -1;
+	}
+	done++;
+	for (attempt = 0; attempt < 2; attempt++) {
+		uint32_t prev = 0;
+
+		memset(&sc, 0, sizeof(sc));
+		if (real_ioctl(drv_fd, REQ_SYNCOBJ_CREATE, &sc)) {
+			pc2("double: syncobj create failed: %s", strerror(errno));
+			return -1;
+		}
+		memset(&p, 0, sizeof(p));
+		p.jc = s->jc;
+		p.bo_handles = s->bo_handles;
+		p.bo_handle_count = s->bo_handle_count;
+		p.out_sync = sc.handle;
+		/* Copy 1 preserves the batch's external dependencies;
+		 * copy 2 depends on copy 1's own fence. Dropping the
+		 * in_sync on the first copy faults the chain (measured:
+		 * immediate POWER_FAULT on JS1). */
+		if (attempt == 0) {
+			p.in_syncs = s->in_syncs;
+			p.in_sync_count = s->in_sync_count;
+		} else {
+			prev = sc1;
+			p.in_syncs = (uint64_t)(uintptr_t)&prev;
+			p.in_sync_count = 1;
+		}
+		rc = real_ioctl(drv_fd, REQ_SUBMIT, &p);
+		pc2("double: copy%u chain jc=0x%llx rc=%d sync=%u in=%u",
+		    attempt + 1, (unsigned long long)s->jc, rc ? -errno : 0,
+		    sc.handle, p.in_sync_count);
+		if (!rc) {
+			int64_t tmo = now_ns() + 1000000000LL;
+
+			rc = syncobj_wait(sc.handle, tmo);
+			pc2("double: copy%u %s", attempt + 1,
+			    rc ? strerror(errno) : "completed");
+		}
+		if (attempt == 0)
+			sc1 = sc.handle;
+		else {
+			memset(&sd, 0, sizeof(sd));
+			sd.handle = sc.handle;
+			real_ioctl(drv_fd, REQ_SYNCOBJ_DESTROY, &sd);
+		}
+		if (rc) {
+			/* Do not pile more chains onto a stuck slot. */
+			pc2("double: stopping after a failed copy");
+			break;
+		}
+		if (limit)
+			scan_pl(attempt ? "double: after copy2"
+					: "double: after copy1");
+	}
+	if (sc1) {
+		memset(&sd, 0, sizeof(sd));
+		sd.handle = sc1;
+		real_ioctl(drv_fd, REQ_SYNCOBJ_DESTROY, &sd);
+	}
+	return 0;
+}
+
+/* Split the batch's single job chain at the vertex->tiler boundary and
+ * submit it as two jobs with a fence between:
+ *
+ *   part 1: WRITE_VALUE (index 2) -> VERTEX (index 1), next=NULL
+ *   wait on its out_sync
+ *   part 2: WRITE_VALUE (index 2) -> TILER (index 3), tiler dep2=write
+ *           value, next=NULL; out_sync, wait
+ *
+ * Part 2 starts with JS_CONFIG START_FLUSH_CLEAN_INVALIDATE, i.e. the
+ * "cache flush/clean immediately before the tiler" variant, and the
+ * vertex job has provably retired (fence) before the tiler is even
+ * submitted. The original submit is skipped; the headers are restored
+ * afterwards so the census/decode sees Mesa's bytes. Env PC2_SPLIT=1.
+ * Returns 0 when it handled the submit (caller must not issue the
+ * original ioctl), -1 to fall through to the untouched submit. */
+static int split_chain(struct pf_submit *s)
+{
+	uint32_t h, off, size = 0, vh, voff, th, toff;
+	uint64_t v_jc, t_jc, wv_next, v_next, t_dep;
+	uint32_t *map, *wv, *vj, *tj;
+	struct pf_syncobj_create sc;
+	struct pf_syncobj_destroy sd;
+	struct pf_submit p;
+	int rc = -1, j, handled = 0;
+
+	if (!s || !s->jc || s->out_sync || !s->bo_handles)
+		return -1;
+	if (bo_find(s->jc, &h, &off))
+		return -1;
+	for (j = 0; j < nbos; j++)
+		if (bos[j].handle == h)
+			size = bos[j].size;
+	if (!size)
+		return -1;
+	map = bo_map_rw(h, size);
+	if (!map)
+		return -1;
+	wv = (uint32_t *)((char *)map + off);
+	if (((wv[4] >> 1) & 0xf) != 2)	/* head must be WRITE_VALUE */
+		goto fail;
+	wv_next = (uint64_t)wv[6] | ((uint64_t)wv[7] << 32);
+	v_jc = wv_next;
+	if (!v_jc || bo_find(v_jc, &vh, &voff) || vh != h)
+		goto fail;
+	vj = (uint32_t *)((char *)map + voff);
+	if (((vj[4] >> 1) & 0xf) != 5)
+		goto fail;
+	v_next = (uint64_t)vj[6] | ((uint64_t)vj[7] << 32);
+	t_jc = v_next;
+	if (!t_jc || bo_find(t_jc, &th, &toff) || th != h)
+		goto fail;
+	tj = (uint32_t *)((char *)map + toff);
+	if (((tj[4] >> 1) & 0xf) != 7)
+		goto fail;
+	t_dep = tj[5];
+
+	pc2("split: chain jc=0x%llx wv->v=0x%llx v->t=0x%llx tdep=0x%x",
+	    (unsigned long long)s->jc, (unsigned long long)v_jc,
+	    (unsigned long long)t_jc, t_dep);
+
+	/* Part 1: WRITE_VALUE -> VERTEX. */
+	vj[6] = 0;
+	vj[7] = 0;
+	memset(&sc, 0, sizeof(sc));
+	if (real_ioctl(drv_fd, REQ_SYNCOBJ_CREATE, &sc)) {
+		pc2("split: syncobj create failed: %s", strerror(errno));
+		goto restore;
+	}
+	memset(&p, 0, sizeof(p));
+	p.jc = s->jc;
+	p.bo_handles = s->bo_handles;
+	p.bo_handle_count = s->bo_handle_count;
+	p.out_sync = sc.handle;
+	rc = real_ioctl(drv_fd, REQ_SUBMIT, &p);
+	pc2("split: part1 wv+vertex rc=%d sync=%u", rc ? -errno : 0, sc.handle);
+	if (rc) {
+		pc2("split: part1 not submitted, leaving chain intact");
+		goto restore;
+	}
+	handled = 1;
+	{
+		int64_t tmo = now_ns() + 5000000000LL;
+
+		rc = syncobj_wait(sc.handle, tmo);
+		pc2("split: part1 %s", rc ? strerror(errno) : "completed");
+	}
+	memset(&sd, 0, sizeof(sd));
+	sd.handle = sc.handle;
+	real_ioctl(drv_fd, REQ_SYNCOBJ_DESTROY, &sd);
+	if (rc)
+		goto restore;
+
+	/* Part 2: WRITE_VALUE -> TILER, tiler waits on the write value. */
+	wv[6] = (uint32_t)t_jc;
+	wv[7] = (uint32_t)(t_jc >> 32);
+	tj[5] = 0x00020000u;
+	memset(&sc, 0, sizeof(sc));
+	if (real_ioctl(drv_fd, REQ_SYNCOBJ_CREATE, &sc)) {
+		pc2("split: syncobj2 create failed: %s", strerror(errno));
+		goto restore;
+	}
+	memset(&p, 0, sizeof(p));
+	p.jc = s->jc;
+	p.bo_handles = s->bo_handles;
+	p.bo_handle_count = s->bo_handle_count;
+	p.out_sync = sc.handle;
+	rc = real_ioctl(drv_fd, REQ_SUBMIT, &p);
+	pc2("split: part2 wv+tiler rc=%d sync=%u", rc ? -errno : 0, sc.handle);
+	if (!rc) {
+		int64_t tmo = now_ns() + 5000000000LL;
+
+		rc = syncobj_wait(sc.handle, tmo);
+		pc2("split: part2 %s", rc ? strerror(errno) : "completed");
+	}
+	memset(&sd, 0, sizeof(sd));
+	sd.handle = sc.handle;
+	real_ioctl(drv_fd, REQ_SYNCOBJ_DESTROY, &sd);
+	if (!rc)
+		handled = 1;
+
+restore:
+	wv[6] = (uint32_t)wv_next;
+	wv[7] = (uint32_t)(wv_next >> 32);
+	vj[6] = (uint32_t)v_next;
+	vj[7] = (uint32_t)(v_next >> 32);
+	tj[5] = t_dep;
+	munmap(map, size);
+	/* The original submit must not be issued once a part has been
+	 * submitted, or the chain would run twice. */
+	return handled ? 0 : -1;
+fail:
+	munmap(map, size);
+	return -1;
+}
+
 static void on_submit(const struct pf_submit *s)
 {
 	static unsigned nsub, nchain, nfrag;
@@ -1124,9 +1588,36 @@ int ioctl(int fd, unsigned long req, ...)
 	va_end(ap);
 
 	if (nr_fd_seen && fd == drv_fd && _IOC_TYPE(req) == DRM_IOCTL_BASE &&
-	    _IOC_NR(req) == NR_SUBMIT && arg)
+	    _IOC_NR(req) == NR_SUBMIT && arg) {
+		struct pf_submit *sub = arg;
+
+		if (getenv("PC2_REFUSE_FRAG") && sub->out_sync) {
+			/* Diagnostic: do not let the fragment leg consume
+			 * the polygon list or fault-stall the batch. The
+			 * chain measurement is already on disk. */
+			pc2("refusefrag: jc=0x%llx out_sync=%u -> EIO",
+			    (unsigned long long)sub->jc, sub->out_sync);
+			errno = EIO;
+			return -1;
+		}
 		patch_tiler_varyings(arg);
-	r = real_ioctl(fd, req, arg);
+		if ((getenv("PC2_DOUBLE") || getenv("PC2_COPY0")) && double_chain(arg) == 0)
+			r = 0;
+		else if (getenv("PC2_SPLIT") && split_chain(arg) == 0)
+			r = 0;
+		else
+			r = real_ioctl(fd, req, arg);
+		if (r == 0 && getenv("PC2_POLLSCAN") && !sub->out_sync) {
+			static unsigned polled;
+
+			if (polled < 1) {
+				polled++;
+				poll_scan("chain", g_pl);
+			}
+		}
+	} else {
+		r = real_ioctl(fd, req, arg);
+	}
 	(void)0;
 	if (r != 0 || _IOC_TYPE(req) != DRM_IOCTL_BASE)
 		return r;
