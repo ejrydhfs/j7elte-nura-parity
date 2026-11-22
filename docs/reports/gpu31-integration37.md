@@ -292,6 +292,22 @@ The only changed applied file is driver `0001` (plus the chain helpers
 appended to `jobs/panfrost7580_jm_hw.h`/`job.h`), so every int36
 routing/gate holds; the split adds the probes below.
 
+**Post-int37 finding (this image is superseded for the census).**
+Device work after the build showed the split runs but never bins: the
+shadow copy captured 96 B for a VERTEX job, while the Mesa
+VERTEX/COMPUTE aggregate is `MALI_COMPUTE_JOB_LENGTH` = 192 B (Draw is
+128 B at +64), so the standalone vertex dispatch read zeroed
+Textures/Samplers/Push uniforms/State/attribute and varying buffers/
+Viewport/FBD and faulted/hung. Fixed in **742dc52** (VERTEX 192,
+WRITE_VALUE 56, TILER/FUSED 192, FRAGMENT 64, NULL 32; host T1 pins
+those; jm_hw hunk regenerated, submit.c unchanged). So on `int37` the
+dmesg probes in 5.1 are valid but 5.2/5.3 report `tiles_nonempty = 0`
+followed by a watchdog. Run the census on the next image built with
+742dc52 (int38); 5.2–5.4 apply there unchanged. The walker itself was
+proved on int37 with a non-graphics 3×`JOB_TYPE_NULL` chain
+(`chain nodes=3`, three split jc at `+0x000/+0x100/+0x120`, cfg
+`0x83700`).
+
 ### 5.1 The split is active
 
 For the first 8 split submits / 8 nodes the kernel prints:
