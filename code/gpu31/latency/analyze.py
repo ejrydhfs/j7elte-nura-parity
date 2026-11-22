@@ -5,11 +5,11 @@ import collections
 import statistics
 import sys
 
+# DRM command numbers are DRM_COMMAND_BASE(0x40) + UAPI cmd.
 CMD = {
-    0x00: "SUBMIT", 0x01: "WAIT_BO", 0x02: "CREATE_BO", 0x03: "MMAP_BO",
-    0x04: "GET_BO_OFFSET", 0xC0: "GET_PARAM", 0xC1: "?c1", 0xC2: "?c2",
-    0xC3: "?c3", 0xBF: "?bf", 0x48: "MADVISE", 0x0C: "?0c",
-    0x41: "WAIT_BO", 0x40: "SUBMIT",
+    0x40: "SUBMIT", 0x41: "WAIT_BO", 0x42: "CREATE_BO", 0x43: "MMAP_BO",
+    0x44: "GET_BO_OFFSET", 0x48: "MADVISE", 0xC0: "GET_PARAM",
+    0xC1: "?c1", 0xC2: "?c2", 0xC3: "?c3", 0xBF: "?bf", 0x0C: "?0c",
 }
 
 
@@ -47,7 +47,13 @@ def report(path, frames):
 
 
 if __name__ == "__main__":
+    # usage: analyze.py [LOG...]  (set FRAMES=N for the frame rate column)
+    import os
+    import signal
+
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    frames = int(os.environ.get("FRAMES", "300"))
     if len(sys.argv) < 2:
         sys.exit("usage: analyze.py LOG [LOG...]")
     for p in sys.argv[1:]:
-        report(p, 300)
+        report(p, frames)
