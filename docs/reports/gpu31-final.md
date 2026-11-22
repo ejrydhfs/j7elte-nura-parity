@@ -144,4 +144,7 @@ numbers must come from our own EGL clients; debug probes (`0xCF`, JDBODY/PTEWALK
 Interpretation: shading is not the bottleneck — per-flush submit latency is (~40 ms/frame:
 submit -> sched -> split jobs -> IRQ -> fence -> user wait). Batching hides it; per-frame
 flushes expose it. Reducing that latency is the next step (`gpu31-latency.md`).
-Also: 512x512 targets currently time out (MFBD path, `gpu31-mfbd.md`).
+Also: 512x512 is **not** an MFBD path — T720 is SFBD-only and a 512² target
+uses a single SFBD (tiles 0,0..31,31); it renders clean via `glFinish`. The
+reported 512²/readback "timeouts" are fault-recovery latency, not FBD type
+(`gpu31-mfbd.md`, `gpu31-latency.md`).
