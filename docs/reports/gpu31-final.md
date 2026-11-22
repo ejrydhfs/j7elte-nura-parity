@@ -108,3 +108,28 @@ byte-exact against kbase/Mesa (FBD at 44*4, tiler section at FBD+192, heap/PLS/p
 Image **int38** (`42d3a160…`, kernel `3bbcc91a…`) contains both fixes and is staged. Flashing and
 the acceptance runs (`--defectb-test`, chain-split trace, polygon census, FS-only matrix) are
 **blocked on physical power-cycle**: the phone is off USB (boot stalls before sshd).
+
+## SUCCESS 2026-11-22 — hardware 3D renders on j7elte
+Kernel **int38** (`42d3a160…`, kernel `3bbcc91a…`) on silicon:
+
+- `pf7580-selftest --defectb-test` → **PASS 32/32**, `lost-immediate=0`, `lost-after-3000us=0`
+  (the shmem linear-alias dirty-line defect is fixed by `__flush_dcache_area()`).
+- `egltest --offscreen-only` (Mesa 20.3.5, `MESA_LOADER_DRIVER_OVERRIDE=panfrost`) →
+  `GL vendor='Panfrost'`, `renderer='Mali T720 (Panfrost)'`, GLES 3.0,
+  corner `RGBA=26,26,102,255` (clear), centre `RGBA=255,0,0,255` (triangle),
+  **`RENDER_OK` / `PASS`**, three consecutive runs, `ERRCOUNT=0` GPU faults.
+- Throughput in that test: 60 draws at 256x256 in ~0.17 s (~350 FPS incl. readback).
+
+Winning fixes that made it work (all in this tree):
+1. render-only DRM node (no `card0`), full v5.2 ioctls + syncobj, PM lifetime/teardown guards.
+2. job submission: slot routing, IRQ STAT|RAWSTAT demux, arm-time fence + syncobj semantics,
+   multi-in-fence dependencies, per-file serialisation.
+3. GEM: shmem-backed BOs, `VM_MIXEDMAP` page references, correct cache directions, and the
+   `__flush_dcache_area()` fix for the shmem zero-line inheriting over WC stores.
+4. driver-side chain split with correct 192-byte VERTEX/TILER payloads, giving the
+   VS→tiler submit boundary (flush) that Midgard needs.
+5. Mesa 20.3.5 paired with the v5.2 UAPI; attribute-array bounds fix (0007).
+
+Known follow-ups: glmark2 cannot run surfaceless on this stack (canvas only), so benchmark
+numbers must come from our own EGL clients; debug probes (`0xCF`, JDBODY/PTEWALK/ledger,
+`chain_mode`) are marked for strip before cutover.
