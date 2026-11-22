@@ -252,16 +252,20 @@ D: 512² long-frame regression).
 ```
 echo 5000 > /sys/kernel/debug/p7580/job_timeout_ms   # A/B: old budget
 echo 1    > /sys/kernel/debug/p7580/hang_inject      # one silent dispatch
-# ... FRAME 0 ≈ 5.1 s ...
+# dmesg: TIMEOUT +5003 ms, recover-done +114 ms (hang+recovery 5.117 s)
 echo 750  > /sys/kernel/debug/p7580/job_timeout_ms
 echo 1    > /sys/kernel/debug/p7580/hang_inject
-# ... FRAME 0 ≈ 0.86 s ...
+# dmesg: TIMEOUT +748.7 ms, recover-done +107 ms (hang+recovery 0.855 s)
 ```
 
 `hang_inject` needs no Mesa change and no special userspace: any submit
 (the bench's first `WRITE_VALUE` chain node) is enough. `job_timeout_ms`
 affects **new** opens (each client run is a new process), which is what
-makes the A/B possible in one boot.
+makes the A/B possible in one boot. Measure the *kernel* pair
+(mask -> TIMEOUT -> recover-done) for the hang cost: a client that only
+renders one frame can exit before the masked chain node's fence is
+needed (close then waits it out), while gfdemo with 3 frames makes the
+stall visible in the bench window (1.15 s at 750 ms; §4.1).
 
 ## 6. Limits / notes
 
