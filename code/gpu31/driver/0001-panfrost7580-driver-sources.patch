@@ -6690,7 +6690,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1965 @@
+@@ -0,0 +1,1969 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -8179,8 +8179,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	}
 +	sched_job->slot = s->slot;
 +	drm_sched_job_arm(sched_job);
-+	if (sched_job->fence)
-+		fence_ref = dma_fence_get(sched_job->fence);
++	if (sched_job->fence) {
++		fence_ref = sched_job->fence;
++		dma_fence_get(fence_ref);
++	}
 +
 +	/* Ordering: this node waits for the previous fence. For pos 0
 +	 * that is the per-file serial predecessor; for every later node
@@ -8584,8 +8586,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	/* The ioctl's lookup references and in-fence references are no
 +	 * longer needed: each queued node owns its own set, and the
 +	 * sched dependency graph owns the external fence references. */
++err_objs:
 +	for (i = 0; i < nr; i++)
 +		drm_gem_object_unreference_unlocked(objs[i]);
++err_inf:
 +	for (i = 0; i < nf; i++)
 +		dma_fence_put(inf[i]);
 +	return ret;
