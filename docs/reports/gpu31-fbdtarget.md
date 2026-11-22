@@ -230,6 +230,20 @@ Verdict: the tiler job is submitted with a correct descriptor but leaves the
 polygon list empty. The fragment job therefore clears tiles and invokes no
 fragment shader for them — matching "clear colour at the centre".
 
+### 5.3a Patch 0007 was NOT in the device tree (applied during this ticket)
+
+`grep "unsigned specials" /data/mesabuild/mesa20/src/gallium/drivers/panfrost/pan_cmdstream.c`
+returned nothing *before* this ticket's work: the tree the running Mesa was
+built from did **not** contain patch 0007's hunk, despite the session note
+that it had been applied. The patch applies cleanly
+(`patch -p1 --dry-run`: "Hunk #1 succeeded at 1136, offset 30 lines") and has
+now been applied and rebuilt (`ninja`: 7 steps, `libgallium_dri.so` relinked).
+Result: pixels are unchanged (corner and centre both 26,26,102,255; 4
+`ERR/TIMEOUT` lines in a clean window), so 0007 is not the cause of the empty
+polygon list either — but the vertex attribute-overflow fix is now genuinely
+in the tree, which removes one uncontrolled variable from every later run
+(and is worth keeping).
+
 ### 5.4 The fragment shader BO is read as zeros
 
 `FBDDBG compile` shows both shaders compiled and uploaded (96 B each, first
@@ -319,11 +333,16 @@ The two open causes are upstream of it and are handed off below.
    vertex `0x51/0x52` fixed by patch 0007. Once (1) is settled, capture
    `FBDDBG meta FS` + `FBDDBG isa FS` at the *faulting* submit and compare the
    bytes with the host disassembly of the same shader.
-3. **Polygon list**: if (1) turns out to be a Mesa-side/BO-lifetime issue
+3. **Patch 0007** is now applied to `/data/mesabuild/mesa20` and the DRI
+   library rebuilt (verified by hunk + `unsigned specials` in
+   `panfrost_emit_vertex_data`); keep it there. Re-run the polygon-list
+   census (`FBDDBG polylist`) after any future driver change: a covered tile
+   must leave an entry pointing into `list + body_offset + tile·0x200`.
+4. **Polygon list**: if (1) turns out to be a Mesa-side/BO-lifetime issue
    instead, the census (`FBDDBG polylist`) is the assertion to keep: any
    covered tile must leave an entry pointing into `list + body_offset +
    tile·0x200`.
-4. **Instrumentation hygiene:** the device tree
+5. **Instrumentation hygiene:** the device tree
    `/data/mesabuild/mesa20` currently carries the diagnostic patch (all
    prints are behind `PAN_FBD_DEBUG`, so a normal run is byte-identical in
    behaviour). Apply/revert with
