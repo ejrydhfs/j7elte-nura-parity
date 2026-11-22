@@ -371,6 +371,12 @@ addition to the existing int36 gate set:
    and exactly one `p7580_drv_shadow_put` call site from `free_job`.
 3. `Image`/`System.map` strings contain `p7580_sched: chain jc=`,
    `p7580_sched: split seq=`, `p7580_sched: submit_err stage=chain`.
-4. `make -C code/gpu31/driver check` passes (this report's host tests).
+4. `make -C code/gpu31/driver check` passes (this report's host tests);
+   the T1 length assertions are the gate that would have caught the
+   int37 96-byte VERTEX truncation.
+5. `panfrost7580_jm_hw.h` in the applied tree contains
+   `MALI_COMPUTE_JOB_LENGTH 192` and `p7580_chain_job_bytes()` returns
+   192 for `P7580_JOB_TYPE_VERTEX` (grep the applied file and the
+   `chainsplit_test` output, not just the patch).
 
 Then run §5.1–§5.3 on the device; §5.4 only after Defect B is fixed.
