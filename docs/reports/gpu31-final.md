@@ -148,3 +148,10 @@ Also: 512x512 is **not** an MFBD path — T720 is SFBD-only and a 512² target
 uses a single SFBD (tiles 0,0..31,31); it renders clean via `glFinish`. The
 reported 512²/readback "timeouts" are fault-recovery latency, not FBD type
 (`gpu31-mfbd.md`, `gpu31-latency.md`).
+
+## After int39 (2026-11-22) — latency fixed, readback faults remain
+- Fault-IRQ timeout kick works: 30 readback frames went from ~45 s to **5.58 s** (fences signalled in ms;
+  no more 5 s stalls).
+- No-readback bench (glFinish/frame, 256², 300 frames): **141 fps** (7 ms/frame) vs llvmpipe ~1000 fps.
+- Per-frame `glReadPixels` still faults the fragment job: `POWER_FAULT 0x41` (36/36 at 256², 19/19 at 512²);
+  the clean ordering is `glFinish()` **before** readback (verified at 512²). Tracked in `gpu31-readback.md`.
