@@ -122,6 +122,15 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Vertex faults eliminated by Mesa fix (2026-11-21)
+- Root cause of the earlier VERTEX-job faults: Mesa 20.3 emitted an OOB attribute/trampoline
+  store and handed 16 uninitialised attribute descriptors to hardware. Patch
+  `code/gpu31/mesa/patches/0007-mesa203-vertex-attribute-array-bounds.patch` applied to the
+  on-device Mesa 20.3.5 tree and rebuilt.
+- Result: clean dmesg window now shows **0 `ERR`** with 299 job IRQs (jobs execute/completed).
+- Still clear-only pixels -> next: decode the fragment FBD (RT pointer/stride/format/geometry)
+  vs the readback BO (`gpu31-fbdtarget.md`).
+
 ## Zero GPU faults; geometry still missing (2026-11-21, int33)
 - After `job->bo_count` stamping (int32) + multi-in-fence AND-node (int33), the per-frame
   `INSTR_TYPE_MISMATCH` is **gone**: ERR count 0, 104 job IRQs, jobs DONE, clear colour exact.
