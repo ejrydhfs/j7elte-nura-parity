@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,149 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -96,6 +96,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +
 +/* submit.c entry points. */
 +int p7580_drv_sched_ensure(void);
++/* gpu31-watchdog: sched dispatch-timeout (ms) accessors behind the
++ * jobs slice's job_timeout_ms debugfs knob. The setter clamps
++ * 100..60000, updates an already-live sched->timeout and seeds the
++ * entities of later opens (entity->timeout is copied at init). */
++unsigned int p7580_drv_get_job_timeout_ms(void *priv);
++int p7580_drv_set_job_timeout_ms(void *priv, unsigned int ms);
 +int p7580_drv_file_init(struct p7580_drv_file *df, struct p7580_drv *drv);
 +void p7580_drv_file_fini(struct p7580_drv_file *df);
 +
@@ -2512,7 +2518,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,390 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_jm_hw.h - Midgard job-manager hardware interface for the
@@ -2608,13 +2614,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#define P7580_GPU_IRQ_RESET_COMPLETED	(1u << 8)
 +
 +/* ------------------------------------------------------------------ */
-+/* Timeouts. SHIM-5S is the drm_sched shim's hardcoded dispatch        */
-+/* timeout (0004 pump: msecs_to_jiffies(5000)); JOB_TIMEOUT_MS must     */
-+/* stay in sync with it until the one-line wiring to sched->timeout    */
-+/* lands (see jobs report). 3 s matches kbase's soft-job default       */
-+/* (mali_kbase_config_defaults.h:185) and the reset default (:210).    */
++/* Timeouts. JOB_TIMEOUT_MS is the drm_sched dispatch budget (passed   */
++/* to drm_sched_init): the job's delayed_work fires when done_fence    */
++/* has not signalled that long. 750 ms bounds a silent hang (dispatch, */
++/* no IRQ ever, NO_EXCEPTION 0x08) to <1 s incl. recovery, and still   */
++/* keeps 2x the worst measured frame (512^2 readback 373 ms, CPU       */
++/* detile - GPU work is tens of us), so a legitimate long frame is     */
++/* not mistaken for a hang. RESET_TIMEOUT_MS is the reset poll bound   */
++/* (kbase soft-job default, mali_kbase_config_defaults.h:185/:210).    */
++/* Tune at runtime with debugfs p7580/job_timeout_ms (new entities).   */
 +/* ------------------------------------------------------------------ */
-+#define P7580_JOB_TIMEOUT_MS	5000u
++#define P7580_JOB_TIMEOUT_MS	750u
 +#define P7580_RESET_TIMEOUT_MS	3000u
 +
 +/* Slot for a submit. Matches mainline v5.2 panfrost_job_get_slot
@@ -2902,7 +2912,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1834 @@
+@@ -0,0 +1,1949 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -3149,6 +3159,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	spin_lock_irqsave(&jd->hw_lock, flags);
 +	jd->desc_dump = fn;
 +	jd->desc_dump_priv = priv;
++	spin_unlock_irqrestore(&jd->hw_lock, flags);
++}
++
++/* gpu31-watchdog: wire the driver's dispatch-timeout accessors. The
++ * timeout value itself lives with the drm_sched seed (driver), so the
++ * jobs slice only renders job_timeout_ms. */
++void p7580_job_set_timeout_hooks(struct p7580_job_dev *jd,
++				 unsigned int (*get)(void *priv),
++				 int (*set)(void *priv, unsigned int ms),
++				 void *priv)
++{
++	unsigned long flags;
++
++	if (!jd)
++		return;
++	spin_lock_irqsave(&jd->hw_lock, flags);
++	jd->get_timeout_ms = get;
++	jd->set_timeout_ms = set;
++	jd->timeout_priv = priv;
 +	spin_unlock_irqrestore(&jd->hw_lock, flags);
 +}
 +
@@ -3415,6 +3444,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	jd->desc_dump = NULL;
 +	jd->desc_dump_priv = NULL;
 +	jd->serialize_fs = 0;
++	/* gpu31-watchdog: injection disarmed, timeout knob unwired. */
++	jd->hang_arm = 0;
++	jd->get_timeout_ms = NULL;
++	jd->set_timeout_ms = NULL;
++	jd->timeout_priv = NULL;
 +	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 +		jd->in_flight[i] = NULL;
 +		mask |= P7580_MK_JS_MASK(i);
@@ -3532,6 +3566,22 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		st_pre = p7580_js_read(jd, slot, P7580_JS_STATUS);
 +	}
 +
++	/* gpu31-watchdog hang_inject: mask this slot's DONE+ERR bits for
++	 * one dispatch. The job still runs and retires in hardware, but
++	 * no IRQ is delivered, so the fence waits for the sched timeout:
++	 * the deterministic form of the silent hang (STAT/RAWSTAT 0,
++	 * COMMAND_NEXT drained, NO_EXCEPTION 0x08). Recovery's
++	 * dev_rearm() restores the mask. hang_arm is 0 unless written
++	 * through debugfs, so the production path is untouched. */
++	if (jd->hang_arm) {
++		jd->hang_arm--;
++		p7580_writel(jd, P7580_JOB_INT_MASK,
++			     (jd->js_present | (jd->js_present << 16)) &
++			     ~P7580_MK_JS_MASK(slot));
++		pr_info("p7580_job: hang_inject slot=%d seq=%u irq-masked\n",
++			slot, job->seqno);
++	}
++
 +	p7580_js_write(jd, slot, P7580_JS_HEAD_NEXT_LO, lo);
 +	p7580_js_write(jd, slot, P7580_JS_HEAD_NEXT_HI, hi);
 +
@@ -3640,7 +3690,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +/* dispatched job completes when this handler observes               */
 +/* STAT & MK_JS_MASK(slot) with the DONE bit set, clears the slot    */
 +/* bit(s), syncs the BOs, and dma_fence_signal()s the in-flight      */
-+/* fence -- the 5 s timeout (timedout_job -> recover) only fires     */
++/* fence -- the job timeout (timedout_job -> recover) only fires     */
 +/* when no IRQ arrives.                                               */
 +/* ------------------------------------------------------------------ */
 +
@@ -3864,7 +3914,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			p7580_job_ev(jd, P7580_EV_ERR, j, seq, jc, es,
 +				     status | rawstat, 0);
 +			/* Latency fix (gpu31-latency): before this kick the
-+			 * faulted job's fence was only signalled by the 5 s
++			 * faulted job's fence was only signalled by the full
 +			 * sched timeout (timedout_job -> recover), so one
 +			 * fault stalled the frame for the whole retry
 +			 * budget (a 300-frame bench showed 28 fps instead
@@ -3988,7 +4038,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +
 +	status = p7580_js_read(jd, slot, P7580_JS_STATUS);
 +	/* gpu31-firstfault: one-shot ring + descriptor-page dump BEFORE
-+	 * recover() touches the slots. Arrives here either from the 5 s
++	 * recover() touches the slots. Arrives here either from the job
 +	 * sched timeout (silent job) or from the ERR leg's delay-0 kick
 +	 * (a real JS_STATUS fault), so both signatures are covered by
 +	 * the same capture. */
@@ -4513,8 +4563,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	seq_printf(m, "job_int stat=0x%08x rawstat=0x%08x mask=0x%08x js_present=0x%x pgd=0x%llx\n",
 +		   job_stat, job_raw, job_mask, jd->js_present,
 +		   (unsigned long long)jd->pgd_dma);
-+	seq_printf(m, "faultdbg ev_arm=%u ev_head=%u ev_dumped=%u serialize_fs=%u\n",
-+		   jd->ev_arm, jd->ev_head, jd->ev_dumped, jd->serialize_fs);
++	seq_printf(m, "faultdbg ev_arm=%u ev_head=%u ev_dumped=%u serialize_fs=%u hang_arm=%u\n",
++		   jd->ev_arm, jd->ev_head, jd->ev_dumped, jd->serialize_fs,
++		   jd->hang_arm);
 +	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 +		uint32_t st, h_lo, h_hi, t_lo, t_hi;
 +		uint64_t head, tail;
@@ -4670,6 +4721,71 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +			p7580_job_serialize_fs_get,
 +			p7580_job_serialize_fs_set, "%llu\n");
 +
++/* gpu31-watchdog knobs.
++ *
++ * hang_inject: write N to mask the slot IRQ for the next N dispatches
++ * (the deterministic silent hang: job runs, no IRQ, fence waits the
++ * full dispatch timeout). 0 disarms. Nothing else changes; recovery
++ * re-arms the mask.
++ *
++ * job_timeout_ms: the driver's sched dispatch timeout (default
++ * P7580_JOB_TIMEOUT_MS = 750 ms). A write applies to entities created
++ * afterwards (each bench run opens a new file) and to the live
++ * sched->timeout; the setter clamps 100..60000. Read-only when the
++ * driver has not wired the hooks. */
++static int p7580_job_hang_get(void *data, u64 *val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd)
++		return -EINVAL;
++	*val = jd->hang_arm;
++	return 0;
++}
++
++static int p7580_job_hang_set(void *data, u64 val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd)
++		return -EINVAL;
++	jd->hang_arm = (unsigned int)val;
++	pr_info("p7580_job: hang_inject=%u (IRQ masked at the next %u dispatches)\n",
++		jd->hang_arm, jd->hang_arm);
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(p7580_job_hang_fops, p7580_job_hang_get,
++			p7580_job_hang_set, "%llu\n");
++
++static int p7580_job_timeout_get(void *data, u64 *val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd)
++		return -EINVAL;
++	if (!jd->get_timeout_ms) {
++		*val = P7580_JOB_TIMEOUT_MS;
++		return 0;
++	}
++	*val = jd->get_timeout_ms(jd->timeout_priv);
++	return 0;
++}
++
++static int p7580_job_timeout_set(void *data, u64 val)
++{
++	struct p7580_job_dev *jd = data;
++
++	if (!jd)
++		return -EINVAL;
++	if (!jd->set_timeout_ms)
++		return -ENODEV;
++	return jd->set_timeout_ms(jd->timeout_priv, (unsigned int)val);
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(p7580_job_timeout_fops, p7580_job_timeout_get,
++			p7580_job_timeout_set, "%llu\n");
++
 +static int p7580_job_dump_show_seq(struct seq_file *m, void *v)
 +{
 +	struct p7580_job_dev *jd = m->private;
@@ -4724,6 +4840,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +				&p7580_job_serialize_fs_fops);
 +	if (IS_ERR_OR_NULL(f))
 +		pr_info("p7580_job: serialize_fs knob unavailable\n");
++	/* gpu31-watchdog: silent-hang injection + dispatch-timeout A/B. */
++	f = debugfs_create_file("hang_inject", 0600, dir, jd,
++				&p7580_job_hang_fops);
++	if (IS_ERR_OR_NULL(f))
++		pr_info("p7580_job: hang_inject knob unavailable\n");
++	f = debugfs_create_file("job_timeout_ms", 0600, dir, jd,
++				&p7580_job_timeout_fops);
++	if (IS_ERR_OR_NULL(f))
++		pr_info("p7580_job: job_timeout_ms knob unavailable\n");
 +	f = debugfs_create_file("dump", 0400, dir, jd,
 +				&p7580_job_dump_fops);
 +	if (IS_ERR_OR_NULL(f))
@@ -4740,7 +4865,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,433 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -5028,6 +5153,20 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	 * tiler by one FIFO instead of relying on the cross-entity
 +	 * dependency alone. Runtime A/B knob (serialize_fs). */
 +	unsigned int serialize_fs;
++	/* gpu31-watchdog: deterministic silent-hang injection. hang_arm
++	 * = number of upcoming dispatches whose slot DONE+ERR bits are
++	 * masked at START, so the job runs and retires in hardware but
++	 * no IRQ is ever delivered: the exact silent signature (fence
++	 * unsignalled, STAT/RAWSTAT 0, COMMAND_NEXT drained) that only
++	 * the sched timeout can break. The timeout/recover path re-arms
++	 * the mask. Debugfs hang_inject, default 0 (inert). */
++	unsigned int hang_arm;
++	/* gpu31-watchdog: sched dispatch-timeout accessors (job_timeout_ms
++	 * debugfs). The timeout lives in the driver's drm_sched seed, so
++	 * the jobs slice only forwards; NULL set = read-only knob. */
++	unsigned int (*get_timeout_ms)(void *priv);
++	int (*set_timeout_ms)(void *priv, unsigned int ms);
++	void *timeout_priv;
 +};
 +#else
 +struct p7580_job_dev {
@@ -5148,6 +5287,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +void p7580_job_set_desc_dump(struct p7580_job_dev *jd,
 +			     int (*fn)(void *priv, uint64_t gpu,
 +				       const char *tag), void *priv);
++/* gpu31-watchdog: sched dispatch-timeout accessors behind the
++ * job_timeout_ms debugfs knob. The driver owns the timeout (it is the
++ * drm_sched seed), so the jobs slice only forwards get/set; NULL set
++ * leaves the knob read-only. Process context, no MMIO. */
++void p7580_job_set_timeout_hooks(struct p7580_job_dev *jd,
++				 unsigned int (*get)(void *priv),
++				 int (*set)(void *priv, unsigned int ms),
++				 void *priv);
 +void p7580_job_first_fault(struct p7580_job_dev *jd,
 +			   struct p7580_submit_job *job, uint32_t status);
 +
@@ -5155,7 +5302,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,758 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -5756,6 +5903,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	/* gpu31-firstfault: first-fault descriptor/SFBD/tiler-heap page
 +	 * dumper (process-context only; armed per run by ev_arm). */
 +	p7580_job_set_desc_dump(&drv->jd, p7580_drv_desc_dump, drv);
++	/* gpu31-watchdog: job_timeout_ms knob -> the sched seed above. */
++	p7580_job_set_timeout_hooks(&drv->jd,
++				    p7580_drv_get_job_timeout_ms,
++				    p7580_drv_set_job_timeout_ms, drv);
 +	p7580_drv_register_iova_trace(&p7580_iova_trace);
 +	ret = p7580_drv_sched_ensure();
 +	if (ret)
@@ -7361,7 +7512,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,2103 @@
+@@ -0,0 +1,2136 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -7473,6 +7624,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +static struct drm_sched p7580_drv_sched;
 +static int p7580_drv_sched_live;
 +static DEFINE_MUTEX(p7580_drv_sched_lock);
++/* gpu31-watchdog: dispatch timeout seed for drm_sched_init and the
++ * job_timeout_ms debugfs knob. 750 ms bounds a silent hang to <1 s
++ * (timeout + one recovery) while staying 2x above the worst measured
++ * frame (512^2 readback 373 ms of CPU detile; GPU jobs are tens of
++ * us). Runtime writes apply to entities created afterwards (each
++ * client run opens a new file) and to the live sched->timeout. */
++static unsigned int p7580_drv_job_timeout_ms = P7580_JOB_TIMEOUT_MS;
 +
 +/* Bounded SUBMIT/run_job trace (schedtrace): ST-IOCTL/ST-QUEUE see
 + * the ioctl entry and the 0004 queue handoff; ST-RUN/ST-PMGET see
@@ -8322,13 +8480,39 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	if (!p7580_drv_sched_live) {
 +		ret = drm_sched_init(&p7580_drv_sched,
 +				     &p7580_drv_sched_ops,
-+				     msecs_to_jiffies(P7580_JOB_TIMEOUT_MS),
++				     msecs_to_jiffies(p7580_drv_job_timeout_ms),
 +				     "panfrost7580");
 +		if (!ret)
 +			p7580_drv_sched_live = 1;
 +	}
 +	mutex_unlock(&p7580_drv_sched_lock);
 +	return ret;
++}
++
++/* gpu31-watchdog: job_timeout_ms get/set (jobs slice debugfs hook).
++ * The value is the drm_sched dispatch budget: it is copied into
++ * entity->timeout at entity_init (per open), so a write takes effect
++ * for the next client; the live sched->timeout is updated too. Clamp
++ * to 100..60000 ms (below the poll granularity this part can resolve,
++ * above the 5 s the port shipped with). */
++unsigned int p7580_drv_get_job_timeout_ms(void *priv)
++{
++	(void)priv;
++	return p7580_drv_job_timeout_ms;
++}
++
++int p7580_drv_set_job_timeout_ms(void *priv, unsigned int ms)
++{
++	(void)priv;
++	if (ms < 100u || ms > 60000u)
++		return -EINVAL;
++	mutex_lock(&p7580_drv_sched_lock);
++	p7580_drv_job_timeout_ms = ms;
++	if (p7580_drv_sched_live)
++		p7580_drv_sched.timeout = msecs_to_jiffies(ms);
++	mutex_unlock(&p7580_drv_sched_lock);
++	pr_info("p7580_sched: job_timeout_ms=%u (new entities)\n", ms);
++	return 0;
 +}
 +
 +/* Per-file entities on the shared scheduler workqueue. */
@@ -9318,7 +9502,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		 * readback: flush_batches then panfrost_bo_wait on the
 +		 * render target) saw the previous submit's fence and
 +		 * mapped a BO the GPU was about to write -> fragment
-+		 * DATA_INVALID_FAULT, whose recovery cost the 5 s timeout.
++		 * DATA_INVALID_FAULT, whose recovery cost a full timeout.
 +		 * This is the same last_fence installed on out_sync and
 +		 * published as serial_prev, so waiters observe the whole
 +		 * split and later submits gate on it at queue time. The

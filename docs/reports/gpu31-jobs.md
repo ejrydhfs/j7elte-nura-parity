@@ -112,12 +112,15 @@ unmodified userspace.
 
 ## 4. Timeouts
 
-- `P7580_JOB_TIMEOUT_MS = 5000`: **intentionally equal** to the 0004
-  shim's hardcoded dispatch timeout (`pump:
-  msecs_to_jiffies(5000)`). The shim's `sched->timeout` is currently
-  unreachable (review §4 F5: no entity→sched back-pointer), so this
-  slice pins both to 5 s and documents the one-line wiring
-  (`entity->sched` + `pump` uses `sched->timeout`) for G31_Sched.
+- `P7580_JOB_TIMEOUT_MS = 750`: the drm_sched dispatch budget, passed
+  to `drm_sched_init` (the shim's `sched->timeout` is live and copied
+  into `entity->timeout` at `entity_init`, per open). It bounds a
+  silent hang (job dispatched, no IRQ ever, `NO_EXCEPTION 0x08`) to
+  timeout + one recovery, measured <1 s, while staying 2x above the
+  worst measured frame (512² readback 373 ms, all of it Mesa's CPU
+  detile; GPU jobs are tens of µs). `gpu31-watchdog.md` carries the
+  tradeoff and the silicon measurement; debugfs `p7580/job_timeout_ms`
+  retunes it at runtime for the next open.
 - `P7580_RESET_TIMEOUT_MS = 3000`: slot-drain + `RESET_COMPLETED`
   poll bound; matches kbase `DEFAULT_JS_SOFT_JOB_TIMEOUT` and
   `DEFAULT_RESET_TIMEOUT_MS` (config_defaults.h:185,210).

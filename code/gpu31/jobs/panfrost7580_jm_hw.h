@@ -93,13 +93,17 @@
 #define P7580_GPU_IRQ_RESET_COMPLETED	(1u << 8)
 
 /* ------------------------------------------------------------------ */
-/* Timeouts. SHIM-5S is the drm_sched shim's hardcoded dispatch        */
-/* timeout (0004 pump: msecs_to_jiffies(5000)); JOB_TIMEOUT_MS must     */
-/* stay in sync with it until the one-line wiring to sched->timeout    */
-/* lands (see jobs report). 3 s matches kbase's soft-job default       */
-/* (mali_kbase_config_defaults.h:185) and the reset default (:210).    */
+/* Timeouts. JOB_TIMEOUT_MS is the drm_sched dispatch budget (passed   */
+/* to drm_sched_init): the job's delayed_work fires when done_fence    */
+/* has not signalled that long. 750 ms bounds a silent hang (dispatch, */
+/* no IRQ ever, NO_EXCEPTION 0x08) to <1 s incl. recovery, and still   */
+/* keeps 2x the worst measured frame (512^2 readback 373 ms, CPU       */
+/* detile - GPU work is tens of us), so a legitimate long frame is     */
+/* not mistaken for a hang. RESET_TIMEOUT_MS is the reset poll bound   */
+/* (kbase soft-job default, mali_kbase_config_defaults.h:185/:210).    */
+/* Tune at runtime with debugfs p7580/job_timeout_ms (new entities).   */
 /* ------------------------------------------------------------------ */
-#define P7580_JOB_TIMEOUT_MS	5000u
+#define P7580_JOB_TIMEOUT_MS	750u
 #define P7580_RESET_TIMEOUT_MS	3000u
 
 /* Slot for a submit. Matches mainline v5.2 panfrost_job_get_slot

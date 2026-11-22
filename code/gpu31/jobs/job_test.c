@@ -100,8 +100,8 @@ int main(void)
 	CHECK(!p7580_js_status_is_fault(0x02));
 	CHECK(!p7580_js_status_is_fault(0x03));
 
-	/* Timeouts: SHIM-5S parity, kbase defaults. */
-	CHECK(P7580_JOB_TIMEOUT_MS == 5000u);
+	/* Timeouts: 750 ms silent-hang bound (watchdog), 3 s reset poll. */
+	CHECK(P7580_JOB_TIMEOUT_MS == 750u);
 	CHECK(P7580_RESET_TIMEOUT_MS == 3000u);
 
 	/* Descriptor header: 32 bytes, v5.2-compatible field order. */

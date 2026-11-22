@@ -39,7 +39,7 @@
 #include <stdint.h>
 
 /* P7580_JOB_TIMEOUT_MS / P7580_RESET_TIMEOUT_MS from jm_hw.h. */
-#define JOB_TIMEOUT_MS		5000u
+#define JOB_TIMEOUT_MS		750u
 #define RESET_TIMEOUT_MS	3000u
 
 static int fails = 0;
