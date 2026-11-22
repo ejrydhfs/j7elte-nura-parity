@@ -347,18 +347,33 @@ first recovery the run continues with `TIMEOUT slot=0 js_status=0x58`
 for seqs 7, 11, 15, ... every ~113 ms — 29 ERR / 33 TIMEOUT in 30
 frames. So the cascade only needs an FS timeout, not a torn SFBD.
 
-## 6. Silicon acceptance (int43/int44) and current state
+## 6. Silicon acceptance (int44) and current state
 
-int43 was built and flashed from the first commit (publish-order half
-only, commit `3104a90`); the `WAIT_BO` half (§3.1) landed after that
-build, so **int43 is expected to still storm** and its 10x300 numbers are
-an isolation datum, not a verdict. int44 needs:
+Builds: int43 (`b769c29`, publish-order half only, driver sha `58972560…`,
+boot img `f9b6f10f…`) is superseded; **int44 is the acceptance image** —
+`88e011a`, driver sha `1c295834…`, 28/28 gates pass, boot
+`/run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7k/gpu31/kernel-boot-int44.img`
+(27 348 992 B, sha256
+`e32de3ac213b4f7d843a299ecc2728b6f0fb07e924c9ce5bc2dc9b45e617155b`),
+Image `Image-int44` (18 209 976 B, sha256
+`bf834883694a588b2b9af240896b1354eb5ba42674f03ab17ab7e70fdbe8c6a9`).
+int44's gate 6ae scopes the new mapping to the
+`if (timeout == 0)` -> `return -ETIMEDOUT;` pair in
+`panfrost_ioctl_wait_bo()` (driver 0001 already has two unrelated
+`-ETIMEDOUT` returns in the MMU/GEM wait helpers, so a global grep is
+wrong); `ioctl.o` shows `bl p7580_gem_wait` followed by
+`mov w1, #0xffffff92` (-ETIMEDOUT) in the next slot.
 
-* gate 6j/6z as the integrator already has them (one `add_excl` site, no
-  `publish_excl`), plus a new gate: exactly one `return -ETIMEDOUT;`
-  immediately after the `p7580_gem_wait()` call in
-  `panfrost7580_ioctl.c` (`panfrost_ioctl_wait_bo`), and one occurrence of
-  that string in the whole file.
+int44 is flashed and boots (`3.10.108 #37 17:29:16`). The first
+acceptance attempt produced **no valid datum**: the flash reboot landed
+at 22:31:38 in the middle of section A (runs 1-4 straddle the old and new
+image; runs 7-10 hit a booting system with 0.1-0.9 s walls and no BENCH
+line), and after that boot the phone was in boot-time memory pressure
+(shmem 1.2 GB unevictable, load 12.8 with Xorg/fbwin in D, 23+
+lowmemorykiller kills, rootfs 96 % full): every `gfdemo` launch was
+SIGKILLed within 0.1-0.3 s even at 3 frames, and sshd closed most
+sessions right after the session-open. Device work was stopped (Main);
+acceptance re-runs on the next boot with `storm58/accept44.sh`.
 
 Acceptance command (Main runs it on the flashed image), `ev_arm=1`, the
 pre-existing clean cost is 1.98-2.03 s so any regression shows as wall
