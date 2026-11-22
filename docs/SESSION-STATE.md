@@ -122,6 +122,16 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Polygon list is empty though the tiler runs (2026-11-21, int36)
+- Census: VS wrote 3 valid pixel-space vertices; tiler executes and reads its inputs; polygon-list
+  header is fully initialised (256/256 in range) but **every tile record is the empty-list
+  terminator `0xa0000000`**; tiler heap is all zeros. Fragment therefore invokes no FS and the RT
+  keeps the clear colour.
+- Working hypothesis: vertex->tiler consumption (JS_CONFIG chain bit and/or cache flush between the
+  VS and tiler jobs). Active slice: `gpu31-chainexec.md`.
+- Second, independent defect: the fragment-shader ISA page intermittently reads all-zero even with
+  the int36 page-ref fix; REUPLOAD masks it (`gpu31-polycensus2.md`).
+
 ## Page-reference mmap removes last GPU fault (2026-11-21, int36)
 - GEM user mappings now hold real page references (VM_MIXEDMAP fault-driven `vm_insert_page`,
   per-mapping pin, `put_page` on last close). The shader/vertex BOs no longer get zeroed mid-frame.
