@@ -1,0 +1,271 @@
+--- a/src/panfrost/lib/pan_bo.c
++++ b/src/panfrost/lib/pan_bo.c
+@@ -24,6 +24,8 @@
+  *   Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
+  */
+ #include <errno.h>
++#include <stdint.h>
++#include <sys/ioctl.h>
+ #include <stdio.h>
+ #include <fcntl.h>
+ #include <xf86drm.h>
+@@ -79,6 +81,7 @@
+         bo = pan_lookup_bo(dev, create_bo.handle);
+         assert(!memcmp(bo, &((struct panfrost_bo){}), sizeof(*bo)));
+ 
++        pan_fbddbg_watch_check("post-create-ioctl");
+         bo->size = create_bo.size;
+         bo->ptr.gpu = create_bo.offset;
+         bo->gem_handle = create_bo.handle;
+@@ -93,6 +96,9 @@
+         struct drm_gem_close gem_close = { .handle = bo->gem_handle };
+         int ret;
+ 
++        if (getenv("PAN_FBD_DEBUG"))
++                fprintf(stderr, "FBDDBG bo FREE gpu=0x%llx h=%d size=%zu\n",
++                        (unsigned long long)bo->ptr.gpu, bo->gem_handle, bo->size);
+         ret = drmIoctl(bo->dev->fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
+         if (ret) {
+                 fprintf(stderr, "DRM_IOCTL_GEM_CLOSE failed: %m\n");
+@@ -190,6 +196,8 @@
+ panfrost_bo_cache_fetch(struct panfrost_device *dev,
+                         size_t size, uint32_t flags, bool dontwait)
+ {
++        if (getenv("PAN_FBD_NOCACHE") || getenv("PAN_FBD_NOFETCH"))
++                return NULL;
+         pthread_mutex_lock(&dev->bo_cache.lock);
+         struct list_head *bucket = pan_bucket(dev, size);
+         struct panfrost_bo *bo = NULL;
+@@ -220,6 +228,10 @@
+                         continue;
+                 }
+                 /* Let's go! */
++                if (getenv("PAN_FBD_DEBUG"))
++                        fprintf(stderr, "FBDDBG bo FETCH gpu=0x%llx h=%d size=%zu "
++                                "flags=0x%x\n", (unsigned long long)entry->ptr.gpu,
++                                entry->gem_handle, entry->size, entry->flags);
+                 bo = entry;
+                 break;
+         }
+@@ -261,6 +273,8 @@
+ {
+         struct panfrost_device *dev = bo->dev;
+ 
++        if (getenv("PAN_FBD_NOCACHE") || getenv("PAN_FBD_NOPUT"))
++                return false;
+         if (bo->flags & PAN_BO_SHARED)
+                 return false;
+ 
+@@ -275,6 +289,9 @@
+ 
+         drmIoctl(dev->fd, DRM_IOCTL_PANFROST_MADVISE, &madv);
+ 
++        if (getenv("PAN_FBD_DEBUG"))
++                fprintf(stderr, "FBDDBG bo PUT gpu=0x%llx h=%d size=%zu\n",
++                        (unsigned long long)bo->ptr.gpu, bo->gem_handle, bo->size);
+         /* Add us to the bucket */
+         list_addtail(&bo->bucket_link, bucket);
+ 
+@@ -316,6 +333,30 @@
+         pthread_mutex_unlock(&dev->bo_cache.lock);
+ }
+ 
++
++struct pan_fbddbg_read { uint32_t handle, offset, value, pad; };
++#define PAN_FBDDBG_IOC _IOWR('d', 0xCF, struct pan_fbddbg_read)
++
++
++void *
++pan_fbddbg_remap(struct panfrost_bo *bo)
++{
++        struct drm_panfrost_mmap_bo m = { .handle = bo->gem_handle };
++        void *p;
++        if (drmIoctl(bo->dev->fd, DRM_IOCTL_PANFROST_MMAP_BO, &m))
++                return MAP_FAILED;
++        p = os_mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
++                    bo->dev->fd, m.offset);
++        return p;
++}
++uint32_t
++pan_fbddbg_kread(struct panfrost_device *dev, int handle, unsigned off)
++{
++        struct pan_fbddbg_read r = { .handle = (uint32_t) handle, .offset = off };
++        if (ioctl(dev->fd, PAN_FBDDBG_IOC, &r))
++                return 0xdeadbeefu;
++        return r.value;
++}
+ void
+ panfrost_bo_mmap(struct panfrost_bo *bo)
+ {
+@@ -326,6 +367,8 @@
+                 return;
+ 
+         ret = drmIoctl(bo->dev->fd, DRM_IOCTL_PANFROST_MMAP_BO, &mmap_bo);
++        if (!ret)
++                pan_fbddbg_watch_check("post-mmap-ioctl");
+         if (ret) {
+                 fprintf(stderr, "DRM_IOCTL_PANFROST_MMAP_BO failed: %m\n");
+                 assert(0);
+--- a/src/panfrost/lib/pan_bo.h
++++ b/src/panfrost/lib/pan_bo.h
+@@ -131,5 +131,7 @@
+ /* FBDDBG (diagnostic) shader-BO watch */
+ void pan_fbddbg_watch(struct panfrost_bo *bo);
+ void pan_fbddbg_watch_check(const char *where);
++uint32_t pan_fbddbg_kread(struct panfrost_device *dev, int handle, unsigned off);
++void *pan_fbddbg_remap(struct panfrost_bo *bo);
+ 
+ #endif /* __PAN_BO_H__ */
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -22,6 +22,7 @@
+  * SOFTWARE.
+  */
+ 
++#include "os/os_mman.h"
+ #include "util/macros.h"
+ #include "util/u_prim.h"
+ #include "util/u_vbuf.h"
+@@ -465,9 +466,63 @@
+                         }
+ 
+                         fprintf(stderr, "FBDDBG fsbo gpu=0x%llx size=%zu "
+-                                "isa=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                "isa=%08x %08x %08x %08x %08x %08x %08x %08x m256=%08x\n",
+                                 (unsigned long long)fs->bo->ptr.gpu, fs->bo->size,
+-                                iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[6], iw[7]);
++                                iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[6], iw[7],
++                                fs->bo->size >= 0x404 ? iw[256] : 0);
++                        if (getenv("PAN_FBD_CENSUS") && fs->bo->ptr.cpu) {
++                                uint32_t *w = (uint32_t *) fs->bo->ptr.cpu;
++                                unsigned n = fs->bo->size / 4, nz = 0, firstnz = 0;
++                                for (unsigned q = 0; q < n; q++)
++                                        if (w[q]) { if (!nz) firstnz = q; nz++; }
++                                fprintf(stderr, "FBDDBG census gpu=0x%llx nz=%u/%u "
++                                        "firstnz=%u w0=%08x w8=%08x w32=%08x w256=%08x\n",
++                                        (unsigned long long)fs->bo->ptr.gpu, nz, n,
++                                        firstnz, w[0], w[8], w[32], w[256]);
++                        }
++                        if (getenv("PAN_FBD_RECHECK") && fs->bo->ptr.cpu) {
++                                extern unsigned char pan_fbddbg_saved[];
++                                extern size_t pan_fbddbg_saved_sz;
++                                uint32_t *w = (uint32_t *) fs->bo->ptr.cpu;
++                                uint32_t k0, k8;
++
++                                if (pan_fbddbg_saved_sz)
++                                        memcpy(w, pan_fbddbg_saved, pan_fbddbg_saved_sz);
++                                __sync_synchronize();
++                                k0 = pan_fbddbg_kread(fs->bo->dev, fs->bo->gem_handle, 0);
++                                k8 = pan_fbddbg_kread(fs->bo->dev, fs->bo->gem_handle, 32);
++                                fprintf(stderr, "FBDDBG recheck gpu=0x%llx h=%d "
++                                        "after u=%08x %08x k=%08x %08x\n",
++                                        (unsigned long long)fs->bo->ptr.gpu,
++                                        fs->bo->gem_handle, w[0], w[8], k0, k8);
++                        }
++                        if (getenv("PAN_FBD_MAGIC") && fs->bo->ptr.cpu &&
++                            fs->bo->size >= 0x404) {
++                                uint32_t *w = (uint32_t *) fs->bo->ptr.cpu;
++                                uint32_t k;
++                                w[256] = 0x5a5aa5a5u;
++                                __sync_synchronize();
++                                k = pan_fbddbg_kread(fs->bo->dev,
++                                                     fs->bo->gem_handle, 0x400);
++                                fprintf(stderr, "FBDDBG magic gpu=0x%llx h=%d "
++                                        "kern=%08x mag=%08x isa=%08x %08x %08x %08x "
++                                        "%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                        (unsigned long long)fs->bo->ptr.gpu,
++                                        fs->bo->gem_handle, k, w[256],
++                                        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
++                                        w[8], w[9], w[10], w[11]);
++                                {
++                                        void *p2 = pan_fbddbg_remap(fs->bo);
++                                        if (p2 && p2 != MAP_FAILED) {
++                                                uint32_t *w2 = (uint32_t *) p2;
++                                                fprintf(stderr, "FBDDBG magic2 gpu=0x%llx "
++                                                        "w0=%08x w8=%08x w256=%08x\n",
++                                                        (unsigned long long)fs->bo->ptr.gpu,
++                                                        w2[0], w2[8], w2[256]);
++                                                munmap(p2, fs->bo->size);
++                                        }
++                                }
++                        }
+                 }
+         }
+ 
+@@ -1136,26 +1191,39 @@
+         struct panfrost_shader_state *vs = panfrost_get_shader_state(ctx, PIPE_SHADER_VERTEX);
+ 
+         /* Worst case: everything is NPOT, which is only possible if instancing
+-         * is enabled. Otherwise single record is gauranteed */
++         * is enabled. Otherwise single record is gauranteed.  Two extra
++         * records are reserved for the synthesised gl_VertexID and
++         * gl_InstanceID descriptors written below: the emitter writes BOTH
++         * whenever attribute_count >= PAN_VERTEX_ID (16), while
++         * attribute_count is only PAN_VERTEX_ID + 1 (17) for a shader that
++         * reads gl_VertexID alone, so an array sized attribute_count would
++         * take the PAN_INSTANCE_ID store out of bounds and corrupt the next
++         * pool allocation (the viewport descriptor).  The arrays are also
++         * zeroed: the hardware walks `attribute_count` descriptors, and an
++         * index the shader does not source must not decode as a random
++         * buffer/format pair. */
++        unsigned specials = 2;
++        unsigned buffer_slots =
++                (vs->attribute_count + specials) *
++                (ctx->instance_count > 1 ? 2 : 1);
+         struct panfrost_ptr S = panfrost_pool_alloc_aligned(&batch->pool,
+-                        MALI_ATTRIBUTE_BUFFER_LENGTH * (vs->attribute_count + 1) *
+-                        (ctx->instance_count > 1 ? 2 : 1),
++                        MALI_ATTRIBUTE_BUFFER_LENGTH * buffer_slots,
+                         MALI_ATTRIBUTE_BUFFER_LENGTH * 2);
+ 
+         struct panfrost_ptr T = panfrost_pool_alloc_aligned(&batch->pool,
+-                        MALI_ATTRIBUTE_LENGTH * vs->attribute_count,
++                        MALI_ATTRIBUTE_LENGTH * (vs->attribute_count + specials),
+                         MALI_ATTRIBUTE_LENGTH);
+ 
+         struct mali_attribute_buffer_packed *bufs =
+                 (struct mali_attribute_buffer_packed *) S.cpu;
+ 
+-        /* Determine (n + 1)'th index to suppress prefetch on Bifrost */
+-        unsigned last = vs->attribute_count * ((ctx->instance_count > 1) ? 2 : 1);
+-        memset(bufs + last, 0, sizeof(*bufs));
++        memset(bufs, 0, MALI_ATTRIBUTE_BUFFER_LENGTH * buffer_slots);
+ 
+         struct mali_attribute_packed *out =
+                 (struct mali_attribute_packed *) T.cpu;
+ 
++        memset(out, 0, MALI_ATTRIBUTE_LENGTH * (vs->attribute_count + specials));
++
+         unsigned attrib_to_buffer[PIPE_MAX_ATTRIBS] = { 0 };
+         unsigned k = 0;
+ 
+--- a/src/gallium/drivers/panfrost/pan_assemble.c
++++ b/src/gallium/drivers/panfrost/pan_assemble.c
+@@ -25,6 +25,7 @@
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <string.h>
+ #include "pan_bo.h"
+ #include "pan_context.h"
+@@ -265,8 +266,18 @@
+         int size = program->compiled.size;
+ 
+         if (size) {
+-                state->bo = panfrost_bo_create(dev, size, PAN_BO_EXECUTE);
++                int alloc_size = size;
++                if (getenv("PAN_FBD_BO_PAD"))
++                        alloc_size = MAX2(alloc_size, atoi(getenv("PAN_FBD_BO_PAD")));
++                state->bo = panfrost_bo_create(dev, alloc_size, PAN_BO_EXECUTE);
+                 memcpy(state->bo->ptr.cpu, program->compiled.data, size);
++                if (getenv("PAN_FBD_MAGIC") && state->bo->size >= 0x404)
++                        ((uint32_t *) state->bo->ptr.cpu)[256] = 0xcafe1234u;
++                /* FBDDBG: optional settle delay to test write-vs-next-op races */
++                if (getenv("PAN_FBD_DELAY_US")) {
++                        useconds_t d = (useconds_t) atoi(getenv("PAN_FBD_DELAY_US"));
++                        if (d) usleep(d);
++                }
+                 shader = state->bo->ptr.gpu;
+ 
+                 /* FBDDBG (diagnostic): what was just compiled and uploaded. */
