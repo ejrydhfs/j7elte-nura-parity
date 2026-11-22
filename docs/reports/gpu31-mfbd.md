@@ -157,6 +157,12 @@ dmesg after the run: **0** `p7580_job: (ERR|TIMEOUT)` lines. So one SFBD
 covering 1024 hardware tiles executes to completion: the fragmentation in the
 ticket was not the FBD.
 
+Note the precise ordering of this control: `gfdemo` does `glFinish()` every
+frame and still calls one `glReadPixels()` after the final `glFinish()`
+(`GFDEMO_NOREAD` path). That single ordered readback was clean at 512² too —
+i.e. the "glFinish before readback" ordering (§5 item 5) already has 512² silicon
+behind it, minus the per-frame pixel verdict that `rdtest` adds.
+
 ## 4. Silicon: the failing job under per-frame `glReadPixels`
 
 Same client and size, readback every frame.
@@ -295,7 +301,7 @@ for 512² (`read+finish`) and 1024² are the two runs still outstanding.
   `pan_screen.c`).
 * Land G31_Latency's fault-IRQ timeout kick; it is what converts every observed
   fault from a 5 s stall into a millisecond recovery.
-* Land the submit-time BO fence publication (§5.4) if bare `glReadPixels` after
+* Land the submit-time BO fence publication (§5 item 4) if bare `glReadPixels` after
   a frame must be safe without `glFinish`; otherwise document
   `glFinish`-before-readback as the supported ordering.
 * Keep the 4 MiB flat-tile polygon-list over-allocation in mind when auditing
