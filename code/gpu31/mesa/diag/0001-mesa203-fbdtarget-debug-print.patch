@@ -1,0 +1,570 @@
+diff -r a/src/gallium/drivers/panfrost/pan_assemble.c b/src/gallium/drivers/panfrost/pan_assemble.c
+--- a/src/gallium/drivers/panfrost/pan_assemble.c	2026-11-21 19:31:35.917703350 -0500
++++ b/src/gallium/drivers/panfrost/pan_assemble.c	2026-11-21 19:31:35.918014215 -0500
+@@ -40,6 +40,9 @@
+ 
+ #include "tgsi/tgsi_dump.h"
+ 
++unsigned char pan_fbddbg_saved[65536];
++size_t pan_fbddbg_saved_sz;
++
+ static void
+ pan_prepare_midgard_props(struct panfrost_shader_state *state,
+                           gl_shader_stage stage)
+@@ -265,6 +268,32 @@
+                 state->bo = panfrost_bo_create(dev, size, PAN_BO_EXECUTE);
+                 memcpy(state->bo->ptr.cpu, program->compiled.data, size);
+                 shader = state->bo->ptr.gpu;
++
++                /* FBDDBG (diagnostic): what was just compiled and uploaded. */
++                pan_fbddbg_watch(state->bo);
++
++                /* FBDDBG (diagnostic): keep a pristine copy of each MIDGARD
++                 * shader binary and, with PAN_FBD_REUPLOAD=1, re-upload it at
++                 * every meta emit (tests whether user BO data is being lost
++                 * between compilation and GPU consumption). */
++                if (stage == MESA_SHADER_FRAGMENT && size > 0 && size <= 65536) {
++                        memcpy(pan_fbddbg_saved, program->compiled.data, size);
++                        pan_fbddbg_saved_sz = size;
++                }
++                if (getenv("PAN_FBD_DEBUG")) {
++                        uint32_t *iw = program->compiled.data;
++
++                        fprintf(stderr, "FBDDBG compile stage=%d size=%d tag=%u "
++                                "bo=0x%llx bytes=%08x %08x %08x %08x %08x %08x\n",
++                                (int) stage, size, program->first_tag,
++                                (unsigned long long)state->bo->ptr.gpu,
++                                size >= 4 ? iw[0] : 0, size >= 8 ? iw[1] : 0,
++                                size >= 12 ? iw[2] : 0, size >= 16 ? iw[3] : 0,
++                                size >= 20 ? iw[4] : 0, size >= 24 ? iw[5] : 0);
++                }
++        } else if (getenv("PAN_FBD_DEBUG")) {
++                fprintf(stderr, "FBDDBG compile stage=%d size=0 tag=%u (no shader)\n",
++                        (int) stage, program->first_tag);
+         }
+ 
+         /* Midgard needs the first tag on the bottom nibble */
+diff -r a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-11-21 19:31:35.916578623 -0500
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c	2026-11-21 19:31:35.916879710 -0500
+@@ -448,6 +448,27 @@
+                         fs->outputs_read || (!zs_enabled && fs->can_discard);
+                 state->properties.midgard.shader_contains_discard = zs_enabled && fs->can_discard;
+                 state->shader = fs->shader;
++
++                /* FBDDBG (diagnostic): the CPU-side shader BO the meta points
++                 * at, and its first bundles, so the GPU-side ISA read can be
++                 * compared with what Mesa actually uploaded. */
++                if (getenv("PAN_FBD_DEBUG") && fs->bo && fs->bo->ptr.cpu) {
++                        uint32_t *iw = fs->bo->ptr.cpu;
++
++                        if (getenv("PAN_FBD_REUPLOAD")) {
++                                extern unsigned char pan_fbddbg_saved[];
++                                extern size_t pan_fbddbg_saved_sz;
++
++                                if (pan_fbddbg_saved_sz)
++                                        memcpy(fs->bo->ptr.cpu, pan_fbddbg_saved,
++                                               pan_fbddbg_saved_sz);
++                        }
++
++                        fprintf(stderr, "FBDDBG fsbo gpu=0x%llx size=%zu "
++                                "isa=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                (unsigned long long)fs->bo->ptr.gpu, fs->bo->size,
++                                iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[6], iw[7]);
++                }
+         }
+ 
+         if (dev->quirks & MIDGARD_SFBD) {
+@@ -555,6 +576,15 @@
+                               PAN_BO_ACCESS_READ |
+                               PAN_BO_ACCESS_VERTEX_TILER);
+ 
++        if (getenv("PAN_FBD_DEBUG") && ss->bo && ss->bo->ptr.cpu) {
++                uint32_t *iw = ss->bo->ptr.cpu;
++
++                fprintf(stderr, "FBDDBG vsbo gpu=0x%llx size=%zu "
++                        "isa=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                        (unsigned long long)ss->bo->ptr.gpu, ss->bo->size,
++                        iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[6], iw[7]);
++        }
++
+         return pan_resource(ss->upload.rsrc)->bo->ptr.gpu + ss->upload.offset;
+ }
+ 
+diff -r a/src/gallium/drivers/panfrost/pan_fragment.c b/src/gallium/drivers/panfrost/pan_fragment.c
+--- a/src/gallium/drivers/panfrost/pan_fragment.c	2026-11-21 19:31:35.912867457 -0500
++++ b/src/gallium/drivers/panfrost/pan_fragment.c	2026-11-21 19:31:35.913232728 -0500
+@@ -108,5 +108,22 @@
+                 payload.framebuffer = framebuffer;
+         }
+ 
++        /* FBDDBG (diagnostic): one fragment job per batch carries BOTH the
++         * clear (SFBD clear/clean-pixel fields) and the draw (SFBD tiler
++         * section); print what was emitted for this one. */
++        if (getenv("PAN_FBD_DEBUG"))
++                fprintf(stderr, "FBDDBG fragjob has_draws=%d job=0x%llx fbd=0x%llx "
++                        "batch=%p fb=%ux%u cbufs=%u clear=0x%x "
++                        "min=%u,%u max=%u,%u tiles=%u,%u..%u,%u\n",
++                        has_draws, (unsigned long long)transfer.gpu,
++                        (unsigned long long)framebuffer, (void *)batch,
++                        batch->key.width, batch->key.height,
++                        batch->key.nr_cbufs, batch->clear,
++                        batch->minx, batch->miny, batch->maxx, batch->maxy,
++                        batch->minx >> MALI_TILE_SHIFT,
++                        batch->miny >> MALI_TILE_SHIFT,
++                        (batch->maxx - 1) >> MALI_TILE_SHIFT,
++                        (batch->maxy - 1) >> MALI_TILE_SHIFT);
++
+         return transfer.gpu;
+ }
+diff -r a/src/gallium/drivers/panfrost/pan_job.c b/src/gallium/drivers/panfrost/pan_job.c
+--- a/src/gallium/drivers/panfrost/pan_job.c	2026-11-21 19:31:35.914126559 -0500
++++ b/src/gallium/drivers/panfrost/pan_job.c	2026-11-21 19:31:35.914424712 -0500
+@@ -934,6 +934,76 @@
+         bo->gpu_access |= flags & (PAN_BO_ACCESS_RW);
+ }
+ 
++static bool
++pan_fbddbg_read(struct pan_pool *pool, mali_ptr addr, unsigned words,
++                uint32_t *out)
++{
++        for (unsigned i = 0; i < panfrost_pool_num_bos(pool); i++) {
++                struct panfrost_bo *b =
++                        *util_dynarray_element(&pool->bos, struct panfrost_bo *, i);
++
++                if (b && b->ptr.cpu && addr >= b->ptr.gpu &&
++                    addr + words * 4 <= b->ptr.gpu + b->size) {
++                        memcpy(out, (char *)b->ptr.cpu + (addr - b->ptr.gpu),
++                               words * 4);
++                        return true;
++                }
++        }
++
++        fprintf(stderr, "FBDDBG chain addr=0x%llx: no pool BO\n",
++                (unsigned long long)addr);
++        return false;
++}
++
++static bool
++pan_fbddbg_read_batch(struct panfrost_batch *batch, mali_ptr addr,
++                      unsigned words, uint32_t *out)
++{
++        struct hash_entry *entry;
++
++        if (!addr)
++                return false;
++
++        hash_table_foreach(batch->bos, entry) {
++                struct panfrost_bo *b = (struct panfrost_bo *)entry->key;
++
++                if (b && b->ptr.cpu && addr >= b->ptr.gpu &&
++                    addr + words * 4 <= b->ptr.gpu + b->size) {
++                        memcpy(out, (char *)b->ptr.cpu + (addr - b->ptr.gpu),
++                               words * 4);
++                        return true;
++                }
++        }
++
++        if (pan_fbddbg_read(&batch->invisible_pool, addr, words, out))
++                return true;
++
++        fprintf(stderr, "FBDDBG batch-read addr=0x%llx: not in batch->bos\n",
++                (unsigned long long)addr);
++        return false;
++}
++
++static void
++pan_fbddbg_dump_bo(struct panfrost_bo *bo, unsigned off, unsigned words,
++                   const char *tag)
++{
++        uint32_t *p;
++
++        if (!bo || !bo->ptr.cpu || off + words * 4 > bo->size) {
++                fprintf(stderr, "FBDDBG %s bo=%p: not mmapped/short\n",
++                        tag, (void *)bo);
++                return;
++        }
++
++        p = (uint32_t *)((char *)bo->ptr.cpu + off);
++        fprintf(stderr, "FBDDBG %s bo=0x%llx gpu=0x%llx off=%u:",
++                tag, (unsigned long long)bo->ptr.gpu,
++                (unsigned long long)(bo->ptr.gpu + off), off);
++        for (unsigned w = 0; w < words; w++)
++                fprintf(stderr, " %08x", p[w]);
++        fprintf(stderr, "\n");
++}
++
+ static int
+ panfrost_batch_submit_ioctl(struct panfrost_batch *batch,
+                             mali_ptr first_job_desc,
+@@ -983,7 +1053,9 @@
+         bo_handles[submit.bo_handle_count++] = dev->tiler_heap->gem_handle;
+ 
+         submit.bo_handles = (u64) (uintptr_t) bo_handles;
++        pan_fbddbg_watch_check("submit-pre-ioctl");
+         ret = drmIoctl(dev->fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
++        pan_fbddbg_watch_check("submit-post-ioctl");
+         free(bo_handles);
+ 
+         if (ret) {
+@@ -999,6 +1071,155 @@
+                 drmSyncobjWait(dev->fd, &out_sync, 1,
+                                INT64_MAX, 0, NULL);
+ 
++                /* FBDDBG (diagnostic): after the GPU has retired this submit,
++                 * dump the tiler job's descriptor (the Primitive section is
++                 * what pandecode does not print) and the polygon list the
++                 * fragment job will consume. All-zero polygon list == the
++                 * tiler emitted no geometry, so the SFBD clear would be the
++                 * only thing that reaches the render target. */
++                if (getenv("PAN_FBD_DEBUG")) {
++                        mali_ptr job = batch->scoreboard.first_job;
++                        mali_ptr tiler_pos = 0, tiler_state = 0, vs_state = 0;
++
++                        for (int k = 0; k < 4 && job; k++) {
++                                uint32_t w[32];
++
++                                if (!pan_fbddbg_read(&batch->pool, job, 32, w))
++                                        break;
++
++                                fprintf(stderr, "FBDDBG chain k=%d job=0x%llx "
++                                        "type=%u idx=%u next=0x%llx:\n",
++                                        k, (unsigned long long)job,
++                                        (w[4] >> 1) & 0xf, (w[4] >> 16) & 0xff,
++                                        (unsigned long long)w[6] |
++                                        ((unsigned long long)w[7] << 32));
++                                for (unsigned i = 0; i < 32; i += 8)
++                                        fprintf(stderr, "FBDDBG   +%02x: %08x %08x "
++                                                "%08x %08x %08x %08x %08x %08x\n",
++                                                i * 4, w[i], w[i+1], w[i+2], w[i+3],
++                                                w[i+4], w[i+5], w[i+6], w[i+7]);
++
++                                if (((w[4] >> 1) & 0xf) == 5)
++                                        vs_state = (mali_ptr)w[30] |
++                                                ((mali_ptr)w[31] << 32);
++
++                                if (((w[4] >> 1) & 0xf) == 7) {
++                                        tiler_pos = (mali_ptr)w[20] |
++                                                ((mali_ptr)w[21] << 32);
++                                        tiler_state = (mali_ptr)w[30] |
++                                                ((mali_ptr)w[31] << 32);
++                                }
++
++                                job = (mali_ptr)w[6] |
++                                      ((mali_ptr)w[7] << 32);
++                        }
++
++                        /* Position buffer: what the vertex shader left for the
++                         * tiler. A degenerate/zero triangle here means the
++                         * tiler has nothing to bin, not an FBD problem. */
++                        if (tiler_pos) {
++                                uint32_t w[32];
++
++                                if (pan_fbddbg_read_batch(batch, tiler_pos, 32, w)) {
++                                        fprintf(stderr, "FBDDBG positions at=0x%llx "
++                                                "w=%08x %08x %08x %08x %08x %08x %08x %08x "
++                                                "%08x %08x %08x %08x %08x %08x %08x %08x "
++                                                "%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                                (unsigned long long)tiler_pos,
++                                                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
++                                                w[8], w[9], w[10], w[11], w[12], w[13], w[14],
++                                                w[15], w[16], w[17], w[18], w[19], w[20],
++                                                w[21], w[22], w[23]);
++                                }
++                        }
++
++                        /* Vertex/fragment shader meta (Draw.State of the two
++                         * jobs) and the ISA each one points at: the FS half of
++                         * the 0x52 is only decidable from the ISA bytes. */
++                        for (unsigned which = 0; which < 2; which++) {
++                                mali_ptr st = which ? tiler_state : vs_state;
++                                uint32_t w[32], isa[24];
++                                uint64_t sh;
++
++                                if (!st)
++                                        continue;
++                                if (!pan_fbddbg_read(&batch->pool, st, 32, w))
++                                        continue;
++
++                                sh = w[0] | ((uint64_t)w[1] << 32);
++                                fprintf(stderr, "FBDDBG meta %s at=0x%llx "
++                                        "shader=0x%llx tag=%u "
++                                        "w0..7=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                        which ? "FS" : "VS",
++                                        (unsigned long long)st,
++                                        (unsigned long long)sh, (unsigned)(sh & 0xf),
++                                        w[0], w[1], w[2], w[3],
++                                        w[4], w[5], w[6], w[7]);
++
++                                if (!pan_fbddbg_read_batch(batch, sh & ~0xfull, 24, isa))
++                                        continue;
++
++                                fprintf(stderr, "FBDDBG isa %s at=0x%llx "
++                                        "%08x %08x %08x %08x %08x %08x %08x %08x "
++                                        "%08x %08x %08x %08x %08x %08x %08x %08x "
++                                        "%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                        which ? "FS" : "VS",
++                                        (unsigned long long)(sh & ~0xfull),
++                                        isa[0], isa[1], isa[2], isa[3], isa[4],
++                                        isa[5], isa[6], isa[7], isa[8], isa[9],
++                                        isa[10], isa[11], isa[12], isa[13], isa[14],
++                                        isa[15], isa[16], isa[17], isa[18], isa[19],
++                                        isa[20], isa[21], isa[22], isa[23]);
++                        }
++
++                        if (batch->polygon_list) {
++                                struct panfrost_bo *plb = batch->polygon_list;
++                                static unsigned n_dump = 0;
++
++                                panfrost_bo_mmap(plb);
++                                if (plb->ptr.cpu) {
++                                        uint32_t *pl = plb->ptr.cpu;
++                                        unsigned nz = 0, inrange = 0;
++                                        unsigned first = ~0u, last = 0;
++                                        unsigned nent = 1024;
++                                        char map[1025];
++
++                                        for (unsigned i = 0; i < nent; i++) {
++                                                uint64_t v;
++
++                                                memcpy(&v, &pl[16 + i * 2], 8);
++                                                if (v) {
++                                                        nz++;
++                                                        if (first == ~0u)
++                                                                first = i;
++                                                        last = i;
++                                                }
++                                                bool ok = (v & ~0xffull) >= plb->ptr.gpu &&
++                                                          (v & ~0xffull) < plb->ptr.gpu + plb->size;
++                                                map[i] = ok ? '#' : (v ? '.' : '_');
++                                                if (ok)
++                                                        inrange++;
++                                        }
++                                        map[nent] = 0;
++
++                                        /* Only the first batch prints the full
++                                         * census: 32 rows of 32 entries. */
++                                        fprintf(stderr, "FBDDBG polylist bo=0x%llx size=%zu "
++                                                "nent=%u nz=%u inrange=%u first=%u last=%u "
++                                                "pro=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                                (unsigned long long)plb->ptr.gpu, plb->size,
++                                                nent, nz, inrange, first, last,
++                                                pl[0], pl[1], pl[2], pl[3],
++                                                pl[4], pl[5], pl[6], pl[7]);
++                                        if (n_dump++ < 2) {
++                                                for (unsigned r = 0; r < 32; r++)
++                                                        fprintf(stderr, "FBDDBG pcol row=%02u %.*s\n",
++                                                                r, 32, &map[r * 32]);
++                                        }
++                                }
++                        }
++                }
++
+                 /* Trace gets priority over sync */
+                 bool minimal = !(dev->debug & PAN_DBG_TRACE);
+                 pandecode_jc(submit.jc, dev->quirks & IS_BIFROST, dev->gpu_id, minimal);
+@@ -1027,6 +1248,20 @@
+         if (has_tiler)
+                 pthread_mutex_lock(&dev->submit_lock);
+ 
++        /* FBDDBG (diagnostic): does this batch emit a draw chain, a clear, or
++         * both? A clear-only fragment job (has_tiler=0) cannot produce the
++         * red centre no matter how correct the SFBD is. */
++        if (getenv("PAN_FBD_DEBUG"))
++                fprintf(stderr, "FBDDBG batch batch=%p has_draws=%d has_tiler=%d "
++                        "has_frag=%d first_job=0x%llx first_tiler=0x%llx clear=0x%x "
++                        "poly=0x%llx\n",
++                        (void *)batch, has_draws, has_tiler, has_frag,
++                        (unsigned long long)batch->scoreboard.first_job,
++                        (unsigned long long)(mali_ptr)batch->scoreboard.first_tiler,
++                        batch->clear,
++                        (unsigned long long)(batch->polygon_list ?
++                                batch->polygon_list->ptr.gpu : 0));
++
+         if (has_draws) {
+                 ret = panfrost_batch_submit_ioctl(batch, batch->scoreboard.first_job,
+                                                   0, in_sync, has_frag ? 0 : out_sync);
+diff -r a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+--- a/src/gallium/drivers/panfrost/pan_resource.c	2026-11-21 19:31:35.915334677 -0500
++++ b/src/gallium/drivers/panfrost/pan_resource.c	2026-11-21 19:31:35.915634087 -0500
+@@ -915,6 +915,20 @@
+                 }
+         }
+ 
++        /* FBDDBG (diagnostic): the BO the CPU is about to detile/read. For the
++         * client's glReadPixels this is the render target resource: its GPU
++         * base must equal the SFBD Color Writeback Base from the same frame. */
++        if (getenv("PAN_FBD_DEBUG") && (usage & PIPE_MAP_READ))
++                fprintf(stderr, "FBDDBG readback rsrc=%p bo=0x%llx tex_addr=0x%llx "
++                        "stride=%u tiled=%d fmt=%s %ux%u box=%u,%u %ux%u\n",
++                        (void *)rsrc, (unsigned long long)bo->ptr.gpu,
++                        (unsigned long long)panfrost_get_texture_address(rsrc, level, 0, 0),
++                        rsrc->slices[level].stride,
++                        rsrc->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED,
++                        util_format_short_name(rsrc->base.format),
++                        rsrc->base.width0, rsrc->base.height0,
++                        box->x, box->y, box->width, box->height);
++
+         if (rsrc->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED) {
+                 transfer->base.stride = box->width * bytes_per_pixel;
+                 transfer->base.layer_stride = transfer->base.stride * box->height;
+@@ -996,6 +1010,7 @@
+ panfrost_ptr_unmap(struct pipe_context *pctx,
+                         struct pipe_transfer *transfer)
+ {
++        pan_fbddbg_watch_check("ptr_unmap");
+         /* Gallium expects writeback here, so we tile */
+ 
+         struct panfrost_transfer *trans = pan_transfer(transfer);
+@@ -1032,6 +1047,17 @@
+         if (trans->map) {
+                 struct panfrost_bo *bo = prsrc->bo;
+ 
++                if (getenv("PAN_FBD_DEBUG"))
++                        fprintf(stderr, "FBDDBG unmap bo=0x%llx size=%zu off=%u "
++                                "box=%u,%u %ux%u usage=0x%x tiled=%d rsrc=%p\n",
++                                (unsigned long long)bo->ptr.gpu, bo->size,
++                                prsrc->slices[transfer->level].offset,
++                                transfer->box.x, transfer->box.y,
++                                transfer->box.width, transfer->box.height,
++                                transfer->usage,
++                                prsrc->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED,
++                                (void *)prsrc);
++
+                 if (transfer->usage & PIPE_MAP_WRITE) {
+                         prsrc->slices[transfer->level].initialized = true;
+ 
+@@ -1077,6 +1103,7 @@
+ 
+         /* Transfer itself is RALLOCed at the moment */
+         ralloc_free(transfer);
++        pan_fbddbg_watch_check("ptr_unmap-end");
+ }
+ 
+ static void
+diff -r a/src/gallium/drivers/panfrost/pan_sfbd.c b/src/gallium/drivers/panfrost/pan_sfbd.c
+--- a/src/gallium/drivers/panfrost/pan_sfbd.c	2026-11-21 19:31:35.911199852 -0500
++++ b/src/gallium/drivers/panfrost/pan_sfbd.c	2026-11-21 19:31:35.911638247 -0500
+@@ -103,6 +103,18 @@
+                 fprintf(stderr, "Invalid render modifier\n");
+                 assert(0);
+         }
++
++        /* FBDDBG (diagnostic): the exact render-target base the hardware is
++         * told to write, so it can be compared with the BO glReadPixels maps. */
++        if (getenv("PAN_FBD_DEBUG"))
++                fprintf(stderr, "FBDDBG cbuf bo=0x%llx slice_off=%u base=0x%llx "
++                        "stride=%d sfbd_stride=%u tiled=%d fmt=%s\n",
++                        (unsigned long long)rsrc->bo->ptr.gpu,
++                        (unsigned)rsrc->slices[level].offset,
++                        (unsigned long long)base, (int)stride,
++                        fb->color_writeback.row_stride,
++                        rsrc->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED,
++                        util_format_short_name(surf->format));
+ }
+ 
+ static void
+diff -r a/src/panfrost/lib/pan_bo.c b/src/panfrost/lib/pan_bo.c
+--- a/src/panfrost/lib/pan_bo.c	2026-11-21 19:31:35.918725969 -0500
++++ b/src/panfrost/lib/pan_bo.c	2026-11-21 19:31:35.919199215 -0500
+@@ -333,6 +333,13 @@
+ 
+         bo->ptr.cpu = os_mmap(NULL, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                               bo->dev->fd, mmap_bo.offset);
++        pan_fbddbg_watch_check("bo_mmap-post");
++        if (getenv("PAN_FBD_DEBUG") && bo->ptr.cpu != MAP_FAILED)
++                fprintf(stderr, "FBDDBG bo mmap gpu=0x%llx size=%zu cpu=%p first=%08x "
++                        "off=0x%llx\n",
++                        (unsigned long long)bo->ptr.gpu, bo->size, bo->ptr.cpu,
++                        ((uint32_t *)bo->ptr.cpu)[0],
++                        (unsigned long long)mmap_bo.offset);
+         if (bo->ptr.cpu == MAP_FAILED) {
+                 fprintf(stderr, "mmap failed: %p %m\n", bo->ptr.cpu);
+                 assert(0);
+@@ -345,6 +352,10 @@
+         if (!bo->ptr.cpu)
+                 return;
+ 
++        if (getenv("PAN_FBD_DEBUG"))
++                fprintf(stderr, "FBDDBG bo munmap gpu=0x%llx size=%zu cpu=%p first=%08x\n",
++                        (unsigned long long)bo->ptr.gpu, bo->size, bo->ptr.cpu,
++                        ((uint32_t *)bo->ptr.cpu)[0]);
+         if (os_munmap((void *) (uintptr_t)bo->ptr.cpu, bo->size)) {
+                 perror("munmap");
+                 abort();
+@@ -353,6 +364,48 @@
+         bo->ptr.cpu = NULL;
+ }
+ 
++/* FBDDBG (diagnostic): watch the first 16 B of up to 8 shader BOs and report
++ * the first place their contents change. */
++static struct panfrost_bo *pan_fbddbg_watched[8];
++static uint32_t pan_fbddbg_seen[8][4];
++
++void
++pan_fbddbg_watch(struct panfrost_bo *bo)
++{
++        for (unsigned i = 0; i < 8; i++) {
++                if (!pan_fbddbg_watched[i] || pan_fbddbg_watched[i] == bo) {
++                        pan_fbddbg_watched[i] = bo;
++                        if (bo->ptr.cpu)
++                                memcpy(pan_fbddbg_seen[i], bo->ptr.cpu, 16);
++                        return;
++                }
++        }
++}
++
++void
++pan_fbddbg_watch_check(const char *where)
++{
++        if (!getenv("PAN_FBD_DEBUG"))
++                return;
++
++        for (unsigned i = 0; i < 8; i++) {
++                struct panfrost_bo *b = pan_fbddbg_watched[i];
++                uint32_t now[4];
++
++                if (!b || !b->ptr.cpu)
++                        continue;
++                memcpy(now, b->ptr.cpu, 16);
++                if (memcmp(now, pan_fbddbg_seen[i], 16)) {
++                        fprintf(stderr, "FBDDBG WATCH %s: shader bo=0x%llx "
++                                "changed %08x %08x -> %08x %08x\n", where,
++                                (unsigned long long)b->ptr.gpu,
++                                pan_fbddbg_seen[i][0], pan_fbddbg_seen[i][1],
++                                now[0], now[1]);
++                        memcpy(pan_fbddbg_seen[i], now, 16);
++                }
++        }
++}
++
+ struct panfrost_bo *
+ panfrost_bo_create(struct panfrost_device *dev, size_t size,
+                    uint32_t flags)
+@@ -396,6 +449,14 @@
+ 
+         p_atomic_set(&bo->refcnt, 1);
+ 
++        pan_fbddbg_watch_check("bo_create");
++        /* FBDDBG (diagnostic): every BO allocation, so a recycled BO that is
++         * still referenced as a shader can be spotted by its GPU address. */
++        if (getenv("PAN_FBD_DEBUG"))
++                fprintf(stderr, "FBDDBG bo create gpu=0x%llx size=%zu flags=0x%x "
++                        "cpu=%p\n", (unsigned long long)bo->ptr.gpu, bo->size,
++                        bo->flags, bo->ptr.cpu);
++
+         if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
+                 if (flags & PAN_BO_INVISIBLE)
+                         pandecode_inject_mmap(bo->ptr.gpu, NULL, bo->size, NULL);
+diff -r a/src/panfrost/lib/pan_bo.h b/src/panfrost/lib/pan_bo.h
+--- a/src/panfrost/lib/pan_bo.h	2026-11-21 19:31:35.920030468 -0500
++++ b/src/panfrost/lib/pan_bo.h	2026-11-21 19:31:35.920333301 -0500
+@@ -128,4 +128,8 @@
+ void
+ panfrost_bo_cache_evict_all(struct panfrost_device *dev);
+ 
++/* FBDDBG (diagnostic) shader-BO watch */
++void pan_fbddbg_watch(struct panfrost_bo *bo);
++void pan_fbddbg_watch_check(const char *where);
++
+ #endif /* __PAN_BO_H__ */
