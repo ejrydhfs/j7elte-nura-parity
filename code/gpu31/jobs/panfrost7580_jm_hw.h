@@ -297,19 +297,21 @@ static inline int p7580_jc_valid(uint64_t jc)
 #define P7580_JOB_TYPE_FRAGMENT		9u
 
 /* Total bytes (header + inline payload) a shadow slot must carry.      */
-/* Null 32; Write Value 24 B payload (midgard.xml); Compute/Vertex     */
-/* 96 B (midgard.xml Compute Job: Draw ends at +96); Tiler/Fused 192 B */
-/* (Midgard Tiler Job size=192); Fragment 64 B (32 B header + 32 B     */
-/* payload fields through Tile Enable Map Row Stride).                 */
+/* Values are the generated Mesa aggregate lengths (midgard_pack.h):   */
+/* MALI_WRITE_VALUE_JOB_LENGTH 56, MALI_COMPUTE_JOB_LENGTH 192 (the    */
+/* VERTEX job: header 32 + Invocation 8 + Parameters 8 + Draw 128 +    */
+/* padding 16), MALI_MIDGARD_TILER_JOB_LENGTH 192, MALI_FRAGMENT_JOB_  */
+/* LENGTH 64, MALI_JOB_HEADER_LENGTH 32. A truncated VERTEX copy is    */
+/* fatal: Draw pointers from Textures/State/attributes/varyings/       */
+/* viewport on live above +96 and the hardware would read zeros.       */
 static inline unsigned int p7580_chain_job_bytes(uint32_t type)
 {
 	switch (type) {
 	case P7580_JOB_TYPE_NULL:
 		return P7580_JOB_DESC_HDR_SIZE;
 	case P7580_JOB_TYPE_WRITE_VALUE:
-		return 64u;
+		return 56u;
 	case P7580_JOB_TYPE_VERTEX:
-		return 96u;
 	case P7580_JOB_TYPE_TILER:
 	case P7580_JOB_TYPE_FUSED:
 		return 192u;

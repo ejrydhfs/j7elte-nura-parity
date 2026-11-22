@@ -133,9 +133,13 @@ page). Header **and inline payload** are copied; the payload is not
 relocated because every field in it is an absolute GPU address. The whole
 shadow BO is cleaned once with `p7580_gem_submit_sync()` after the fill.
 
-Payload lengths are grounded per type (`p7580_chain_job_bytes`):
-`NULL 32`, `WRITE_VALUE 64`, `VERTEX 96`, `TILER/FUSED 192`,
-`FRAGMENT 64`; anything else is rejected rather than guessed.
+Payload lengths are grounded per type (`p7580_chain_job_bytes`, values
+from the generated Mesa `midgard_pack.h`): `NULL 32`,
+`WRITE_VALUE 56`, `VERTEX 192` (= `MALI_COMPUTE_JOB_LENGTH`: header 32 +
+Invocation 8 + Parameters 8 + Draw 128 + padding 16), `TILER/FUSED 192`,
+`FRAGMENT 64`; anything else is rejected rather than guessed. A VERTEX
+copy shorter than 192 truncates the Draw pointers from Textures/State
+through attributes/varyings/viewport/FBD and the hardware reads zeros.
 
 ### 2.3 Per-node sched job and ordering
 
@@ -229,7 +233,7 @@ chainsplit_test: all checks passed
 
 | Test | What it pins |
 |---|---|
-| T1 chain decode/isolate | Mesa sample `0x00020005 / 0x0001000b / 0x0003000f`: types 2/5/7, indices 2/1/3, 64-bit `next` chain, tiler deps 1/2; isolate clears `next`/deps, sets index `pos+1`, preserves type/Is64; 256-B slots are 64-B aligned/do not overlap and 16 fit one page |
+| T1 chain decode/isolate | Mesa sample `0x00020005 / 0x0001000b / 0x0003000f`: types 2/5/7, indices 2/1/3, 64-bit `next` chain, tiler deps 1/2; isolate clears `next`/deps, sets index `pos+1`, preserves type/Is64; captured Mesa aggregate lengths 56/192/192/64/32 are asserted (VERTEX must be 192, not 96); 256-B slots are 64-B aligned/do not overlap and 16 fit one page |
 | T2 ordering | 3 nodes queued on one slot; node 0 has no dependency, node 1 depends on node 0's fence, node 2 on node 1's |
 | T3 single out-fence | exactly one `replace_fence`, target is node 2's fence; `serial_prev` is node 2 |
 | T4 error unwinding | failure at node 1: only node 0 queued, out-fence and serial published with node 0, unqueued nodes' shadow refs released; after retire: PM arms == releases, user BO refs back to caller-only, last shadow release unmaps once. Failure at node 0: nothing queued, no out-fence install, no serial publish, all shadow refs released |
@@ -300,6 +304,38 @@ page defect is fixed the centre pixel must be red and the corner clear
 
 Any of the three probes must be run under the existing device lock
 (`flock /tmp/gpsdev.lock`) with short holds, as in `gpu31-chainexec`.
+
+## 5.5 int37 silicon finding and the payload-length fix (int38)
+
+int37 flashed this split but the Mesa chain did not produce a usable run.
+The decisive split lines were lost with a watchdog reboot, so the
+reported "no chain/split lines" was a post-reboot observation. A
+non-graphics probe settles the mechanism: a three-node chain of
+`JOB_TYPE_NULL` descriptors built directly in a CREATE_BO/mmap BO and
+submitted on int37 produces
+
+```
+p7580_sched: chain jc=0x2000000 nodes=3 shadow=0x2001000 stride=256
+p7580_sched: split seq=0 pos=0/2 slot=1 jc=0x2001000 rc=0
+p7580_sched: split seq=1 pos=1/2 slot=1 jc=0x2001100 rc=0
+p7580_sched: split seq=2 pos=2/2 slot=1 jc=0x2001200 rc=0
+p7580_job: dispatch slot=1 jc=0x2001000 cfg=0x00083700 ... sw=... 00010003 00000000 00000000 00000000
+```
+
+so the walker, `next` encoding (w6 | w7<<32 with Is64=w4 bit 0), shadow
+isolation, per-node queueing and cfg are correct. The defect was the
+**shadow copy length**: the VERTEX job is `MALI_COMPUTE_JOB_LENGTH` =
+**192 bytes** (Draw is 128 bytes at offset 64), but int37's header
+returned `p7580_chain_job_bytes(VERTEX) = 96`, copying only Draw words
+0..7. The hardware then read zeros for Textures, Samplers, Push
+uniforms, State, attribute/varying buffers, Viewport and FBD, which
+faults/hangs the standalone vertex dispatch and leaves the tiler with no
+bins (census 0) until the watchdog resets the GPU.
+
+Fixed in this tree: `VERTEX -> 192`, `WRITE_VALUE -> 56` (exact
+`MALI_WRITE_VALUE_JOB_LENGTH`), TILER/FUSED 192, FRAGMENT 64, NULL 32;
+the host T1 now pins 56/192/192/64/32. Acceptance is unchanged
+(§5.1–§5.4) on the next image.
 
 ## 6. Risks / limits
 

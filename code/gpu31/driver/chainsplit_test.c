@@ -76,12 +76,12 @@ static void test_chain_decode(void)
 	CHECK(p7580_chain_hdr_type(wv_hdr) == P7580_JOB_TYPE_WRITE_VALUE);
 	CHECK(p7580_chain_hdr_index(wv_hdr) == 2);
 	CHECK(p7580_chain_hdr_next(wv_hdr) == 0x35840c0ull);
-	CHECK(p7580_chain_job_bytes(P7580_JOB_TYPE_WRITE_VALUE) == 64);
+	CHECK(p7580_chain_job_bytes(P7580_JOB_TYPE_WRITE_VALUE) == 56);
 
 	CHECK(p7580_chain_hdr_type(vs_hdr) == P7580_JOB_TYPE_VERTEX);
 	CHECK(p7580_chain_hdr_index(vs_hdr) == 1);
 	CHECK(p7580_chain_hdr_next(vs_hdr) == 0x3584000ull);
-	CHECK(p7580_chain_job_bytes(P7580_JOB_TYPE_VERTEX) == 96);
+	CHECK(p7580_chain_job_bytes(P7580_JOB_TYPE_VERTEX) == 192);
 
 	CHECK(p7580_chain_hdr_type(tiler_hdr) == P7580_JOB_TYPE_TILER);
 	CHECK(p7580_chain_hdr_index(tiler_hdr) == 3);
@@ -89,6 +89,10 @@ static void test_chain_decode(void)
 	CHECK(p7580_chain_hdr_dep2(tiler_hdr) == 2);
 	CHECK(p7580_chain_hdr_next(tiler_hdr) == 0);
 	CHECK(p7580_chain_job_bytes(P7580_JOB_TYPE_TILER) == 192);
+	/* Generated Mesa lengths (midgard_pack.h): a VERTEX (COMPUTE_JOB)
+	 * is as long as the tiler; +96 truncates Textures..FBD. */
+	CHECK(p7580_chain_job_bytes(P7580_JOB_TYPE_FRAGMENT) == 64);
+	CHECK(p7580_chain_job_bytes(P7580_JOB_TYPE_NULL) == 32);
 
 	/* Isolate the tiler into the last shadow slot: no next, no deps,
 	 * renumbered to its split position + 1, type/Is64 preserved. */
