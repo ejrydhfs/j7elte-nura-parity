@@ -133,3 +133,15 @@ Winning fixes that made it work (all in this tree):
 Known follow-ups: glmark2 cannot run surfaceless on this stack (canvas only), so benchmark
 numbers must come from our own EGL clients; debug probes (`0xCF`, JDBODY/PTEWALK/ledger,
 `chain_mode`) are marked for strip before cutover.
+
+## Performance (int38, 256x256 triangle, Mesa 20.3.5)
+| Engine | Workload | FPS | ms/frame |
+|---|---|---|---|
+| Panfrost (Mali T720) | 300 frames, glFinish each | 24.4 | 41 |
+| llvmpipe (8x A53) | same | 2365 | 0.42 |
+| Panfrost | 60 draws in one batch + readback (egltest) | ~357 | 2.8 |
+
+Interpretation: shading is not the bottleneck — per-flush submit latency is (~40 ms/frame:
+submit -> sched -> split jobs -> IRQ -> fence -> user wait). Batching hides it; per-frame
+flushes expose it. Reducing that latency is the next step (`gpu31-latency.md`).
+Also: 512x512 targets currently time out (MFBD path, `gpu31-mfbd.md`).
