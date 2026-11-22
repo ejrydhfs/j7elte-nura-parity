@@ -185,7 +185,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1661 @@
+@@ -0,0 +1,1681 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -712,6 +712,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		return -EINVAL;
 +	gd->dev = dev;
 +	mutex_init(&gd->iova_lock);
++	mutex_init(&gd->mmap_offset_lock);
 +	ret = drm_mm_init(&gd->iova_mm, P7580_IOVA_START >> PAGE_SHIFT,
 +			  P7580_IOVA_SIZE >> PAGE_SHIFT);
 +	if (ret) {
@@ -956,7 +957,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	}
 +	dma_resv_init(&bo->resv);			/* 0002 */
 +
++	mutex_lock(&gd->mmap_offset_lock);
 +	ret = drm_gem_create_mmap_offset(&bo->base);
++	mutex_unlock(&gd->mmap_offset_lock);
 +	if (ret)
 +		goto err_resv;
 +
@@ -968,7 +971,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	return 0;
 +
 +err_offset:
++	mutex_lock(&gd->mmap_offset_lock);
 +	drm_gem_free_mmap_offset(&bo->base);
++	mutex_unlock(&gd->mmap_offset_lock);
 +err_resv:
 +	dma_resv_fini(&bo->resv);			/* 0002 */
 +err_obj:
@@ -1237,8 +1242,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	if (WARN_ON_ONCE(bo->map_pinned))
 +		p7580_gem_map_unpin(bo);
 +
-+	if (obj->map_list.map)
-+		drm_gem_free_mmap_offset(obj);
++	if (obj->map_list.map) {
++		/* gpu31-mmapoff: this runs from the sched free_job
++		 * workqueue without struct_mutex, while CREATE_BO/import
++		 * run from the ioctl context; the offset manager has no
++		 * internal locking, so serialise the manager calls. */
++		if (gd) {
++			mutex_lock(&gd->mmap_offset_lock);
++			drm_gem_free_mmap_offset(obj);
++			mutex_unlock(&gd->mmap_offset_lock);
++		} else {
++			drm_gem_free_mmap_offset(obj);
++		}
++	}
 +	drm_gem_object_release(obj);
 +
 +	dma_resv_fini(&bo->resv);			/* 0002 */
@@ -1626,6 +1642,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +struct drm_gem_object *p7580_gem_prime_import_sg_table(
 +		struct drm_device *dev, size_t size, struct sg_table *sgt)
 +{
++	struct p7580_dev *gd = dev ? dev->dev_private : NULL;
 +	struct p7580_bo *bo;
 +	int ret;
 +
@@ -1649,7 +1666,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +
 +	dma_resv_init(&bo->resv);			/* 0002 */
 +
++	mutex_lock(&gd->mmap_offset_lock);
 +	ret = drm_gem_create_mmap_offset(&bo->base);
++	mutex_unlock(&gd->mmap_offset_lock);
 +	if (ret) {
 +		dma_resv_fini(&bo->resv);
 +		drm_gem_object_release(&bo->base);
@@ -1661,8 +1680,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	 * GEM mmap-offset manager). Imported BOs carry the exporter's
 +	 * attachment mapping in bo->sgt; the node owns the new range
 +	 * and free removes it. */
-+	if (dev->dev_private) {
-+		struct p7580_dev *gd = dev->dev_private;
++	if (gd) {
 +		unsigned long npages = size >> PAGE_SHIFT;
 +		struct drm_mm_node *hole;
 +		int alloc_ret = -ENOSPC;
@@ -1680,7 +1698,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		}
 +		mutex_unlock(&gd->iova_lock);
 +		if (alloc_ret) {
++			mutex_lock(&gd->mmap_offset_lock);
 +			drm_gem_free_mmap_offset(&bo->base);
++			mutex_unlock(&gd->mmap_offset_lock);
 +			dma_resv_fini(&bo->resv);
 +			drm_gem_object_release(&bo->base);
 +			kfree(bo);
@@ -1850,7 +1870,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,272 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
@@ -1992,6 +2012,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +	struct device *dev;
 +	struct drm_mm iova_mm;
 +	struct mutex iova_lock;
++	/* gpu31-mmapoff: the 3.10 offset manager (drm_mm + drm_hashtab)
++	 * has NO internal locking, and our create/import/free paths run
++	 * in different contexts (ioctl vs sched free_job workqueue), so
++	 * every drm_gem_*_mmap_offset call is serialised on this mutex. */
++	struct mutex mmap_offset_lock;
 +};
 +
 +struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj);
