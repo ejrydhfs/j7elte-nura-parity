@@ -2507,7 +2507,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,386 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_jm_hw.h - Midgard job-manager hardware interface for the
@@ -2716,6 +2716,20 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +	return status >= 0x40u;
 +}
 +
++/* Latched JM status codes (kbase jm_hw.h). 0x41 = POWER_FAULT: the slot
++ * was powered down with work queued. It survives the GPU-level SOFT/HARD
++ * reset, so recovery must power-cycle the cores to clear it
++ * (gpu31-readback). The other three are what our own STOP/HARD_STOP
++ * leaves in JS_STATUS; they are stop results, not latched HW faults. */
++#define P7580_JS_STATUS_POWER_FAULT	0x41u
++
++static inline int p7580_js_status_is_stop(uint32_t status)
++{
++	return status == 0x02u /* INTERRUPTED */ ||
++	       status == 0x03u /* STOPPED */ ||
++	       status == 0x04u /* TERMINATED */;
++}
++
 +/* ------------------------------------------------------------------ */
 +/* Job descriptor header (what job->jc points at). [KT]                */
 +/* mali_kbase_defs.h:1689-1712, "identical for all GPU archs". 32      */
@@ -2883,7 +2897,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1459 @@
+@@ -0,0 +1,1531 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -3190,7 +3204,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 +		       uint32_t js_present, uint64_t shader_present,
 +		       dma_addr_t pgd_dma, void *pm_dev,
-+		       int (*pm_get)(void *dev), void (*pm_put)(void *dev))
++		       int (*pm_get)(void *dev), void (*pm_put)(void *dev),
++		       int (*power_cycle)(void *dev))
 +{
 +	int i;
 +	uint32_t mask = 0;
@@ -3205,6 +3220,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	jd->pm_dev = pm_dev;
 +	jd->pm_get = pm_get;
 +	jd->pm_put = pm_put;
++	jd->power_cycle = power_cycle;
 +	spin_lock_init(&jd->hw_lock);
 +	mutex_init(&jd->reset_lock);
 +	/* Arm-time fence timelines (gpu31-armfence): one dma-fence
@@ -3276,7 +3292,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		     mask & (jd->js_present | (jd->js_present << 16)));
 +}
 +
-+/* Idle when no slot has a queued command and no job is in flight. */
++/* Idle when no slot has a queued command, no job is in flight and no
++ * present slot reports ACTIVE in JS_STATUS. gpu31-readback: the software
++ * view alone is not enough to gate a power-off -- recovery clears
++ * in_flight while the JM may still be executing, and a latched fault code
++ * (0x41 = ACTIVE|POWER_FAULT) reads COMMAND_NEXT==0. Powering the cores
++ * down in that window is a GPU power event (measured: 22 power-offs with
++ * "did not idle" per bench run, then POWER_FAULT storms). Our own HARD_STOP
++ * leaves STOPPED (0x03, bit 0 set) in the slot, which is not activity. */
 +int p7580_job_is_idle(struct p7580_job_dev *jd)
 +{
 +	int i;
@@ -3284,9 +3307,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	if (!jd)
 +		return 1;
 +	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
++		uint32_t st;
++
 +		if (p7580_js_read(jd, i, P7580_JS_COMMAND_NEXT))
 +			return 0;
 +		if (jd->in_flight[i])
++			return 0;
++		if (!(jd->js_present & (1u << i)))
++			continue;
++		st = p7580_js_read(jd, i, P7580_JS_STATUS);
++		if ((st & 0x1u) && !p7580_js_status_is_stop(st))
 +			return 0;
 +	}
 +	return 1;
@@ -3998,10 +4028,35 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +/* path for the retry decision (Mesa re-submits the batch).           */
 +/* ------------------------------------------------------------------ */
 +
++/* Read every present slot's JS_STATUS after the GPU reset: true when a
++ * HW fault code survived it. Our own HARD_STOP leaves INTERRUPTED /
++ * STOPPED / TERMINATED (0x02/0x03/0x04) in the stopped slots, so those
++ * are skipped; anything else >= 0x40 is a latched fault, and
++ * POWER_FAULT in particular is only cleared by cycling the cores
++ * (gpu31-readback: without the cycle every following job on the slot
++ * re-reports 0x41 until the block is power-cycled by a suspend). */
++int p7580_job_slots_latched_fault(struct p7580_job_dev *jd)
++{
++	int i;
++
++	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
++		uint32_t st;
++
++		if (!(jd->js_present & (1u << i)))
++			continue;
++		st = p7580_js_read(jd, i, P7580_JS_STATUS);
++		if (p7580_js_status_is_fault(st) &&
++		    !p7580_js_status_is_stop(st))
++			return 1;
++	}
++	return 0;
++}
++
 +int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 +		      uint32_t status)
 +{
 +	int i, ret = 0;
++	int cycled = 0;
 +	unsigned long end;
 +	struct p7580_submit_job *fault_job = NULL;
 +
@@ -4056,7 +4111,26 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	}
 +	p7580_writel(jd, P7580_GPU_INT_CLEAR, P7580_GPU_IRQ_RESET_COMPLETED);
 +
-+	/* 4. re-arm the slot IRQs the handler demuxes. Order mirrors
++	/* 4. Clear a latched JM fault (gpu31-readback). A POWER_FAULT
++	 * (0x41) latch means the slot was powered down with work queued;
++	 * the GPU-level SOFT/HARD reset above does NOT clear it, and while
++	 * it is set every following job on that slot reports 0x41 again
++	 * (measured: one fault turned into 36 ERR/36 TIMEOUT for the rest
++	 * of the process, while the next process was clean because the
++	 * block had been power-cycled in between). Cycle the cores, then
++	 * reprogram AS0 and re-arm below, exactly as after resume. The
++	 * caller holds a live runtime-PM ref, so the domain stays up. */
++	if (jd->power_cycle && jd->pm_dev &&
++	    (status == P7580_JS_STATUS_POWER_FAULT ||
++	     p7580_job_slots_latched_fault(jd))) {
++		int crc = jd->power_cycle(jd->pm_dev);
++
++		cycled = 1;
++		if (crc)
++			pr_err("p7580_job: recover-cycle FAIL rc=%d\n", crc);
++	}
++
++	/* 5. re-arm the slot IRQs the handler demuxes. Order mirrors
 +	 * kbase_pm_clock_on (mali_kbase_pm_driver.c: MMU first, then
 +	 * JOB unmask last at :1109): TRANSTAB + MEMATTR + TRANSCFG(0) +
 +	 * UPDATE rebind AS0 BEFORE CLEAR+unmask, so the first post-reset
@@ -4066,6 +4140,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +	p7580_mmu_program_as(jd->regs, 0, jd->pgd_dma,
 +			     P7580_MEMATTR_KBASE_LO, P7580_MEMATTR_KBASE_HI);
 +	p7580_job_dev_rearm(jd);
++
++	/* 6. Post-recovery register state, always on (faults are rare):
++	 * proves the slot is usable again (no fault code left in
++	 * JS_STATUS, JOB_INT masked for the present slots) instead of
++	 * leaving the next fault to be discovered by a cascade. */
++	pr_err("p7580_job: recover-done slot=%d latched=0x%08x cycle=%d js0=0x%08x js1=0x%08x intmask=0x%08x drain_rc=%d\n",
++	       fault_slot, status, cycled,
++	       (jd->js_present & 1u) ?
++			p7580_js_read(jd, 0, P7580_JS_STATUS) : 0u,
++	       (jd->js_present & 2u) ?
++			p7580_js_read(jd, 1, P7580_JS_STATUS) : 0u,
++	       p7580_readl(jd, P7580_JOB_INT_MASK), ret);
 +
 +	mutex_unlock(&jd->reset_lock);
 +
@@ -4346,7 +4432,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,332 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.h - submit-path state for the T720 panfrost port.
@@ -4546,6 +4632,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +	void *pm_dev;
 +	int (*pm_get)(void *dev);
 +	void (*pm_put)(void *dev);
++	/* Fault-recovery core power cycle (gpu31-readback), wired by
++	 * p7580_job_dev_init from the driver TU (the jobs slice never
++	 * includes the power slice). Called from p7580_job_recover()
++	 * with reset_lock held and a live PM ref owned by the caller,
++	 * only when a POWER_FAULT latch survived the GPU reset: that
++	 * latch is only cleared by cycling the cores, and until it is
++	 * cleared every following job on the slot reports 0x41 again.
++	 * MMU AS0 reprogram + JOB_INT re-arm happen after it returns.
++	 * NULL when unwired: recovery then behaves as before. */
++	int (*power_cycle)(void *dev);
 +	/* Chain-bit experiment (gpu31-lastjob): runtime switch, no
 +	 * rebuild needed to A/B. 0 = off (both variants disabled,
 +	 * submit bytes untouched); 1 = variant A (set JS_CONFIG
@@ -4585,7 +4681,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 +		       uint32_t js_present, uint64_t shader_present,
 +		       dma_addr_t pgd_dma, void *pm_dev,
-+		       int (*pm_get)(void *dev), void (*pm_put)(void *dev));
++		       int (*pm_get)(void *dev), void (*pm_put)(void *dev),
++		       int (*power_cycle)(void *dev));
 +#else
 +#include <stdint.h>
 +typedef uint64_t p7580_dma_addr_t;
@@ -4594,6 +4691,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +		       p7580_dma_addr_t pgd_dma);
 +#endif
 +void p7580_job_dev_fini(struct p7580_job_dev *jd);
++/* True when a present job slot still reports a latched HW fault code in
++ * JS_STATUS after a reset/power-on (POWER_FAULT 0x41 and friends; our
++ * own HARD_STOP's INTERRUPTED/STOPPED/TERMINATED are not faults). The
++ * driver's resume path uses it to clear such a latch with a core power
++ * cycle before the first job is dispatched; recover() uses it for the
++ * same reason after the GPU-level reset. Process context, block must be
++ * powered (runtime-PM ref held). */
++int p7580_job_slots_latched_fault(struct p7580_job_dev *jd);
 +/* Debug knobs (errtrace): re-arm the trace budget (copies N into both
 + * trace_arm and trace_left under hw_lock; N=0 stops tracing). Dump
 + * renders the last-dispatch snapshot + live slot registers into buf
@@ -4663,7 +4768,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,751 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -5018,6 +5123,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +		if (ret)
 +			return ret;
 +	}
++	/* A POWER_FAULT latch left by a previous fault survives the
++	 * soft reset inside the power-on above (measured on int39: after
++	 * one fault every following job re-reported 0x41 until the block
++	 * was cycled by a suspend). Clear it here, before any job can be
++	 * dispatched, and let the reprogram below rebuild AS/IRQs on the
++	 * fresh core state (gpu31-readback). */
++	if (drv && drv->jd.power_cycle &&
++	    p7580_job_slots_latched_fault(&drv->jd)) {
++		int crc = drv->jd.power_cycle(drv->jd.pm_dev);
++
++		pr_err("p7580_job: resume-cycle rc=%d (latched JS fault)\n",
++		       crc);
++	}
 +	/* Resume re-arms what reset + power-off lost (mainline
 +	 * panfrost_device_resume order: soft_reset -> power_on ->
 +	 * mmu_enable(0) -> job_enable_interrupts; kbase_pm_clock_on:
@@ -5132,6 +5250,27 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	pm_runtime_put_autosuspend((struct device *)dev);
 +}
 +
++/* Fault-recovery core power cycle for the jobs slice (gpu31-readback).
++ * Same opaque-device argument as the PM hooks above: the jobs slice never
++ * includes the power slice, and the power slice never includes DRM. */
++static int p7580_job_power_cycle_void(void *dev)
++{
++	struct platform_device *pdev;
++	struct drm_device *ddev;
++	struct p7580_drv *drv;
++
++	if (!dev)
++		return -ENODEV;
++	pdev = to_platform_device((struct device *)dev);
++	ddev = platform_get_drvdata(pdev);
++	if (!ddev)
++		return -ENODEV;
++	drv = ddev->dev_private;
++	if (!drv || !drv->power)
++		return -ENODEV;
++	return pf7580_power_cycle(drv->power);
++}
++
 +static int p7580_drv_probe(struct platform_device *pdev)
 +{
 +	struct resource *mem;
@@ -5214,7 +5353,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	ret = p7580_job_dev_init(&drv->jd, regs, js_present,
 +				 ((u64)0 << 32) | shader_present,
 +				 drv->mmu.root_dma, &pdev->dev,
-+				 p7580_job_pm_get_void, p7580_job_pm_put_void);
++				 p7580_job_pm_get_void, p7580_job_pm_put_void,
++				 p7580_job_power_cycle_void);
 +	if (ret)
 +		goto err_mmu;
 +	/* R1: warm up the shared sched workqueue at probe so the first
@@ -6009,7 +6149,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b/drivers/gpu/drm/panfrost/panfrost7580_power.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,603 @@
 +/*
 + * panfrost7580_power.c - PM / clock / reset sequencing for Mali-T720
 + *                        (Exynos 7580, j7elte) panfrost-class driver.
@@ -6271,8 +6411,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 +
 +/* Cores off in reverse (tiler -> shader -> L2), polling READY==0. Used on
 + * the runtime-suspend path; kbase likewise powers cores down before
-+ * clock-off while the domain is still up. */
-+static void pf7580_cores_off_locked(struct pf7580_power *p)
++ * clock-off while the domain is still up.
++ *
++ * gpu31-readback: a core that does not acknowledge PWRON=0 means the block
++ * is still executing (or wedged). Continuing to gate the clock and drop
++ * pd-g3d then turns that into a GPU power event, which the JM reports as
++ * JS_STATUS POWER_FAULT for the victim job. Measured: 22 x (tiler +
++ * shader + L2 "did not idle") per bench run, i.e. 22 power-offs under a
++ * busy JM, followed by POWER_FAULT storms. Fail closed instead: power the
++ * cores back on and report -EBUSY so runtime_suspend aborts, leaving the
++ * block up (the PM core retries after the next usage put). */
++static int pf7580_cores_off_locked(struct pf7580_power *p)
 +{
 +	int ret;
 +
@@ -6280,38 +6429,58 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 +	writel(0, p->regs + PF7580_TILER_PWRON_HI);
 +	ret = pf7580_poll(p->regs, PF7580_TILER_READY_LO, 0xFFFFFFFF, 0,
 +			  PF7580_CORE_TIMEOUT_US);
-+	if (ret)
-+		dev_warn(p->dev, "pf7580: tiler did not idle on power-off\n");
++	if (ret) {
++		dev_warn(p->dev, "pf7580: tiler did not idle on power-off, aborting suspend\n");
++		goto busy;
++	}
 +
 +	writel(0, p->regs + PF7580_SHADER_PWRON_LO);
 +	writel(0, p->regs + PF7580_SHADER_PWRON_HI);
 +	ret = pf7580_poll(p->regs, PF7580_SHADER_READY_LO, 0xFFFFFFFF, 0,
 +			  PF7580_CORE_TIMEOUT_US);
-+	if (ret)
-+		dev_warn(p->dev, "pf7580: shaders did not idle on power-off\n");
++	if (ret) {
++		dev_warn(p->dev, "pf7580: shaders did not idle on power-off, aborting suspend\n");
++		goto busy;
++	}
 +
 +	writel(0, p->regs + PF7580_L2_PWRON_LO);
 +	writel(0, p->regs + PF7580_L2_PWRON_HI);
 +	ret = pf7580_poll(p->regs, PF7580_L2_READY_LO, 0xFFFFFFFF, 0,
 +			  PF7580_CORE_TIMEOUT_US);
-+	if (ret)
-+		dev_warn(p->dev, "pf7580: L2 did not idle on power-off\n");
++	if (ret) {
++		dev_warn(p->dev, "pf7580: L2 did not idle on power-off, aborting suspend\n");
++		goto busy;
++	}
++	return 0;
++
++busy:
++	/* Put the cores back on while the domain and clock are still up,
++	 * so an aborted suspend never leaves a half-powered block. */
++	writel(readl(p->regs + PF7580_L2_PRESENT_LO),
++	       p->regs + PF7580_L2_PWRON_LO);
++	writel(0, p->regs + PF7580_L2_PWRON_HI);
++	writel(readl(p->regs + PF7580_SHADER_PRESENT_LO),
++	       p->regs + PF7580_SHADER_PWRON_LO);
++	writel(0, p->regs + PF7580_SHADER_PWRON_HI);
++	writel(readl(p->regs + PF7580_TILER_PRESENT_LO),
++	       p->regs + PF7580_TILER_PWRON_LO);
++	writel(0, p->regs + PF7580_TILER_PWRON_HI);
++	return -EBUSY;
 +}
 +
-+int pf7580_runtime_resume(struct pf7580_power *p)
++/* Power-on sequence shared by runtime resume and the fault-recovery
++ * power cycle. Caller holds p->lock and has established that the domain
++ * is up (runtime-PM active). Clock on -> SOFT_RESET (+HARD_RESET
++ * fallback) -> cores on L2 -> shader -> tiler with READY polls. */
++static int pf7580_power_on_locked(struct pf7580_power *p)
 +{
 +	u32 shader_present, tiler_present, l2_present;
 +	int ret;
 +
-+	if (!p)
-+		return -ENODEV;
-+
-+	mutex_lock(&p->lock);
-+
 +	/* 1. functional clock (kbase gpu_control_enable_clock). */
 +	ret = pf7580_clk_on_locked(p, true);
 +	if (ret)
-+		goto out;
++		return ret;
 +
 +	/* 2. reset the block (kbase kbase_pm_init_hw reset leg). */
 +	ret = pf7580_soft_reset_locked(p);
@@ -6327,23 +6496,73 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 +	if (ret)
 +		goto err_clk;
 +
-+	mutex_unlock(&p->lock);
 +	return 0;
 +
 +err_clk:
 +	pf7580_clk_off_locked(p);
-+out:
++	return ret;
++}
++
++int pf7580_runtime_resume(struct pf7580_power *p)
++{
++	int ret;
++
++	if (!p)
++		return -ENODEV;
++
++	mutex_lock(&p->lock);
++	ret = pf7580_power_on_locked(p);
++	mutex_unlock(&p->lock);
++	return ret;
++}
++
++/* Full core power cycle for fault recovery (gpu31-readback): cores off
++ * (tiler -> shader -> L2) and clock gated, then the complete power-on
++ * sequence. A JM POWER_FAULT (JS_STATUS 0x41) is the slot's "powered
++ * down with work queued" latch; it survives the GPU-level SOFT/HARD
++ * reset that p7580_job_recover() already issues, so a slot that latched
++ * it reports the same fault for every following job until the cores are
++ * actually cycled. kbase treats a power fault the same way (force
++ * power-off/on through its PM state machine); this is the collapsed
++ * version for a driver whose PM is already held by the caller. Caller
++ * context: p7580_job_recover(), process context, reset_lock held and a
++ * live runtime-PM ref taken, so the domain cannot go away underneath.
++ * MMU AS0 reprogram + JOB_INT re-arm stay with the jobs slice: they
++ * must run after this returns (the reset cleared the registers). */
++int pf7580_power_cycle(struct pf7580_power *p)
++{
++	int ret;
++
++	if (!p)
++		return -ENODEV;
++
++	mutex_lock(&p->lock);
++	/* A busy core cannot be idled; cycle anyway: the following power-on
++	 * issues the reset that clears the state the cores are stuck in. */
++	if (pf7580_cores_off_locked(p))
++		dev_warn(p->dev, "pf7580: power cycle with busy cores\n");
++	pf7580_clk_off_locked(p);
++	ret = pf7580_power_on_locked(p);
 +	mutex_unlock(&p->lock);
 +	return ret;
 +}
 +
 +int pf7580_runtime_suspend(struct pf7580_power *p)
 +{
++	int ret;
++
 +	if (!p)
 +		return -ENODEV;
 +
 +	mutex_lock(&p->lock);
-+	pf7580_cores_off_locked(p);
++	ret = pf7580_cores_off_locked(p);
++	if (ret) {
++		/* Cores still executing: keep the clock and the domain up.
++		 * -EBUSY makes the PM core retry this suspend later instead
++		 * of powering off under a live job (gpu31-readback). */
++		mutex_unlock(&p->lock);
++		return ret;
++	}
 +	pf7580_clk_off_locked(p);
 +	mutex_unlock(&p->lock);
 +	return 0;
@@ -6537,7 +6756,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b/drivers/gpu/drm/panfrost/panfrost7580_power.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,211 @@
 +/*
 + * panfrost7580_power.h - PM / clock / reset sequencing for Mali-T720
 + *                        (Exynos 7580, j7elte) panfrost-class driver.
@@ -6698,6 +6917,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 + */
 +int pf7580_runtime_suspend(struct pf7580_power *p);
 +int pf7580_runtime_resume(struct pf7580_power *p);
++
++/* Fault-recovery core power cycle (gpu31-readback): cores off + clock
++ * gate, then the full power-on sequence (clock, SOFT/HARD_RESET with
++ * RESET_COMPLETED poll, L2/shader/tiler PWRON with READY polls). Needed
++ * because a JM POWER_FAULT latch (JS_STATUS 0x41) survives the GPU
++ * SOFT/HARD reset issued by p7580_job_recover(): without a cycle every
++ * following job on that slot reports the same fault. Process context,
++ * caller holds a runtime-PM ref; the MMU AS0 reprogram and JOB_INT
++ * re-arm are done by the jobs slice after this returns. */
++int pf7580_power_cycle(struct pf7580_power *p);
 +
 +/*
 + * System-sleep callbacks:

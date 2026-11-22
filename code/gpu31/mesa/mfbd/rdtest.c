@@ -165,7 +165,7 @@ main(int argc, char **argv)
 	px = malloc((size_t)W * H * 4);
 
 	for (int f = 0; f < frames; f++) {
-		long t0, dt_ms;
+		long t0, t1, t2, t3, t4, dt_ms;
 		unsigned long long sum = 0, nz = 0;
 		unsigned char *c, *m;
 		const char *verdict;
@@ -173,21 +173,28 @@ main(int argc, char **argv)
 		t0 = now_ns();
 		glClearColor(0.05f, 0.05f, 0.12f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
+		t1 = now_ns();
 		glDrawArrays(GL_TRIANGLES, 0, 3);
+		t2 = now_ns();
 
 		if (!do_read) {
 			glFinish();
-			dt_ms = (now_ns() - t0) / 1000000L;
-			printf("FRAME %d %ldms (no readback)\n", f, dt_ms);
+			t3 = now_ns();
+			dt_ms = (t3 - t0) / 1000000L;
+			printf("FRAME %d %ldms (no readback) phases=%ld,%ld,%ld,0\n",
+			       f, dt_ms, (t1 - t0) / 1000000L,
+			       (t2 - t1) / 1000000L, (t3 - t2) / 1000000L);
 			continue;
 		}
 
 		if (pre_finish)
 			glFinish();
+		t3 = now_ns();
 
 		memset(px, 0, (size_t)W * H * 4);
 		glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
-		dt_ms = (now_ns() - t0) / 1000000L;
+		t4 = now_ns();
+		dt_ms = (t4 - t0) / 1000000L;
 
 		for (size_t i = 0; i < (size_t)W * H * 4; i++) {
 			sum += px[i];
