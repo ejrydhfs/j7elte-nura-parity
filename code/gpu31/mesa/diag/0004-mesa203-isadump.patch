@@ -1,0 +1,147 @@
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -23,6 +23,9 @@
+  */
+ 
+ #include "os/os_mman.h"
++#include <fcntl.h>
++#include <unistd.h>
++#include <string.h>
+ #include "util/macros.h"
+ #include "util/u_prim.h"
+ #include "util/u_vbuf.h"
+@@ -36,6 +39,68 @@
+ #include "pan_context.h"
+ #include "pan_job.h"
+ 
++/* FBDDBG (isadump): capture the exact BO bytes and the packed renderer-state
++ * descriptor that a live submit will consume, for offline Midgard
++ * disassembly.  Env-gated; no effect when PAN_FBD_ISADUMP is unset. */
++
++static void
++pan_fbddbg_dump_file(const char *path, const void *p, size_t n)
++{
++        int fd;
++
++        if (!getenv("PAN_FBD_ISADUMP") || !p || !n)
++                return;
++
++        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++        if (fd < 0)
++                return;
++
++        (void) write(fd, p, n);
++        close(fd);
++}
++
++static void
++pan_fbddbg_isadump(const char *stage, const char *tag, uint64_t shader,
++                   const struct panfrost_bo *bo, const void *meta,
++                   size_t meta_size)
++{
++        char path[64], text[1024];
++        unsigned nz = 0, n, i, len = 0;
++        uint32_t *w;
++
++        if (!getenv("PAN_FBD_ISADUMP") || !bo || !bo->ptr.cpu)
++                return;
++
++        w = bo->ptr.cpu;
++        n = bo->size / 4;
++        if (n > 24)
++                n = 24;
++
++        for (i = 0; i < n; i++)
++                nz += !!(w[i] & ~0xFu);
++
++        len += snprintf(text + len, sizeof(text) - len,
++                        "stage=%s tag=%s shader=0x%llx first_tag=%u "
++                        "bo=0x%llx size=%zu nonzero=%u/24 isa=",
++                        stage, tag, (unsigned long long) shader,
++                        (unsigned) (shader & 0xF),
++                        (unsigned long long) bo->ptr.gpu, bo->size, nz);
++        for (i = 0; i < n && len + 16 < sizeof(text); i++)
++                len += snprintf(text + len, sizeof(text) - len, " %08x", w[i]);
++        len += snprintf(text + len, sizeof(text) - len, "\n");
++
++        snprintf(path, sizeof(path), "/tmp/isadump-%s-isa.bin", tag);
++        pan_fbddbg_dump_file(path, bo->ptr.cpu, n * 4);
++
++        if (meta && meta_size) {
++                snprintf(path, sizeof(path), "/tmp/isadump-%s-meta.bin", tag);
++                pan_fbddbg_dump_file(path, meta, meta_size);
++        }
++
++        snprintf(path, sizeof(path), "/tmp/isadump-%s.txt", tag);
++        pan_fbddbg_dump_file(path, text, strlen(text));
++}
++
+ /* If a BO is accessed for a particular shader stage, will it be in the primary
+  * batch (vertex/tiler) or the secondary batch (fragment)? Anything but
+  * fragment will be primary, e.g. compute jobs will be considered
+@@ -614,6 +679,14 @@
+         pan_pack(fragmeta, RENDERER_STATE, cfg) {
+                 panfrost_prepare_fs_state(ctx, blend, &cfg);
+         }
++
++        if (getenv("PAN_FBD_ISADUMP")) {
++                struct panfrost_shader_state *fs =
++                        panfrost_get_shader_state(ctx, PIPE_SHADER_FRAGMENT);
++
++                pan_fbddbg_isadump("FS", "fs", fs->shader.shader, fs->bo,
++                                   fragmeta, MALI_RENDERER_STATE_LENGTH);
++        }
+ }
+ 
+ mali_ptr
+@@ -640,6 +713,15 @@
+                         iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[6], iw[7]);
+         }
+ 
++        if (getenv("PAN_FBD_ISADUMP") && ss->upload.rsrc) {
++                const void *meta = (const char *)
++                        pan_resource(ss->upload.rsrc)->bo->ptr.cpu +
++                        ss->upload.offset;
++
++                pan_fbddbg_isadump("VS", "vs", ss->shader.shader, ss->bo, meta,
++                                   MALI_RENDERER_STATE_LENGTH);
++        }
++
+         return pan_resource(ss->upload.rsrc)->bo->ptr.gpu + ss->upload.offset;
+ }
+ 
+
+--- a/src/gallium/drivers/panfrost/pan_assemble.c
++++ b/src/gallium/drivers/panfrost/pan_assemble.c
+@@ -393,6 +393,31 @@
+                                 size >= 12 ? iw[2] : 0, size >= 16 ? iw[3] : 0,
+                                 size >= 20 ? iw[4] : 0, size >= 24 ? iw[5] : 0);
+                 }
++                if (getenv("PAN_FBD_ISADUMP")) {
++                        char path[64], text[256];
++                        int fd, n;
++
++                        snprintf(path, sizeof(path), "/tmp/isadump-s%d-compile.bin",
++                                 (int) stage);
++                        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++                        if (fd >= 0) {
++                                (void) write(fd, program->compiled.data, size);
++                                close(fd);
++                        }
++                        n = snprintf(text, sizeof(text),
++                                     "stage=%d size=%d first_tag=%u bo=0x%llx "
++                                     "w0=%08x\n", (int) stage, size,
++                                     program->first_tag,
++                                     (unsigned long long)state->bo->ptr.gpu,
++                                     size >= 4 ? iw[0] : 0);
++                        snprintf(path, sizeof(path), "/tmp/isadump-s%d-compile.txt",
++                                 (int) stage);
++                        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++                        if (fd >= 0) {
++                                (void) write(fd, text, n);
++                                close(fd);
++                        }
++                }
+         } else if (getenv("PAN_FBD_DEBUG")) {
+                 fprintf(stderr, "FBDDBG compile stage=%d size=0 tag=%u (no shader)\n",
+                         (int) stage, program->first_tag);

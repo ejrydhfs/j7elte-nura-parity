@@ -262,6 +262,20 @@ static int64_t now_ns(void)
 	return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+static void dump_blob(const char *which, const char *kind, const void *p,
+		      unsigned n)
+{
+	char path[64];
+	int fd;
+
+	snprintf(path, sizeof(path), "/tmp/pc2-%s-%s.bin", which, kind);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		return;
+	(void)write(fd, p, n);
+	close(fd);
+}
+
 static void dump_state(uint64_t st, const char *which)
 {
 	uint32_t w[32];
@@ -277,15 +291,18 @@ static void dump_state(uint64_t st, const char *which)
 		return;
 	}
 	hexline("state", st, w, 16);
+	dump_blob(which, "meta", w, 64);
 	sh = (uint64_t)w[0] | ((uint64_t)w[1] << 32);
 	pc2("%s meta shader=0x%llx tag=%u", which,
 	    (unsigned long long)sh, (unsigned)(sh & 0xf));
 	ih = sh & ~0xfull;
-	if (rd_words(ih, isa, 24) == 0)
-		hexline("isa", ih, isa, 12);
-	else
+	if (rd_words(ih, isa, 24) == 0) {
+		hexline("isa", ih, isa, 24);
+		dump_blob(which, "isa", isa, sizeof(isa));
+	} else {
 		pc2("%s isa at=0x%llx: unreadable", which,
 		    (unsigned long long)ih);
+	}
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
