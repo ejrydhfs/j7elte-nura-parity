@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,180 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -38,10 +38,26 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +#define P7580_DRV_AS_NR		0u
 +
 +/* Bound-BO record: one per BO mapped into the context tables, so the
-+ * remove/unload path can unmap + invalidate before tearing down. */
++ * remove/unload path can unmap + invalidate before tearing down.
++ *
++ * gpu31-boleak: the entry is NON-OWNING -- it holds no GEM reference.
++ * A list-owned reference can never be dropped: its only unlink runs in
++ * p7580_gem_free_object() -> p7580_gem_gpu_unmap(), and free_object
++ * only runs once the refcount is zero, which the list reference itself
++ * prevents. Every BO ever submitted then stays alive forever (its
++ * pages, its private shmem inode and its IOVA range with it).
++ * The entry is unlinked (under bo_lock) by p7580_gem_gpu_unmap() at
++ * free and by p7580_drv_unmap_bo() at remove, both before the BO's
++ * memory is released, so an entry seen under bo_lock names a live
++ * object -- except for the window between the refcount reaching zero
++ * and the destructor taking bo_lock. A walker that needs to *use* the
++ * object must therefore take a reference with
++ * p7580_drv_gem_try_get() (kref_get_unless_zero, submit.c), which
++ * loses that race instead of resurrecting a dying object. Callers that
++ * already hold a reference (a GEM handle lookup, job->bos) need none. */
 +struct p7580_drv_bo {
 +	struct list_head node;
-+	struct drm_gem_object *obj;	/* referenced while bound */
++	struct drm_gem_object *obj;	/* weak: valid while linked */
 +	/* gpu31-iova: IOVA + size of the live mapping (for the
 +	 * overlap detector + fault-time identity; stable while the
 +	 * entry is linked under bo_lock). */
@@ -169,7 +185,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1658 @@
+@@ -0,0 +1,1661 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -626,8 +642,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +
 +/* gpu31-iova (stale-TLB lifetime fix): free-time GPU unmap.
 + * p7580_gem_free_object calls p7580_gem_gpu_unmap (driver snapshot,
-+ * submit.c: PM-held TLB invalidate + bo_list unlink + ref drop)
-+ * BEFORE iova_free returns the range and before pages are released.
++ * submit.c: PM-held TLB invalidate + bo_list unlink) BEFORE iova_free
++ * returns the range and before pages are released. The unlink drops no
++ * reference: the entry is weak (gpu31-boleak).
 + * p7580_gem_mmu_register_notify is a link-compat no-op (an earlier
 + * draft registered a callback; the landed design links directly so
 + * GEM never dereferences driver state). */
@@ -1042,7 +1059,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +
 +/* Forward: frees one live BO's GPU mapping before its IOVA is
 + * recycled (p7580_gem_free_object below). Defined in the driver
-+ * snapshot (submit.c, PM-held TLB invalidate + bo_list drop); the
++ * snapshot (submit.c, PM-held TLB invalidate + bo_list unlink); the
 + * linker resolves it inside panfrost7580. Keeps this TU decoupled
 + * from drv/mmu structs (same opaque-void discipline as the
 + * pre-signal-sync helper above). */
@@ -1172,7 +1189,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	/* gpu31-iova: unmap GPU PTEs + flush TLB BEFORE the IOVA is
 +	 * reusable. p7580_gem_gpu_unmap walks the driver's bo_list
 +	 * entry: leaf-clear (CPU-side, PM-safe), PM-held TLB
-+	 * invalidate, bo_list unlink + ref drop, DMA unbind. After
++	 * invalidate, bo_list unlink (weak entry, no ref drop -- this
++	 * is the unlink that lets the object finish dying,
++	 * gpu31-boleak), DMA unbind. After
 +	 * this the IOVA range is unmapped everywhere; iova_free
 +	 * below only then returns it to the allocator. Never-bound
 +	 * BOs (never on bo_list) no-op inside; their DMA mapping is
@@ -1831,7 +1850,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,267 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost_gem.h - GEM object model for the Mali-T720 panfrost port
@@ -2066,8 +2085,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
 +/* gpu31-iova: free-time GPU unmap (driver snapshot, submit.c).
 + * Called from p7580_gem_free_object before iova_free; clears the
-+ * BO's leaf PTEs + PM-held TLB invalidate + bo_list unlink + DMA
-+ * unbind. Never-bound BOs no-op. Register hook is link-compat. */
++ * BO's leaf PTEs + PM-held TLB invalidate + bo_list unlink (weak
++ * entry, no ref drop) + DMA unbind. Never-bound BOs no-op. Register
++ * hook is link-compat. */
 +void p7580_gem_gpu_unmap(struct drm_gem_object *obj);
 +void p7580_gem_mmu_register_notify(void (*fn)(void *, struct drm_gem_object *,
 +					      unsigned long, unsigned int),
@@ -5344,7 +5364,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,758 @@
+@@ -0,0 +1,760 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -6057,12 +6077,14 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +				 "panfrost7580: remove with GPU dark;"
 +				 " skipping TLB invalidate\n");
 +		}
-+		/* Unmap every bound BO before freeing the tables. */
++		/* Unmap every bound BO before freeing the tables. The
++		 * entries are weak (gpu31-boleak, see struct
++		 * p7580_drv_bo): unlinking them drops no reference, the
++		 * BOs keep whatever references their owners hold. */
 +		mutex_lock(&drv->bo_lock);
 +		list_for_each_entry_safe(e, tmp, &drv->bo_list, node) {
 +			p7580_drv_unmap_bo(drv, e->obj, pm_held);
 +			list_del(&e->node);
-+			drm_gem_object_unreference(e->obj);
 +			kfree(e);
 +		}
 +		mutex_unlock(&drv->bo_lock);
@@ -7554,7 +7576,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,2195 @@
+@@ -0,0 +1,2258 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.c - render-minor-only platform driver for Mali-T720
@@ -7712,6 +7734,24 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +static unsigned int p7580_chain_trace = 8;
 +
 +static unsigned int p7580_drv_run_seq = 0;
++
++/* gpu31-boleak: take a reference on a BO named by a drv->bo_list entry.
++ *
++ * bo_list entries are weak (drv.h struct p7580_drv_bo): unlinking runs
++ * from the object's destructor, so "entry still linked" does not by
++ * itself mean the refcount is nonzero -- between kref_put() reaching
++ * zero and p7580_gem_gpu_unmap() taking bo_lock the object is dying and
++ * its entry is still linked. kref_get_unless_zero() turns that race
++ * into a clean miss (the caller skips the entry) instead of a
++ * resurrection that would hand out a pointer the destructor is about
++ * to free. Every caller of this helper runs with bo_lock held and uses
++ * the reference to dereference the BO after unlocking. */
++static int p7580_drv_gem_try_get(struct drm_gem_object *obj)
++{
++	if (!obj)
++		return 0;
++	return kref_get_unless_zero(&obj->refcount);
++}
 +
 +static struct dma_fence *p7580_drv_run_job(struct drm_sched_job *sched_job)
 +{
@@ -7973,9 +8013,11 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	 * close); safe to dereference here in process context while
 +	 * the job owns the refs. (2) Live view: scan drv->bo_list
 +	 * under bo_lock for an IOVA range containing jc, taking a GEM
-+	 * ref while linked. Snapshot-miss + live-hit (int29 NO-OWNER
-+	 * with jc inside an ERR-MAP range) means a stale snapshot,
-+	 * not an unmapped jc; miss + miss means genuinely unowned. */
++	 * ref while linked (weak entry -> try_get; a dying object is
++	 * skipped, see p7580_drv_gem_try_get). Snapshot-miss + live-hit
++	 * (int29 NO-OWNER with jc inside an ERR-MAP range) means a stale
++	 * snapshot, not an unmapped jc; miss + miss means genuinely
++	 * unowned. */
 +	if (job->bos && job->bo_count) {
 +		unsigned int i;
 +
@@ -8003,7 +8045,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +
 +		list_for_each_entry(le, &drv->bo_list, node) {
 +			if (jc >= le->iova && jc + 32 <= le->iova + le->size) {
-+				drm_gem_object_reference(le->obj);
++				if (!p7580_drv_gem_try_get(le->obj))
++					continue;
 +				live_obj = le->obj;
 +				live_iova = le->iova;
 +				live_size = le->size;
@@ -8407,15 +8450,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +/* gpu31-iova: free-time GPU unmap (called from GEM free BEFORE the
 + * IOVA range is recycled). Clears the BO's leaf PTEs, flushes the TLB
 + * for the exact range under a PM-held window, unlinks the bo_list
-+ * entry (dropping its ref), then tears down the DMA mapping. Order:
-+ * leaves + TLB flush happen while the IOVA node is still linked, so
-+ * the range is unmapped everywhere before iova_free reuses it.
-+ * Never-bound BOs (no bo_list entry) no-op after the DMA unbind.
-+ * Dark block: leaves still cleared + list/DMA torn down CPU-side;
-+ * the TLB flush is skipped and re-covered by resume (TRANSTAB +
-+ * invalidate before the next job). Runs under dev->struct_mutex from
-+ * gem_free_object: takes bo_lock (leaf; same order as map_bo) and at
-+ * most one PM get/put; never sleeps beyond those. */
++ * entry (gpu31-boleak: a weak, non-owning entry -- unlinking drops no
++ * reference and is what lets the object finish dying), then tears
++ * down the DMA mapping. Order: leaves + TLB flush happen while the
++ * IOVA node is still linked, so the range is unmapped everywhere
++ * before iova_free reuses it. Never-bound BOs (no bo_list entry)
++ * no-op after the DMA unbind. Dark block: leaves still cleared +
++ * list/DMA torn down CPU-side; the TLB flush is skipped and re-covered
++ * by resume (TRANSTAB + invalidate before the next job). Runs under
++ * dev->struct_mutex from gem_free_object: takes bo_lock (leaf; same
++ * order as map_bo) and at most one PM get/put; never sleeps beyond
++ * those. */
 +void p7580_gem_gpu_unmap(struct drm_gem_object *obj)
 +{
 +	struct drm_device *ddev;
@@ -8437,7 +8482,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +		goto out_dma;
 +	/* Snapshot the range under bo_lock; unlink the entry now so a
 +	 * concurrent submit re-mapping the same object re-adds cleanly
-+	 * (map_bo re-checks under the same lock). */
++	 * (map_bo re-checks under the same lock). The entry owns no
++	 * reference (gpu31-boleak), so unlinking drops nothing: this is
++	 * the unlink the destructor performs, not a put. */
 +	mutex_lock(&drv->bo_lock);
 +	{
 +		struct p7580_drv_bo *e, *tmp;
@@ -8449,7 +8496,6 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			npages = p7580_bo_npages(obj);
 +			list_del(&e->node);
 +			mutex_unlock(&drv->bo_lock);
-+			drm_gem_object_unreference(e->obj);
 +			kfree(e);
 +			found = 1;
 +			goto out_unmap;
@@ -8743,6 +8789,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	struct p7580_bo *bo = to_p7580_bo(obj);
 +	unsigned int npages = p7580_bo_npages(obj);
 +	unsigned int i;
++	int ret = 0;
 +
 +	mutex_lock(&drv->bo_lock);
 +	{
@@ -8792,16 +8839,17 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	for (i = 0; i < npages; i++) {
 +		int ok = 0;
 +		phys_addr_t phys = p7580_bo_page_phys(obj, i, &ok);
-+		int ret;
 +
-+		if (!ok)
-+			return -EFAULT;
++		if (!ok) {
++			ret = -EFAULT;
++			goto rollback;
++		}
 +		ret = p7580_mmu_map(&drv->mmu, bo->iova +
 +				    ((u64)i << PAGE_SHIFT),
 +				    phys, P7580_PROT_RD | P7580_PROT_WR,
 +				    P7580_MEMATTR_IDX_DEFAULT);
 +		if (ret)
-+			return ret;
++			goto rollback;
 +	}
 +	p7580_mmu_invalidate(drv->regs, P7580_DRV_AS_NR,
 +			     bo->iova >> PAGE_SHIFT, npages, 0);
@@ -8809,10 +8857,21 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	{
 +		struct p7580_drv_bo *e = kzalloc(sizeof(*e), GFP_KERNEL);
 +
-+		if (!e)
-+			return -ENOMEM;
++		if (!e) {
++			ret = -ENOMEM;
++			goto rollback;
++		}
 +		mutex_lock(&drv->bo_lock);
-+		drm_gem_object_reference(obj);
++		/* gpu31-boleak: NON-OWNING entry -- deliberately no
++		 * drm_gem_object_reference() here. The only unlink of
++		 * this entry lives in p7580_gem_gpu_unmap(), which runs
++		 * from p7580_gem_free_object() i.e. only once the
++		 * refcount is zero; a reference owned by the entry would
++		 * therefore never be dropped and every submitted BO
++		 * (pages + shmem inode + IOVA) would leak forever.
++		 * The object is guaranteed live here: the caller holds a
++		 * handle-lookup reference (SUBMIT) or the shadow's own
++		 * per-node refs. */
 +		e->obj = obj;
 +		e->iova = bo->iova;
 +		e->size = bo->base.size;
@@ -8829,6 +8888,26 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			bo->base.size, npages);
 +	}
 +	return 0;
++
++rollback:
++	/* gpu31-boleak: this bind failed after programming leaves, and no
++	 * bo_list entry exists for the object yet -- so nothing would ever
++	 * unmap them (the free-time unmap keys on the entry). Clear what
++	 * this call programmed and publish the clear, keeping "leaves
++	 * programmed" exactly equivalent to "entry linked"; otherwise a
++	 * freed BO could leave PTEs naming recycled pages. i is the index
++	 * that failed (not yet mapped), or npages when only the entry
++	 * allocation failed. */
++	{
++		unsigned int k = i;
++
++		while (k--)
++			p7580_mmu_unmap(&drv->mmu, bo->iova +
++					((u64)k << PAGE_SHIFT));
++	}
++	p7580_mmu_invalidate(drv->regs, P7580_DRV_AS_NR,
++			     bo->iova >> PAGE_SHIFT, npages, 0);
++	return ret;
 +}
 +
 +/* ------------------------------------------------------------------ */
@@ -8863,7 +8942,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +	atomic_t refs;
 +};
 +
-+/* Locate the live BO covering [gpu, gpu+len) and take a reference. */
++/* Locate the live BO covering [gpu, gpu+len) and take a reference.
++ * The bo_list entry is weak (gpu31-boleak), so the reference is taken
++ * with kref_get_unless_zero(): an entry whose object is already in
++ * p7580_gem_free_object() is skipped rather than resurrected. The
++ * caller's own submitted BOs are still referenced (job lookup refs),
++ * so the lookup for a live descriptor always succeeds. */
 +static int p7580_drv_gpu_span(struct p7580_drv *drv, uint64_t gpu,
 +			      size_t len, struct drm_gem_object **out,
 +			      uint64_t *base)
@@ -8879,7 +8963,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +			continue;
 +		if (gpu - e->iova > e->size - len)
 +			continue;
-+		drm_gem_object_reference(e->obj);
++		if (!p7580_drv_gem_try_get(e->obj))
++			continue;
 +		*out = e->obj;
 +		*base = e->iova;
 +		found = 1;
