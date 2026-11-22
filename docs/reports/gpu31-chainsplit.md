@@ -357,9 +357,12 @@ the host T1 now pins 56/192/192/64/32. Acceptance is unchanged
 
 ## 7. Hand-off
 
-Integrator rebuild: int37 is int36 plus the regenerated
+Integrator rebuild: the next image is int36 plus the regenerated
 `code/gpu31/driver/0001-panfrost7580-driver-sources.patch` (the 0002 wiring
-and every other patch are unchanged). Suggested post-build gates, in
+and every other patch are unchanged). The image must include both the
+int37 build fixes (9da3df8) and the payload-length fix in this tree
+(742dc52: VERTEX 192); an image built from the int37 split alone hangs
+the standalone vertex dispatch per §5.5. Suggested post-build gates, in
 addition to the existing int36 gate set:
 
 1. `git apply --check` of driver `0001` on the pristine tree: clean.
