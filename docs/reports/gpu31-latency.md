@@ -40,9 +40,9 @@ remains unchanged (same fences, same sync ordering, same FIFO).
 
 ### 1.1 Userspace / ioctl timeline
 
-Method: `LD_PRELOAD` interposer around `ioctl(2)` (`/tmp/iotrace.c`,
-built on-device, static timestamps from `CLOCK_MONOTONIC`), 50 frames,
-NOREAD. 1020 DRM ioctls = 20.4/frame; the bench printed
+Method: `LD_PRELOAD` interposer around `ioctl(2)`
+(`code/gpu31/latency/iotrace.c`, built on-device; one
+`CLOCK_MONOTONIC` pair per DRM ioctl), 50 frames, NOREAD. 1020 DRM ioctls = 20.4/frame; the bench printed
 `BENCH 256x256 frames=50 time=0.188s fps=266.5`.
 
 | ioctl | calls/50f | mean | p50 | max | share |
@@ -277,3 +277,10 @@ at build time):
 
 Flash and the "after" rows in §4 are Main's (device was off USB after a
 GPU wedge before the build finished; no flash by this ticket).
+
+Reproduce the matrix after boot with `code/gpu31/latency/run.sh`
+(build `iotrace.so` on the phone first: `make -C code/gpu31/latency`;
+the boot wipes /tmp). It runs 300 NOREAD x2, provokes the fault
+signature with `trace_arm=400` + 4 frames, then 300 post-fault and 30
+readback frames, printing wall time and the TIMEOUT/ERR count per
+phase.
