@@ -233,11 +233,14 @@ produced the reported 41 ms average.
 
 ## 6. Tests / gates
 
-- `code/gpu31/sched`: **407 checks, 0 failures** native and
-  qemu-aarch64, all structural gates PASS, `kcheck` (4 files
-  syntax-only + object compile) PASS. New
+- `code/gpu31/sched`: **409 checks, 0 failures** native and
+  qemu-aarch64 (407 at int39 build time; the kick-retirement assertion
+  below was added after the image), all structural gates PASS,
+  `kcheck` (4 files syntax-only + object compile) PASS. New
   `test_fault_kick_timeout` pins the shim contract: unarmed -> armed at
-  delay 0, second kick stays delay 0, NULL tolerated.
+  delay 0, second kick stays delay 0, NULL tolerated, and running the
+  kicked timeout work retires the fence (recovery path) instead of
+  leaving it pending.
 - Host emu gained `mod_delayed_work()` with the kernel return contract.
 - `build-int39.sh` gate 6z pins the applied tree, `job.o`
   (exactly one call reloc), `drm_sched.o`/`System.map` (definition),
