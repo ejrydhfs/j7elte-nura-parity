@@ -36,6 +36,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <inttypes.h>
+#include <sys/ioctl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1486,6 +1487,138 @@ out_close:
 	return rc;
 }
 
+/* gpu31-defectb device test: page-lifetime/content of a CPU-written SHMEM
+ * BO with no GPU submit at all.
+ *
+ * Each trial frees the previous BO (GEM_CLOSE -> shmem inode eviction ->
+ * pages returned to the allocator) and creates the next one immediately, so
+ * the new BO reuses a just-freed page -- exactly Mesa's shader-BO pattern.
+ * The trial writes an ISA-shaped page (word 0 + a 0x400 marker + a
+ * deterministic fill), reads it back through the kernel 0xCF view at once,
+ * sleeps a few ms (the window in which the shaderbo trace sees the page
+ * zeroed), and reads both views again. A loss here, with no submit and no
+ * GPU job, proves the clobber is a CPU/page-lifetime effect and not the
+ * GPU. The 0xCF read also emits the p7580_pin ledger line per sample. */
+#define PF7580_DB_WORD0		0xc87a9835u
+#define PF7580_DB_MARK_OFF	0x400u
+#define PF7580_DB_MARK		0xcafe1234u
+#define PF7580_DB_TRIALS	32u
+#define PF7580_DB_DELAY_US	3000u
+
+static int run_defectb_test(const char *path)
+{
+	struct pf7580_dev *dev;
+	char err[256] = "";
+	uint64_t prod = 0, map = 0;
+	uint32_t h = 0;
+	unsigned char *p = NULL;
+	unsigned int i, ok = 0, lost_now = 0, lost_late = 0, first_bad = 0;
+	int rc;
+
+	printf("-- pf7580 defectb-test (CPU-written BO page lifetime, no submit)"
+	       " on %s --\n", path);
+	rc = pf7580_open(path, &dev, err, sizeof(err));
+	if (rc) {
+		printf("defectb-test %s unavailable: %s\n", path, err);
+		return 2;
+	}
+	rc = pf7580_get_param(dev, PF7580_PARAM_GPU_PROD_ID, &prod);
+	if (rc || prod != PF7580_T720_PROD_ID) {
+		printf("GET_PARAM: FAIL rc=%d (%s) prod=0x%" PRIx64 "\n",
+		       rc, pf7580_strerror(rc), prod);
+		rc = 1;
+		goto out_close;
+	}
+
+	for (i = 0; i < PF7580_DB_TRIALS; i++) {
+		struct drm_gem_close gc;
+		uint32_t k0 = 0, kmark = 0;
+		unsigned int j;
+
+		rc = pf7580_create_bo(dev, 4096, &h, &map);
+		if (rc || !h) {
+			printf("TRIAL %u: CREATE_BO FAIL rc=%d (%s)\n", i, rc,
+			       pf7580_strerror(rc));
+			rc = 1;
+			goto out_close;
+		}
+		rc = pf7580_mmap_bo(dev, h, &map);
+		if (rc) {
+			printf("TRIAL %u: MMAP_BO FAIL rc=%d (%s)\n", i, rc,
+			       pf7580_strerror(rc));
+			rc = 1;
+			goto out_close;
+		}
+		p = pf7580_cpu_map(dev, h, map, 4096);
+		if (!p) {
+			printf("TRIAL %u: cpu map FAIL errno=%d (%s)\n", i,
+			       pf7580_cpu_map_errno,
+			       strerror(pf7580_cpu_map_errno));
+			rc = 1;
+			goto out_close;
+		}
+
+		for (j = 0; j < 1024u; j++)
+			((uint32_t *) p)[j] = 0x9e3779b9u * (j + 1u) + i;
+		((uint32_t *) p)[0] = PF7580_DB_WORD0;
+		*(uint32_t *) (p + PF7580_DB_MARK_OFF) = PF7580_DB_MARK;
+
+		rc = pf7580_debug_read_bo(dev, h, 0, &k0);
+		if (rc) {
+			printf("TRIAL %u: 0xCF immediate FAIL rc=%d (%s)\n", i,
+			       rc, pf7580_strerror(rc));
+			rc = 1;
+			goto out_close;
+		}
+		if (k0 != PF7580_DB_WORD0) {
+			printf("TRIAL %u: immediate 0xCF word0=0x%08x (want "
+			       "0x%08x)\n", i, k0, PF7580_DB_WORD0);
+			lost_now++;
+		}
+
+		usleep(PF7580_DB_DELAY_US);
+
+		rc = pf7580_debug_read_bo(dev, h, 0, &k0);
+		if (rc)
+			k0 = 0xdeadbeefu;
+		rc = pf7580_debug_read_bo(dev, h, PF7580_DB_MARK_OFF, &kmark);
+		if (rc)
+			kmark = 0xdeadbeefu;
+		if (k0 == PF7580_DB_WORD0 && kmark == PF7580_DB_MARK &&
+		    ((uint32_t *) p)[0] == PF7580_DB_WORD0)
+			ok++;
+		else {
+			lost_late++;
+			if (!first_bad)
+				first_bad = i + 1;
+			printf("TRIAL %u: LOST after %u us  k0=0x%08x "
+			       "kmark=0x%08x user0=0x%08x\n", i,
+			       PF7580_DB_DELAY_US, k0, kmark,
+			       ((uint32_t *) p)[0]);
+		}
+
+		pf7580_cpu_unmap(dev, p, 4096);
+		p = NULL;
+		memset(&gc, 0, sizeof(gc));
+		gc.handle = h;
+		ioctl(pf7580_fd(dev), DRM_IOCTL_GEM_CLOSE, &gc);
+		h = 0;
+	}
+
+	printf("DEFECTB: %u/%u trials kept the page; lost-immediate=%u "
+	       "lost-after-%uus=%u first-bad=%u\n",
+	       ok, PF7580_DB_TRIALS, lost_now, PF7580_DB_DELAY_US, lost_late,
+	       first_bad);
+	rc = (ok == PF7580_DB_TRIALS) ? 0 : 1;
+
+out_close:
+	if (p)
+		pf7580_cpu_unmap(dev, p, 4096);
+	pf7580_close(dev);
+	printf("DEFECTB-TEST: %s\n", rc == 0 ? "PASS" : "FAILED");
+	return rc;
+}
+
 /* gpu31-cachedir device test: CPU-filled BO survives a job that reads it.
  *
  * Shape (the ticket's ask, no GL needed): a 4 KiB BO carries BOTH the
@@ -1771,6 +1904,7 @@ int main(int argc, char **argv)
 	const char *patterntest = NULL;
 	const char *cachedirtest = NULL;
 	const char *mmaprefstest = NULL;
+	const char *defectbtest = NULL;
 	int i;
 
 	/* Unbuffered: on HW a hang must leave partial output behind. */
@@ -1800,12 +1934,16 @@ int main(int argc, char **argv)
 			mmaprefstest = argv[++i];
 		} else if (!strncmp(argv[i], "--mmaprefs-test=", 16)) {
 			mmaprefstest = argv[i] + 16;
+		} else if (!strcmp(argv[i], "--defectb-test") && i + 1 < argc) {
+			defectbtest = argv[++i];
+		} else if (!strncmp(argv[i], "--defectb-test=", 15)) {
+			defectbtest = argv[i] + 15;
 		} else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			devpath = argv[++i];
 		} else if (!strncmp(argv[i], "--device=", 9)) {
 			devpath = argv[i] + 9;
 		} else {
-			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH] [--submit-test PATH] [--pattern-test PATH] [--cachedir-test PATH] [--mmaprefs-test PATH]\n",
+			fprintf(stderr, "usage: %s [--print-abi] [--device PATH] [--probe-only PATH] [--submit-test PATH] [--pattern-test PATH] [--cachedir-test PATH] [--mmaprefs-test PATH] [--defectb-test PATH]\n",
 				argv[0]);
 			return 1;
 		}
@@ -1820,6 +1958,8 @@ int main(int argc, char **argv)
 		return run_cachedir_test(cachedirtest);
 	if (mmaprefstest)
 		return run_mmaprefs_test(mmaprefstest);
+	if (defectbtest)
+		return run_defectb_test(defectbtest);
 	if (devpath)
 		return run_device(devpath);
 	return run_mock_suite();

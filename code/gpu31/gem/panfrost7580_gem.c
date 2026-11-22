@@ -659,6 +659,26 @@ static int p7580_shmem_alloc(struct drm_device *dev, struct p7580_bo *bo,
 			fput(filp);
 			return err;
 		}
+		/* gpu31-defectb: flush_dcache_page() is NOT a flush on this
+		 * arm64 tree (arch/arm64/mm/flush.c only clears
+		 * PG_dcache_clean), so the zeroes shmem_getpage_gfp() wrote
+		 * with clear_highpage() (clear_page -> dc zva) are still DIRTY
+		 * lines in the kernel's cached linear alias when userspace gets
+		 * the page through the WC (MT_NORMAL_NC) VMA. The CPU's NC
+		 * stores go straight to DRAM while that stale dirty zero line
+		 * stays in the cache; when it is evicted it overwrites the
+		 * NC-written data with zeros -- a whole-page, asynchronously
+		 * timed loss (gpu31-defectb: the Ferrofluid ISA BO reading
+		 * zero at submit with every reference and flag intact).
+		 * Cleaning+invalidating the linear alias here writes the
+		 * allocation zeroes to DRAM and drops the line, so from this
+		 * point the page has a single coherent copy: the userspace
+		 * mapping. Do it before the page can leave this function.
+		 * (A cached CPU mapping would avoid the mixed-attribute
+		 * hazard altogether; the WC attribute is kept because the
+		 * driver's submit/completion clean-then-invalidate discipline
+		 * is built around it.) */
+		__flush_dcache_area(page_address(page), PAGE_SIZE);
 		pages[i] = page;
 	}
 

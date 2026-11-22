@@ -358,7 +358,10 @@ targeted write.
   on host and qemu-aarch64.
 * Needs the flash (Main): `vm_insert_page()`/`vm_ops->close` on real
   hardware, and the ledger's absolute `count` values on silicon. The
-  ticket's silicon acceptance is §6 steps 1–4.
+  ticket's silicon acceptance is §6 steps 1–4. A still-zeroed ISA page
+  after this fix is not a reference problem: `gpu31-defectb.md` proves it
+  is a stale cached zero line from the shmem allocation clear (mixed
+  cache attributes) and adds the alloc-time clean+invalidate fix.
 * Not changed: the WC/cached prot selection, `pgprot_writecombine`, the
   bind-time GPU pin, `dma_sync` clean-then-invalidate discipline, the
   CMA/scanout path, PRIME attachment ownership, IOVA/GPU mapping, and

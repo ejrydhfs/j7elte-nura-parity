@@ -221,6 +221,14 @@ same line identifies by `!up`/`!lru`.
 ### 5.2 The fix (driver, needs flash)
 
 **Status: implemented, `docs/reports/gpu31-mmaprefs.md` (2026-11-21).**
+**Root cause found and fixed: `docs/reports/gpu31-defectb.md` (2026-11-21).**
+The page was never freed: it is clobbered by the writeback of a stale dirty
+zero cache line from the shmem allocation clear (the WC user mapping and the
+WB linear alias are not coherent, and this tree's `flush_dcache_page()` does
+not flush). The driver now cleans+invalidates each page right after
+`shmem_read_mapping_page()`; `--defectb-test` reproduces the loss with no GPU
+(31/32 trials) and is the next-flash acceptance together with the 5-frame
+`0x52`-free run.
 Exactly this shape is now in the driver (`VM_MIXEDMAP` + `vm_insert_page`
 in the fault handler, `put_page` when the last VMA closes, WC prot and
 the clean-then-invalidate discipline untouched), plus the §5.1 ledger as

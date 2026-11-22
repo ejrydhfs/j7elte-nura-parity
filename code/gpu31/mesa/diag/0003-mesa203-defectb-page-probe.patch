@@ -1,0 +1,229 @@
+--- a/src/panfrost/lib/pan_bo.c
++++ b/src/panfrost/lib/pan_bo.c
+@@ -28,6 +28,27 @@
+ #include <sys/ioctl.h>
+ #include <stdio.h>
+ #include <fcntl.h>
++#include <unistd.h>
++#include <sys/mman.h>
++
++/* FBDDBG (defectb): one line into the ftrace ring so BO create/mmap/free
++ * can be interleaved with kmem/filemap page events (root only; no-op
++ * otherwise). */
++static void
++pan_fbddbg_marker(const char *what, unsigned long long gpu, int h, size_t size)
++{
++        int fd = open("/sys/kernel/debug/tracing/trace_marker", O_WRONLY);
++        char line[128];
++        int n;
++
++        if (fd < 0)
++                return;
++        n = snprintf(line, sizeof(line), "FBDDBG %s gpu=0x%llx h=%d size=%zu",
++                     what, gpu, h, size);
++        if (n > 0)
++                (void) write(fd, line, (size_t) n);
++        close(fd);
++}
+ #include <xf86drm.h>
+ #include <pthread.h>
+ #include "drm-uapi/panfrost_drm.h"
+@@ -72,6 +93,10 @@
+                         create_bo.flags |= PANFROST_BO_NOEXEC;
+         }
+ 
++        /* FBDDBG (defectb): checkpoint before the ioctl so a change seen at
++         * post-create-ioctl is attributable to the CREATE_BO ioctl itself
++         * (and not to the userspace window before it). */
++        pan_fbddbg_watch_check("pre-create-ioctl");
+         ret = drmIoctl(dev->fd, DRM_IOCTL_PANFROST_CREATE_BO, &create_bo);
+         if (ret) {
+                 fprintf(stderr, "DRM_IOCTL_PANFROST_CREATE_BO failed: %m\n");
+@@ -87,6 +112,8 @@
+         bo->gem_handle = create_bo.handle;
+         bo->flags = flags;
+         bo->dev = dev;
++        pan_fbddbg_marker("create", (unsigned long long)create_bo.offset,
++                          create_bo.handle, size);
+         return bo;
+ }
+ 
+@@ -99,6 +126,8 @@
+         if (getenv("PAN_FBD_DEBUG"))
+                 fprintf(stderr, "FBDDBG bo FREE gpu=0x%llx h=%d size=%zu\n",
+                         (unsigned long long)bo->ptr.gpu, bo->gem_handle, bo->size);
++        pan_fbddbg_marker("FREE", (unsigned long long)bo->ptr.gpu,
++                          bo->gem_handle, bo->size);
+         ret = drmIoctl(bo->dev->fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
+         if (ret) {
+                 fprintf(stderr, "DRM_IOCTL_GEM_CLOSE failed: %m\n");
+@@ -387,6 +416,23 @@
+                 fprintf(stderr, "mmap failed: %p %m\n", bo->ptr.cpu);
+                 assert(0);
+         }
++        /* FBDDBG (defectb): switch the VMA from the driver's WC (Normal-NC)
++         * protection to the default cached protection to test the
++         * cache-attribute-mismatch hypothesis (kernel alias is WB). */
++        if (getenv("PAN_FBD_MPROTECT")) {
++                /* mprotect_fixup returns early when vm_flags are unchanged,
++                 * so flip through a read-only VMA to force pgprot_modify() to
++                 * replace the driver's WC ATTRINDX with the cached one. */
++                if (mprotect(bo->ptr.cpu, bo->size, PROT_READ) ||
++                    mprotect(bo->ptr.cpu, bo->size, PROT_READ | PROT_WRITE))
++                        fprintf(stderr, "FBDDBG mprotect failed: %m\n");
++                else
++                        pan_fbddbg_marker("mprotect-cached",
++                                          (unsigned long long)bo->ptr.gpu,
++                                          bo->gem_handle, bo->size);
++        }
++        pan_fbddbg_marker("mmap", (unsigned long long)bo->ptr.gpu,
++                          bo->gem_handle, bo->size);
+ }
+ 
+ static void
+@@ -444,6 +490,15 @@
+                                 (unsigned long long)b->ptr.gpu,
+                                 pan_fbddbg_seen[i][0], pan_fbddbg_seen[i][1],
+                                 now[0], now[1]);
++                        /* FBDDBG (defectb): the kernel's own view of the
++                         * same page at the instant the change is seen; the
++                         * 0xCF read emits the p7580_pin ledger line too. */
++                        if (b->dev)
++                                fprintf(stderr, "FBDDBG KVIEW %s: bo=0x%llx "
++                                        "k0=%08x k256=%08x\n", where,
++                                        (unsigned long long)b->ptr.gpu,
++                                        pan_fbddbg_kread(b->dev, b->gem_handle, 0),
++                                        pan_fbddbg_kread(b->dev, b->gem_handle, 0x400));
+                         memcpy(pan_fbddbg_seen[i], now, 16);
+                 }
+         }
+--- a/src/gallium/drivers/panfrost/pan_assemble.c
++++ b/src/gallium/drivers/panfrost/pan_assemble.c
+@@ -27,7 +27,68 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <string.h>
++#include <stdint.h>
++#include <fcntl.h>
+ #include "pan_bo.h"
++
++/* FBDDBG (defectb): print the physical identity and kernel page flags of
++ * the user-mapped shader page at a given instant. Needs root (pagemap,
++ * kpageflags, kpagecount are root-only); silently no-ops otherwise. */
++static void
++pan_fbddbg_page_probe(const char *where, void *p)
++{
++        if (!getenv("PAN_FBD_PAGE_PROBE") || !p)
++                return;
++
++        uint64_t va = (uintptr_t) p;
++        uint64_t entry = 0, flags = 0, count = 0;
++        uint64_t pfn;
++        int fd;
++
++        fd = open("/proc/self/pagemap", O_RDONLY);
++        if (fd < 0)
++                return;
++        if (pread(fd, &entry, 8, (off_t) ((va >> 12) * 8)) != 8)
++                entry = 0;
++        close(fd);
++        pfn = entry & ((1ULL << 55) - 1);
++
++        fd = open("/proc/kpageflags", O_RDONLY);
++        if (fd >= 0) {
++                if (pread(fd, &flags, 8, (off_t) (pfn * 8)) != 8)
++                        flags = 0;
++                close(fd);
++        }
++        fd = open("/proc/kpagecount", O_RDONLY);
++        if (fd >= 0) {
++                if (pread(fd, &count, 8, (off_t) (pfn * 8)) != 8)
++                        count = 0;
++                close(fd);
++        }
++
++        fprintf(stderr, "FBDDBG PAGEPROBE %s: va=0x%llx pfn=0x%llx "
++                "present=%u kcount=%llu kflags=0x%llx w0=%08x w256=%08x\n",
++                where, (unsigned long long) va, (unsigned long long) pfn,
++                (unsigned) (entry >> 63), (unsigned long long) count,
++                (unsigned long long) flags,
++                ((uint32_t *) p)[0],
++                ((uint32_t *) p)[256]);
++
++        /* Same line into ftrace, so page free/alloc events can be ordered
++         * against the probe without guessing timestamps. */
++        fd = open("/sys/kernel/debug/tracing/trace_marker", O_WRONLY);
++        if (fd >= 0) {
++                char line[160];
++                int n = snprintf(line, sizeof(line),
++                        "FBDDBG %s pfn=0x%llx kcount=%llu kflags=0x%llx w0=%08x",
++                        where, (unsigned long long) pfn,
++                        (unsigned long long) count, (unsigned long long) flags,
++                        ((uint32_t *) p)[0]);
++                if (n > 0)
++                        (void) write(fd, line, (size_t) n);
++                close(fd);
++        }
++}
+ #include "pan_context.h"
+ #include "pan_util.h"
+ #include "panfrost-quirks.h"
+@@ -270,19 +331,58 @@
+                 if (getenv("PAN_FBD_BO_PAD"))
+                         alloc_size = MAX2(alloc_size, atoi(getenv("PAN_FBD_BO_PAD")));
+                 state->bo = panfrost_bo_create(dev, alloc_size, PAN_BO_EXECUTE);
++                /* FBDDBG (defectb): let any stale writer to the reused page
++                 * finish before we write, then write. If the content survives
++                 * this second write, the earlier loss was a one-shot tied to
++                 * the page's previous owner, not to our mapping/write. */
++                if (getenv("PAN_FBD_PRESLEEP_US")) {
++                        useconds_t ps = (useconds_t) atoi(getenv("PAN_FBD_PRESLEEP_US"));
++                        if (ps) usleep(ps);
++                        pan_fbddbg_page_probe("pre-memcpy", state->bo->ptr.cpu);
++                }
+                 memcpy(state->bo->ptr.cpu, program->compiled.data, size);
+                 if (getenv("PAN_FBD_MAGIC") && state->bo->size >= 0x404)
+                         ((uint32_t *) state->bo->ptr.cpu)[256] = 0xcafe1234u;
++                pan_fbddbg_page_probe("post-memcpy", state->bo->ptr.cpu);
++                /* FBDDBG (defectb): the kernel's cached linear alias vs the
++                 * WC user alias immediately after the write. A stale dirty
++                 * zero line from clear_page() would make these disagree. */
++                if (getenv("PAN_FBD_KREAD_AFTER"))
++                        fprintf(stderr, "FBDDBG KREAD-AFTER: user=%08x k0=%08x "
++                                "k256=%08x\n",
++                                ((uint32_t *) state->bo->ptr.cpu)[0],
++                                pan_fbddbg_kread(dev, state->bo->gem_handle, 0),
++                                pan_fbddbg_kread(dev, state->bo->gem_handle, 0x400));
+                 /* FBDDBG: optional settle delay to test write-vs-next-op races */
+                 if (getenv("PAN_FBD_DELAY_US")) {
+                         useconds_t d = (useconds_t) atoi(getenv("PAN_FBD_DELAY_US"));
+                         if (d) usleep(d);
+                 }
++                /* FBDDBG (defectb): did the page change while no BO was
++                 * being created (asynchronous freer) or only at the next
++                 * CREATE_BO ioctl? */
++                pan_fbddbg_watch_check("post-delay");
+                 shader = state->bo->ptr.gpu;
+ 
+                 /* FBDDBG (diagnostic): what was just compiled and uploaded. */
+                 pan_fbddbg_watch(state->bo);
+ 
++                /* FBDDBG (defectb): with the baseline just taken, wait
++                 * without any kernel call. If the page still zeroes here,
++                 * the freer is asynchronous (job/worker), not this path. */
++                if (getenv("PAN_FBD_DELAY2_US")) {
++                        useconds_t d2 = (useconds_t) atoi(getenv("PAN_FBD_DELAY2_US"));
++                        int loops = getenv("PAN_FBD_DELAY2_LOOP") ?
++                                atoi(getenv("PAN_FBD_DELAY2_LOOP")) : 1;
++                        int k;
++                        for (k = 0; k < loops; k++) {
++                                if (d2) usleep(d2);
++                                pan_fbddbg_page_probe("delay-step", state->bo->ptr.cpu);
++                        }
++                }
++                pan_fbddbg_watch_check("post-watch-delay");
++                pan_fbddbg_page_probe("post-watch-delay", state->bo->ptr.cpu);
++
+                 /* FBDDBG (diagnostic): keep a pristine copy of each MIDGARD
+                  * shader binary and, with PAN_FBD_REUPLOAD=1, re-upload it at
+                  * every meta emit (tests whether user BO data is being lost
