@@ -122,6 +122,14 @@ So the command id is right and the command is accepted, but the payload
 parameter block for command 27 from the firmware handler, or try
 param1 = ch|0x0100-style encodings used elsewhere in this driver.
 
+## Page-reference mmap removes last GPU fault (2026-11-21, int36)
+- GEM user mappings now hold real page references (VM_MIXEDMAP fault-driven `vm_insert_page`,
+  per-mapping pin, `put_page` on last close). The shader/vertex BOs no longer get zeroed mid-frame.
+- Clean 5-frame run: **ERR=0** (no job faults at all); submit-time probes show real BO data
+  (colour `ff0000ff…`, shader words) instead of zeros.
+- Still clear-only pixels: polygon-list census being re-measured on this kernel
+  (`gpu31-polycensus2.md`), now that shader data survives.
+
 ## Vertex faults eliminated by Mesa fix (2026-11-21)
 - Root cause of the earlier VERTEX-job faults: Mesa 20.3 emitted an OOB attribute/trampoline
   store and handed 16 uninitialised attribute descriptors to hardware. Patch
