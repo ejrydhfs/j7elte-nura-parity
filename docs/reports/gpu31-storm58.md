@@ -383,6 +383,31 @@ observed termination is SIGKILL with `lowmemorykiller` /
 two minutes of that boot). Device work was stopped (Main);
 acceptance re-runs on the next boot with `storm58/accept44.sh`.
 
+### 6.1 Why even a clean 10x300 cannot fit yet (separate defect)
+
+Measured by Main on int44 while chasing the `gfdemo` SIGKILLs: the
+kernel leaks **~1.16 MB of shmem pages per frame** (389 MB after one
+300-frame run, +35 MB per 30-frame run, persisting after the client
+exits; `gem_names` empty, so pages, not GEM objects). One 300-frame run
+costs ~350 MB on a 1.4 GB/no-swap part, which is what starved the phone
+and starved earlier attempts at this acceptance. It also explains why the
+"thrash" state returned between boots without any client running.
+
+That leak is **not** touched by this ticket and is owned by G31_BOLeak
+(page refs / mmap pin-unpin / free path in driver 0001). Nothing in this
+patch allocates per submit (`fbd`/`jc_age` are fixed fields, the age
+ledger is a 64-entry array inside `p7580_drv_file`, and the extra
+`p7580_drv_gpu_read()` for the SFBD word takes and drops exactly one GEM
+ref). The 10x300 acceptance therefore runs on the kernel that carries
+the leak fix (int45); the storm proof in §5 does not depend on it (§5.2
+used a 60 s fence window, not memory pressure, and §2's first faults
+happened at frames 0 and ~88, long before the leak could matter).
+
+Note for the leak work: the per-frame BO set is *identical* every frame
+in every storm capture (same `h6` slab, same IOVA, same 10-BO map), so
+the growth is in per-page refs, not in new BOs — consistent with
+Main's `gem_names` observation.
+
 Acceptance command (Main runs it on the flashed image), `ev_arm=1`, the
 pre-existing clean cost is 1.98-2.03 s so any regression shows as wall
 time plus `ERR`/`TIMEOUT`:
