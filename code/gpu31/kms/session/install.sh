@@ -30,6 +30,7 @@ install -m755 "$here/nura-plasma-session"       /usr/local/bin/nura-plasma-sessi
 install -m755 "$here/nura-plasma-wrapper"       /usr/local/bin/nura-plasma-wrapper
 install -m755 "$here/nura-session-run"         /usr/local/bin/nura-session-run
 install -m755 "$here/nura-session.initd"       /etc/init.d/nura-session
+install -m755 "$here/nura-zswap-off.initd"     /etc/init.d/nura-zswap-off
 install -m644 "$here/nura-plasma.desktop"       /usr/share/wayland-sessions/nura-plasma.desktop
 install -m644 "$here/60-nura-session.conf"      /etc/lightdm/lightdm.conf.d/60-nura-session.conf
 install -m644 "$here/kms-atomic-probe.c"        /usr/local/src/nura-session/kms-atomic-probe.c
@@ -93,10 +94,16 @@ fi
 rc-update add polkit default >/dev/null 2>&1 || true
 rc-service polkit start >/dev/null 2>&1 || true
 
+# zswap.enabled is 0444; record the current max_pool_percent and block
+# stores before zram is enabled.  The real fix is zswap.enabled=0 on the
+# kernel cmdline (KMS boot slice).
+[ -e /etc/nura/zswap-max-pool ] || \
+    cat /sys/module/zswap/parameters/max_pool_percent > /etc/nura/zswap-max-pool 2>/dev/null || true
+rc-update add nura-zswap-off default >/dev/null 2>&1 || true
+rc-service nura-zswap-off start >/dev/null 2>&1 || true
+
 # zram is already in the default runlevel on this image; it only fails to
 # start because zramstart defaults to zstd.  /etc/deviceinfo fixes the algo.
-# zswap is enabled (0444, cannot be disabled at runtime): the boot image must
-# add zswap.enabled=0 for the memory budget - see the report.
 rc-service postmarketos-zram-swap start >/dev/null 2>&1 || \
     echo "WARN: postmarketos-zram-swap did not start (check /etc/deviceinfo)" >&2
 

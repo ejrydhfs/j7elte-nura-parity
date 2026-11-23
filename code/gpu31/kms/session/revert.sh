@@ -46,6 +46,13 @@ rc-service polkit stop >/dev/null 2>&1 || true
 # runlevel entry alone.
 rc-service postmarketos-zram-swap stop >/dev/null 2>&1 || true
 
+# zswap stopgap: restore the recorded max_pool_percent.
+if [ -f /etc/nura/zswap-max-pool ]; then
+    cat /etc/nura/zswap-max-pool > /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || true
+fi
+rc-service nura-zswap-off stop >/dev/null 2>&1 || true
+rc-update del nura-zswap-off default >/dev/null 2>&1 || true
+
 # /etc/deviceinfo: remove our block, or the file if it is exactly ours.
 if [ -f /etc/deviceinfo ]; then
     if cmp -s /etc/deviceinfo "$here/deviceinfo-zram"; then
@@ -62,6 +69,7 @@ rm -f /usr/local/bin/nura-session-mode \
       /usr/local/bin/nura-plasma-session \
       /usr/local/bin/nura-plasma-wrapper \
       /etc/init.d/nura-session \
+      /etc/init.d/nura-zswap-off \
       /usr/local/bin/nura-session-run \
       /usr/share/wayland-sessions/nura-plasma.desktop \
       /etc/lightdm/lightdm.conf.d/60-nura-session.conf \

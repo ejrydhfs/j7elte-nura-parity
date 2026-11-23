@@ -29,7 +29,7 @@ Probed on the running image (kernel `3.10.108 #37`, Nura edge):
 | Backlight | `/sys/class/backlight/panel` (`type=raw`, `max_brightness=355`); `brightnessctl` + openrc/udev helpers installed; **powerdevil absent**; `polkit` installed but not in a runlevel | sysfs; `apk list -I`; `rc-status` |
 | Rotation sensor | accelerometer is Samsung `K2HH` in `/sys/class/sensors/accelerometer_sensor` (`raw_data`) plus an `EV_REL` input device.  `/sys/bus/iio/devices/iio:device0` is the **ADC** (`13900000.adc`), not the accelerometer.  **iio-sensor-proxy absent and not applicable** | sysfs, `/proc/bus/input/devices` |
 | zram | `postmarketos-zram-swap` is in the default runlevel but **stopped**; kernel `CONFIG_ZRAM=y`, `CONFIG_ZRAM_LZ4_COMPRESS=y`, `comp_algorithm=[lzo] lz4`; zramstart defaults to **zstd** (fails); **0 swap** | `apk info -L postmarketos-zram*`; `/sys/block/zram0/comp_algorithm`; `free -m` |
-| zswap | **enabled (`Y`, `max_pool_percent=50`, lzo)**; `enabled` is `0444`, so it cannot be turned off at runtime | `/sys/module/zswap/parameters/*` |
+| zswap | **enabled (`Y`, `max_pool_percent=50`, lzo)**; `enabled` is `0444` (no runtime disable), but `max_pool_percent` is `0644` and the pool is empty (no swap device has ever existed) | `/sys/module/zswap/parameters/*` |
 | Memory/disk | 1374 MiB RAM, ~564 MiB used; `/` 2.0 GiB, **69.9 MiB free**; gcc 130 MiB + binutils 14 MiB + musl-dev 11 MiB installed | `free -m`, `df -h` |
 | Xwayland | **not installed** | `command -v Xwayland`; `apk policy xwayland` |
 
@@ -110,10 +110,12 @@ rotation.
 
 `/sys/module/zswap/parameters/enabled` is `0444`; `zswap.enabled=0` must be
 added to the kernel command line (or `CONFIG_ZSWAP_DEFAULT_ON` disabled) by
-the KMS boot-image slice.  zram still works with zswap on, but it is a front
-cache and changes the memory measurement; `nura-session-mode status` warns
-about it.  zram itself must use **lz4**: this kernel's zram only advertises
-`[lzo] lz4`, while `zramstart` defaults to zstd.
+the KMS boot-image slice.  The session install ships a stopgap service,
+`nura-zswap-off`, which runs before `postmarketos-zram-swap` and writes `0`
+to the writable `max_pool_percent` (`mm/zswap.c:93-95`).  With no swap device
+yet, `zswap_is_full()` is then true and no pages are stored; the pool is
+empty today, so nothing leaks.  zram itself must use **lz4**: this kernel's
+zram only advertises `[lzo] lz4`, while `zramstart` defaults to zstd.
 
 ### 2.6 Xwayland is missing
 
@@ -168,6 +170,7 @@ builds the probe; it does not enable `nura-session` or switch modes.
 | `nura-plasma-wrapper` | `/usr/local/bin/nura-plasma-wrapper` | 755 |
 | `nura-session-run` | `/usr/local/bin/nura-session-run` | 755 |
 | `nura-session.initd` | `/etc/init.d/nura-session` | 755 |
+| `nura-zswap-off.initd` | `/etc/init.d/nura-zswap-off` | 755 |
 | `nura-plasma.desktop` | `/usr/share/wayland-sessions/nura-plasma.desktop` | 644 |
 | `60-nura-session.conf` | `/etc/lightdm/lightdm.conf.d/60-nura-session.conf` | 644 |
 | `kms-atomic-probe.c` | `/usr/local/src/nura-session/kms-atomic-probe.c`, compiled to `/usr/local/sbin/kms-atomic-probe` | 644 / 755 |
@@ -193,8 +196,9 @@ apk add --no-cache xwayland powerdevil kscreen
 /usr/local/bin/nura-session-mode status
 ```
 
-`install.sh` also starts `postmarketos-zram-swap` with the lz4 override and
-enables `polkit` (needed by powerdevil's brightness helper).  The session
+`install.sh` also starts `postmarketos-zram-swap` with the lz4/50 % override,
+enables `nura-zswap-off` before it, and enables `polkit` (needed by
+powerdevil's brightness helper).  The session
 itself is not enabled: `xsession` stays in the default runlevel, the running
 UI is untouched, and `nura-session` is not in a runlevel until
 `nura-session-mode` is run.
@@ -256,10 +260,14 @@ deviceinfo_zram_swap_algo="lz4"
 deviceinfo_zram_swap_pct="150"
 ```
 
-This makes `postmarketos-zram-swap` create a ~2061 MiB zram0 with lz4.  The
-service was already in the default runlevel but stopped; `install.sh` starts
-it, `revert.sh` stops it again.  zswap remains on until the boot image adds
-`zswap.enabled=0`; that is a KMS boot slice action, not a session action.
+This makes `postmarketos-zram-swap` create a **687 MiB** zram0 (50 % of
+1374 MiB, the memory-budget assumption) with lz4.  The service was already in
+the default runlevel but stopped; `install.sh` starts it, `revert.sh` stops it
+again.  `nura-zswap-off` is enabled in the same runlevel and ordered before
+it, blocking zswap stores through `max_pool_percent=0`; the permanent fix
+remains `zswap.enabled=0` on the boot cmdline.  `install.sh` records the
+original `max_pool_percent` in `/etc/nura/zswap-max-pool`, which `revert.sh`
+restores.
 
 ## 7. Revert path
 
@@ -283,7 +291,8 @@ sh code/gpu31/kms/session/revert.sh
 `revert.sh` stops `nura-session`/LightDM, re-adds `xsession` to `default`,
 removes the installed files and `/etc/nura`, removes only the groups recorded
 in `/etc/nura/installed-groups`, stops zram (the runlevel entry was already
-there), removes `polkit` from the runlevel it was not in before, strips the
+there), restores the recorded zswap `max_pool_percent`, removes
+`nura-zswap-off`, removes `polkit` from the runlevel it was not in before, strips the
 marked zram block from `/etc/deviceinfo`, and removes its
 `/etc/elogind/logind.conf.d/60-nura-lid.conf` drop-in.  Package changes are
 deliberately not downgraded; `apk del` lines for the optional packages are
@@ -308,8 +317,8 @@ Before switching to Plasma:
 | KWin loads | `kwin_wayland --version` | `kwin 6.8.3` (after r1); no relocation errors |
 | Seat | `loginctl show-seat seat0 -p CanGraphical` | `CanGraphical=yes` once card0 is tagged |
 | Input access | `id user`; `su - user -c 'head -c0 /dev/input/event2'` | `input` group present; command succeeds |
-| zram | `swapon --show`; `zramctl` | `/dev/zram0` ~2 GiB, lz4 |
-| zswap | `cat /sys/module/zswap/parameters/enabled` | `N` if the boot cmdline fix landed; otherwise a known warning |
+| zram | `swapon --show`; `zramctl` | `/dev/zram0` ~687 MiB, lz4 |
+| zswap | `cat /sys/module/zswap/parameters/enabled`; `cat .../max_pool_percent` | `N` if the boot cmdline fix landed; otherwise `Y` with `max_pool_percent=0` (stopgap) |
 | Session files | `ls /usr/share/wayland-sessions/nura-plasma.desktop /etc/lightdm/lightdm.conf.d/60-nura-session.conf` | present |
 | Gate | `nura-session-mode status` | all required lines OK |
 

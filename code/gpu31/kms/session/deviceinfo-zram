@@ -3,5 +3,7 @@
 # /sys/block/zram0/comp_algorithm.  postmarketOS zramstart defaults to zstd,
 # which fails.  source_deviceinfo sources /etc/deviceinfo after the packaged
 # device file, so this override wins.
+#
+# 50% of 1374 MiB = 687 MiB, matching the memory-budget Gate A assumptions.
 deviceinfo_zram_swap_algo="lz4"
-deviceinfo_zram_swap_pct="150"
+deviceinfo_zram_swap_pct="50"

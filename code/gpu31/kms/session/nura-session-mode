@@ -79,8 +79,9 @@ check_plasma() {
     if ! swapon --show 2>/dev/null | grep -q zram; then
         echo "WARN: no zram swap active (postmarketos-zram-swap not started)" >&2
     fi
-    if [ "$(cat /sys/module/zswap/parameters/enabled 2>/dev/null)" = "Y" ]; then
-        echo "WARN: zswap is enabled (0444, cannot be changed at runtime); add zswap.enabled=0 to the kernel cmdline" >&2
+    if [ "$(cat /sys/module/zswap/parameters/enabled 2>/dev/null)" = "Y" ] && \
+       [ "$(cat /sys/module/zswap/parameters/max_pool_percent 2>/dev/null)" != "0" ]; then
+        echo "WARN: zswap is enabled and max_pool_percent != 0; start nura-zswap-off or add zswap.enabled=0 to the kernel cmdline" >&2
     fi
     if ! command -v Xwayland >/dev/null 2>&1; then
         echo "WARN: Xwayland is not installed; X11 applications will not start" >&2
@@ -128,7 +129,7 @@ status() {
     done
     echo "swap:"
     swapon --show 2>/dev/null || echo "  (none)"
-    echo "zswap:           $(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo '?')"
+    echo "zswap:           enabled=$(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo '?') max_pool_percent=$(cat /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || echo '?')"
     echo "xwayland:        $(command -v Xwayland 2>/dev/null || echo 'not installed')"
     echo "memory:"
     free -m | sed -n '1,3p'

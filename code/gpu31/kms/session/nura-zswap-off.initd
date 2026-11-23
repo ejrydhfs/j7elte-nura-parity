@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+# Stopgap until the KMS boot image adds zswap.enabled=0 to the cmdline.
+#
+# /sys/module/zswap/parameters/enabled is 0444, but max_pool_percent is 0644
+# (mm/zswap.c).  Setting it to 0 before any swap device is enabled makes
+# zswap_is_full() true, so zswap stores nothing.  The pool is empty on this
+# image today, so there is nothing to tear down.
+name="nura-zswap-off"
+description="Block zswap stores before zram swap is enabled"
+
+depend() {
+    before postmarketos-zram-swap
+    after localmount
+}
+
+start() {
+    p=/sys/module/zswap/parameters/max_pool_percent
+    if [ -w "$p" ]; then
+        echo 0 > "$p" || return 1
+        einfo "zswap max_pool_percent=0 (stopgap; cmdline zswap.enabled=0 is the real fix)"
+    fi
+    return 0
+}
+
+stop() {
+    # The zswap pool is empty by construction; revert.sh restores
+    # max_pool_percent from /etc/nura/zswap-max-pool.
+    return 0
+}
