@@ -45,7 +45,6 @@
 
 #include <drm/drmP.h>
 #include <drm/drm_atomic.h>
-#include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_gem_cma_helper.h>
@@ -176,6 +175,7 @@ static struct sg_table *exynos7580_gem_prime_get_sg_table(
 		return ERR_PTR(ret);
 	}
 
+	sg_set_buf(sgt->sgl, cma_obj->vaddr, obj->size);
 	sg_dma_address(sgt->sgl) = cma_obj->paddr;
 	sg_dma_len(sgt->sgl) = obj->size;
 
@@ -193,47 +193,30 @@ static void exynos7580_gem_prime_vunmap(struct drm_gem_object *obj,
 }
 
 /* ------------------------------------------------------------------------
- * Atomic commit
+ * Atomic check/commit
  *
- * The generic drm_atomic_helper_commit() is deliberately not used: the DECON
- * link enable (DSIM stream on, DECON clocks, iovmm) can fail, and it has to
- * happen before any plane state is prepared or swapped so that a failure
- * leaves userspace's previous state untouched.  The window programming itself
- * (one decon_kms_commit() from the last plane hook) and the vblank-armed flip
- * event are owned by the plane and fence slices respectively.
+ * Both are implemented and exported by the CRTC slice
+ * (exynos_drm7580_crtc.c): the fallible DECON/DSI bring-up has to run before
+ * any plane state is prepared or swapped, and a NONBLOCK|PAGE_FLIP_EVENT
+ * request (KWin flips) must run the same tail as a blocking one, so the
+ * generic drm_atomic_helper_commit()/drm_atomic_helper_check() entry points
+ * are not used directly here.  The window programming itself (one
+ * decon_kms_commit() from the last plane hook) and the vblank-armed flip event
+ * are owned by the plane and fence slices.
+ *
+ * Declared here rather than in the contract header: the header is frozen for
+ * this slice, and KmsAssemble folds the two prototypes in when it assembles
+ * the series.
  * ------------------------------------------------------------------------ */
 
-static int exynos7580_atomic_commit(struct drm_device *drm,
-				    struct drm_atomic_state *state, bool async)
-{
-	struct exynos7580_device *ex = to_exynos7580(drm);
-	int ret;
-
-	if (async)
-		return -EBUSY;
-	if (!ex)
-		return -ENODEV;
-
-	ret = exynos7580_crtc_enable_link(ex);
-	if (ret) {
-		DRM_ERROR("DECON link enable failed: %d\n", ret);
-		return ret;
-	}
-
-	ret = drm_atomic_helper_prepare_planes(drm, state);
-	if (ret)
-		return ret;
-
-	drm_atomic_helper_swap_state(drm, state);
-
-	exynos7580_commit_tail(state);
-
-	return 0;
-}
+int exynos7580_atomic_check(struct drm_device *drm,
+			    struct drm_atomic_state *state);
+int exynos7580_atomic_commit(struct drm_device *drm,
+			     struct drm_atomic_state *state, bool async);
 
 static const struct drm_mode_config_funcs exynos7580_mode_config_funcs = {
 	.fb_create	= exynos7580_fb_create,
-	.atomic_check	= drm_atomic_helper_check,
+	.atomic_check	= exynos7580_atomic_check,
 	.atomic_commit	= exynos7580_atomic_commit,
 };
 

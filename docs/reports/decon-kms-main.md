@@ -7,8 +7,8 @@ declared in the frozen contract `code/gpu31/kms/exynos_drm7580.h`
 (commit `8048d08`).
 
 Deliverables
-- `code/gpu31/kms/exynos_drm7580_main.c` (sha256 `a7ad012f…65674f`, 554 lines)
-- `patches/drm-kms/0200-kms-main-bind.patch` (sha256 `3f51a5dc…fc8128`, 745 lines)
+- `code/gpu31/kms/exynos_drm7580_main.c` (sha256 `4d13bafe…482a0`, 554 lines)
+- `patches/drm-kms/0200-kms-main-bind.patch` (sha256 `ef2b88b3…98858`, 729 lines)
 - this report
 
 The patch creates `drivers/gpu/drm/exynos7580/` (`Kconfig`, `Makefile`,
@@ -25,7 +25,7 @@ second time.
 | `DRIVER_NAME` | `exynos` | Mesa's kmsro pairs `/usr/lib/dri/exynos_dri.so` with the KMS node by driver name; changing it sends KWin to software rendering (`docs/reports/decon-kms-req.md` req. 2) |
 | `driver_features` | `DRIVER_ATOMIC \| DRIVER_MODESET \| DRIVER_GEM \| DRIVER_PRIME` | req. 5/6 (atomic), 1 (primary KMS node), 9 (planes/props created by the backport only for atomic drivers), 18/19/21 (PRIME + dumb) |
 | GEM flavour | CMA | `dumb_create/dumb_map_offset/dumb_destroy = drm_gem_cma_*`, `gem_vm_ops = drm_gem_cma_vm_ops`, `gem_free_object = drm_gem_cma_free_object` |
-| PRIME | `gem_prime_import = exynos7580_gem_prime_import` (KmsDmabuf), `gem_prime_export = drm_gem_prime_export` + local sg-table/vmap callbacks for CMA buffers | import = product of the dmabuf slice; export is what KWin's gbm dumb path needs (req. 21) |
+| PRIME | `gem_prime_import = exynos7580_gem_prime_import` (KmsDmabuf), `gem_prime_export = drm_gem_prime_export` + local sg-table/vmap callbacks for CMA buffers; the sg table carries `sg_set_buf()` as well as the DMA address/length | import = product of the dmabuf slice; export is what KWin's gbm dumb path needs (req. 21) and needs a real `sg_page()` so `dma_map_sg()` has something to map |
 | probe match | `samsung,exynos5-decon_driver` only | stock `dt.img`; the DSIM node belongs to the vendor `dsim_drv.c` and the encoder calls into it |
 | bind point | `late_initcall(exynos7580_drm_init)` | level 7 in `drivers/gpu/`, after `drivers/video/` (vendor DSIM/panel, also level 7) and before `late_initcall_sync` |
 | registration | `drm_platform_init()` | 3.10 has no `drm_dev_alloc()`; the core allocates the `drm_device`, so state hangs off `drm->dev_private` and `to_exynos7580()` reads it |
@@ -56,11 +56,9 @@ triggers `exynos7580_probe()` for the already-populated platform device
    1. `ex = platform_get_drvdata(drm->platformdev)`, `drm->dev_private = ex`,
       `ex->drm = drm`, `ex->dev = &pdev->dev`.
    2. `drm_mode_config_init()`; `min 64x64`, `max 2048x2048`; `funcs = {fb_create =
-      exynos7580_fb_create, atomic_check = drm_atomic_helper_check, atomic_commit =
-      exynos7580_atomic_commit}`.
-      `drm_atomic_helper_check()` is what descends into
-      `crtc/plane/encoder/connector->helper_private->atomic_check`, so the
-      siblings' checks are not skipped.
+      exynos7580_fb_create, atomic_check = exynos7580_atomic_check,
+      atomic_commit = exynos7580_atomic_commit}` — the check/commit pair is
+      implemented and exported by the CRTC slice (see §4).
    3. `drm_vblank_init(drm, 1)` — one pipe; also installs the vblank timestamp
       machinery the flip events are stamped from.
    4. `exynos7580_planes_init(ex)` **before** `exynos7580_crtc_init(ex)`; the
@@ -137,19 +135,30 @@ is what triggers the vendor fallback. It also refuses to continue when
 
 Atomic commit path (`->load` → `atomic_commit` callback):
 
+The two `mode_config.funcs` entries are `exynos7580_atomic_check()` and
+`exynos7580_atomic_commit()`, both implemented and exported by
+`exynos_drm7580_crtc.c` (declared at the top of the mode-config section of
+`exynos_drm7580_main.c`; the frozen contract header does not carry them yet).
+Their shape, which main relies on:
+
 ```text
+exynos7580_atomic_check(dev, state)     = drm_atomic_helper_check()
 exynos7580_atomic_commit(dev, state, async):
-    async                      -> -EBUSY
-    exynos7580_crtc_enable_link(ex)     (fallible: DSIM stream/clock/iovmm)
+    -ENODEV guard (no dev_private/decon)
+    for each crtc state that becomes active or has mode_changed:
+        exynos7580_crtc_enable_link(ex)     (fallible: DSIM/clock/iovmm)
     drm_atomic_helper_prepare_planes()
     drm_atomic_helper_swap_state()
-    exynos7580_commit_tail(state)       (plane hooks commit, fence arms events)
+    exynos7580_commit_tail(state)           (plane hooks, fence event, cleanup)
 ```
 
-`drm_atomic_helper_commit()` is not used precisely because the link enable must
-happen before any state is prepared or swapped and may fail; a failure returns
-to userspace with its previous state intact. Window programming stays in the
-plane slice: this file never touches `decon_kms_commit()`.
+`async` is **not** rejected: KWin issues `NONBLOCK|PAGE_FLIP_EVENT` page flips,
+and they must run the same tail and complete through the flip event (the plane
+and fence slices own that). `drm_atomic_helper_commit()` is not used because the
+link enable has to happen before any state is prepared or swapped and may fail;
+a failure returns to userspace with its previous state intact. Window
+programming stays in the plane slice: this file never touches
+`decon_kms_commit()`.
 
 ## 5. Failure injection table (vendor fallback)
 
@@ -190,7 +199,8 @@ Created by the patch:
 drivers/gpu/drm/exynos7580/Kconfig      config DRM_EXYNOS7580 (bool)
                                         depends on DRM=y && OF && ARM64 &&
                                                    ARCH_EXYNOS &&
-                                                   EXYNOS7580_DISPLAY_KMS
+                                                   EXYNOS7580_DISPLAY_KMS &&
+                                                   EXYNOS_IOVMM_V6
                                         select DRM_KMS_HELPER DRM_KMS_CMA_HELPER
                                         VIDEOMODE_HELPERS
 drivers/gpu/drm/exynos7580/Makefile     obj-$(CONFIG_DRM_EXYNOS7580) += exynos-drm7580.o
@@ -281,11 +291,30 @@ Kernel tree is the read-only vendor tree copy
 (`/run/media/…/j7k/kms/KmsMain`, `cp -a`); the source tree itself was never
 written.
 
-1. **Patch applies cleanly to a pristine tree** (`KmsVerify`, fresh `cp -a`):
-   `git apply --check` then `git apply` for
-   `patches/drm-atomic/0001..0005`, `patches/drm-kms/0001-core…`,
-   `0002-core…`, `0003-core-drm-gem-cma-helper-arm64-dma-attrs.patch`, then
-   `0200-kms-main-bind.patch` — all **OK**, no fuzz, no rejects.
+1. **The whole assembled series applies cleanly to a pristine tree**
+   (`KmsVerify`, fresh `cp -a`), `git apply --check` then `git apply`, in this
+   order — all **OK**, no fuzz, no rejects:
+
+   ```
+   patches/drm-atomic/0001..0005
+   patches/drm-kms/0001-core-drm-crtc-helper-atomic-aware-unused-function-teardown.patch
+   patches/drm-kms/0002-core-drm-fb-helper-fix-id-drmfb.patch
+   patches/drm-kms/0003-core-drm-gem-cma-helper-arm64-dma-attrs.patch
+   patches/drm-kms/0005-core-drm-gem-cma-import-free.patch
+   patches/drm-kms/0100-decon-export-shim.patch
+   patches/drm-kms/0101-crtc-decon-atomic-crtc-and-link-enable.patch
+   patches/drm-kms/0001-dsi-encoder-connector.patch
+   patches/drm-kms/0001-kmsfence-vblank-flip-events.patch
+   patches/drm-kms/0001-plane-primary-overlays-and-formats.patch
+   patches/drm-kms/0004-kmsfbdev-decon-kms-fbdev-emulation.patch
+   patches/drm-kms/0001-kmsdmabuf-import-and-framebuffer.patch
+   patches/drm-kms/0200-kms-main-bind.patch          (this slice)
+   ```
+
+   `0005-core-drm-gem-cma-import-free.patch` is required for imported GEM
+   objects and must come after `0003-core…`; main does not duplicate that
+   teardown. `patches/drm-kms-coexist/0001-display-owner-kconfig.patch` is
+   *not* in the list: 0200 carries its content.
 2. **Kconfig resolves in both owner modes** (`make olddefconfig`):
    - stock config (`CONFIG_FB=y`, `CONFIG_DRM=y`, vendor DECON on):
      `CONFIG_EXYNOS7580_DISPLAY_FBDEV=y`, `# CONFIG_DRM_EXYNOS7580 is not set` —

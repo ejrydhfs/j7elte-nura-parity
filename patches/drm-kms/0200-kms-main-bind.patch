@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: KmsMain <kmsmain@local>
-Date: Mon, 23 Nov 2026 09:45:56 
+Date: Mon, 23 Nov 2026 09:53:27 
 Subject: [PATCH 0200] gpu31-kms: DECON KMS main bind - card0, atomic drm_driver, late_initcall
 
 Register the DECON DRM/KMS device (card0) on the stock Exynos 7580 tree.
@@ -24,10 +24,11 @@ implements the binding rules of docs/reports/decon-kms-coexist.md 4.3:
     drm_vblank_init() plus get/enable/disable_vblank and the DECON FRAME
     interrupt trampoline, which calls drm_handle_vblank() and
     exynos7580_vblank_irq();
-  - the global atomic commit: fallible CRTC link enable ->
-    drm_atomic_helper_prepare_planes() -> drm_atomic_helper_swap_state() ->
-    exynos7580_commit_tail(); drm_atomic_helper_commit() is deliberately not
-    used because the link enable can fail before any state is swapped;
+  - the mode_config.funcs atomic check/commit entries, which point at
+    exynos7580_atomic_check()/exynos7580_atomic_commit() exported by the CRTC
+    slice: the fallible CRTC link enable runs before any plane state is
+    prepared or swapped, and NONBLOCK|PAGE_FLIP_EVENT requests (KWin flips)
+    run the same commit tail instead of being rejected;
   - construction order planes -> crtc (index 0, primary = planes[0]) -> DSI
     encoder/connector -> fbdev (fb0 + initial modeset), with the unwind of
     everything this patch registered.
@@ -143,7 +144,7 @@ new file mode 100644
 @@ -0,0 +1,17 @@
 +config DRM_EXYNOS7580
 +	bool "DRM/KMS support for Samsung Exynos 7580 (DECON + MIPI DSIM)"
-+	depends on DRM=y && OF && ARM64 && ARCH_EXYNOS && EXYNOS7580_DISPLAY_KMS
++	depends on DRM=y && OF && ARM64 && ARCH_EXYNOS && EXYNOS7580_DISPLAY_KMS && EXYNOS_IOVMM_V6
 +	select DRM_KMS_HELPER
 +	select DRM_KMS_CMA_HELPER
 +	select VIDEOMODE_HELPERS
@@ -185,7 +186,7 @@ diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c b/drivers/gpu/drm/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,537 @@
 +/*
 + * Samsung Exynos 7580 DECON DRM/KMS - driver registration, probe and bind
 + *
@@ -233,7 +234,6 @@ new file mode 100644
 +
 +#include <drm/drmP.h>
 +#include <drm/drm_atomic.h>
-+#include <drm/drm_atomic_helper.h>
 +#include <drm/drm_crtc.h>
 +#include <drm/drm_crtc_helper.h>
 +#include <drm/drm_gem_cma_helper.h>
@@ -364,6 +364,7 @@ new file mode 100644
 +		return ERR_PTR(ret);
 +	}
 +
++	sg_set_buf(sgt->sgl, cma_obj->vaddr, obj->size);
 +	sg_dma_address(sgt->sgl) = cma_obj->paddr;
 +	sg_dma_len(sgt->sgl) = obj->size;
 +
@@ -381,47 +382,30 @@ new file mode 100644
 +}
 +
 +/* ------------------------------------------------------------------------
-+ * Atomic commit
++ * Atomic check/commit
 + *
-+ * The generic drm_atomic_helper_commit() is deliberately not used: the DECON
-+ * link enable (DSIM stream on, DECON clocks, iovmm) can fail, and it has to
-+ * happen before any plane state is prepared or swapped so that a failure
-+ * leaves userspace's previous state untouched.  The window programming itself
-+ * (one decon_kms_commit() from the last plane hook) and the vblank-armed flip
-+ * event are owned by the plane and fence slices respectively.
++ * Both are implemented and exported by the CRTC slice
++ * (exynos_drm7580_crtc.c): the fallible DECON/DSI bring-up has to run before
++ * any plane state is prepared or swapped, and a NONBLOCK|PAGE_FLIP_EVENT
++ * request (KWin flips) must run the same tail as a blocking one, so the
++ * generic drm_atomic_helper_commit()/drm_atomic_helper_check() entry points
++ * are not used directly here.  The window programming itself (one
++ * decon_kms_commit() from the last plane hook) and the vblank-armed flip event
++ * are owned by the plane and fence slices.
++ *
++ * Declared here rather than in the contract header: the header is frozen for
++ * this slice, and KmsAssemble folds the two prototypes in when it assembles
++ * the series.
 + * ------------------------------------------------------------------------ */
 +
-+static int exynos7580_atomic_commit(struct drm_device *drm,
-+				    struct drm_atomic_state *state, bool async)
-+{
-+	struct exynos7580_device *ex = to_exynos7580(drm);
-+	int ret;
-+
-+	if (async)
-+		return -EBUSY;
-+	if (!ex)
-+		return -ENODEV;
-+
-+	ret = exynos7580_crtc_enable_link(ex);
-+	if (ret) {
-+		DRM_ERROR("DECON link enable failed: %d\n", ret);
-+		return ret;
-+	}
-+
-+	ret = drm_atomic_helper_prepare_planes(drm, state);
-+	if (ret)
-+		return ret;
-+
-+	drm_atomic_helper_swap_state(drm, state);
-+
-+	exynos7580_commit_tail(state);
-+
-+	return 0;
-+}
++int exynos7580_atomic_check(struct drm_device *drm,
++			    struct drm_atomic_state *state);
++int exynos7580_atomic_commit(struct drm_device *drm,
++			     struct drm_atomic_state *state, bool async);
 +
 +static const struct drm_mode_config_funcs exynos7580_mode_config_funcs = {
 +	.fb_create	= exynos7580_fb_create,
-+	.atomic_check	= drm_atomic_helper_check,
++	.atomic_check	= exynos7580_atomic_check,
 +	.atomic_commit	= exynos7580_atomic_commit,
 +};
 +
