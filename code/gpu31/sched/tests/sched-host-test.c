@@ -199,6 +199,14 @@ static void test_default_wait_remaining(void)
 	CHECK(dma_fence_is_signaled(&tf->base));
 	ret = dma_fence_wait_timeout(&tf->base, false, 100);
 	CHECK_EQ(ret, 100);
+	/* gpu31-fpssplit: a 0-jiffy poll of a SIGNALED fence is "ready",
+	 * i.e. a positive remainder (mainline: timeout ? timeout : 1).
+	 * This is Mesa's BO-cache probe; 0 here is indistinguishable from
+	 * "budget ran out" and made panfrost_ioctl_wait_bo answer
+	 * -ETIMEDOUT for an idle BO (BO cache never hit). */
+	ret = dma_fence_wait_timeout(&tf->base, false, 0);
+	CHECK_EQ(ret, 1);
+	CHECK(ret > 0);
 
 	/* Slow path: completion already done with budget 80. Our emu
 	 * completion returns the full budget when done; mainline
@@ -208,7 +216,10 @@ static void test_default_wait_remaining(void)
 	 * Assert the pass-through: remaining comes from the helper. */
 	kfree(tf);
 	tf = mkfence(2, 2);
-	/* Unsignaled + zero budget: non-blocking, must not claim time. */
+	/* Unsignaled + zero budget: non-blocking, must not claim time.
+	 * This is the OTHER half of the WAIT_BO contract: a pending fence
+	 * must answer 0 so panfrost_ioctl_wait_bo maps it to -ETIMEDOUT
+	 * (gpu31-storm58), while an idle one answers >0 (gpu31-fpssplit). */
 	ret = dma_fence_wait_timeout(&tf->base, false, 0);
 	CHECK_EQ(ret, 0);
 	/* Unsignaled + budget: helper finds no completion -> -ETIME. */
@@ -297,6 +308,12 @@ static void test_resv_lock_and_pin(void)
 	CHECK(dma_resv_test_signaled(&resv, true));
 	ret = dma_resv_wait_timeout(&resv, true, false, 7);
 	CHECK_EQ(ret, 7);
+	/* gpu31-fpssplit: an empty resv is idle even for a 0-jiffy poll
+	 * (mainline initialises the remainder to timeout ? timeout : 1).
+	 * Without this a freshly cached BO with no fence would answer
+	 * -ETIMEDOUT forever. */
+	ret = dma_resv_wait_timeout(&resv, true, false, 0);
+	CHECK(ret > 0);
 
 	/* copy_fences: self-copy no-op; real copy pins new refs. */
 	CHECK_EQ(dma_resv_copy_fences(&resv, &resv), 0);

@@ -118,7 +118,16 @@ EXPORT_SYMBOL(dma_fence_signal);
 signed long dma_fence_default_wait(struct dma_fence *fence, bool intr,
 				   signed long timeout)
 {
-	signed long ret;
+	signed long ret = timeout ? timeout : 1;
+
+	/* gpu31-fpssplit: mainline returns a POSITIVE remainder for an
+	 * already-signaled fence, including a 0-jiffy poll
+	 * (timeout ? timeout : 1). Returning the bare budget made a
+	 * 0-jiffy poll of an IDLE fence look like a timeout, and the
+	 * WAIT_BO handler (rightly) maps 0 to -ETIMEDOUT -- see
+	 * dma_fence_wait_timeout below. */
+	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+		return ret;
 
 	if (intr) {
 		ret = wait_for_completion_interruptible_timeout(
@@ -144,8 +153,17 @@ signed long dma_fence_wait_timeout(struct dma_fence *fence, bool intr,
 	if (WARN_ON(!fence))
 		return -EINVAL;
 
+	/* gpu31-fpssplit: a signaled fence is ready even for a non-blocking
+	 * (0-jiffy) poll. Upstream's default_wait contract is "remaining
+	 * budget, minimum 1" -- returning `timeout` here returned 0 for the
+	 * poll, which the 0002 resv shim cannot tell apart from "budget ran
+	 * out". Mesa's BO-cache fetch is exactly that poll
+	 * (panfrost_bo_wait(bo, 0, RW)); with 0 it could never reuse a BO
+	 * whose fence had long signaled, so every frame allocated and freed
+	 * a full BO set (measured: 5.2 ms/frame system time, Shmem
+	 * +1.8 MB/frame, 155 -> 101 fps). */
 	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
-		return timeout;
+		return timeout ? timeout : 1;
 
 	if (fence->ops->wait)
 		ret = fence->ops->wait(fence, intr, timeout);

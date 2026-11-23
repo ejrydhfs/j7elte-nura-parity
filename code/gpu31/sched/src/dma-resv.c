@@ -168,7 +168,10 @@ long dma_resv_wait_timeout(struct dma_resv *obj, bool wait_all, bool intr,
 	struct dma_fence **extra = NULL;
 	struct dma_fence *excl;
 	unsigned i, nshared = 0, nwait;
-	long ret = timeout;
+	/* gpu31-fpssplit: an object with no fences is idle; a 0-jiffy
+	 * poll must return a positive remainder (mainline:
+	 * timeout ? timeout : 1), not 0 (= timed out). */
+	long ret = timeout ? timeout : 1;
 
 	mutex_lock(&obj->lock);
 	excl = obj->fence_excl;
@@ -211,7 +214,11 @@ long dma_resv_wait_timeout(struct dma_resv *obj, bool wait_all, bool intr,
 		timeout = dma_fence_wait_timeout(pinned[i], intr, timeout);
 	for (i = 0; extra && i < nshared - nwait && timeout > 0; ++i)
 		timeout = dma_fence_wait_timeout(extra[i], intr, timeout);
-	ret = timeout;
+	/* gpu31-fpssplit: a resv with no fence is idle, so a 0-jiffy poll
+	 * keeps the positive remainder from above; a waited fence set
+	 * reports the remaining budget (0 = timed out). */
+	if (excl || nshared)
+		ret = timeout;
 out:
 	for (i = 0; i < nwait; ++i)
 		dma_fence_put(pinned[i]);
