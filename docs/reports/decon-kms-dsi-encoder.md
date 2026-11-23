@@ -272,3 +272,14 @@ patch executes — it only compiles.
 | `vrefresh` field is 60 while the exact rate is 59.92 Hz | the field is an integer Hz (3.10 rounds); the clock + porches are the authoritative values and are what userspace recomputes. KWin's timing maths tolerates it |
 | Encoder `disable` delegation depends on `exynos7580_crtc_disable_link()` existing | header-declared, owned by DeconCrtc; stubbed only in the build copy. Coordinates with the CRTC slice; `s_stream(0)` is idempotent if the CRTC calls it again |
 | No suspend/resume here | by design: system suspend is the CRTC/driver slice's (DispPower), the encoder adds no state to save |
+
+## 9. Integration dependencies (what the assembled M1 must provide)
+
+| Dependency | Owner | Why |
+|---|---|---|
+| `exynosdrm-y += exynos_drm7580_dsi.o` | KmsAssemble | the patch ships no Makefile hunk (would collide with every sibling patch) |
+| `exynos7580_crtc_init()` returns before `exynos7580_dsi_init()` | KmsBoot/main | `possible_crtcs = drm_crtc_mask()` needs a registered CRTC (`ex->crtc.base.id != 0`) |
+| `drm_dev->driver->driver_features` includes `DRIVER_MODESET \| DRIVER_ATOMIC`, `mode_config.funcs.atomic_commit = drm_atomic_helper_commit` | KmsBoot/main | `drm_atomic_helper_connector_dpms` (the connector `->dpms`) commits through it; and atomic is what KWin needs |
+| `exynos7580_crtc_enable_link()`/`_disable_link()` behave as §3.1/§3.2 (idempotent, `s_stream` + `DSIM_IOC_SET_PORCH` if timings ever differ) | DeconCrtc | the encoder never starts/stops the link itself |
+| `CONFIG_EXYNOS_MIPI_DSI=y`, `CONFIG_PANEL_EA8061_DYNAMIC=y`, `CONFIG_FB_WINDOW_UPDATE=y`, mdev driver probed before the DECON bind | KmsAssemble | no subdev / no `lcd_info` / no `DSIM_IOC_SET_PORCH` otherwise (`decon-kms-dsi.md` §4) |
+| `disp-pll-clk` present in the board DT (64 500 000) | stock DT | the pixel clock of the single mode; fallback constant equals it |
