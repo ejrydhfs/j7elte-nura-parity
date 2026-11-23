@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsBuiltin <kmsbuiltin@local>
+Date: Mon, 23 Nov 2026 15:05:00 
+Subject: [PATCH 0103] gpu31-kms: built-in KMS owns DECON; vendor probe refuses (int60)
+
+int60 keeps the vendor driver compiled in but never bound, with both drivers
+at the stock late_initcall order (drivers/video before drivers/gpu):
+
+  - decon_probe() returns -ENODEV at the top under
+    CONFIG_EXYNOS7580_DISPLAY_KMS, before taking any resource, so the DECON
+    platform device stays unbound after the vendor late_initcall;
+  - the KMS driver's late_initcall then registers its platform_driver and the
+    bus probes the now-unbound device: decon_kms_get() sees no drvdata and
+    calls decon_probe_common(pdev, false), standing DECON up without fb0,
+    then card0 + the CMA fbdev are created;
+  - no ordering change: no late_initcall_sync anywhere (int58 proved that move
+    bootloops), and no unbind;
+  - decon_remove() is back to the minimal stock sequence (unbind is not part of
+    the test: the int59 experiment showed the full teardown hangs in
+    decon_disable()/vsync waits after X is stopped), still without the kfree()
+    of the devm decon_device so a forced unbind or a failed probe cannot
+    double free.  The devm kfree removals in the probe fail paths from 0102
+    stay: the KMS probe calls decon_probe_common() and a failure must return an
+    error, not double free.
+
+iovmm_map/iovmm_unmap exports from 0102 stay (harmless for built-in, required
+if the series is ever built as a module).
+
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -5115,6 +5115,16 @@
+ 
+ static int decon_probe(struct platform_device *pdev)
+ {
++#ifdef CONFIG_EXYNOS7580_DISPLAY_KMS
++	/*
++	 * int60: the DRM/KMS driver owns the DECON node.  Refuse here, before
++	 * any resource is taken, so the device stays unbound and the KMS
++	 * late_initcall (drivers/gpu after drivers/video) binds it and stands
++	 * the controller up through decon_kms_get(register_fb == false).
++	 * No ordering change: both stay at the stock late_initcall.
++	 */
++	return -ENODEV;
++#endif
+ 	return decon_probe_common(pdev, true);
+ }
+ 
+@@ -5128,24 +5138,16 @@
+ 		return 0;
+ 
+ 	/*
+-	 * int53: the vendor driver never supported unbind.  The stock remove
+-	 * only stopped the update thread, released the framebuffers and
+-	 * kfree()d the devm-allocated decon_device (double free when the
+-	 * driver core releases devres after ->remove), and it left the
+-	 * psr/vsync threads, the lpd workqueue, the ion client and the V4L2
+-	 * subdev alive against freed memory.  Unbind is a supported operation
+-	 * for the module test, so mirror the probe unwind (fail_* labels) and
+-	 * decon_kms_teardown(); decon and decon->pdata stay devm allocations
+-	 * and are released by the driver core after this returns.
++	 * int60: unbind is not a supported operation (the vendor probe refuses
++	 * to bind, so this only runs if the driver is force-unbound; doing the
++	 * full teardown there hung on decon_disable()/vsync waits).  Keep the
++	 * stock sequence, minus the kfree of the devm decon_device and with
++	 * the fb0 conditional, and let devres release the memory.
+ 	 */
+-	if (decon->state != DECON_STATE_OFF)
+-		decon_disable(decon);
+-
+ 	pm_runtime_disable(dev);
+ 	decon_put_clocks(decon);
++
+ 	iovmm_deactivate(dev);
+-
+-	/* fb0 may not exist (KMS stand-up never registered one). */
+ 	if (decon->fb_registered) {
+ 		unregister_framebuffer(
+ 			decon->windows[decon->pdata->default_win]->fbinfo);
+@@ -5155,33 +5157,12 @@
+ 	if (decon->update_regs_thread)
+ 		kthread_stop(decon->update_regs_thread);
+ 
+-	decon_int_destroy_psr_thread(decon);
+-
+-	if (decon->vsync_info.thread)
+-		kthread_stop(decon->vsync_info.thread);
+-	decon_int_destroy_vsync_thread(decon);
+-
+-	if (decon->ion_client) {
+-		ion_client_destroy(decon->ion_client);
+-		decon->ion_client = NULL;
+-	}
+-
+-	if (decon->lpd_wq) {
+-		destroy_workqueue(decon->lpd_wq);
+-		decon->lpd_wq = NULL;
+-	}
+-
+ 	for (i = 0; i < decon->pdata->max_win; i++)
+ 		decon_release_windows(decon->windows[i]);
+ 
+ 	debugfs_remove_recursive(decon->debug_root);
+-	decon->debug_root = NULL;
+-
+-	decon_unregister_entity(decon);
+ 
+-	platform_set_drvdata(pdev, NULL);
+-	if (decon_int_drvdata == decon)
+-		decon_int_drvdata = NULL;
++	/* decon is a devm allocation: devres frees it. */
+ 
+ 	decon_info("remove sucessful\n");
+ 	return 0;
