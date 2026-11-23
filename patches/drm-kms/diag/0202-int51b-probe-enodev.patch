@@ -1,0 +1,17 @@
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+@@ -446,6 +446,13 @@
+ 	if (!of_device_is_available(dev->of_node))
+ 		return -ENODEV;
+ 
++	/* int51b diagnostic: refuse after matching and before the DECON
++	 * stand-up, so the vendor late_initcall_sync fbdev driver must bind.
++	 * This isolates whether the KMS bind path hangs from the rest of the
++	 * series; it is not part of the shipping driver. */
++	dev_err(dev, "int51b: probe refused before decon_kms_get (diagnostic)\n");
++	return -ENODEV;
++
+ 	ex = devm_kzalloc(dev, sizeof(*ex), GFP_KERNEL);
+ 	if (!ex)
+ 		return -ENOMEM;
