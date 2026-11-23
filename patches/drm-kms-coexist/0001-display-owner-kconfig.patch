@@ -1,0 +1,83 @@
+diff --git a/drivers/video/exynos/decon_7580/Kconfig b/drivers/video/exynos/decon_7580/Kconfig
+--- a/drivers/video/exynos/decon_7580/Kconfig
++++ b/drivers/video/exynos/decon_7580/Kconfig
+@@ -1,3 +1,34 @@
++choice
++	prompt "Exynos 7580 display stack"
++	default EXYNOS7580_DISPLAY_FBDEV if FB
++	default EXYNOS7580_DISPLAY_KMS if DRM=y
++	help
++	  Selects whether the DECON DRM/KMS display driver is built.  The
++	  vendor fbdev stack is always built: it provides the DSIM/panel
++	  and window/register code the KMS driver calls, and it stays in
++	  the image as the late_initcall_sync fallback if the KMS probe
++	  fails.
++
++config EXYNOS7580_DISPLAY_FBDEV
++	bool "Legacy DECON fbdev only (X11 / nura-shell)"
++	depends on FB
++	help
++	  Shipping default.  No DRM display driver; the vendor fbdev
++	  driver owns DECON and registers /dev/fb0, as it does today.
++
++config EXYNOS7580_DISPLAY_KMS
++	bool "DECON DRM/KMS on top of the vendor stack (Plasma Mobile)"
++	depends on DRM=y
++	help
++	  Builds the DRM/KMS display driver.  It binds the DECON node at
++	  late_initcall (after the vendor DSIM/panel driver) and registers
++	  card0 plus an fb0 through drm_fbdev_cma.  The vendor fbdev
++	  driver is compiled in but cannot bind while KMS owns DECON; if
++	  the KMS probe fails, it binds at late_initcall_sync and restores
++	  the fbdev/X11 path.
++
++endchoice
++
+ config EXYNOS_DECON_EXYNOS7580
+ 	bool "Samsung Exynos Display system (DECON, MIPI)"
+ 	depends on FB
+diff --git a/drivers/video/exynos/decon_7580/decon_core.c b/drivers/video/exynos/decon_7580/decon_core.c
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -4887,7 +4887,13 @@
+ {
+ 	platform_driver_unregister(&decon_driver);
+ }
+-late_initcall(exynos_decon_register);
++/*
++ * Run after every other late_initcall so that a DECON DRM/KMS driver built
++ * into the same image (EXYNOS7580_DISPLAY_KMS) can bind the device first.
++ * If that driver's probe fails the device stays unbound and this vendor
++ * fbdev driver takes over here, restoring /dev/fb0 and the X11 path.
++ */
++late_initcall_sync(exynos_decon_register);
+ module_exit(exynos_decon_unregister);
+ 
+ MODULE_AUTHOR("Ayoung Sim <a.sim@samsung.com>");
+diff --git a/drivers/gpu/drm/exynos7580/Kconfig b/drivers/gpu/drm/exynos7580/Kconfig
+--- a/drivers/gpu/drm/exynos7580/Kconfig
++++ b/drivers/gpu/drm/exynos7580/Kconfig
+@@ -1,6 +1,6 @@
+ config DRM_EXYNOS7580
+-	tristate "DRM/KMS support for Samsung Exynos 7580 (DECON + MIPI DSIM)"
+-	depends on DRM && OF && ARM64 && ARCH_EXYNOS
++	bool "DRM/KMS support for Samsung Exynos 7580 (DECON + MIPI DSIM)"
++	depends on DRM=y && OF && ARM64 && ARCH_EXYNOS && EXYNOS7580_DISPLAY_KMS
+ 	select DRM_KMS_HELPER
+ 	select DRM_KMS_CMA_HELPER
+ 	select VIDEOMODE_HELPERS
+@@ -10,9 +10,8 @@
+ 	  ea8061 720x1280 panel found on the Galaxy J7 (j7elte).
+ 
+ 	  Provides a single CRTC with one primary plane, a DSI encoder and
+-	  connector, CMA backed dumb buffers and fbdev emulation.  The
+-	  vendor fbdev display stack (EXYNOS_DECON_EXYNOS7580) must be
+-	  disabled when this driver is enabled, both claim the same
+-	  hardware.
+-
+-	  If M is selected the module will be called exynos7580-drm.
++	  connector, CMA backed dumb buffers and fbdev emulation.  Only the
++	  EXYNOS7580_DISPLAY_KMS choice may select it.  It must be built in
++	  (not a module): it binds the DECON node at late_initcall, after
++	  the vendor DSIM/panel driver, and the vendor fbdev driver binds
++	  only at late_initcall_sync when this probe fails.

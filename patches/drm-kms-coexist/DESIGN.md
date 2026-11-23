@@ -1,5 +1,12 @@
 # DRM/KMS coexistence design — exynos7580 (j7elte, Nura 3.10.108)
 
+> **Status 2026-11-23:** this is the earlier coexistence study. The M3
+> decision, the applicable Kconfig patch and the rollback runbook are in
+> `docs/reports/decon-kms-coexist.md` (slice `KmsCoexist`). Its key
+> correction: the KMS driver must keep the existing compatibles and must not
+> remove the vendor fbdev driver from the image; a boot parameter cannot
+> switch modes on this device because `CONFIG_CMDLINE_FORCE=y`.
+
 Scope: this directory ONLY. No change to `patches/drm/`, no DTS, no config,
 no DTB payload. The S-Boot DT-payload rule is absolute: M1 must boot with the
 stock DT and the vendor fbdev stack driving DECON/DSIM.

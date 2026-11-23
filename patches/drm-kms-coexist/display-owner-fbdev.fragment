@@ -1,0 +1,12 @@
+# Display stack: legacy DECON fbdev only (shipping default).
+#
+# This is the stock pmaports display configuration: the vendor DECON
+# fbdev driver owns the hardware and registers /dev/fb0.  Selecting the
+# FBDEV choice only makes the DECON KMS driver unselectable; the existing
+# vendor symbols (EXYNOS_DECON_EXYNOS7580 / EXYNOS_MIPI_DSI /
+# EXYNOS_DECON_LCD / PANEL_EA8061_DYNAMIC) stay exactly as they are.
+#
+# Apply on top of config-samsung-j7elte.aarch64, then olddefconfig.
+CONFIG_EXYNOS7580_DISPLAY_FBDEV=y
+# CONFIG_EXYNOS7580_DISPLAY_KMS is not set
+# CONFIG_DRM_EXYNOS7580 is not set

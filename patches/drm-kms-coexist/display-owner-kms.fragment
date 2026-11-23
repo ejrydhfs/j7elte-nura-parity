@@ -1,0 +1,41 @@
+# Display stack: DECON DRM/KMS with the vendor fbdev stack as boot fallback.
+#
+# Apply on top of config-samsung-j7elte.aarch64, then olddefconfig.
+#
+# Ownership model:
+#   - The KMS driver binds "samsung,exynos5-decon_driver" at late_initcall,
+#     after the vendor DSIM/panel driver (both are late_initcall; video/ is
+#     linked before gpu/).
+#   - The vendor DECON fbdev driver is still built, but its registration is
+#     late_initcall_sync: it can only bind if the KMS probe failed, in which
+#     case /dev/fb0 and the X11/nura-shell path come back automatically.
+#   - No device-tree change: both drivers use the existing compatibles; the
+#     KMS driver never claims the dsim node.
+
+CONFIG_EXYNOS7580_DISPLAY_KMS=y
+# CONFIG_EXYNOS7580_DISPLAY_FBDEV is not set
+
+# KMS driver.  It must be built in: a module would load after the vendor
+# fallback already bound DECON.
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_KMS_CMA_HELPER=y
+CONFIG_DRM_EXYNOS7580=y
+
+# Do NOT also build the in-tree exynos DRM core: its M1 card0 (G2D only,
+# no modeset) would take the card0 name and hand KWin a useless node.
+# CONFIG_DRM_EXYNOS is not set
+
+# /dev/fb0 comes from drm_fbdev_cma; keep fbcon off the VT.
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
+
+# Vendor display stack stays ON: it supplies DSIM/panel and the
+# window/register code the KMS driver calls, and it is the fallback.
+CONFIG_EXYNOS_DECON_EXYNOS7580=y
+CONFIG_EXYNOS_MIPI_DSI=y
+CONFIG_EXYNOS_DECON_LCD=y
+CONFIG_PANEL_EA8061_DYNAMIC=y
+
+# CMA area for drm_gem_cma/dumb buffers and the fbdev buffer
+# (the stock config has CONFIG_CMA_SIZE_MBYTES=0).
+CONFIG_CMA_SIZE_MBYTES=32
