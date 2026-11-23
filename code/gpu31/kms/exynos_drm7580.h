@@ -27,8 +27,7 @@
 #define __EXYNOS_DRM7580_H__
 
 #include <drm/drmP.h>
-#include <drm/drm_crtc.h>
-#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>	/* 3.10 keeps connector/encoder decls here */
 
 /* Bit flags for exynos7580_connector_state()/debug. */
 #define EXYNOS7580_MAX_PLANES		3
