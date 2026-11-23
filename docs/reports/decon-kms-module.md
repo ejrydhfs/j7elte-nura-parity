@@ -1,5 +1,11 @@
 # DECON KMS as a loadable module (int53)
 
+> **Superseded by int59** (`docs/reports/decon-kms-int59.md`): int53 bootlooped
+> because it still carried `0200`'s vendor `late_initcall -> late_initcall_sync`
+> move (int58 isolated that as fatal), and its `0102` still `kfree()`d the devm
+> `decon` in `remove()`/probe-fail paths.  int59 drops the move and fixes the
+> devm lifetime; use its image and `.ko`s.
+
 int53 keeps the int52 source series and adds `patches/drm-kms/0102-kms-module.patch`,
 so the DECON DRM/KMS driver can be brought up on a running device instead of
 replacing the vendor display stack at boot.  The vendor DECON fbdev driver stays
