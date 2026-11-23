@@ -84,6 +84,11 @@ struct drm_gem_object *exynos7580_gem_prime_import(struct drm_device *drm,
 struct drm_framebuffer *exynos7580_fb_create(struct drm_device *drm,
 					     struct drm_file *file,
 					     struct drm_mode_fb_cmd2 *mode_cmd);
+/* Scanout DMA address of `plane` in `fb` (imported or CMA). Returns 0 and
+ * writes *addr, or -EINVAL/-ENODEV. Implemented by KmsDmabuf; used by
+ * DeconPlane (windows) and KmsFbdev (fb0). */
+int exynos7580_fb_scanout(struct drm_framebuffer *fb, unsigned int plane,
+			  dma_addr_t *addr);
 
 /* ---- KmsFence ----------------------------------------------------------- */
 /* Arms flip events for the pending commit (vblank-armed, from M0 helper). */
