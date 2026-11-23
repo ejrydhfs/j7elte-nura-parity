@@ -297,7 +297,7 @@ int exynos7580_dsi_init(struct exynos7580_device *ex)
 	if (dsi->ready)
 		return 0;
 
-	drm = &ex->drm;
+	drm = ex->drm;
 
 	/* Same lookup as the vendor DECON driver (decon-int_drv.c:203-227):
 	 * the DSIM platform driver registers its v4l2 subdev into the media

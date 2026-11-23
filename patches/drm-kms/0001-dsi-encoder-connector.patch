@@ -1,6 +1,6 @@
-From bf6480b283108a5c0f69f01ffeba03ac61656019 Mon Sep 17 00:00:00 2001
+From e8d81f05811db713fe3de1a49699a2c7fc040f75 Mon Sep 17 00:00:00 2001
 From: dsi <dsi@local>
-Date: Mon, 23 Nov 2026 09:28:50 -0500
+Date: Mon, 23 Nov 2026 09:55:35 -0500
 Subject: [PATCH] drm/exynos7580: add the DSI encoder and connector (DECON KMS)
 
 Slice DsiEncoder of the DECON KMS port (docs/reports/decon-kms-dsi.md).
@@ -20,16 +20,20 @@ file: exynos7580_dsi_init() and exynos7580_dsi_get_modes().
   crtc->disable, which is the vendor panel-off order).
 - connector detect() reports the soldered panel as connected, polled = 0,
   get_modes() returns exactly one mode, mode_valid() accepts nothing else.
----
- drivers/gpu/drm/exynos/exynos_drm7580_dsi.c | 407 ++++++++++++++++++++
- 1 file changed, 407 insertions(+)
- create mode 100644 drivers/gpu/drm/exynos/exynos_drm7580_dsi.c
 
-diff --git a/drivers/gpu/drm/exynos/exynos_drm7580_dsi.c b/drivers/gpu/drm/exynos/exynos_drm7580_dsi.c
+Uses the final contract (8048d08): struct exynos7580_device.drm is a
+drm_device * owned by drm_platform_init(), and to_exynos7580() resolves
+through drm->dev_private.
+---
+ .../gpu/drm/exynos7580/exynos_drm7580_dsi.c   | 407 ++++++++++++++++++
+ 1 file changed, 407 insertions(+)
+ create mode 100644 drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c
+
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c
 new file mode 100644
-index 0000000..2973528
+index 0000000..f21993e
 --- /dev/null
-+++ b/drivers/gpu/drm/exynos/exynos_drm7580_dsi.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c
 @@ -0,0 +1,407 @@
 +/* SPDX-License-Identifier: GPL-2.0
 + *
@@ -330,7 +334,7 @@ index 0000000..2973528
 +	if (dsi->ready)
 +		return 0;
 +
-+	drm = &ex->drm;
++	drm = ex->drm;
 +
 +	/* Same lookup as the vendor DECON driver (decon-int_drv.c:203-227):
 +	 * the DSIM platform driver registers its v4l2 subdev into the media

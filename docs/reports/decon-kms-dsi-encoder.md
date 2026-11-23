@@ -43,7 +43,11 @@ The file is DRM glue only, per `decon-kms-dsi.md` §2.1/§2.6:
   `dsim_drv.c:1118-1120`), the same lookup the vendor DECON driver does
   (`decon-int_drv.c:203-227`);
 * no `s_stream()` call of its own: the link is enabled by the CRTC
-  (§3.2/§3.3). `->disable` only delegates to the CRTC-owned teardown.
+  (§3.2/§3.3). `->disable` only delegates to the CRTC-owned teardown;
+* built against the final contract (`8048d08`): `ex->drm` is a
+  `struct drm_device *` owned by `drm_platform_init()`, and `to_exynos7580()`
+  resolves through `drm->dev_private`, so nothing here does `container_of()`
+  on a DRM device. The file lives in `drivers/gpu/drm/exynos7580/`.
 
 Single instance: the contract header has no private DSI storage in
 `struct exynos7580_device`, and the SoC has one DSI output
@@ -213,17 +217,26 @@ the plane hook and affects `DeconPlane`.)
 
 Tree: private copy `/run/media/…/j7k/kms/DsiEncoder` (`cp -a` of the read-only
 vendor tree), M0 series 0001–0004 applied, contract header copied from
-`code/gpu31/kms/` after commit `5b2be23`, `exynosdrm-y +=` line for
-`exynos_drm7580_dsi.o` **in the copy only**, plus a scratch
-`exynos_drm7580_stub.c` providing the not-yet-written
-`exynos7580_crtc_disable_link()` (not part of the patch).
+`code/gpu31/kms/` at `8048d08` (`struct drm_device *drm`, `to_exynos7580()`
+via `dev_private`). The file sits in `drivers/gpu/drm/exynos7580/`. The
+copy-only wiring is `obj-y += exynos7580/` in `drivers/gpu/drm/Makefile` plus
+`obj-y += exynos_drm7580_dsi.o exynos_drm7580_stub.o` in
+`drivers/gpu/drm/exynos7580/Makefile`, and a scratch `exynos_drm7580_stub.c`
+providing the not-yet-written `exynos7580_crtc_disable_link()` — none of that
+is in the patch.
 
 ```
 $ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error -j8 drivers/gpu/drm/
-  CC      drivers/gpu/drm/exynos/exynos_drm7580_dsi.o
-  LD      drivers/gpu/drm/exynos/exynosdrm.o
+  CC      drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.o
+  CC      drivers/gpu/drm/exynos7580/exynos_drm7580_stub.o
+  LD      drivers/gpu/drm/exynos7580/built-in.o
   LD      drivers/gpu/drm/exynos/built-in.o
   LD      drivers/gpu/drm/built-in.o
+
+$ make … drivers/video/exynos/decon_7580/
+  LD      drivers/video/exynos/decon_7580/dsim.o
+  LD      drivers/video/exynos/decon_7580/decon.o
+  LD      drivers/video/exynos/decon_7580/built-in.o
 ```
 
 * exit status 0, **0 errors**;
@@ -277,7 +290,7 @@ patch executes — it only compiles.
 
 | Dependency | Owner | Why |
 |---|---|---|
-| `exynosdrm-y += exynos_drm7580_dsi.o` | KmsAssemble | the patch ships no Makefile hunk (would collide with every sibling patch) |
+| wire `drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.o` into the build (`obj-y += exynos7580/` + the per-dir Makefile) | KmsAssemble | the patch ships no Makefile hunk (would collide with every sibling patch) |
 | `exynos7580_crtc_init()` returns before `exynos7580_dsi_init()` | KmsBoot/main | `possible_crtcs = drm_crtc_mask()` needs a registered CRTC (`ex->crtc.base.id != 0`) |
 | `drm_dev->driver->driver_features` includes `DRIVER_MODESET \| DRIVER_ATOMIC`, `mode_config.funcs.atomic_commit = drm_atomic_helper_commit` | KmsBoot/main | `drm_atomic_helper_connector_dpms` (the connector `->dpms`) commits through it; and atomic is what KWin needs |
 | `exynos7580_crtc_enable_link()`/`_disable_link()` behave as §3.1/§3.2 (idempotent, `s_stream` + `DSIM_IOC_SET_PORCH` if timings ever differ) | DeconCrtc | the encoder never starts/stops the link itself |
