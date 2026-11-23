@@ -290,6 +290,32 @@ turns the intended reuse into one fresh ~1.15 MB allocation per frame.
 This is the int42–45 ambient change the ticket suspected; it is not a
 teardown cost and no driver-0001 change can fix it.
 
+## 5.5 int47 silicon (shim fix, driver 04db08d unchanged) — the poll lie is gone, fps is not
+
+`kernel-boot-int47.img` sha256 `80ff0f9e…`, built by G31_Integrator41
+(31/31 gates, 5950b7e hunk headers repaired in d2c82ab), flashed and
+measured here on a fresh boot (`#37 19:33:43`):
+
+| check | int47 result |
+|---|---|
+| 3 × 300 f, 256², NOREAD | **107.2 / 108.0 / 104.7 fps** (2.799 / 2.777 / 2.865 s) |
+| ERR / TIMEOUT | 0 / 0 / 0 |
+| `Shmem:` per run | +56 / +36 / +44 kB (flat) |
+| 512² readback ×10 | 13.1 fps, 0 ERR/TIMEOUT |
+| 512² readback ×30 | 6.1 fps, 2 ERR/TIMEOUT (the int41 “silent 0x08” storm, unrelated) |
+| `WAIT_BO` 0-jiffy poll of an idle BO | **rc=0** (was `-ETIMEDOUT`), +100 ms still rc=0 |
+| churn 4 × 250 | SIGSEGV, kernel log clean (`poison=0`) — same userspace item as §6.1 |
+
+So the shim contract is fixed end to end (silicon-verified before/after
+on the same raw-UAPI test), but it buys **~5 %** (101 → 105–108 fps), not
+the 45 % gap. Qualification of §5.4: the poll lie was real and is now
+gone, but either Mesa 20.3 re-fetches BOs rarely enough for it not to
+dominate, or the fresh-BO cost is smaller than the `Shmem` growth
+suggested. The remaining gap is still the ~5.2 ms/frame client sys time
+plus the resolution-scaling GPU term; the per-class instrumentation
+(§6.2) is what decides it. The 150 fps target is **not** reached by
+either 04db08d or int47.
+
 ## 6. Open items
 
 1. **Churn SIGSEGV on the fixed image** (a userspace-open item, kept
@@ -325,7 +351,8 @@ teardown cost and no driver-0001 change can fix it.
    exact run conditions (int42's report records `serialize_fs=1` for
    that number, which is now known to be harmful; the watchdog report
    records 154–160 fps for plain runs).
-3. **fps acceptance (≥150 at 256²) is not reached** by this change:
+3. **fps acceptance (≥150 at 256²) is not reached** by this change
+   (and int47's shim fix only reaches 105–108, §5.5):
    clean runs are 94–103 fps, `serialize_fs=1` 112. The teardown is not
    the cause (§5); per §5.4 the likely cause is the 0002 shim's
    0-jiffy signaled-fence return making Mesa re-fetch BOs every frame
