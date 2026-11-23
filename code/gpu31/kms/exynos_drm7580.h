@@ -39,6 +39,7 @@ struct decon_kms_dev;
  * drm_platform_init() allocates the drm_device itself, so our state hangs off
  * drm->dev_private and we must NEVER container_of() a drm_device. */
 struct exynos7580_device {
+	struct drm_device	*drm;	/* owned by drm_platform_init(), not us */
 	struct device		*dev;
 	struct decon_kms_dev	*decon;
 
