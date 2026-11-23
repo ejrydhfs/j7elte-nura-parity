@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/drivers/base/dma-fence.c
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,253 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * dma-fence minimal subset implementation for Nura 3.10.108.

@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/drivers/base/dma-resv.c
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,307 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * dma-resv minimal shim implementation (Nura 3.10.108).
