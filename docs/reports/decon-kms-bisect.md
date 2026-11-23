@@ -247,3 +247,66 @@ after a power cycle — the record survives only until power is removed.
   `9b61f6e23035069e3e22f61512cfb6c5d9587840ec149b725d6a868268534c1c`,
   `…/shim-only.fragment`
   `3c5cb59b4ffd3ada6454df3392ea06dd697a10ea690b35e1290d335c838a7123`
+
+## 9. Fix for 0100 (int51f / int52)
+
+int51e localized the bootloop to `0100` alone. The static cause, as Main
+identified in the vendor path: the patch deleted the original
+`register_framebuffer()` block, and the window-programming branch further
+down (`decon_reg_get_stop_status()` false) dereferences the local
+`fbinfo` that block assigned:
+
+```c
+win_regs.vidosd_b = vidosd_b(0, 0, fbinfo->var.xres, fbinfo->var.yres);
+win_regs.vidw_buf_start = fbinfo->fix.smem_start;
+```
+
+With registration moved to the probe tail, that branch runs first and
+`fbinfo` is an uninitialised stack pointer -> panic during probe (the
+"yellow lines brightening, then reboot" signature). The
+bootloader-fb `goto decon_init_done` path does not help because it needs
+`psr_mode == DECON_VIDEO_MODE && !decon_is_no_bootloader_fb()`.
+
+Fixed `0100` (sha256 `744e2ce9…`), exactly per the requested shape:
+
+1. `register_framebuffer()` is back at its original position — before
+   `mutex_init(&decon->output_lock)`, the update kthread, `pm_runtime_
+   enable()` and the window branch — gated by `register_fb`, keeping the
+   original `fail_iovmm` path, and it sets `fb_registered`.
+2. The `CONFIG_EXYNOS_DECON_7580_KMS` / `decon_kms_attach()` hand-off
+   branch is **gone** from the vendor probe (the KMS driver binds the
+   node itself); the weak stub and its export remain but have no caller.
+3. `register_fb == false` (KMS stand-up) now `goto decon_init_done;`
+   before the stop-status/window-programming section, so it never touches
+   `fbinfo`; the local is initialised to NULL and the tail registration
+   block is deleted. `fb_registered` still makes `decon_remove()` correct.
+
+| | **int51f** (fixed shim only) | **int52** (full series, fixed shim) |
+|---|---|---|
+| patches | fixed `0100` only, pristine vendor tree | the 18-patch KMS series with fixed `0100` |
+| config | stock + `PSTORE_CONSOLE=y` (no DRM) | full KMS config (as int50) |
+| proves | the corrected DECON probe (registration in place, no hand-off, KMS path skips fb) boots the vendor fbdev stack | the full KMS assembly boots past probe with the corrected shim |
+| Image | 17184904 B `0d88f443128d8f0d2d9917ca64d41c8d88076a976511edfdef3f387c66fc64f5` | 17500384 B `a9a53890928f0568d4dd1c3aeb3f591393ca3e712b26fa57c78c34e5e40b2e75` |
+| boot.img | 26324992 B `e81144ccf408c3b317969b387b842b9abb8a2fbe75343cac0e2508dec51cb9df` | 26640384 B `aff0c6e8c6555e4592b9abc119721dce8128e5f8f195f883c6f92d15644245dd` |
+
+Gates (both PASS): patch hunk integrity, config closure, pstore/ramoops
+linked, fresh Image+vmlinux, stock `dt.img`; int51f additionally gates
+`register_framebuffer(fbinfo)` count 1 and **before**
+`mutex_init(&decon->output_lock)`, absence of the tail-registration
+comment and of any `decon_kms_attach(decon)` call, presence of the
+`if (!register_fb)` skip before the `fbinfo` window branch, the
+`decon_init_done` target, `fbinfo = NULL` and `fb_registered = true`.
+int52 gates the same ordering plus the full KMS layout/symbol set as
+int50. Builds: int51f 5236 lines / 486 warnings, int52 5304 / 487 — 0
+errors, 0 in `drivers/gpu/drm/exynos7580/`.
+
+int51e (`8472eff1…`) is kept as the defect reproduction: its log/gates
+assert the tail registration (registration line **after**
+`output_lock`), so the pair e/f brackets the exact change.
+
+Log sha256s: int51f build `ed3ee1a1e88d9f2cfd6b769bd43a8d85c011e678dca071f1f605b072891913ba`,
+gates `332cf22bc23ce9abb9972403c03c8d0ac30e205643ceeae06303b02864b352fd`,
+evidence `bbec2949184765062313a4b4d8cd0eb9ede4878034a0176216594a184b1ffdbf`;
+int52 build `444bafe03ac3afd87ba7e98bae9bbb29b10943b5781aefa1372ae04cdaf018b5`,
+gates `7275ee0155d3591ed4e4da1d232e7637d93b23e58fbbb9fce7886aa0805506c4`,
+evidence `22543f2506c0623cb9ad15dbb6e41794d085148e06d28405412f585da304d16e`.

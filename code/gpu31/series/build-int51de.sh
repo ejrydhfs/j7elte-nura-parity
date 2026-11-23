@@ -2,9 +2,12 @@
 # integration51d/e (strict-minimal bisect after int51a ALSO bootlooped):
 #   MODE=d: drm-atomic/0001..0005 only, stock vendor tree otherwise. Proves
 #           whether the 3.10 atomic core backport alone boots.
-#   MODE=e: 0100 DECON export shim only, stock vendor tree otherwise, KMS
-#           driver absent. Proves whether the vendor DECON probe split /
-#           register_framebuffer-at-tail change breaks boot.
+#   MODE=e: 0100 as originally committed (register_framebuffer at probe
+#           tail) - the int51e bootloop reproduction.
+#   MODE=f: 0100 fixed (int51f): registration back at its original
+#           position, gated by register_fb, the option-A hand-off branch
+#           removed, and register_fb==false skipping the whole
+#           fb/window-programming section.
 # Both configs are the stock j7elte config plus a diagnostic fragment that
 # differs from stock only by PSTORE_CONSOLE (ramoops is registered by the
 # vendor exynos-ss driver on the bootloader "log_pstore" region, so no DT
@@ -12,7 +15,7 @@
 # need to build.  Build only; Main flashes.
 set -u
 MODE=${MODE:-d}
-case "$MODE" in d|e) ;; *) echo "MODE must be d or e"; exit 2 ;; esac
+case "$MODE" in d|e|f) ;; *) echo "MODE must be d, e or f"; exit 2 ;; esac
 EXT=${EXT:-/run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7k/gpu31}
 REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
 PRISTINE=${PRISTINE:-/run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7k/android_kernel_samsung_universal7580-2a746c1bc1a41eae05988c153f527c8a5dc72d07}
@@ -109,7 +112,7 @@ done
 note "config closure: $(printf '%s\n' "$CONFIG_EXPECT" | grep -c .) expectations exact (stock + diagnostic only)"
 # The stock config must stay otherwise untouched: these must not appear.
 [ "$MODE" = d ] && grep -q '^CONFIG_DRM_EXYNOS7580=' .config && gate_fail "KMS driver symbol present (not minimal)"
-[ "$MODE" = e ] && grep -q '^CONFIG_DRM=' .config && gate_fail "DRM enabled in shim-only variant (not minimal)"
+[ "$MODE" != d ] && grep -q '^CONFIG_DRM=' .config && gate_fail "DRM enabled in shim-only variant (not minimal)"
 
 # ---------------------------------------------------------------- build
 BUILD_START=$(date +%s)
@@ -143,19 +146,39 @@ if [ "$MODE" = d ]; then
 	[ ! -f drivers/video/exynos/decon_7580/decon_kms_api.c ] || gate_fail "decon_kms_api.c present (not M0-only)"
 	note "int51d proof: only drm-atomic/0001..0005 are in the tree; no shim, no KMS, vendor DECON logs unchanged"
 else
-	note "== int51e gate: shim only, no DRM/KMS =="
+	note "== int51$MODE gate: shim only, no DRM/KMS =="
+	CORE=drivers/video/exynos/decon_7580/decon_core.c
 	[ -f drivers/video/exynos/decon_7580/decon_kms_api.c ] || gate_fail "shim source missing"
 	[ -f include/linux/exynos_decon_kms.h ] || gate_fail "shim header missing"
 	aarch64-linux-gnu-nm vmlinux | grep -q ' [tT] decon_probe_common$' \
 		|| gate_fail "decon_probe_common not linked"
 	aarch64-linux-gnu-nm vmlinux | grep -q ' [tT] decon_kms_get$' \
 		|| gate_fail "decon_kms_get not linked"
-	grep -q 'register_framebuffer' drivers/video/exynos/decon_7580/decon_core.c || gate_fail "register_framebuffer lost"
-	grep -q 'decon->fb_registered = true;' drivers/video/exynos/decon_7580/decon_core.c \
-		|| gate_fail "fb_registered stamp missing (shim not applied)"
+	[ "$(grep -c 'register_framebuffer(fbinfo);' "$CORE")" = 1 ] || gate_fail "register_framebuffer(fbinfo) count != 1"
+	REG_L=$(grep -n 'register_framebuffer(fbinfo);' "$CORE" | cut -d: -f1 | head -1)
+	MUT_L=$(grep -n 'mutex_init(&decon->output_lock);' "$CORE" | cut -d: -f1 | head -1)
+	grep -q 'decon->fb_registered = true;' "$CORE" || gate_fail "fb_registered stamp missing"
 	[ ! -f drivers/gpu/drm/drm_atomic.c ] || gate_fail "atomic core present (not shim-only)"
 	[ ! -d drivers/gpu/drm/exynos7580 ] || gate_fail "KMS driver present (not shim-only)"
-	note "int51e proof: pristine vendor tree + 0100 only; DECON probe split + register_framebuffer at probe tail are the only deltas"
+	if [ "$MODE" = e ]; then
+		# the committed-int51e defect: registration moved to probe tail
+		grep -q 'fb0 is registered at the very end of probe' "$CORE" 			|| gate_fail "int51e reproduction lost the tail-registration block"
+		[ -n "$REG_L" ] && [ -n "$MUT_L" ] && [ "$REG_L" -gt "$MUT_L" ] 			|| gate_fail "int51e reproduction: registration is not after output_lock"
+		note "int51e proof: original 0100 shape (register_framebuffer after mutex_init/output_lock and the kthread start)"
+	else
+		# int51f: registration restored in place, hand-off gone, KMS stand-up skips fb
+		grep -q 'fb0 is registered at the very end of probe' "$CORE" 			&& gate_fail "fixed shim still registers fb0 at the probe tail"
+		grep -q 'decon_kms_attach(decon)' "$CORE" 			&& gate_fail "fixed shim still calls the option-A hand-off"
+		[ -n "$REG_L" ] && [ -n "$MUT_L" ] && [ "$REG_L" -lt "$MUT_L" ] 			|| gate_fail "fixed shim registration is not before mutex_init/output_lock"
+		grep -q 'if (!register_fb)' "$CORE" 			|| gate_fail "fixed shim has no register_fb==false skip"
+		SKIP_L=$(grep -n 'if (!register_fb)' "$CORE" | cut -d: -f1 | head -1)
+		WIN_L=$(grep -n 'win_regs.vidosd_b = vidosd_b(0, 0, fbinfo->var.xres' "$CORE" | cut -d: -f1 | head -1)
+		[ -n "$SKIP_L" ] && [ -n "$WIN_L" ] && [ "$SKIP_L" -lt "$WIN_L" ] \
+			|| gate_fail "register_fb skip is not before the fbinfo window branch (skip=$SKIP_L win=$WIN_L)"
+		grep -q 'goto decon_init_done;' "$CORE" || gate_fail "no decon_init_done target for the skip"
+		grep -q 'struct fb_info \*fbinfo = NULL;' "$CORE" || gate_fail "fbinfo not initialised"
+		note "int51f proof: register_framebuffer back before output_lock and the kthread, gated by register_fb; hand-off branch removed; KMS stand-up jumps past the fbinfo window branch"
+	fi
 fi
 
 # ---------------------------------------------------------------- pack

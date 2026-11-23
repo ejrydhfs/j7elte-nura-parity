@@ -47,8 +47,8 @@ Probe split and fb0 lifetime
   update kthread, pm_runtime_enable() and the panel hand-off, so an fb0 client
   can no longer race a half-initialised DECON; decon->fb_registered records it
   and decon_remove() only unregisters when it was registered.
-  The coexistence hook (CONFIG_EXYNOS_DECON_7580_KMS, decon-kms-coexist.md
-  section 6 option A) calls decon_kms_attach() before fb0 registration; the
+  int51f: the option-A hand-off branch was removed from the vendor probe
+  (the KMS driver binds the node itself); registration stays in place.  The
   weak stub in the shim returns -ENODEV, so a plain fbdev image is unaffected.
 
 Vblank
@@ -207,7 +207,6 @@ index 5168cd8..6656176 100644
  static inline void decon_lpd_block(struct decon_device *decon)
  {
 diff --git a/drivers/video/exynos/decon_7580/decon_core.c b/drivers/video/exynos/decon_7580/decon_core.c
-index 742f8c9..54854ae 100644
 --- a/drivers/video/exynos/decon_7580/decon_core.c
 +++ b/drivers/video/exynos/decon_7580/decon_core.c
 @@ -32,6 +32,8 @@
@@ -219,7 +218,7 @@ index 742f8c9..54854ae 100644
  
  #include <mach/regs-clock.h>
  #include <mach/exynos-pm.h>
-@@ -116,7 +118,7 @@ void decon_extra_vsync_wait_add(int skip_count)
+@@ -116,7 +118,7 @@
  #endif /* CONFIG_USE_VSYNC_SKIP */
  
  /* ---------- CHECK FUNCTIONS ----------- */
@@ -228,7 +227,7 @@ index 742f8c9..54854ae 100644
  		struct decon_reg_data *regs, int idx)
  {
  	win_regs->wincon = regs->wincon[idx];
-@@ -1174,7 +1176,7 @@ blank_exit:
+@@ -1174,7 +1176,7 @@
  }
  
  /* ---------- FB_IOCTL INTERFACE ----------- */
@@ -237,7 +236,7 @@ index 742f8c9..54854ae 100644
  {
  	struct decon_psr_info psr;
  	int prev_refcount, ret;
-@@ -1198,7 +1200,7 @@ static void decon_activate_vsync(struct decon_device *decon)
+@@ -1198,7 +1200,7 @@
  	mutex_unlock(&decon->vsync_info.irq_lock);
  }
  
@@ -246,7 +245,7 @@ index 742f8c9..54854ae 100644
  {
  	struct decon_psr_info psr;
  	int new_refcount, ret;
-@@ -1513,7 +1515,7 @@ static inline int decon_set_alpha_blending(struct decon_win_config *win_config,
+@@ -1513,7 +1515,7 @@
  	return 0;
  }
  
@@ -255,7 +254,7 @@ index 742f8c9..54854ae 100644
  		struct decon_win_config *win_config, struct decon_reg_data *regs)
  {
  	struct ion_handle *handle;
-@@ -2063,7 +2065,7 @@ wait_done:
+@@ -2063,7 +2065,7 @@
  	return 0;
  }
  
@@ -264,7 +263,7 @@ index 742f8c9..54854ae 100644
  {
  	struct decon_dma_buf_data old_dma_bufs[decon->pdata->max_win][MAX_BUF_PLANE_CNT];
  	int i, j;
-@@ -2357,6 +2359,274 @@ err:
+@@ -2357,6 +2359,274 @@
  	return ret;
  }
  
@@ -539,7 +538,7 @@ index 742f8c9..54854ae 100644
  static ssize_t decon_fb_read(struct fb_info *info, char __user *buf,
  		size_t count, loff_t *ppos)
  {
-@@ -2679,7 +2949,7 @@ static int decon_create_links(struct decon_device *decon,
+@@ -2679,7 +2949,7 @@
  	return create_link_mipi(decon);
  }
  
@@ -548,7 +547,7 @@ index 742f8c9..54854ae 100644
  {
  	v4l2_device_unregister_subdev(&decon->sd);
  }
-@@ -2730,7 +3000,7 @@ static int decon_register_entity(struct decon_device *decon)
+@@ -2730,7 +3000,7 @@
  	return find_subdev_mipi(decon);
  }
  
@@ -557,7 +556,7 @@ index 742f8c9..54854ae 100644
  {
  	if (win->fbinfo)
  		framebuffer_release(win->fbinfo);
-@@ -2833,7 +3103,7 @@ static void decon_missing_pixclock(struct decon_fb_videomode *win_mode)
+@@ -2833,7 +3103,7 @@
  	win_mode->videomode.pixclock = pixclk;
  }
  
@@ -566,7 +565,7 @@ index 742f8c9..54854ae 100644
  {
  	struct decon_win *win;
  	struct fb_info *fbinfo;
-@@ -4382,7 +4652,14 @@ int decon_tui_protection(struct decon_device *decon, bool tui_en)
+@@ -4382,12 +4652,19 @@
  
  
  /* --------- DRIVER INITIALIZATION ---------- */
@@ -582,7 +581,13 @@ index 742f8c9..54854ae 100644
  {
  	struct device *dev = &pdev->dev;
  	struct decon_device *decon;
-@@ -4410,6 +4687,7 @@ static int decon_probe(struct platform_device *pdev)
+ 	struct resource *res;
+-	struct fb_info *fbinfo;
++	struct fb_info *fbinfo = NULL;
+ 	int ret = 0;
+ 	char device_name[MAX_NAME_SIZE], debug_name[MAX_NAME_SIZE];
+ 	struct decon_psr_info psr;
+@@ -4410,6 +4687,7 @@
  
  	/* setup pointer to master device */
  	decon->dev = dev;
@@ -590,7 +595,7 @@ index 742f8c9..54854ae 100644
  	decon->pdata = devm_kzalloc(dev, sizeof(struct exynos_decon_platdata),
  						GFP_KERNEL);
  	if (!decon->pdata) {
-@@ -4431,6 +4709,8 @@ static int decon_probe(struct platform_device *pdev)
+@@ -4431,6 +4709,8 @@
  	decon->regs = devm_request_and_ioremap(dev, res);
  	if (decon->regs == NULL) {
  		decon_err("failed to claim register region\n");
@@ -599,7 +604,7 @@ index 742f8c9..54854ae 100644
  		goto fail_kfree;
  	}
  
-@@ -4464,12 +4744,15 @@ static int decon_probe(struct platform_device *pdev)
+@@ -4464,12 +4744,15 @@
  	decon->debug_root = debugfs_create_dir(debug_name, NULL);
  	if (!decon->debug_root) {
  		decon_err("failed to create debugfs root directory.\n");
@@ -615,7 +620,7 @@ index 742f8c9..54854ae 100644
  		goto fail_lpd_work;
  	}
  
-@@ -4571,6 +4854,7 @@ static int decon_probe(struct platform_device *pdev)
+@@ -4571,6 +4854,7 @@
  	md = (struct exynos_md *)module_name_to_driver_data(MDEV_MODULE_NAME);
  	if (!md) {
  		decon_err("failed to get output media device\n");
@@ -623,7 +628,7 @@ index 742f8c9..54854ae 100644
  		goto fail_iovmm;
  	}
  
-@@ -4585,15 +4869,6 @@ static int decon_probe(struct platform_device *pdev)
+@@ -4585,13 +4869,17 @@
  	if (ret)
  		goto fail_iovmm;
  
@@ -634,53 +639,34 @@ index 742f8c9..54854ae 100644
 -	if (ret < 0) {
 -		decon_err("failed to register framebuffer\n");
 -		goto fail_iovmm;
--	}
--
- 	/* mutex mechanism */
- 	mutex_init(&decon->output_lock);
- 	mutex_init(&decon->mutex);
-@@ -4769,6 +5044,40 @@ decon_init_done:
- #endif
- 	decon_esd_enable_interrupt(decon);
- 
-+	/*
-+	 * fb0 is registered at the very end of probe, after the update
-+	 * kthread, pm_runtime_enable() and the panel hand-off: everything the
-+	 * window API needs must exist before /dev/fb0 is visible, otherwise a
-+	 * client that opens it immediately races with probe.
-+	 *
-+	 * In KMS mode (register_fb == false) the DRM driver owns the pipe and
-+	 * no fb0 is created; the DRM fbdev emulation reintroduces it.
-+	 */
++	/* register framebuffer (vendor fbdev probe only; the KMS stand-up
++	 * path never touches fbinfo).  Kept at its original position: the
++	 * window-programming branch below dereferences fbinfo. */
 +	if (register_fb) {
-+		bool kms_owned = false;
-+
-+#ifdef CONFIG_EXYNOS_DECON_7580_KMS
-+		/*
-+		 * Coexistence option A (decon-kms-coexist.md section 6): the
-+		 * vendor probe hands the live DECON to the DRM driver, which
-+		 * then owns card0 and does not need fb0.  The weak
-+		 * decon_kms_attach() stub returns -ENODEV when the KMS driver
-+		 * is not built in, so this branch is a no-op for a plain fbdev
-+		 * image and fb0 stays registered.
-+		 */
-+		kms_owned = !decon_kms_attach(decon);
-+#endif
-+		if (!kms_owned) {
-+			fbinfo = decon->windows[decon->pdata->default_win]->fbinfo;
-+			ret = register_framebuffer(fbinfo);
-+			if (ret < 0) {
-+				decon_err("failed to register framebuffer\n");
-+				goto fail_thread;
-+			}
-+			decon->fb_registered = true;
++		fbinfo = decon->windows[decon->pdata->default_win]->fbinfo;
++		ret = register_framebuffer(fbinfo);
++		if (ret < 0) {
++			decon_err("failed to register framebuffer\n");
++			goto fail_iovmm;
 +		}
-+	}
-+
- 	decon_info("decon registered successfully\n");
++		decon->fb_registered = true;
+ 	}
  
- 	return 0;
-@@ -4816,6 +5125,11 @@ fail_kfree:
+ 	/* mutex mechanism */
+@@ -4632,6 +4920,12 @@
+ 	decon_runtime_resume(decon->dev);
+ #endif
+ 
++	/* gpu31-kms: register_fb == false is the KMS stand-up path.  The DRM
++	 * driver owns the pipe and programs DECON itself, and no fb0 exists
++	 * here, so never enter the fb/window-programming section below. */
++	if (!register_fb)
++		goto decon_init_done;
++
+ 	/* DECON does not need to start, if DECON is already
+ 	 * running(enabled in LCD_ON_UBOOT) */
+ 	if (decon_reg_get_stop_status(DECON_INT)) {
+@@ -4816,6 +5110,11 @@
  	return ret;
  }
  
@@ -692,7 +678,7 @@ index 742f8c9..54854ae 100644
  static int decon_remove(struct platform_device *pdev)
  {
  	struct device *dev = &pdev->dev;
-@@ -4826,7 +5140,16 @@ static int decon_remove(struct platform_device *pdev)
+@@ -4826,7 +5125,16 @@
  	decon_put_clocks(decon);
  
  	iovmm_deactivate(dev);
@@ -1718,7 +1704,7 @@ index 0000000..e8d7ffc
 + * @decon_dev: the DECON platform device (&pdev->dev).
 + *
 + * In the recommended binding (decon-kms-api.md 6, option A) nobody calls this
-+ * from outside: the vendor decon_probe() calls decon_kms_attach() itself, in
++ * from outside: int51f removed the vendor probe's hand-off call, so this stub
 + * the same context, right where it would have called register_framebuffer().
 + * A caller that has to look the device up instead can use
 + *     of_find_device_by_node(of_find_compatible_node(NULL, NULL,
