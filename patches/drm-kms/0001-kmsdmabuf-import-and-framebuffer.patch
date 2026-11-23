@@ -1,20 +1,20 @@
-From 2995b5077321f2eaaa3c7ef1b33a9e4df508a2c8 Mon Sep 17 00:00:00 2001
+From 62e8ea0b3255bda7f3d11d67af3fd75079c74e9a Mon Sep 17 00:00:00 2001
 From: KmsDmabuf <kmsdmabuf@local>
-Date: Mon, 23 Nov 2026 09:44:30 -0500
+Date: Mon, 23 Nov 2026 09:49:00 -0500
 Subject: [PATCH] drm/exynos7580: dma-buf import, framebuffer creation and
  scanout IOVA (KmsDmabuf)
 
 ---
- .../drm/exynos7580/exynos_drm7580_dmabuf.c    | 640 ++++++++++++++++++
- 1 file changed, 640 insertions(+)
+ .../drm/exynos7580/exynos_drm7580_dmabuf.c    | 647 ++++++++++++++++++
+ 1 file changed, 647 insertions(+)
  create mode 100644 drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
 
 diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
 new file mode 100644
-index 0000000..91e5a34
+index 0000000..8b265d2
 --- /dev/null
 +++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,647 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * gpu31-kms: dma-buf import and framebuffer creation for the DECON KMS device.
@@ -75,6 +75,13 @@ index 0000000..91e5a34
 +#include <drm/drm_fourcc.h>
 +
 +#include "exynos_drm7580.h"
++
++/* DECON windows are programmed with SYSMMU/IOVMM addresses; iovmm_map() only
++ * exists with one of these, and the display does not work without it. */
++#if !IS_ENABLED(CONFIG_EXYNOS_IOVMM) && !IS_ENABLED(CONFIG_EXYNOS_IOVMM_V6)
++#error "exynos_drm7580_dmabuf.c requires CONFIG_EXYNOS_IOVMM_V6"
++#endif
++
 +
 +/*
 + * How many fbdev (foreign CMA) framebuffers may have a cached DECON mapping.

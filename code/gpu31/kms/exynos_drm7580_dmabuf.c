@@ -59,6 +59,13 @@
 
 #include "exynos_drm7580.h"
 
+/* DECON windows are programmed with SYSMMU/IOVMM addresses; iovmm_map() only
+ * exists with one of these, and the display does not work without it. */
+#if !IS_ENABLED(CONFIG_EXYNOS_IOVMM) && !IS_ENABLED(CONFIG_EXYNOS_IOVMM_V6)
+#error "exynos_drm7580_dmabuf.c requires CONFIG_EXYNOS_IOVMM_V6"
+#endif
+
+
 /*
  * How many fbdev (foreign CMA) framebuffers may have a cached DECON mapping.
  * fbdev registers exactly one (fb0); the other slots only exist so an fb0 that

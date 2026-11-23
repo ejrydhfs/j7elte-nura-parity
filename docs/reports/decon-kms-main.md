@@ -7,8 +7,8 @@ declared in the frozen contract `code/gpu31/kms/exynos_drm7580.h`
 (commit `8048d08`).
 
 Deliverables
-- `code/gpu31/kms/exynos_drm7580_main.c` (sha256 `2ee29271…528260`, 554 lines)
-- `patches/drm-kms/0200-kms-main-bind.patch` (sha256 `3c00e771…d3c71c`, 745 lines)
+- `code/gpu31/kms/exynos_drm7580_main.c` (sha256 `a7ad012f…65674f`, 554 lines)
+- `patches/drm-kms/0200-kms-main-bind.patch` (sha256 `3f51a5dc…fc8128`, 745 lines)
 - this report
 
 The patch creates `drivers/gpu/drm/exynos7580/` (`Kconfig`, `Makefile`,
@@ -72,9 +72,13 @@ triggers `exynos7580_probe()` for the already-populated platform device
       has no state, its `funcs->reset()` is called by hand (a second
       `drm_mode_config_reset()` would force `connector->status` back to
       `unknown` and KWin drops the CRTC for lack of a connected output).
-   7. `exynos7580_fbdev_init(ex)` — registers `/dev/fb0` and runs the initial
+   7. `decon_kms_register_vblank_cb(ex->decon, exynos7580_vblank_isr, ex)` —
+      arm the DECON FRAME interrupt before the first commit, because the
+      initial modeset below arms its flip event at vblank and the counter has
+      to advance.
+   8. `exynos7580_fbdev_init(ex)` — registers `/dev/fb0` and runs the initial
       modeset (see §3).
-   8. `exynos7580_initial_modeset(ex, drm)` — postcondition check under
+   9. `exynos7580_initial_modeset(ex, drm)` — postcondition check under
       `drm_modeset_lock_all()`: `crtc.state->enable` and `crtc.primary->fb` must
       be set, i.e. fb0 is actually being scanned out.
 
@@ -111,12 +115,18 @@ is what triggers the vendor fallback. It also refuses to continue when
 - `->get_vblank_counter = exynos7580_get_vblank_counter` returns
   `drm_vblank_count(dev, 0)`; the core accounts for interrupts missed while the
   IRQ was off.
-- `->enable_vblank` / `->disable_vblank` refcount users of the single pipe
+- `->enable_vblank` / `->disable_vblank` only refcount users of the single pipe
   (`exynos7580_vblank_users`, a file static because the contract struct is
-  frozen) and install/remove the DECON FRAME callback through
-  `decon_kms_register_vblank_cb()`, which also enables/leaves the vendor
-  interrupt refcounting alone. The callback is the only IRQ registration this
-  driver makes: the vendor DECON driver owns the interrupt line.
+  frozen). They do not touch the DECON: the DRM core calls them with
+  `dev->vbl_lock` held (spinlock, IRQs off, `drm_vblank_get()`/
+  `drm_vblank_put()`), while `decon_kms_register_vblank_cb()` is documented as
+  process context.
+- The DECON FRAME callback is installed once from `->load()` (§2 step 7) and
+  removed in the load unwind and in `->unload()`. `decon_kms_register_vblank_cb()`
+  enables the vendor interrupt while a callback is registered and leaves the
+  vendor `decon_activate_vsync()` refcounting alone; the vendor fbdev path
+  enables the same interrupt whenever the display is on, so this adds no new
+  interrupt load.
 - The callback (`exynos7580_vblank_isr`, hard IRQ) calls
   `drm_handle_vblank(drm, 0)` and then `exynos7580_vblank_irq(drm, 0)`, the
   fence slice's event completion. It does not sleep and does not re-enter the
@@ -299,14 +309,29 @@ written.
    `drivers/gpu/drm/exynos7580/`: **none**. The pre-existing
    `drivers/gpu/drm/exynos/` warnings listed in `decon-kms-m0.md` §6.2 are
    unchanged, and the run reports no Kconfig error or recursion.
-4. **Integration compile against the real sibling sources**: after dropping the
-   DSI, fence, plane and fbdev files from the sibling patches into
-   `drivers/gpu/drm/exynos7580/` (CRTC still stubbed), `exynos-drm7580.o` links
-   with 0 errors and **one** warning, in a sibling file:
+4. **Integration compile against the real sibling sources** (same fresh tree,
+   after applying `0001-dsi…`, `0001-kmsfence…`, `0001-plane…`,
+   `0004-kmsfbdev…` and copying those four files into
+   `drivers/gpu/drm/exynos7580/`; CRTC still stubbed):
+   `make … -j8 drivers/gpu/drm/` → exit 0, 0 errors,
+   `LD drivers/gpu/drm/exynos7580/exynos-drm7580.o`, and **one** warning, in a
+   sibling file:
    `exynos_drm7580_dsi.c:300: assignment to 'struct drm_device *' from
    incompatible pointer type 'struct drm_device **'` — `drm = &ex->drm;` is a
    leftover from the container_of-era header and must become `drm = ex->drm;`
    (reported to `DsiEncoder`).
+
+   The same run exposed the assembly mismatch this patch had already flagged:
+   the sibling patches create `drivers/gpu/drm/exynos/exynos_drm7580_*.c` and
+   `0004-kmsfbdev…` wires the fbdev file into `exynosdrm.o` through
+   `CONFIG_DRM_EXYNOS7580_FBDEV`, which then fails with
+   `fatal error: exynos_drm7580.h: No such file or directory` (the contract
+   header lives in `drivers/gpu/drm/exynos7580/`). With
+   `CONFIG_DRM_EXYNOS7580_FBDEV` off (or after re-pathing those files into
+   `drivers/gpu/drm/exynos7580/` and dropping that `exynosdrm-*` Makefile line)
+   the build is clean. `KmsAssemble` must pick one directory for the whole
+   slice set; this patch's Makefile builds all seven objects from
+   `drivers/gpu/drm/exynos7580/`.
 
 Not verified (out of scope for this seat): boot, `card0` node creation on the
 device, `modetest`/`kmscube`, actual atomic commits and flip events. Those are

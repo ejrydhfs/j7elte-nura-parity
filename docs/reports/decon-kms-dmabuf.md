@@ -247,6 +247,11 @@ Therefore:
   `BUG_ON(dmabuf->ops != &dma_buf_ops)` (`ion.c:2643`), so a panfrost dma-buf
   panics the kernel. `iovmm_map()` is the same primitive `ion_iovmm_map()`
   calls internally (`ion.c:2604`).
+* There is no fallback address: `include/linux/exynos_iovmm.h` does not even
+  declare `iovmm_map()` without `CONFIG_EXYNOS_IOVMM{, _V6}`, so the source
+  has a hard `#error` for that configuration. The stock j7elte config has
+  `CONFIG_EXYNOS_IOVMM_V6=y`; the KMS Kconfig should state
+  `depends on EXYNOS_IOVMM_V6` rather than rely on the `#error`.
 
 ## 5. ADDFB2 validation
 
@@ -380,6 +385,10 @@ Already satisfied by `0200-kms-main-bind.patch`:
   objects corrupt memory on free);
 * `.fb_create = exynos7580_fb_create` via `mode_config.funcs`;
 * `exynos-drm7580-y` contains `exynos_drm7580_dmabuf.o`.
+
+One Kconfig ask: `config DRM_EXYNOS7580` should carry
+`depends on EXYNOS_IOVMM_V6` (or `EXYNOS_IOVMM`); the file otherwise fails to
+compile because `iovmm_map()` is not declared.
 
 Two issues found outside this slice, for the assembly seat:
 

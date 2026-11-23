@@ -80,6 +80,12 @@ static struct exynos7580_device *exynos7580_device;
  * owned by the vendor shim (decon_kms_register_vblank_cb()), so the DRM
  * refcount is kept here instead of in struct exynos7580_device, whose layout
  * is fixed by the shared contract header.
+ *
+ * The callback is installed once from ->load() and removed in the unwind and
+ * in ->unload(), never from enable_vblank()/disable_vblank(): the DRM core
+ * calls those with dev->vbl_lock held (spinlock, IRQs off, drm_irq.c
+ * drm_vblank_get/put), and decon_kms_register_vblank_cb() is documented as
+ * process context.
  */
 static atomic_t exynos7580_vblank_users = ATOMIC_INIT(0);
 
@@ -121,38 +127,22 @@ static void exynos7580_vblank_isr(void *data)
 
 static int exynos7580_enable_vblank(struct drm_device *drm, int pipe)
 {
-	struct exynos7580_device *ex = to_exynos7580(drm);
-	int ret;
-
 	if (pipe != EXYNOS7580_PIPE)
 		return -EINVAL;
-	if (!ex || !ex->decon)
+	if (!to_exynos7580(drm))
 		return -ENODEV;
 
-	if (atomic_inc_return(&exynos7580_vblank_users) > 1)
-		return 0;
-
-	ret = decon_kms_register_vblank_cb(ex->decon, exynos7580_vblank_isr, ex);
-	if (ret) {
-		atomic_dec(&exynos7580_vblank_users);
-		DRM_ERROR("failed to arm DECON FRAME interrupt: %d\n", ret);
-		return ret;
-	}
-
+	/* The FRAME interrupt is already armed from ->load(). */
+	atomic_inc(&exynos7580_vblank_users);
 	return 0;
 }
 
 static void exynos7580_disable_vblank(struct drm_device *drm, int pipe)
 {
-	struct exynos7580_device *ex = to_exynos7580(drm);
-
-	if (pipe != EXYNOS7580_PIPE || !ex || !ex->decon)
+	if (pipe != EXYNOS7580_PIPE)
 		return;
 
-	if (!atomic_dec_and_test(&exynos7580_vblank_users))
-		return;
-
-	decon_kms_register_vblank_cb(ex->decon, NULL, NULL);
+	atomic_dec(&exynos7580_vblank_users);
 }
 
 /* ------------------------------------------------------------------------
@@ -346,6 +336,16 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
 		ex->connector.funcs->reset(&ex->connector);
 
 	/*
+	 * Arm the FRAME interrupt before the first commit: the initial modeset
+	 * below arms its flip event from vblank, so the counter must advance.
+	 */
+	ret = decon_kms_register_vblank_cb(ex->decon, exynos7580_vblank_isr, ex);
+	if (ret) {
+		DRM_ERROR("failed to arm DECON FRAME interrupt: %d\n", ret);
+		goto err_vblank;
+	}
+
+	/*
 	 * Last fallible step: this registers /dev/fb0 and runs the initial
 	 * modeset.  exynos7580_fbdev_init() must leave no fb0 behind when it
 	 * fails (otherwise the vendor fallback would only get fb1).
@@ -366,6 +366,7 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
 	return 0;
 
 err_vblank:
+	decon_kms_register_vblank_cb(ex->decon, NULL, NULL);
 	drm_vblank_cleanup(drm);
 err_config:
 	drm_mode_config_cleanup(drm);
@@ -381,8 +382,7 @@ static int exynos7580_unload(struct drm_device *drm)
 	if (!ex)
 		return 0;
 
-	if (!atomic_dec_and_test(&exynos7580_vblank_users))
-		atomic_set(&exynos7580_vblank_users, 0);
+	atomic_set(&exynos7580_vblank_users, 0);
 	decon_kms_register_vblank_cb(ex->decon, NULL, NULL);
 
 	drm_vblank_cleanup(drm);
