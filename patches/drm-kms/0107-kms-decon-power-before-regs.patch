@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsPower <kmspower@local>
+Date: Mon, 23 Nov 2026 17:05:00 
+Subject: [PATCH 0107] gpu31-kms: power DECON (pd_disp) before the first register read (int65)
+
+int64 loads the DRM modules, but the KMS probe dies on the first DECON
+register read:
+
+    PM DOMAIN: pd-disp can't add device 14830000.decon_fb
+    exynos7580: probe: calling decon_kms_get()
+    ...
+    Kernel BUG at 0
+    PC: decon_reg_get_stop_status+0xc
+    LR: decon_probe_common+0x610
+    x0 : ffffff8003660000   (decon->regs, mapped)
+
+`decon_probe_common()` touches registers (the "DECON already running" VIDCON0
+read) *before* its original pm_runtime_enable()/pm_runtime_get_sync() block
+further down.  The vendor boot path survives this because the bootloader
+leaves pd_disp and the DECON clocks on; in the KMS path the vendor probe
+attempt (which refuses with -ENODEV) has already been through the driver
+core's pm_request_idle, pd_disp can be off, and the read aborts.
+
+The "pd-disp can't add device" line is the duplicate attach, not a failure:
+`arch/arm64/mach-exynos/pm_domains.c` attaches on BUS_NOTIFY_BIND_DRIVER,
+which `drivers/base/dd.c` sends on *every* probe attempt, and a failed probe
+does not send UNBOUND, so the second (KMS) bind's __pm_genpd_add_device()
+returns -EBUSY.  The domain is attached (dev->pm_domain != NULL).
+
+Changes, all in decon_probe_common():
+
+  - check decon_int_get_clocks()'s return (the vendor probe ignored it);
+  - after the IRQ mutex init, before any register access: publish the
+    platform drvdata (the runtime PM callbacks resolve decon from it),
+    verify dev->pm_domain is attached (fail with -ENODEV if not), then
+    pm_runtime_enable() + pm_runtime_get_sync() and log
+    "decon: regs powered (pd attached), reading VIDCON0";
+  - drop the later duplicate pm_runtime_enable()/pm_runtime_get_sync() pair,
+    so the existing teardown's put/disable stays balanced.
+
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -4702,7 +4702,12 @@
+ 
+ 	/* init clock setting for decon */
+ 	decon_int_drvdata = decon;
+-	decon_int_get_clocks(decon);
++	ret = decon_int_get_clocks(decon);
++	if (ret) {
++		/* the vendor probe ignored this: an ERR_PTR clock aborts later */
++		decon_err("failed to get DECON clocks: %d\n", ret);
++		goto fail_kfree;
++	}
+ 
+ 	/* Get memory resource and map SFR region. */
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+@@ -4719,6 +4724,32 @@
+ 	init_waitqueue_head(&decon->wait_frmdone);
+ 	mutex_init(&decon->vsync_info.irq_lock);
+ 
++	/*
++	 * int65: DECON lives in pd_disp, and the first register access in this
++	 * function (the "already running" VIDCON0 read) happens before the
++	 * original pm_runtime_enable()/get_sync().  On the vendor boot path the
++	 * bootloader leaves the domain and the clocks on, so that read works;
++	 * in the KMS path the vendor probe attempt has already gone through
++	 * pm_request_idle, pd_disp can be OFF, and readl aborts.  The platform
++	 * bus BIND_DRIVER notifier has attached the domain by now, so bring it
++	 * (and the clocks) up here, before touching any register, and fail
++	 * cleanly if it cannot be powered.
++	 */
++	platform_set_drvdata(pdev, decon);
++	if (!dev->pm_domain) {
++		decon_err("DECON has no power domain attached (pd_disp)\n");
++		ret = -ENODEV;
++		goto fail_irq_mutex;
++	}
++	pm_runtime_enable(dev);
++	ret = pm_runtime_get_sync(dev);
++	if (ret < 0) {
++		decon_err("failed to power DECON power domain: %d\n", ret);
++		pm_runtime_disable(dev);
++		goto fail_irq_mutex;
++	}
++	dev_info(dev, "decon: regs powered (pd attached), reading VIDCON0\n");
++
+ 	snprintf(device_name, MAX_NAME_SIZE, "decon%d", DECON_INT);
+ 	decon->timeline = sw_sync_timeline_create(device_name);
+ 	decon->timeline_max = 1;
+@@ -4906,19 +4937,12 @@
+ 		decon_err("failed to set lcd information\n");
+ 		goto fail_thread;
+ 	}
+-	platform_set_drvdata(pdev, decon);
+-	pm_runtime_enable(dev);
+-
+-
+ 	decon->max_win_bw = decon_calc_bandwidth(decon->lcd_info->xres,
+ 			decon->lcd_info->yres, 4,
+ 			decon->lcd_info->fps);
+ 
+-#if defined(CONFIG_PM_RUNTIME)
+-	pm_runtime_get_sync(decon->dev);
+-#else
+-	decon_runtime_resume(decon->dev);
+-#endif
++	/* int65: pm_runtime was enabled and the device powered above, before
++	 * the first register access. */
+ 
+ 	/* gpu31-kms: register_fb == false is the KMS stand-up path.  The DRM
+ 	 * driver owns the pipe and programs DECON itself, and no fb0 exists
