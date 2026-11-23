@@ -35,8 +35,10 @@
 /* Opaque handle to the vendor DECON window engine (DeconApi contract). */
 struct decon_kms_dev;
 
+/* 3.10 has no embedded drm_device (drm_dev_alloc arrived in 3.13):
+ * drm_platform_init() allocates the drm_device itself, so our state hangs off
+ * drm->dev_private and we must NEVER container_of() a drm_device. */
 struct exynos7580_device {
-	struct drm_device	drm;
 	struct device		*dev;
 	struct decon_kms_dev	*decon;
 
@@ -50,7 +52,7 @@ struct exynos7580_device {
 
 static inline struct exynos7580_device *to_exynos7580(struct drm_device *drm)
 {
-	return container_of(drm, struct exynos7580_device, drm);
+	return drm->dev_private;
 }
 
 /* ---- DeconCrtc ---------------------------------------------------------- */
