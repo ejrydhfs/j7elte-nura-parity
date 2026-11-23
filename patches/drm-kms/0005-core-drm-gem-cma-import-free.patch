@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsDmabuf <kmsdmabuf@local>
+Date: Mon, 23 Nov 2026 10:05:00 -0500
+Subject: [PATCH] drm/gem-cma: free imported objects through PRIME, not
+ dma_free_attrs
+
+drm_gem_cma_free_object() predates PRIME import in this tree: it always
+calls drm_gem_cma_buf_destroy() -> dma_free_attrs(dev, size, vaddr, paddr).
+That is only correct for objects drm_gem_cma_create() allocated.
+
+An imported dma-buf is a drm_gem_cma_object wrapper owned by the importer:
+vaddr is NULL (the exporter owns the pages), paddr is the exporter's
+sg_dma_address and base.import_attach is set.  Freeing it through
+dma_free_attrs() releases physical page 0 / the exporter's memory and leaks
+the dma-buf attachment, dma-buf reference and mapped sg table.
+
+Upstream fixed the same hole when it gained PRIME import (4.x
+drm_gem_cma_free_object checks import_attach and calls
+drm_prime_gem_destroy()).  Do the same here, taking the sg table from
+driver_private -- the convention the importer uses because 3.10's
+struct drm_gem_cma_object has no sgt field and the alternative would change
+a shared header.
+
+This is what makes .gem_free_object = drm_gem_cma_free_object safe for the
+DECON KMS driver's mixed object set (imported scanout buffers from panfrost
+and its own CMA dumb buffers, exynos_drm7580_main.c).
+
+Fixes: KmsDmabuf / M2 dma-buf import.
+Signed-off-by: KmsDmabuf <kmsdmabuf@local>
+---
+ drivers/gpu/drm/drm_gem_cma_helper.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem_cma_helper.c b/drivers/gpu/drm/drm_gem_cma_helper.c
+index 0a7e011..29dbe35 100644
+--- a/drivers/gpu/drm/drm_gem_cma_helper.c
++++ b/drivers/gpu/drm/drm_gem_cma_helper.c
+@@ -147,7 +147,21 @@ void drm_gem_cma_free_object(struct drm_gem_object *gem_obj)
+ 
+ 	cma_obj = to_drm_gem_cma_obj(gem_obj);
+ 
+-	drm_gem_cma_buf_destroy(gem_obj->dev, cma_obj);
++	if (gem_obj->import_attach) {
++		/*
++		 * Imported dma-buf: the pages belong to the exporter, and
++		 * this wrapper owns nothing but the attachment.  The importer
++		 * stashed the sg table returned by dma_buf_map_attachment()
++		 * in driver_private; drm_prime_gem_destroy() unmaps it,
++		 * detaches the attachment and drops the dma-buf reference.
++		 * 3.10's struct drm_gem_cma_object has no sgt field, so the
++		 * pointer travels in the GEM object itself.
++		 */
++		drm_prime_gem_destroy(gem_obj, gem_obj->driver_private);
++		gem_obj->driver_private = NULL;
++	} else {
++		drm_gem_cma_buf_destroy(gem_obj->dev, cma_obj);
++	}
+ 
+ 	kfree(cma_obj);
+ }
+-- 
+2.43.0
+
