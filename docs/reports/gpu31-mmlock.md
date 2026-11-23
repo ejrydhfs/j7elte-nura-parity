@@ -278,6 +278,18 @@ stamp returns **0**. So the 0-jiffy poll on an idle BO *does* report
 from the cache. Test binary: `/data/mmlock/waitbo` (created BO, no
 submit, two WAIT_BO calls).
 
+Attribution: **98640d5's mapping was right and the 0002 shim is the
+liar.** `dma_resv_wait_timeout()`'s contract is "0 = budget expired, >0 =
+signaled"; a signaled fence must return a positive remainder even for a
+0-jiffy poll. The shim returns 0 there, so the driver's
+0 → `-ETIMEDOUT` mapping faithfully reports what the shim said. The
+mapping only became *expensive* once frees became real
+(gpu31-boleak/int45): that is the first image where Mesa's BO cache can
+actually hold and re-fetch freed BOs, so a poll that always says "busy"
+turns the intended reuse into one fresh ~1.15 MB allocation per frame.
+This is the int42–45 ambient change the ticket suspected; it is not a
+teardown cost and no driver-0001 change can fix it.
+
 ## 6. Open items
 
 1. **Churn SIGSEGV on the fixed image** (the only blocker for the
