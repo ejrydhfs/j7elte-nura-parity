@@ -298,7 +298,7 @@
  	struct p7580_bo *bo = to_p7580_bo(obj);
  	unsigned int npages = p7580_bo_npages(obj);
  	unsigned int i;
-@@ -1747,10 +1777,110 @@
+@@ -1747,10 +1777,124 @@
  	return ret;
  }
  
@@ -376,13 +376,27 @@
 +
 +	if (!drv)
 +		return;
-+	dir = debugfs_create_dir("p7580", NULL);
-+	if (IS_ERR_OR_NULL(dir))
++	/* int49: the job slice already owns the driver's debugfs dir
++	 * (created and stored in p7580_job_dev_init -> jd->dbg_dir).
++	 * debugfs_create_dir("p7580", NULL) on an existing dir returns
++	 * -EEXIST as an ERR_PTR, which IS_ERR_OR_NULL reports as true --
++	 * the int48 code then returned before creating prof_arm, so the
++	 * knob silently did not exist on the flashed image. Reuse the
++	 * dentry the driver already has instead of creating a second
++	 * one; every failure is logged. */
++	dir = (struct dentry *)drv->jd.dbg_dir;
++	if (!dir) {
++		pr_info("p7580perf: prof_arm unavailable (no p7580 debugfs dir)\n");
 +		return;
++	}
 +	f = debugfs_create_file("prof_arm", 0600, dir, drv,
 +				&p7580_prof_arm_fops);
-+	if (IS_ERR_OR_NULL(f))
-+		pr_info("p7580perf: prof_arm knob unavailable\n");
++	if (IS_ERR_OR_NULL(f)) {
++		pr_err("p7580perf: prof_arm knob failed (%ld)\n",
++		       IS_ERR(f) ? PTR_ERR(f) : -ENODEV);
++		return;
++	}
++	pr_info("p7580perf: prof_arm ready\n");
 +}
 +
  int p7580_drv_submit(struct p7580_drv *drv, struct drm_device *dev,
