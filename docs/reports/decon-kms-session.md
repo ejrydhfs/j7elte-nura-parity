@@ -261,9 +261,16 @@ deviceinfo_zram_swap_pct="150"
 ```
 
 This makes `postmarketos-zram-swap` create a **687 MiB** zram0 (50 % of
-1374 MiB, the memory-budget assumption) with lz4.  The service was already in
-the default runlevel but stopped; `install.sh` starts it, `revert.sh` stops it
-again.  `nura-zswap-off` is enabled in the same runlevel and ordered before
+1374 MiB, the memory-budget assumption) with lz4.  687 MiB is the **cap**, not
+a target: Gate A measures `mm_stat` field 1 (`orig`, uncompressed pages
+pushed out) and field 3 (`mem_used`, physical cost), requiring
+`mem_used <= 128 MiB` and `orig <= 400 MiB` at home-screen idle.  Use
+`code/gpu31/kms/tools/memwatch.sh -t 1800 -i 5 -p plasmashell,kwin_wayland`;
+its `#SUMMARY` line reports `min_avail`, the zram ratio and per-process
+first/last PIDs.  If `orig > 400 MiB` with no app open, that is a session
+estimate problem to raise with the memory slice, not a reason to grow zram.
+The service was already in the default runlevel but stopped; `install.sh`
+starts it, `revert.sh` stops it again.  `nura-zswap-off` is enabled in the same runlevel and ordered before
 it, blocking zswap stores through `max_pool_percent=0`; the permanent fix
 remains `zswap.enabled=0` on the boot cmdline.  `install.sh` records the
 original `max_pool_percent` in `/etc/nura/zswap-max-pool`, which `revert.sh`
@@ -317,7 +324,7 @@ Before switching to Plasma:
 | KWin loads | `kwin_wayland --version` | `kwin 6.8.3` (after r1); no relocation errors |
 | Seat | `loginctl show-seat seat0 -p CanGraphical` | `CanGraphical=yes` once card0 is tagged |
 | Input access | `id user`; `su - user -c 'head -c0 /dev/input/event2'` | `input` group present; command succeeds |
-| zram | `swapon --show`; `zramctl` | `/dev/zram0` ~687 MiB, lz4 |
+| zram | `swapon --show`; `zramctl`; `memwatch.sh -t 1800 -i 5 -p plasmashell,kwin_wayland` | `/dev/zram0` lz4, `disksize=687M` (cap); `#SUMMARY` Gate A at idle: `mem_used <= 128 MiB`, `orig <= 400 MiB` |
 | zswap | `cat /sys/module/zswap/parameters/enabled`; `cat .../max_pool_percent` | `N` if the boot cmdline fix landed; otherwise `Y` with `max_pool_percent=0` (stopgap) |
 | Session files | `ls /usr/share/wayland-sessions/nura-plasma.desktop /etc/lightdm/lightdm.conf.d/60-nura-session.conf` | present |
 | Gate | `nura-session-mode status` | all required lines OK |
