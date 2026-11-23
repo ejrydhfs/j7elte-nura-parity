@@ -180,7 +180,7 @@
 +		obj = p7580_offset_lookup(gd, vma->vm_pgoff);
 +		if (!obj)
 +			return drm_mmap(filp, vma);
-+			p7580_prof_add(pdrv, P7580_PROF_MMAP, t0);
++		p7580_prof_add(pdrv, P7580_PROF_MMAP, t0);
 +	}
  
  	vm_size = vma->vm_end - vma->vm_start;
