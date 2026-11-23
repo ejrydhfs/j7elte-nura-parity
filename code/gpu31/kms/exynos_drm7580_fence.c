@@ -1,0 +1,324 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * exynos_drm7580_fence.c - DECON KMS vblank/flip-event completion
+ *
+ * KmsFence slice of the DECON KMS driver (see exynos_drm7580.h).  This file
+ * owns the only two points where a commit meets the vblank interrupt:
+ *
+ *   exynos7580_commit_tail()  driver tail of an atomic commit; runs the M0
+ *                             helper stages and hands each pending flip
+ *                             event to the vblank core;
+ *   exynos7580_vblank_irq()   DECON frame-done interrupt; advances the DRM
+ *                             vblank counter and delivers armed events.
+ *
+ * ---------------------------------------------------------------------------
+ * The 3.10 vblank model used here
+ * ---------------------------------------------------------------------------
+ * This tree predates drm_crtc_vblank_*() and struct drm_vblank_crtc.  The
+ * primitives available (include/drm/drmP.h:1452-1464, drm_irq.c) are:
+ *
+ *   int  dev->num_crtcs                    number of initialised pipes
+ *   int  dev->driver->enable_vblank(dev, pipe)
+ *   int  dev->driver->disable_vblank(dev, pipe)
+ *   u32  dev->driver->get_vblank_counter(dev, pipe)
+ *   int  drm_vblank_get(dev, pipe)         take an interrupt reference;
+ *                                          pipe 0 -> 1 calls enable_vblank()
+ *   void drm_vblank_put(dev, pipe)         drop it; BUG_ON(refcount == 0)
+ *   u32  drm_vblank_count(dev, pipe)       cooked software frame counter
+ *   bool drm_handle_vblank(dev, pipe)      called from the IRQ: timestamp,
+ *                                          ++_vblank_count, wake
+ *                                          dev->vbl_queue[pipe], then send
+ *                                          every due event on
+ *                                          dev->vblank_event_list
+ *   void drm_send_vblank_event(dev, pipe, e)  send now; event_lock held
+ *   wait_queue_head_t *dev->vbl_queue[]    one wait queue per pipe
+ *   struct list_head dev->vblank_event_list  process-wide armed events
+ *   spinlock_t dev->event_lock             protects the list and the events
+ *
+ * There is no drm_crtc_arm_vblank_event() (upstream added it in v4.4), so
+ * exynos7580_arm_vblank_event() below is the minimal 3.10 equivalent: set
+ * ->pipe, sample the current counter, and queue the event.  The counter value
+ * only has to satisfy drm_handle_vblank_events()'s "too old" filter
+ *
+ *         if ((seq - e->event.sequence) > (1 << 23))
+ *                 continue;
+ *
+ * so sampling the *current* count means "deliver at the first vblank after
+ * arming", which for a synchronous DECON commit is exactly the vblank at
+ * which the newly latched frame is scanned out.
+ *
+ * ---------------------------------------------------------------------------
+ * Ordering against the DECON commit and the frame interrupt
+ * ---------------------------------------------------------------------------
+ * The DECON hardware commit (decon_kms_commit(), issued by the plane hooks in
+ * drm_atomic_helper_commit_planes()) is synchronous: it returns after the
+ * shadow registers were unprotected and the vendor driver waited for the
+ * frame interrupt that latches them.  exynos7580_commit_tail() therefore arms
+ * only after the frame is already programmed, i.e. the event cannot describe
+ * a frame that is still in the update kthread.
+ *
+ * The remaining race is arming vs. the very vblank interrupt.  Both paths
+ * serialize on dev->event_lock:
+ *   - the arm samples drm_vblank_count() and appends the event under it;
+ *   - drm_handle_vblank() samples the counter and sends due events under it.
+ * Whichever wins, the event is delivered on the first vblank at or after the
+ * arm: if the interrupt ran first, the sampled count is the new one and the
+ * event goes out on the next frame (one frame late, never lost); if the arm
+ * ran first, the interrupt delivers it immediately (never twice, because
+ * drm_handle_vblank_events() unlinks it under the same lock).
+ *
+ * If the plane slice ever switches to decon_kms_commit_async(), the tail MUST
+ * wait for that commit's completion before arming; otherwise the event can
+ * overtake the frame programming.
+ *
+ * ---------------------------------------------------------------------------
+ * Completion guarantees (no hang, exactly once)
+ * ---------------------------------------------------------------------------
+ * 1. An event is either queued on dev->vblank_event_list with exactly one
+ *    vblank reference held on its behalf, or sent immediately with no
+ *    reference.  The reference taken by drm_vblank_get() is dropped by
+ *    drm_handle_vblank_events() when the event is delivered, by drm_vblank_off()
+ *    when the pipe is switched off, and by drm_events_release() if the client
+ *    closes the file first (drm_fops.c:400-422).  It is never dropped twice.
+ * 2. crtc->state->event is cleared as soon as ownership passes to the core,
+ *    so the state destroy path cannot free a delivered event again.
+ * 3. No vblank available (dev->num_crtcs == 0, no ->enable_vblank hook, the
+ *    pipe is off, or enable_vblank() fails) => the event is sent immediately;
+ *    userspace is never left waiting for an interrupt that cannot happen.
+ * 4. A CRTC that goes inactive in this commit is completed immediately: its
+ *    disable hook has already called drm_vblank_off(), which also flushed any
+ *    event armed for the previous frame.
+ * 5. exynos7580_commit_tail() waits at most 50 ms for the flip vblank
+ *    (drm_atomic_helper_wait_for_vblanks()) and skips that wait entirely if
+ *    vblank was never initialised, so a dead pipe can delay but never hang the
+ *    commit.
+ */
+#include <linux/kernel.h>
+#include <linux/spinlock.h>
+#include <linux/types.h>
+
+#include <drm/drmP.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
+
+#include "exynos_drm7580.h"
+
+/*
+ * exynos7580_vblank_available - can this pipe deliver a vblank event?
+ * @drm: DRM device
+ * @pipe: CRTC index
+ *
+ * This tree has no drm_crtc_vblank_get() that would do this check for us, and
+ * both drm_vblank_get() and dev->vbl_queue[] assume drm_vblank_init() ran and
+ * ->enable_vblank exists.  Checking up front lets the caller fall back to an
+ * immediate completion instead of dereferencing a NULL queue or hook.
+ */
+static bool exynos7580_vblank_available(struct drm_device *drm,
+					unsigned int pipe)
+{
+	if (!drm->num_crtcs || pipe >= (unsigned int)drm->num_crtcs)
+		return false;
+
+	if (!drm->driver || !drm->driver->enable_vblank)
+		return false;
+
+	return true;
+}
+
+/*
+ * exynos7580_arm_vblank_event - minimal drm_crtc_arm_vblank_event() (v4.4)
+ * @drm: DRM device
+ * @pipe: CRTC index the event belongs to
+ * @e: event to deliver on the next vblank
+ *
+ * The caller must hold dev->event_lock and a vblank reference on @pipe taken
+ * with drm_vblank_get(); drm_handle_vblank_events() consumes that reference
+ * when it sends the event.
+ */
+static void exynos7580_arm_vblank_event(struct drm_device *drm,
+					unsigned int pipe,
+					struct drm_pending_vblank_event *e)
+{
+	assert_spin_locked(&drm->event_lock);
+
+	e->pipe = pipe;
+	e->event.sequence = drm_vblank_count(drm, pipe);
+	list_add_tail(&e->base.link, &drm->vblank_event_list);
+}
+
+/*
+ * exynos7580_send_event_now - deliver an event without waiting for a vblank
+ * @drm: DRM device
+ * @pipe: CRTC index, or -1 when the counter must not be touched
+ * @e: event to deliver
+ *
+ * Used for every "no vblank will come" case.  Takes dev->event_lock itself;
+ * drm_send_vblank_event() requires it.
+ */
+static void exynos7580_send_event_now(struct drm_device *drm, int pipe,
+				      struct drm_pending_vblank_event *e)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&drm->event_lock, flags);
+	drm_send_vblank_event(drm, pipe, e);
+	spin_unlock_irqrestore(&drm->event_lock, flags);
+}
+
+/*
+ * exynos7580_complete_crtc_event - hand one commit's event to its owner
+ * @drm: DRM device
+ * @crtc: CRTC the state belongs to
+ * @state: the *new* CRTC state (crtc->state after swap_state)
+ *
+ * Called once per CRTC present in the commit, after the hardware commit ran.
+ * Exactly one of three things happens to a non-NULL event:
+ *
+ *   - the CRTC is going inactive: send now (no vblank will follow);
+ *   - vblank is unusable on this pipe: send now (never wait forever);
+ *   - otherwise: take a vblank reference and arm it for the next vblank.
+ *
+ * The event pointer is detached from the CRTC state before anything else so
+ * the atomic state teardown can never race a second completion.
+ */
+static void exynos7580_complete_crtc_event(struct drm_device *drm,
+					   struct drm_crtc *crtc,
+					   struct drm_crtc_state *state)
+{
+	struct drm_pending_vblank_event *e = state->event;
+	unsigned int pipe = drm_crtc_index(crtc);
+	unsigned long flags;
+
+	if (!e)
+		return;
+
+	/* Ownership moves to the core (or to userspace) right here. */
+	state->event = NULL;
+
+	/*
+	 * A disabling commit has already run the CRTC's disable hook, which
+	 * calls drm_vblank_off() and thus flushes anything armed before.  This
+	 * event describes the disable itself, so it completes now.
+	 */
+	if (!state->active) {
+		exynos7580_send_event_now(drm,
+			exynos7580_vblank_available(drm, pipe) ? (int)pipe : -1,
+			e);
+		return;
+	}
+
+	/*
+	 * Take the interrupt reference first, then arm.  The order matters:
+	 * the arm must never be visible without a reference, because
+	 * drm_handle_vblank_events() drops exactly one reference per event.
+	 */
+	if (!exynos7580_vblank_available(drm, pipe) ||
+	    drm_vblank_get(drm, pipe) != 0) {
+		dev_dbg(drm->dev,
+			"crtc %u: no vblank, completing flip event immediately\n",
+			pipe);
+		exynos7580_send_event_now(drm, -1, e);
+		return;
+	}
+
+	spin_lock_irqsave(&drm->event_lock, flags);
+	exynos7580_arm_vblank_event(drm, pipe, e);
+	spin_unlock_irqrestore(&drm->event_lock, flags);
+}
+
+/**
+ * exynos7580_commit_tail - commit an atomic state to DECON and complete it
+ * @state: atomic state whose old-state pointers were already swapped in
+ *
+ * This is the complete driver tail: the caller (the driver's
+ * mode_config.funcs.atomic_commit hook) must have run
+ * drm_atomic_helper_prepare_planes() and drm_atomic_helper_swap_state()
+ * already, and must not touch @state afterwards.  The required order is
+ *
+ *     1. fallible link/DECON enable          (driver, before prepare_planes)
+ *     2. drm_atomic_helper_prepare_planes()  (driver)
+ *     3. drm_atomic_helper_swap_state()      (driver)
+ *     4. exynos7580_commit_tail()            (this function)
+ *
+ * It must not be replaced by drm_atomic_helper_commit(): the M0 helper never
+ * arms crtc_state->event, so every flip would time out in userspace.
+ *
+ * Because the M0 atomic ioctl holds dev->mode_config.mutex for its whole run,
+ * tails are serialized, and because DECON commits are synchronous the frame
+ * is latched before the events below are armed.
+ *
+ * @state is freed before returning, including on the "vblank never comes"
+ * path.
+ */
+void exynos7580_commit_tail(struct drm_atomic_state *state)
+{
+	struct drm_device *drm;
+	int i;
+
+	if (!state)
+		return;
+
+	drm = state->dev;
+
+	/*
+	 * Hardware commit.  pre: disable the outputs that a modeset removes,
+	 * reprogram the CRTC mode and encoder routing; planes: every driver
+	 * atomic_update/atomic_disable (DECON window programming, one
+	 * synchronous decon_kms_commit()); post: enable the new outputs.
+	 */
+	drm_atomic_helper_commit_pre_planes(drm, state);
+	drm_atomic_helper_commit_planes(drm, state);
+	drm_atomic_helper_commit_post_planes(drm, state);
+
+	/*
+	 * Hardware is done: arm this commit's flip events for the first
+	 * vblank after the latched frame (the drm_atomic_helper_commit_hw_done()
+	 * slot of newer kernels, minus the commit-tracking objects this tree
+	 * does not have).
+	 */
+	for (i = 0; i < drm->mode_config.num_crtc; i++) {
+		struct drm_crtc *crtc = state->crtcs[i];
+
+		if (!crtc)
+			continue;
+
+		exynos7580_complete_crtc_event(drm, crtc, crtc->state);
+	}
+
+	/*
+	 * Wait one frame so the old framebuffers are really off screen before
+	 * cleanup_planes() drops them.  The helper uses
+	 * drm_vblank_get()/dev->vbl_queue[] with a 50 ms timeout and skips a
+	 * CRTC whose vblank cannot be enabled, so this cannot hang.
+	 */
+	if (drm->num_crtcs)
+		drm_atomic_helper_wait_for_vblanks(drm, state);
+
+	drm_atomic_helper_cleanup_planes(drm, state);
+	drm_atomic_state_free(state);
+}
+
+/**
+ * exynos7580_vblank_irq - DECON frame-done interrupt
+ * @drm: DRM device
+ * @pipe: CRTC index that completed a frame
+ *
+ * Runs in hard IRQ context (the vendor FRAME interrupt path); must not sleep.
+ * drm_handle_vblank() is the 3.10 name of the upstream
+ * drm_crtc_handle_vblank(): it timestamps the vblank, increments the cooked
+ * counter, wakes dev->vbl_queue[pipe] (wait_for_vblanks() users) and sends
+ * every armed event for @pipe, dropping each event's vblank reference.
+ *
+ * Spurious interrupts (pipe not initialised, vblank not enabled, redundant
+ * timestamps) are ignored by the core, so calling this unconditionally from
+ * the shared DECON interrupt is safe.
+ */
+void exynos7580_vblank_irq(struct drm_device *drm, unsigned int pipe)
+{
+	if (!drm || pipe >= (unsigned int)drm->num_crtcs)
+		return;
+
+	drm_handle_vblank(drm, pipe);
+}
