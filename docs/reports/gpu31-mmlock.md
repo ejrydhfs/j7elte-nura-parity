@@ -292,15 +292,30 @@ teardown cost and no driver-0001 change can fix it.
 
 ## 6. Open items
 
-1. **Churn SIGSEGV on the fixed image** (the only blocker for the
-   stress acceptance). The kernel log is clean and the corruption
-   signature is gone; the client dies in userspace. Discriminate test
-   client vs driver by (a) running the same churn against a reduced
-   thread count (deterministic sequential phase passes: stale offsets
-   stop resolving) and (b) capturing the faulting address/VMA
-   (`/proc/<pid>/maps` at crash) — if a driver-returned VMA disappears
-   under a live mapping, that is a real bug in the new mmap path, not
-   the test.
+1. **Churn SIGSEGV on the fixed image** (a userspace-open item, kept
+   outside the kernel race acceptance). Discriminator run on
+   int46measure (same 04db08d driver):
+   - deterministic sequential phase (create / mmap / write / munmap /
+     GEM_CLOSE / stale mmap) passes for 4 KiB, 64 KiB and 1 MiB: the
+     stale offset stops resolving, no fault;
+   - **single thread, 250 iterations, stale probes disabled: PASS**
+     (`CHURN ok iters=250 threads=1 errs=0`);
+   - **4 threads, 250 iterations each: SIGSEGV** (with and without the
+     stale probes). Handler-captured fault: a page-aligned address that
+     is the base of a BO region the thread had just mmap'd, inside a
+     hole between `rw-s … /dev/dri/renderD128` VMAs, i.e. the mapping is
+     gone at the moment of the write; kernel log at that point contains
+     no oops/poison line and no `MMAP_BO` returned `-ENOENT` (0
+     `CHURN FAIL` lines).
+   A missing `offset_hash` entry cannot produce this: `.mmap` would
+   return `-EINVAL` and the client would skip the write (the fallback
+   `drm_mmap()` also fails, it only knows the empty core hash).
+   Remaining suspects, in order: the test client's own cross-thread
+   mmap/munmap/GEM_CLOSE/fd-close pattern (it is the only thing that
+   removes a VMA in the process) and, less likely, a VMA that the kernel
+   tears down under a live GEM reference. Next step: same loop with two
+   threads sharing one fd and no fd close/reopen, then a run with all
+   BOs kept alive to the end (no early munmap).
 2. **Where the 5.2 ms/frame sys goes.** Instrumentation patch #2 is
    written (per-class timers for CREATE_BO, `p7580_shmem_alloc`,
    `p7580_drv_map_bo`, SUBMIT, MMAP, WAIT, free_job, `job_done_sync`,
