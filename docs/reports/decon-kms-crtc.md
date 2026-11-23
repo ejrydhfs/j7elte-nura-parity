@@ -101,10 +101,13 @@ in `enable_link()`, `disable_link()`, `mode_set()`, `disable()` and
 `atomic_commit()`. `TEST_ONLY | PAGE_FLIP_EVENT` is rejected earlier by the M0
 UAPI (`drm_atomic.c:1218-1221`), as KWin expects.
 
-It cannot be *executed* here: there is no KMS node on the target (only
-`renderD128` on `panfrost7580`), `modetest`/`kmscube` need a real CRTC, the
-series is not assembled into a boot image yet, and this run is not allowed to
-flash. The target-side exercise stays exactly the one in `decon-kms-req.md`
+It cannot be *executed* here — re-checked on 2026-11-23 against the running
+kernel (`3.10.108`, read-only under `flock /tmp/gpsdev.lock`):
+`/sys/class/drm` contains `renderD128` only, so there is no CRTC, no
+`DRM_IOCTL_MODE_ATOMIC` target and nothing for `modetest`/`kmscube` to drive;
+the series is not assembled into a boot image yet and this run is not allowed to
+flash. The static path proof above is what stands in for the exercise: TEST_ONLY
+cannot reach any hardware entry point of this slice. The target-side exercise stays exactly the one in `decon-kms-req.md`
 §4.3, run under `flock /tmp/gpsdev.lock` + `timeout`:
 
 ```sh
@@ -326,7 +329,28 @@ this series does not touch.
    `drm_vblank_pre/post_modeset()` around `mode_set()` and `drm_vblank_off()` on
    disable, as the 3.10 API requires.
 
-## 8. Open risks carried into M1 bring-up
+## 8. Integration state of the `mode_config` ops (checked against `0200`)
+
+`exynos_drm7580_main.c` (`patches/drm-kms/0200-kms-main-bind.patch`) currently
+defines its **own** `static exynos7580_atomic_commit()` and installs it in
+`mode_config_funcs`, i.e. the two exported functions of §7.1 are dead code in the
+assembled driver (a `static` definition does not collide with the global one at
+link time, so this fails silently). Mismatches against the contract of §2:
+
+| `main.c` as committed | Contract (§2) |
+|---|---|
+| `if (async) return -EBUSY;` | async runs the same tail. Every KWin flip is `NONBLOCK|PAGE_FLIP_EVENT`: `drm_mode_atomic_ioctl()` (NONBLOCK) and `drm_atomic_helper_page_flip()` both call `drm_atomic_async_commit()` → `atomic_commit(..., async = true)` → **-EBUSY**, so non-blocking commits would fail outright |
+| link enable unconditionally | enable only for crtc states that become active / have `mode_changed`; otherwise every modeset-off does a needless DECON enable/disable cycle |
+
+Requested fix (message sent to the integration seat): keep the table, drop the
+static function, point `.atomic_check`/`.atomic_commit` at the exported
+`exynos7580_atomic_check()`/`exynos7580_atomic_commit()` with two local
+declarations in `main.c`. Everything else in `0200` matches this slice:
+`decon_kms_get(dev)` at `:480`, `exynos7580_planes_init()` at `:310` before
+`exynos7580_crtc_init()` at `:316`, `drm->dev_private = ex`,
+`drm_vblank_init(drm, 1)` and `drm_mode_config_reset()`.
+
+## 9. Open risks carried into M1 bring-up
 
 * The first KMS commit after `decon_kms_get()` is a full modeset by construction
   (`needs_full_modeset` starts true), so it re-runs `decon_reg_init()` over a
