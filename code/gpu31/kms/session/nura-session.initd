@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# nura-session - supervise exactly one display backend.
+#
+# /usr/local/bin/nura-session-run reads /etc/nura/session-mode and execs
+# either start-ui.sh (Xorg fbdev + nura-shell) or lightdm (Plasma Mobile
+# autologin).  Replaces both the stock xsession service and the stock lightdm
+# service in the default runlevel so the two can never own the display at the
+# same time.
+
+name="nura-session"
+description="Nura display session (nura-shell or Plasma Mobile)"
+supervisor="supervise-daemon"
+command="/usr/local/bin/nura-session-run"
+respawn_delay=3
+respawn_max=0
+respawn_period=30
+output_log="/var/log/nura-session.log"
+error_log="/var/log/nura-session.log"
+
+depend() {
+    need localmount dbus elogind
+    after udev
+    after postmarketos-zram-swap
+    provide display-manager
+}
+
+start_pre() {
+    # lightdm's own init script does this; we run lightdm directly.
+    checkpath --owner lightdm:lightdm --directory /run/lightdm
+}

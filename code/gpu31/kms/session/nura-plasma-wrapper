@@ -1,0 +1,13 @@
+#!/bin/sh
+# LightDM session-wrapper.
+#
+# LightDM 1.33 passes the whole session command line as a single argument
+# (src/seat.c:get_session_argv), so sh -c is required.  The stock wrapper is
+# /etc/X11/xinit/Xsession, which is X11-specific; this one only loads the
+# login profile and runs the command.
+[ -f /etc/profile ] && . /etc/profile
+
+if [ "$#" -eq 1 ]; then
+    exec /bin/sh -c "$1"
+fi
+exec "$@"

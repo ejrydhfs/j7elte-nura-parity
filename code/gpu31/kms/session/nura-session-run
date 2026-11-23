@@ -1,0 +1,52 @@
+#!/bin/sh
+# nura-session-run - exec exactly one display backend.
+#
+# Started by the nura-session OpenRC service under supervise-daemon.  It never
+# returns while the backend runs; supervise-daemon owns respawn.
+#
+#   mode nura    -> start-ui.sh: Xorg fbdev + nura-shell
+#   mode plasma  -> lightdm: slick-greeter autologin -> Plasma Mobile Wayland
+#   mode auto    -> plasma when card0 is atomic and kwin_wayland loads
+#
+# "plasma" falls back to nura when the gate fails (missing card0, non-atomic
+# KMS, or the Qt 6.12/kwin ABI break) so a kernel rollback cannot leave a
+# black screen.
+
+set -eu
+
+. /etc/nura/session.conf
+mkdir -p /run/nura-session
+rm -f /run/nura-session/probe
+
+mode=$(cat /etc/nura/session-mode 2>/dev/null || echo auto)
+desired=nura
+reason="mode=$mode"
+
+if [ "$mode" != "nura" ]; then
+    if [ ! -c "$NURA_KMS_CARD" ]; then
+        reason="$NURA_KMS_CARD is missing"
+    elif [ ! -x "$NURA_KMS_PROBE" ]; then
+        reason="$NURA_KMS_PROBE is missing (compile kms-atomic-probe.c)"
+    elif ! "$NURA_KMS_PROBE" "$NURA_KMS_CARD" > /run/nura-session/probe 2>&1; then
+        reason="$NURA_KMS_CARD does not support atomic KMS"
+    elif ! command -v kwin_wayland >/dev/null 2>&1 || ! kwin_wayland --version >/dev/null 2>&1; then
+        reason="kwin_wayland does not load (install kwin=6.8.3-r1 for Qt 6.12)"
+    else
+        desired=plasma
+        reason="card0 is atomic and kwin_wayland loads"
+    fi
+    if [ "$mode" = "plasma" ] && [ "$desired" != "plasma" ]; then
+        echo "nura-session: Plasma requested but falling back to nura: $reason" >&2
+    fi
+fi
+
+printf '%s\n' "$desired" > /run/nura-session/decision
+printf '%s\n' "$reason" > /run/nura-session/reason
+
+if [ "$desired" = "plasma" ]; then
+    echo "nura-session: starting lightdm (Plasma Mobile): $reason" >&2
+    exec /usr/bin/lightdm
+fi
+
+echo "nura-session: starting nura-shell: $reason" >&2
+exec /usr/local/bin/start-ui.sh

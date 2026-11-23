@@ -1,0 +1,178 @@
+#!/bin/sh
+# nura-session-mode - inspect or switch the J7 session backend.
+#
+#   nura-session-mode status          show the gate result and running services
+#   nura-session-mode nura            Xorg + nura-shell on /dev/fb0 (proven)
+#   nura-session-mode plasma          lightdm autologin -> Plasma Mobile Wayland
+#   nura-session-mode auto            plasma when card0 is atomic and KWin loads,
+#                                     otherwise nura
+#
+# "plasma" is refused unless the KMS card is atomic, kwin_wayland loads and the
+# session desktop file exists; pass --force to override the check.  At boot the
+# selector falls back to nura anyway when the gate fails.
+
+set -eu
+
+CONF=/etc/nura/session.conf
+MODE_FILE=/etc/nura/session-mode
+
+[ -r "$CONF" ] || { echo "$CONF missing; run install.sh" >&2; exit 1; }
+. "$CONF"
+
+force=0
+args=
+for arg in "$@"; do
+    case "$arg" in
+    --force) force=1 ;;
+    *) args="$args $arg" ;;
+    esac
+done
+# shellcheck disable=SC2086
+set -- $args
+cmd=${1:-status}
+
+kms_ok() {
+    [ -c "$NURA_KMS_CARD" ] || return 1
+    [ -x "$NURA_KMS_PROBE" ] || return 1
+    "$NURA_KMS_PROBE" "$NURA_KMS_CARD" >/dev/null 2>&1
+}
+
+kwin_ok() {
+    command -v kwin_wayland >/dev/null 2>&1 || return 1
+    kwin_wayland --version >/dev/null 2>&1
+}
+
+have_group() {
+    id -nG "$NURA_SESSION_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$1"
+}
+
+check_plasma() {
+    rc=0
+    if ! kms_ok; then
+        if [ ! -c "$NURA_KMS_CARD" ]; then
+            echo "FAIL: $NURA_KMS_CARD is missing (KMS milestone M1 not on this kernel)" >&2
+        elif [ ! -x "$NURA_KMS_PROBE" ]; then
+            echo "FAIL: $NURA_KMS_PROBE is missing (compile it with install.sh)" >&2
+        else
+            echo "FAIL: $NURA_KMS_CARD does not support atomic KMS" >&2
+            "$NURA_KMS_PROBE" "$NURA_KMS_CARD" >&2 || true
+        fi
+        rc=1
+    fi
+    if ! kwin_ok; then
+        echo "FAIL: kwin_wayland cannot load; install kwin=6.8.3-r1 (Qt 6.12 rebuild):" >&2
+        kwin_wayland --version 2>&1 | sed 's/^/      /' >&2 || true
+        rc=1
+    fi
+    [ -f "$NURA_PLASMA_DESKTOP" ] || {
+        echo "FAIL: $NURA_PLASMA_DESKTOP is missing" >&2
+        rc=1
+    }
+    have_group input || {
+        echo "FAIL: $NURA_SESSION_USER is not in group input (addgroup $NURA_SESSION_USER input)" >&2
+        rc=1
+    }
+    have_group video || echo "WARN: $NURA_SESSION_USER is not in group video (brightnessctl fallback)" >&2
+    if ! timeout 3 loginctl show-seat seat0 -p CanGraphical 2>/dev/null | grep -q 'CanGraphical=yes'; then
+        echo "WARN: seat0 CanGraphical is not yes yet (logind may not have seen card0)" >&2
+    fi
+    if ! swapon --show 2>/dev/null | grep -q zram; then
+        echo "WARN: no zram swap active (postmarketos-zram-swap not started)" >&2
+    fi
+    if [ "$(cat /sys/module/zswap/parameters/enabled 2>/dev/null)" = "Y" ]; then
+        echo "WARN: zswap is enabled (0444, cannot be changed at runtime); add zswap.enabled=0 to the kernel cmdline" >&2
+    fi
+    if ! command -v Xwayland >/dev/null 2>&1; then
+        echo "WARN: Xwayland is not installed; X11 applications will not start" >&2
+    fi
+    return $rc
+}
+
+status() {
+    echo "mode:            $(cat "$MODE_FILE" 2>/dev/null || echo auto)"
+    if [ -c "$NURA_KMS_CARD" ]; then
+        echo "card:            $NURA_KMS_CARD present"
+    else
+        echo "card:            $NURA_KMS_CARD MISSING"
+    fi
+    if kms_ok; then
+        printf 'kms:             '
+        "$NURA_KMS_PROBE" "$NURA_KMS_CARD" 2>/dev/null | tail -n 1
+    else
+        echo "kms:             NOT READY"
+    fi
+    if out=$(kwin_wayland --version 2>&1); then
+        echo "kwin:            $out"
+    else
+        echo "kwin:            BROKEN"
+        printf '%s\n' "$out" | sed 's/^/                 /'
+    fi
+    if have_group input; then
+        echo "input group:     $NURA_SESSION_USER in input"
+    else
+        echo "input group:     $NURA_SESSION_USER NOT in input"
+    fi
+    if [ -f "$NURA_PLASMA_DESKTOP" ]; then
+        echo "plasma desktop:  present"
+    else
+        echo "plasma desktop:  MISSING"
+    fi
+    if command -v loginctl >/dev/null 2>&1; then
+        echo "seat0:           $(timeout 3 loginctl show-seat seat0 -p CanGraphical 2>/dev/null | tr -d '\n')"
+    fi
+    echo "decision:        $(cat /run/nura-session/decision 2>/dev/null || echo '(nura-session not running)')"
+    echo "reason:          $(cat /run/nura-session/reason 2>/dev/null || echo '-')"
+    echo "probe:           $(cat /run/nura-session/probe 2>/dev/null | tail -n 1 || echo '-')"
+    for svc in nura-session lightdm xsession postmarketos-zram-swap; do
+        printf 'service %-24s %s\n' "$svc" "$(rc-service "$svc" status 2>&1 | tail -n 1)"
+    done
+    echo "swap:"
+    swapon --show 2>/dev/null || echo "  (none)"
+    echo "zswap:           $(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo '?')"
+    echo "xwayland:        $(command -v Xwayland 2>/dev/null || echo 'not installed')"
+    echo "memory:"
+    free -m | sed -n '1,3p'
+}
+
+ensure_runlevel() {
+    rc-update add nura-session default >/dev/null 2>&1 || true
+    rc-update del nura-session-guard default >/dev/null 2>&1 || true
+    rc-update del xsession default >/dev/null 2>&1 || true
+    rc-update del lightdm default >/dev/null 2>&1 || true
+}
+
+set_mode() {
+    new=$1
+    case "$new" in
+    auto|plasma|nura) ;;
+    *) echo "usage: $0 [status|auto|plasma|nura] [--force]" >&2; exit 2 ;;
+    esac
+    if [ "$new" = plasma ] && [ "$force" -eq 0 ]; then
+        if ! check_plasma; then
+            echo "Refusing to select plasma; rerun with --force to override." >&2
+            exit 1
+        fi
+    fi
+    mkdir -p /etc/nura
+    printf '%s\n' "$new" > "$MODE_FILE"
+    ensure_runlevel
+    # Stop whatever is running (including the boot-time xsession), then let
+    # the supervised selector start the requested backend.
+    rc-service xsession stop >/dev/null 2>&1 || true
+    rc-service lightdm stop >/dev/null 2>&1 || true
+    rc-service nura-session stop >/dev/null 2>&1 || true
+    rc-service nura-session start
+}
+
+case "$cmd" in
+status)
+    status
+    ;;
+auto|plasma|nura)
+    set_mode "$cmd"
+    ;;
+*)
+    echo "usage: $0 [status|auto|plasma|nura] [--force]" >&2
+    exit 2
+    ;;
+esac

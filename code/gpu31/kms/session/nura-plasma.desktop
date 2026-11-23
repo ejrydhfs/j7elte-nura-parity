@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Plasma Mobile (Nura KMS)
+Comment=Plasma Mobile on panfrost + DECON KMS, started by LightDM autologin
+Exec=/usr/lib/libexec/plasma-dbus-run-session-if-needed /usr/local/bin/nura-plasma-session
+TryExec=/usr/local/bin/nura-plasma-session
+DesktopNames=KDE
+X-KDE-PluginInfo-Version=6.8.3

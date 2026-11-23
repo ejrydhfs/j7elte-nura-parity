@@ -1,0 +1,43 @@
+#!/bin/sh
+# Plasma Mobile session environment for the Samsung J7 (SM-J700M).
+#
+# Display (DECON, KMS card0) and rendering (Mali-T720, renderD128) are two
+# different platform DRM devices.  KWin 6.8 has a GpuManager that discovers
+# render devices separately and treats platform-bus devices as compatible,
+# so pin both explicitly instead of letting it guess.
+#
+# GLES2 is not selected by an env var: KWin 6.8 always binds
+# EGL_OPENGL_ES_API and creates a GLES 2 context (src/opengl/eglcontext.cpp).
+# KWIN_COMPOSE=O2ES only forces the OpenGL compositor so KWin exits loudly
+# instead of silently falling back to QPainter.
+
+# --- KMS / KWin ------------------------------------------------------------
+export KWIN_DRM_DEVICES=/dev/dri/card0
+export KWIN_RENDER_NODES=/dev/dri/renderD128
+export KWIN_COMPOSE=O2ES
+# First bring-up: DECON KMS advertises no tiling modifiers.  Drop this once
+# the dma-buf/modifier milestone has validated the scanout formats.
+export KWIN_DRM_USE_MODIFIERS=0
+# 1.4 GiB RAM: two buffers are enough until memory measurements say otherwise.
+export KWIN_DRM_DISABLE_TRIPLE_BUFFERING=1
+# Debug knobs, intentionally unset:
+# export KWIN_DRM_NO_DIRECT_SCANOUT=1
+# export KWIN_DRM_DISABLE_BUFFER_READABILITY_CHECKS=1
+# export KWIN_FORCE_SW_CURSOR=1
+
+# --- Qt --------------------------------------------------------------------
+# kwin_wayland overwrites QT_QPA_PLATFORM with its own QPA plugin and unsets
+# it again for children (src/main_wayland.cpp), so exporting wayland here is
+# safe and makes the Plasma clients deterministic.
+export QT_QPA_PLATFORM=wayland
+export QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+
+# --- Mesa ------------------------------------------------------------------
+# Panfrost is the only renderer that can scan out; forcing the gallium driver
+# keeps a broken panfrost EGL from silently falling back to llvmpipe on a
+# 1.4 GiB phone.  Debug fallback: unset this and set LIBGL_ALWAYS_SOFTWARE=1.
+export GALLIUM_DRIVER=panfrost
+
+# startplasmamobile itself sets QT_QPA_PLATFORMTHEME, QT_QUICK_CONTROLS_*,
+# EGL_PLATFORM, PLASMA_PLATFORM and PLASMA_INTEGRATION_USE_PORTAL.
+exec /usr/bin/startplasmamobile "$@"
