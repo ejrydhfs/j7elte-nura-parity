@@ -1,0 +1,407 @@
+/* SPDX-License-Identifier: GPL-2.0
+ *
+ * exynos_drm7580_dsi.c - MIPI-DSI encoder + connector of the DECON KMS driver
+ *
+ * Slice DsiEncoder (docs/reports/decon-kms-dsi.md).  Ownership, per that
+ * report: the DSI host (dsim_drv.c), the ea8061 panel, the board power/reset
+ * lists and the v4l2 subdev registration stay with the vendor drivers.  This
+ * file only creates the DRM encoder/connector pair and reads the panel
+ * timings from the DSIM subdev - exactly the lookup the vendor DECON driver
+ * does (decon-int_drv.c:203-227).  It never binds "samsung,exynos5-mipi-dsi",
+ * never ioremaps 0x14800000 and never touches DSIM registers, clocks,
+ * regulators or interrupts.
+ *
+ * Link ownership (decon-kms-dsi.md 2.3/2.4).  s_stream(1) is the only
+ * fallible step of a modeset, so it belongs to the CRTC's mode_set and stays
+ * there (exynos7580_crtc_enable_link, owned by DeconCrtc): DSIM -> panel up,
+ * then DECON reg_init, then reg_start from crtc->commit.  The reverse order is
+ * produced by the 3.10 helper itself: drm_helper_disable_unused_functions()
+ * disables unused encoders (drm_crtc_helper.c:288-294) *before* crtc->disable
+ * (:296-306), so ->disable here is the point where the link and the panel are
+ * taken down while the link is still in HS - the vendor order of
+ * decon_core.c:1059-1072.  The encoder itself never starts the link: its
+ * prepare/mode_set/commit hooks are omitted on purpose.
+ *
+ * The panel only ever runs one timing; the connector therefore exposes exactly
+ * one DRIVER|PREFERRED mode and ->mode_valid accepts nothing else.
+ */
+
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/err.h>
+#include <linux/errno.h>
+#include <linux/of.h>
+
+#include <media/exynos_mc.h>
+/* struct decon_lcd + DSIM_IOC_GET_LCD_INFO (vendor, single source of truth) */
+#include "../../../video/exynos/decon_7580/dsim.h"
+
+#include <drm/drmP.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
+#include <drm/drm_atomic_helper.h>
+
+#include "exynos_drm7580.h"
+
+/* DECON_INT: the DECON output 0 is wired to DSIM 0 on this SoC. */
+#define EXYNOS7580_DSI_ID		0
+
+/* Board value of "disp-pll-clk" (exynos7580-j7elte_rev00.dts:1018), used if
+ * the DT property is missing.  DECON divides the PLL by 1 into vclk, so this
+ * is the pixel clock the porches have to be clocked with. */
+#define EXYNOS7580_DISP_PLL_HZ		64500000U
+
+/*
+ * Single-instance driver (one DSI output, one DECON), same assumption as the
+ * rest of the series.  The contract header has no private DSI storage in
+ * struct exynos7580_device, so the state lives here; it is written once in
+ * exynos7580_dsi_init() before the connector can be probed and is read-only
+ * afterwards (no locking needed).
+ */
+struct exynos7580_dsi {
+	struct exynos7580_device *ex;
+	struct v4l2_subdev	 *dsim_sd;
+	struct decon_lcd	  lcd;
+	struct drm_display_mode	  mode;
+	unsigned int		  pixclk_hz;
+	unsigned int		  htotal;
+	unsigned int		  vtotal;
+	bool			  ready;
+};
+
+static struct exynos7580_dsi dsi0;
+
+/* Map a DRM device back to our state; NULL if it is not this instance. */
+static struct exynos7580_dsi *exynos7580_dsi_from_drm(struct drm_device *drm)
+{
+	if (!dsi0.ready || dsi0.ex != to_exynos7580(drm))
+		return NULL;
+
+	return &dsi0;
+}
+
+/* ------------------------------------------------------------------------
+ * panel timing -> DRM mode
+ * ------------------------------------------------------------------------ */
+
+static int exynos7580_dsi_check_lcd(struct device *dev,
+				    const struct decon_lcd *lcd)
+{
+	if (lcd->mode != DECON_VIDEO_MODE) {
+		dev_err(dev, "exynos7580-dsi: panel is not in DSI video mode (%d), DECON KMS needs video mode\n",
+			lcd->mode);
+		return -EINVAL;
+	}
+	if (!lcd->xres || !lcd->yres) {
+		dev_err(dev, "exynos7580-dsi: panel has no resolution (%ux%u)\n",
+			lcd->xres, lcd->yres);
+		return -EINVAL;
+	}
+	/* hsa/vsa == 0 would make drm_mode_vrefresh()/crtcinfo guesswork and
+	 * the DSIM porch registers get "len - 1". */
+	if (!lcd->hsa || !lcd->vsa) {
+		dev_err(dev, "exynos7580-dsi: panel sync lengths are 0 (hsa %u vsa %u)\n",
+			lcd->hsa, lcd->vsa);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * The fbdev driver's pixclock (1e12/(xres*yres*60) = 55.3 MHz,
+ * decon_missing_pixclock()) ignores the porches and is not usable here: the
+ * mode is built from the panel porches and the real vclk (decon-kms-dsi.md
+ * 1.8).  clock is in kHz as the DRM ABI requires.
+ */
+static void exynos7580_dsi_build_mode(struct exynos7580_dsi *dsi)
+{
+	const struct decon_lcd *lcd = &dsi->lcd;
+	struct drm_display_mode *m = &dsi->mode;
+
+	dsi->htotal = lcd->xres + lcd->hfp + lcd->hsa + lcd->hbp;
+	dsi->vtotal = lcd->yres + lcd->vfp + lcd->vsa + lcd->vbp;
+
+	memset(m, 0, sizeof(*m));
+	m->clock	= dsi->pixclk_hz / 1000;
+	m->hdisplay	= lcd->xres;
+	m->hsync_start	= lcd->xres + lcd->hfp;
+	m->hsync_end	= m->hsync_start + lcd->hsa;
+	m->htotal	= dsi->htotal;
+	m->vdisplay	= lcd->yres;
+	m->vsync_start	= lcd->yres + lcd->vfp;
+	m->vsync_end	= m->vsync_start + lcd->vsa;
+	m->vtotal	= dsi->vtotal;
+	/* Video-mode DSI defines the frame by the porches alone; DSIM does not
+	 * transmit HSYNC/VSYNC polarity and the vendor fbdev path sets none. */
+	m->flags	= 0;
+	m->type		= DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	m->vrefresh	= 0;	/* let drm_mode_vrefresh() derive it below */
+	drm_mode_set_name(m);
+	m->vrefresh	= drm_mode_vrefresh(m);
+}
+
+/* ------------------------------------------------------------------------
+ * encoder
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Link + panel down.  Runs before the CRTC is stopped (drm_crtc_helper.c:288-
+ * 306), which is the vendor order: the panel-off DCS sequence needs the link
+ * still in HS, and DECON then underruns only for the few us until
+ * crtc->disable calls decon_reg_stop().
+ *
+ * The link state itself is owned by the CRTC slice, so this only delegates;
+ * exynos7580_crtc_disable_link() must be safe to call when the link is
+ * already down (s_stream(0) is idempotent by itself, dsim_drv.c:913-914).
+ */
+static void exynos7580_dsi_encoder_disable(struct drm_encoder *encoder)
+{
+	exynos7580_crtc_disable_link(to_exynos7580(encoder->dev));
+}
+
+/*
+ * The CRTC hands us the requested mode; reject anything but the panel timing
+ * and give the CRTC the exact values it must program into DECON and DSIM, so
+ * a userspace-supplied variant of the same mode cannot slip through.
+ */
+static bool
+exynos7580_dsi_encoder_mode_fixup(struct drm_encoder *encoder,
+				  const struct drm_display_mode *mode,
+				  struct drm_display_mode *adjusted_mode)
+{
+	struct exynos7580_dsi *dsi = exynos7580_dsi_from_drm(encoder->dev);
+
+	if (!dsi)
+		return false;
+	if (!drm_mode_equal(mode, &dsi->mode))
+		return false;
+
+	drm_mode_copy(adjusted_mode, &dsi->mode);
+	return true;
+}
+
+static const struct drm_encoder_helper_funcs exynos7580_dsi_encoder_helper_funcs = {
+	.disable	= exynos7580_dsi_encoder_disable,
+	.mode_fixup	= exynos7580_dsi_encoder_mode_fixup,
+};
+
+static const struct drm_encoder_funcs exynos7580_dsi_encoder_funcs = {
+	/* drm_encoder_cleanup() is driven by drm_mode_config_cleanup(). */
+};
+
+/* ------------------------------------------------------------------------
+ * connector
+ * ------------------------------------------------------------------------ */
+
+static enum drm_connector_status
+exynos7580_dsi_connector_detect(struct drm_connector *connector, bool force)
+{
+	/* Soldered panel: the vendor panel driver already ran the ID read at
+	 * probe time (ea8061_lcd_ctrl.c:769-840), and a panel that answered
+	 * "no" there is not something DRM can change by polling. */
+	if (!exynos7580_dsi_from_drm(connector->dev))
+		return connector_status_disconnected;
+
+	return connector_status_connected;
+}
+
+/*
+ * Exactly one mode, DRIVER|PREFERRED (KWin 6.8 needs a connected connector
+ * with >= 1 mode, decon-kms-req.md rows 17/22).  drm_mode_duplicate() copies
+ * the template so each probe hands out its own object.
+ */
+int exynos7580_dsi_get_modes(struct drm_connector *connector)
+{
+	struct exynos7580_dsi *dsi = exynos7580_dsi_from_drm(connector->dev);
+	struct drm_display_mode *mode;
+
+	if (!dsi)
+		return 0;
+
+	mode = drm_mode_duplicate(connector->dev, &dsi->mode);
+	if (!mode)
+		return 0;
+
+	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	drm_mode_probed_add(connector, mode);
+
+	return 1;
+}
+
+static int
+exynos7580_dsi_connector_mode_valid(struct drm_connector *connector,
+				    struct drm_display_mode *mode)
+{
+	struct exynos7580_dsi *dsi = exynos7580_dsi_from_drm(connector->dev);
+
+	if (!dsi || !drm_mode_equal(mode, &dsi->mode))
+		return MODE_BAD;
+
+	return MODE_OK;
+}
+
+static struct drm_encoder *
+exynos7580_dsi_connector_best_encoder(struct drm_connector *connector)
+{
+	struct exynos7580_device *ex = to_exynos7580(connector->dev);
+
+	if (!exynos7580_dsi_from_drm(connector->dev))
+		return NULL;
+
+	return &ex->encoder;
+}
+
+static const struct drm_connector_helper_funcs exynos7580_dsi_connector_helper_funcs = {
+	.get_modes	= exynos7580_dsi_get_modes,
+	.mode_valid	= exynos7580_dsi_connector_mode_valid,
+	.best_encoder	= exynos7580_dsi_connector_best_encoder,
+};
+
+static const struct drm_connector_funcs exynos7580_dsi_connector_funcs = {
+	.dpms			= drm_atomic_helper_connector_dpms,
+	.reset			= drm_atomic_helper_connector_reset,
+	.detect			= exynos7580_dsi_connector_detect,
+	.fill_modes		= drm_helper_probe_single_connector_modes,
+	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
+	/*
+	 * no ->atomic_set_property: CRTC_ID is handled by the core
+	 * (drm_atomic.c:630) and the connector has no driver properties.  The
+	 * M0 helper drm_atomic_helper_connector_set_property() still carries
+	 * the 3.19 (connector, property, val) signature and does not fit this
+	 * 4.0 hook.
+	 */
+};
+
+/* ------------------------------------------------------------------------
+ * init
+ * ------------------------------------------------------------------------ */
+
+int exynos7580_dsi_init(struct exynos7580_device *ex)
+{
+	struct exynos7580_dsi *dsi = &dsi0;
+	struct drm_device *drm;
+	struct exynos_md *md;
+	struct v4l2_subdev *sd;
+	struct decon_lcd *lcd;
+	unsigned int hz, refresh_cHz;
+	int ret;
+
+	if (!ex || !ex->dev)
+		return -EINVAL;
+	if (!ex->crtc.base.id) {
+		dev_err(ex->dev, "exynos7580-dsi: CRTC must be registered first\n");
+		return -EINVAL;
+	}
+	if (dsi->ready)
+		return 0;
+
+	drm = &ex->drm;
+
+	/* Same lookup as the vendor DECON driver (decon-int_drv.c:203-227):
+	 * the DSIM platform driver registers its v4l2 subdev into the media
+	 * device named "exynos-mdev". */
+	md = module_name_to_driver_data(MDEV_MODULE_NAME);
+	if (!md) {
+		dev_warn(ex->dev, "exynos7580-dsi: exynos-mdev is not probed yet\n");
+		return -EPROBE_DEFER;
+	}
+
+	sd = md->dsim_sd[EXYNOS7580_DSI_ID];
+	if (IS_ERR_OR_NULL(sd)) {
+		dev_warn(ex->dev, "exynos7580-dsi: DSI%d subdev is not registered yet\n",
+			 EXYNOS7580_DSI_ID);
+		return -EPROBE_DEFER;
+	}
+
+	/* The ioctl publishes the parsed lcd_info as the subdev hostdata. */
+	ret = v4l2_subdev_call(sd, core, ioctl, DSIM_IOC_GET_LCD_INFO, NULL);
+	if (ret) {
+		dev_err(ex->dev, "exynos7580-dsi: DSIM_IOC_GET_LCD_INFO failed (%d)\n",
+			ret);
+		return ret;
+	}
+
+	lcd = v4l2_get_subdev_hostdata(sd);
+	if (!lcd) {
+		dev_err(ex->dev, "exynos7580-dsi: DSIM subdev has no lcd info\n");
+		return -EINVAL;
+	}
+
+	/* Copy: the DSIM driver keeps ownership of its lcd_info. */
+	dsi->lcd = *lcd;
+
+	ret = exynos7580_dsi_check_lcd(ex->dev, &dsi->lcd);
+	if (ret)
+		return ret;
+
+	hz = EXYNOS7580_DISP_PLL_HZ;
+	of_property_read_u32(ex->dev->of_node, "disp-pll-clk", &hz);
+	if (!hz)
+		hz = EXYNOS7580_DISP_PLL_HZ;
+	dsi->pixclk_hz = hz;
+
+	exynos7580_dsi_build_mode(dsi);
+
+	ret = drm_encoder_init(drm, &ex->encoder, &exynos7580_dsi_encoder_funcs,
+			       DRM_MODE_ENCODER_DSI);
+	if (ret) {
+		dev_err(ex->dev, "exynos7580-dsi: failed to init DSI encoder (%d)\n",
+			ret);
+		return ret;
+	}
+
+	ex->encoder.possible_crtcs = drm_crtc_mask(&ex->crtc);
+	drm_encoder_helper_add(&ex->encoder,
+			       &exynos7580_dsi_encoder_helper_funcs);
+
+	ret = drm_connector_init(drm, &ex->connector,
+				 &exynos7580_dsi_connector_funcs,
+				 DRM_MODE_CONNECTOR_DSI);
+	if (ret) {
+		dev_err(ex->dev, "exynos7580-dsi: failed to init DSI connector (%d)\n",
+			ret);
+		return ret;
+	}
+
+	ex->connector.display_info.width_mm = dsi->lcd.width;
+	ex->connector.display_info.height_mm = dsi->lcd.height;
+	ex->connector.interlace_allowed = false;
+	ex->connector.doublescan_allowed = false;
+	ex->connector.polled = 0;		/* fixed panel, nothing to poll */
+	ex->connector.status = connector_status_connected;
+
+	drm_connector_helper_add(&ex->connector,
+				 &exynos7580_dsi_connector_helper_funcs);
+
+	ret = drm_mode_connector_attach_encoder(&ex->connector, &ex->encoder);
+	if (ret) {
+		dev_err(ex->dev, "exynos7580-dsi: failed to attach encoder (%d)\n",
+			ret);
+		return ret;
+	}
+
+	dsi->dsim_sd = sd;
+	dsi->ex = ex;
+	/* Publish last: detect()/get_modes() consult this, and the connector
+	 * can only be probed once the DRM device is registered. */
+	dsi->ready = true;
+
+	refresh_cHz = (unsigned int)((u64)dsi->pixclk_hz * 100 /
+				     ((u64)dsi->htotal * dsi->vtotal));
+
+	dev_info(ex->dev, "exynos7580-dsi: DSIM subdev %s, hs %u Mbps/lane, esc %u MHz\n",
+		 sd->name, dsi->lcd.hs_clk, dsi->lcd.esc_clk);
+	dev_info(ex->dev, "exynos7580-dsi: panel %ux%u (%ux%u mm), hbp/hfp/hsw %u/%u/%u, vbp/vfp/vsw %u/%u/%u\n",
+		 dsi->lcd.xres, dsi->lcd.yres, dsi->lcd.width, dsi->lcd.height,
+		 dsi->lcd.hbp, dsi->lcd.hfp, dsi->lcd.hsa,
+		 dsi->lcd.vbp, dsi->lcd.vfp, dsi->lcd.vsa);
+	dev_info(ex->dev, "exynos7580-dsi: mode %ux%u @ %u.%02u Hz (%u kHz, htotal %u, vtotal %u), encoder DSI(6) possible_crtcs 0x%x, connector DSI(16) connected%s\n",
+		 dsi->lcd.xres, dsi->lcd.yres, refresh_cHz / 100, refresh_cHz % 100,
+		 dsi->mode.clock, dsi->htotal, dsi->vtotal,
+		 ex->encoder.possible_crtcs,
+		 dsi->lcd.mic_enabled ? ", mic" : "");
+
+	return 0;
+}
