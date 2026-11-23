@@ -322,6 +322,17 @@ after a silent timeout), which is exactly what the int48 overlay targets
 (error attribution that survives >8 SUBMITs, plus per-class sys-time
 counters armed only on demand).
 
+**Post-int48 confirmation (G31_Integrator41, int48 report §5).** The
+shim fix retroactively explains the 107 series exactly: with the poll
+lying, Mesa issued **794 WAIT_BO per frame**; after the fix, **4.3 per
+frame**, and the client's sys time fell **5.4 → 1.7 ms/frame** — which
+is precisely the ~5.2 ms/frame sys term §5.2/§5.3 could not attribute to
+teardown. So §5.4's mechanism was right (fresh BO per frame because the
+poll always said busy) and only its small measured effect was an
+artifact of comparing against a contended baseline. The churn SIGSEGV
+open item is also closed: FpsSplit's fixed churn runs rc=0/errs=0/zero
+kernel faults.
+
 ## 6. Open items
 
 1. **Churn SIGSEGV on the fixed image** (a userspace-open item, kept
