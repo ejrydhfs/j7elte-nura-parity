@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsClocks <kmsclocks@local>
+Date: Mon, 23 Nov 2026 18:00:00 
+Subject: [PATCH 0108] gpu31-kms: force clock enable and verify them before the first register read (int66)
+
+int65 still aborted on the first DECON register read although the log said
+"regs powered (pd attached)".  CONFIG_PM_RUNTIME=y, but the device can be
+RPM_ACTIVE from boot, in which case pm_runtime_get_sync() does not invoke
+decon_runtime_resume() and the five DECON clocks stay off; the vendor boot
+path never notices because the bootloader left them on.
+
+Changes in decon_probe_common():
+
+  - pm_runtime_set_suspended(dev) before pm_runtime_enable()/get_sync, so the
+    resume callback really runs;
+  - log pm_runtime_status_suspended() after the get;
+  - new decon_kms_clocks_on(): verify the five clock pointers
+    (pclk/aclk/eclk/vclk/aclk_disp) are not ERR_PTR/NULL (fail -ENODEV with the
+    name otherwise), log their clk_get_rate() values, then
+    clk_prepare_enable() each one (rollback on error) and log
+    "clocks enabled (pclk=..., ...)";
+  - the explicit enables are balanced on the teardown paths: decon_remove()
+    does pm_runtime_put_sync() + pm_runtime_disable() + decon_kms_clocks_off()
+    before decon_put_clocks(), and decon_kms_teardown() disables the same five
+    clocks before decon_put_clocks().
+
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -4659,6 +4659,66 @@
+  * and kthread are brought up, but no framebuffer is registered; the DRM driver
+  * owns the pipe instead.
+  */
++/*
++ * int66: the five DECON clocks are enabled by decon_runtime_resume(), but
++ * runtime PM can consider the device already active (RPM_ACTIVE from boot) and
++ * skip the callback, leaving the clocks off; the first register read then
++ * raises a synchronous external abort.  Enable/disable them explicitly and
++ * verify the clock pointers, so the probe path does not depend on the runtime
++ * PM state machine.
++ */
++static int decon_kms_clocks_on(struct decon_device *decon)
++{
++	struct clk *cks[5] = {
++		decon->res.pclk, decon->res.aclk, decon->res.eclk,
++		decon->res.vclk, decon->res.aclk_disp,
++	};
++	const char *names[5] = { "pclk", "aclk", "eclk", "vclk", "aclk_disp" };
++	int i, ret;
++
++	for (i = 0; i < 5; i++) {
++		if (IS_ERR_OR_NULL(cks[i])) {
++			decon_err("DECON clock %s missing (%p)\n", names[i], cks[i]);
++			return -ENODEV;
++		}
++	}
++
++	decon_info("decon clocks: pclk=%lu aclk=%lu eclk=%lu vclk=%lu aclk_disp=%lu\n",
++		   clk_get_rate(decon->res.pclk), clk_get_rate(decon->res.aclk),
++		   clk_get_rate(decon->res.eclk), clk_get_rate(decon->res.vclk),
++		   clk_get_rate(decon->res.aclk_disp));
++
++	for (i = 0; i < 5; i++) {
++		ret = clk_prepare_enable(cks[i]);
++		if (ret) {
++			decon_err("clk_prepare_enable(%s) failed: %d\n", names[i], ret);
++			while (--i >= 0)
++				clk_disable_unprepare(cks[i]);
++			return ret;
++		}
++	}
++
++	decon_info("clocks enabled (pclk=%lu, aclk=%lu, eclk=%lu, vclk=%lu, aclk_disp=%lu)\n",
++		   clk_get_rate(decon->res.pclk), clk_get_rate(decon->res.aclk),
++		   clk_get_rate(decon->res.eclk), clk_get_rate(decon->res.vclk),
++		   clk_get_rate(decon->res.aclk_disp));
++
++	return 0;
++}
++
++static void decon_kms_clocks_off(struct decon_device *decon)
++{
++	struct clk *cks[5] = {
++		decon->res.pclk, decon->res.aclk, decon->res.eclk,
++		decon->res.vclk, decon->res.aclk_disp,
++	};
++	int i;
++
++	for (i = 0; i < 5; i++)
++		if (!IS_ERR_OR_NULL(cks[i]))
++			clk_disable_unprepare(cks[i]);
++}
++
+ int decon_probe_common(struct platform_device *pdev, bool register_fb)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -4741,6 +4801,13 @@
+ 		ret = -ENODEV;
+ 		goto fail_irq_mutex;
+ 	}
++	/*
++	 * int66: force the suspended state so pm_runtime_get_sync() actually
++	 * runs decon_runtime_resume() (it programmes the clocks); then enable
++	 * and verify the clocks explicitly for the case runtime PM considers
++	 * the device already active.
++	 */
++	pm_runtime_set_suspended(dev);
+ 	pm_runtime_enable(dev);
+ 	ret = pm_runtime_get_sync(dev);
+ 	if (ret < 0) {
+@@ -4748,7 +4815,15 @@
+ 		pm_runtime_disable(dev);
+ 		goto fail_irq_mutex;
+ 	}
+-	dev_info(dev, "decon: regs powered (pd attached), reading VIDCON0\n");
++	dev_info(dev, "decon: pm_runtime suspended=%d\n",
++		 pm_runtime_status_suspended(dev));
++	ret = decon_kms_clocks_on(decon);
++	if (ret) {
++		pm_runtime_put_sync(dev);
++		pm_runtime_disable(dev);
++		goto fail_irq_mutex;
++	}
++	dev_info(dev, "decon: regs powered (pd attached, clocks on), reading VIDCON0\n");
+ 
+ 	snprintf(device_name, MAX_NAME_SIZE, "decon%d", DECON_INT);
+ 	decon->timeline = sw_sync_timeline_create(device_name);
+@@ -5168,7 +5243,9 @@
+ 	 * stock sequence, minus the kfree of the devm decon_device and with
+ 	 * the fb0 conditional, and let devres release the memory.
+ 	 */
++	pm_runtime_put_sync(dev);
+ 	pm_runtime_disable(dev);
++	decon_kms_clocks_off(decon);
+ 	decon_put_clocks(decon);
+ 
+ 	iovmm_deactivate(dev);
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -46,6 +46,7 @@
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/pm_runtime.h>
++#include <linux/clk.h>
+ #include <linux/ion.h>
+ #include <linux/exynos_ion.h>
+ #include <linux/exynos_iovmm.h>
+@@ -425,6 +426,19 @@
+ 		kthread_stop(decon->vsync_info.thread);
+ 	decon_int_destroy_vsync_thread(decon);
+ 
++	/* int66: balance the explicit clock enables from decon_probe_common(). */
++	{
++		struct clk *cks[5] = {
++			decon->res.pclk, decon->res.aclk, decon->res.eclk,
++			decon->res.vclk, decon->res.aclk_disp,
++		};
++		int k;
++
++		for (k = 0; k < 5; k++)
++			if (!IS_ERR_OR_NULL(cks[k]))
++				clk_disable_unprepare(cks[k]);
++	}
++
+ 	decon_put_clocks(decon);
+ 	iovmm_deactivate(decon->dev);
+ 
