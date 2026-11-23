@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsSync <kmssync@local>
+Date: Mon, 23 Nov 2026 15:35:00 
+Subject: [PATCH 0104] gpu31-kms: bind at late_initcall_sync with step logging
+
+int60 booted headless: the vendor DECON refused (-ENODEV) correctly, but the
+KMS probe ran at the plain late_initcall level, where exynos-mdev / the DSIM
+subdev are not guaranteed to be registered yet, and the early log was lost.
+int61:
+
+  - the built-in KMS driver registers its platform_driver at
+    late_initcall_sync (level 7s), after every late_initcall (DSIM driver,
+    panel, exynos-mdev).  This is our driver, not the vendor DECON one, so
+    the int58 hazard does not apply; the vendor DECON keeps the stock
+    late_initcall.
+  - if decon_kms_get() still reports -ENODEV/-EPROBE_DEFER (mdev or DSIM not
+    up), the probe returns -EPROBE_DEFER instead of a hard failure: the
+    driver core puts the device on the deferred-probe list and the deferred
+    workqueue retries it.  A -EPROBE_DEFER from the DSI init inside
+    drm_platform_init()/->load() propagates the same way.
+  - every fallible step of the probe/load path is logged with dev_info/
+    dev_err and its errno: probe entry, decon_kms_get() result, caps,
+    drm_platform_init() result, success/card0, and inside ->load():
+    dsi_init, the DECON FRAME callback, fbdev_init ("card0 fb0") and the
+    initial modeset.  Together with CONFIG_LOG_BUF_SHIFT=18 and
+    ignore_loglevel on the kernel command line, the failure is visible in
+    dmesg and in pstore even when it happens early.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+@@ -310,6 +310,7 @@
+ 	 */
+ 	drm_mode_config_reset(drm);
+ 
++	dev_info(ex->dev, "exynos7580: load: dsi_init()\n");
+ 	ret = exynos7580_dsi_init(ex);
+ 	if (ret) {
+ 		DRM_ERROR("DSI encoder/connector init failed: %d\n", ret);
+@@ -322,6 +323,7 @@
+ 	 * Arm the FRAME interrupt before the first commit: the initial modeset
+ 	 * below arms its flip event from vblank, so the counter must advance.
+ 	 */
++	dev_info(ex->dev, "exynos7580: load: registering DECON FRAME callback\n");
+ 	ret = decon_kms_register_vblank_cb(ex->decon, exynos7580_vblank_isr, ex);
+ 	if (ret) {
+ 		DRM_ERROR("failed to arm DECON FRAME interrupt: %d\n", ret);
+@@ -333,15 +335,19 @@
+ 	 * modeset.  exynos7580_fbdev_init() must leave no fb0 behind when it
+ 	 * fails (otherwise the vendor fallback would only get fb1).
+ 	 */
++	dev_info(ex->dev, "exynos7580: load: fbdev_init() (card0 fb0)\n");
+ 	ret = exynos7580_fbdev_init(ex);
+ 	if (ret) {
+ 		DRM_ERROR("fbdev init failed: %d\n", ret);
+ 		goto err_vblank;
+ 	}
+ 
++	dev_info(ex->dev, "exynos7580: load: initial modeset\n");
+ 	ret = exynos7580_initial_modeset(ex, drm);
+-	if (ret)
++	if (ret) {
++		dev_err(ex->dev, "exynos7580: load: initial modeset failed (%d)\n", ret);
+ 		goto err_vblank;
++	}
+ 
+ 	DRM_INFO("exynos7580: %s bound, card0 ready (atomic)\n",
+ 		 DECON_COMPATIBLE);
+@@ -434,6 +440,7 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct exynos7580_device *ex;
++	const struct decon_kms_caps *caps;
+ 	int ret;
+ 
+ 	/* Match the DECON node only, and never the dsim/panel nodes. */
+@@ -453,6 +460,9 @@
+ 	ex->dev = dev;
+ 	platform_set_drvdata(pdev, ex);
+ 
++	dev_info(dev, "exynos7580: probe entry (DECON node %s), binding card0\n",
++		 of_node_full_name(dev->of_node));
++
+ 	/*
+ 	 * Hand-off with the vendor DECON core.  In KMS mode the vendor
+ 	 * decon_probe() does not run (this driver owns the device), so the
+@@ -460,23 +470,32 @@
+ 	 * mapping, runtime PM/iovmm and the panel hand-off.  If it cannot, the
+ 	 * probe fails here, before any DRM object exists.
+ 	 */
++	dev_info(dev, "exynos7580: probe: calling decon_kms_get()\n");
+ 	ex->decon = decon_kms_get(dev);
+ 	if (IS_ERR(ex->decon)) {
+ 		ret = PTR_ERR(ex->decon);
+ 		ex->decon = NULL;
+-		dev_err(dev, "DECON handle unavailable (%d), vendor fbdev fallback\n",
+-			ret);
++		dev_err(dev, "exynos7580: probe: decon_kms_get failed (%d)\n", ret);
++		if (ret == -ENODEV || ret == -EPROBE_DEFER) {
++			/* exynos-mdev / DSIM / panel not up yet: retry later. */
++			dev_info(dev, "exynos7580: DECON/DSIM not ready, deferring probe\n");
++			ret = -EPROBE_DEFER;
++		}
+ 		goto err_drvdata;
+ 	}
++	caps = decon_kms_caps(ex->decon);
++	dev_info(dev, "exynos7580: probe: decon_kms_get ok (%u windows, default %u)\n",
++		 caps ? caps->max_win : 0, caps ? caps->default_win : 0);
+ 
++	dev_info(dev, "exynos7580: probe: calling drm_platform_init()\n");
+ 	ret = drm_platform_init(&exynos7580_drm_driver, pdev);
+ 	if (ret) {
+-		dev_err(dev, "drm_platform_init failed (%d), vendor fbdev fallback\n",
+-			ret);
++		dev_err(dev, "exynos7580: probe: drm_platform_init failed (%d)\n", ret);
+ 		goto err_decon;
+ 	}
+ 
+ 	exynos7580_device = ex;
++	dev_info(dev, "exynos7580: probe: success, card0 registered\n");
+ 
+ 	return 0;
+ 
+@@ -548,7 +567,14 @@
+ module_init(exynos7580_drm_init);
+ module_exit(exynos7580_drm_exit);
+ #else
+-late_initcall(exynos7580_drm_init);
++/*
++ * int61: run at late_initcall_sync, after every late_initcall (the DSIM
++ * driver, the panel driver and exynos-mdev all register at late_initcall or
++ * earlier).  This is our driver, not the vendor DECON one, so the int58
++ * hazard (moving the *vendor* fbdev driver to sync) does not apply: if the
++ * panel/mdev is still absent the probe defers and the driver core retries.
++ */
++late_initcall_sync(exynos7580_drm_init);
+ #endif
+ 
+ MODULE_AUTHOR("gpu31-kms");
