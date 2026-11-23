@@ -214,6 +214,11 @@ drivers/gpu/drm/Makefile                obj-$(CONFIG_DRM_EXYNOS7580) += exynos75
 `bool`, never `tristate`: a module would load after the vendor fallback bound the
 device, and `module_platform_driver` is level 6, i.e. before the panel driver.
 
+`EXYNOS_IOVMM_V6` is in the dependency list because `iovmm_map()` is only
+declared in `include/linux/exynos_iovmm.h` for that configuration, and the
+dmabuf slice's import path needs it (`drivers/iommu/Kconfig:225-229`;
+`CONFIG_EXYNOS_IOVMM_V6=y` in the stock j7 config).
+
 The patch also inserts the `EXYNOS7580_DISPLAY_FBDEV`/`EXYNOS7580_DISPLAY_KMS`
 choice at the top of `drivers/video/exynos/decon_7580/Kconfig` and rewrites
 `late_initcall(exynos_decon_register)` to `late_initcall_sync(...)`. Both are the
