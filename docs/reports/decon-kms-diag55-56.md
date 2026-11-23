@@ -73,3 +73,30 @@ is the culprit and can be bisected further inside the nine patches.
   `logs/int55-evidence.log` `ceef47c8da2c871b5ffb849f2b6b9a677d0ead8e9bf5252f5198c7245445099f`
 * int56: `logs/int56-build.log` `ecfd7b59e4e3816b74a4e67b14d7d850f4d76f5d7ec4b8e11cffd8d8d8b01d0e`, `logs/int56-gates.log` `bb8eada05f28d32541499b9ed252f2b1fc6e76c97ad72e1b09905f6f003cca4b`,
   `logs/int56-evidence.log` `b9d076c96fc95f6d6cfa5c467b3b3fac204cdc8ac6a3817f2797de5893f353ed`
+
+## int56b (deferred, only if int56 boots and the helper code must be ruled in/out)
+
+Not built.  If int56 boots and the pstore log points at an atomic/helper
+symbol that int56 did not link (`drm_atomic_helper_*`, `drm_plane_helper_*`,
+`drm_fb_helper_*`, `drm_crtc_helper_*`, `drm_fb_cma_helper_*`), the variant is:
+
+* same tree/config as int56 (`DRM=y`, vendor display on, modules off, no
+  shim/KMS), plus a **scratch-only** Kconfig edit that gives the hidden
+  `DRM_KMS_HELPER` tristate a prompt:
+
+  ```
+  config DRM_KMS_HELPER
+  -	tristate
+  +	tristate "Diagnostic: DRM KMS helper"
+  ```
+
+  (edited in the disposable scratch copy, never committed to `patches/`),
+* `CONFIG_DRM_KMS_HELPER=y` forced, so `drm_kms_helper.o` is built in and the
+  M0 helper objects (`drm_atomic_helper.o`, `drm_plane_helper.o`, `drm_rect.o`)
+  plus the four patched helper files are linked,
+* extra gates: `drm_kms_helper.o`/`drm_atomic_helper.o` exist, `vmlinux` has
+  exactly one `drm_atomic_helper_check`/`drm_atomic_helper_commit_planes` and
+  `drm_plane_helper_update`, and the Image contains `drm_atomic_helper` symbols
+  (i.e. the helper code is in the boot image, not only in source).
+
+Until then int56 stays the "DRM core + atomic core init" test, as accepted.
