@@ -269,6 +269,15 @@ cost. This is a hypothesis until the shim fix is measured; it does not
 change §5.1–§5.3, and it makes the teardown micro-optimisations even
 less relevant.
 
+**Silicon check (int46measure, idle never-submitted 64 KiB BO, raw
+UAPI):** `WAIT_BO` with an absolute `timeout_ns` of now (0 jiffies)
+returns **-ETIMEDOUT (errno 110)**; the same BO with a +100 ms absolute
+stamp returns **0**. So the 0-jiffy poll on an idle BO *does* report
+"busy" on the current shims — exactly the call Mesa's BO cache makes
+(`panfrost_bo_wait(bo, 0, RW)`), which means no BO is ever re-fetched
+from the cache. Test binary: `/data/mmlock/waitbo` (created BO, no
+submit, two WAIT_BO calls).
+
 ## 6. Open items
 
 1. **Churn SIGSEGV on the fixed image** (the only blocker for the
