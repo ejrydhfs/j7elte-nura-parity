@@ -171,3 +171,15 @@ reported 512²/readback "timeouts" are fault-recovery latency, not FBD type
 - `serialize_fs=1` is harmful (34 faults + "did not idle"): default stays 0.
 - Residual: occasional silent hang (`js_status=0x08`, no IRQ) costs the 5 s sched timeout; a
   dispatch watchdog slice is in flight (`gpu31-watchdog.md`).
+
+## int49 (2026-11-22) — armed diagnostics; GPU clean in 19 consecutive runs
+- prof_arm restored (int48 registered the knob into a dir it did not own): `ls` lists `prof_arm`,
+  write 1 reads back 1.
+- Armed 300-frame loop, 256²: 152.4 / 155.8 / 155.6 / 153.2 fps, `suberr=0`, no TIMEOUT/EVRING.
+- 15-run armed hunt: **0 faults / 15 runs**, 151.4-156.3 fps; two runs at ~105 fps with no
+  logged fault (the known slow window).
+- 512² x40 readback: 6/6 clean, 39-58 fps.
+- Window counters per 100 SUBMITs (ns totals): submit 6.7 us/SUBMIT, wait 1.09 ms/213 calls,
+  freejob 7.0 us/200, jobsync 26 us/4000, create 0.45 us/50.
+- Residual: intermittent silent `0x08` (~1 in 4-6 runs, last seen before int49) not reproduced in
+  these 19 runs; push to GitHub blocked by credentials (403, account `alosslessdev`).
