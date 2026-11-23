@@ -1,0 +1,2026 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DeconCrtc <deconcrtc@exynos7580>
+Date: Sun, 23 Nov 2026 09:45:00 +0000
+Subject: [PATCH] decon: vendor KMS export shim, attach path and late fb0
+ registration
+
+Reuse contract: code/gpu31/kms/decon_api.h (installed as
+include/linux/exynos_decon_kms.h, added here verbatim).
+
+The DECON window engine is fbdev-owned today.  A DRM/KMS subdriver needs the
+same hardware without dragging fb_info, ION or Android sync_fence into
+drivers/gpu/drm, so this patch adds the shim the DECON KMS plan (slice 3/10)
+specifies.  No vendor behaviour changes: every entry point either wraps an
+existing function or replays the steps the vendor probe/fbdev paths perform.
+
+Layering
+  layer A decon_kms_*      stable fb-free surface: attach/detach, enable/
+                           disable, one-shot commit from DMA addresses,
+                           queued commit with a vendor fence, vblank callback,
+                           runtime PM, exporter-agnostic dma-buf mapping.
+  layer B decon_export_*   raw vendor symbols, prototypes as in the contract
+                           header, EXPORT_SYMBOL_GPL (the DECON driver is
+                           built-in, so the exports are inert today but make
+                           CONFIG_DRM=m and modprobe-free debugging possible).
+
+Address-based window programming
+  decon_export_regs_param_addr() is the missing half of decon_set_win_buffer():
+  it fills buf_start/whole_w/whole_h/offset_x/offset_y/wincon/blendeq/vidosd_*
+  and dma_buf_data[][].dma_addr from caller-owned DMA addresses, with the same
+  validation (format, blending, no blending on window 0, dst geometry,
+  "window >= 128 bytes", src.f_w >= dst.w, x alignment).  It is the only path
+  that can scan out a foreign dma-buf: decon_map_ion_handle() ->
+  ion_iovmm_map() BUG_ON()s on non-ION exporters
+  (drivers/staging/android/ion/ion.c:2643), so a panfrost buffer must never go
+  through decon_set_win_buffer().
+  decon_export_set_win_config() is the fb/ION-free descriptor translation of
+  decon_set_win_config(): window enable bits, colour fill, alpha setup,
+  bandwidth vote, and a hard -EINVAL on scaling.
+
+Probe split and fb0 lifetime
+  decon_probe() is now decon_probe_common(pdev, register_fb).  KMS binds
+  samsung,exynos5-decon_driver itself, so the vendor probe never runs in a KMS
+  image and decon_kms_get() stands the controller up through the same body
+  with register_fb == false (clocks, IRQ, media entity/panel hand-off,
+  windows, update kthread, pm_runtime - no framebuffer).
+  register_framebuffer() moves from the middle of probe to the tail, after the
+  update kthread, pm_runtime_enable() and the panel hand-off, so an fb0 client
+  can no longer race a half-initialised DECON; decon->fb_registered records it
+  and decon_remove() only unregisters when it was registered.
+  The coexistence hook (CONFIG_EXYNOS_DECON_7580_KMS, decon-kms-coexist.md
+  section 6 option A) calls decon_kms_attach() before fb0 registration; the
+  weak stub in the shim returns -ENODEV, so a plain fbdev image is unaffected.
+
+Vblank
+  decon_int_irq_handler() calls an optionally registered KMS callback outside
+  decon->slock on the FRAME interrupt.  The DRM vblank code takes its own
+  locks afterwards and never takes decon->slock, so the order is acyclic.
+
+Exports added: decon_export_{acquire,release}_windows, regs_alloc/free,
+set_win_buffer, regs_param, regs_param_addr, update_regs, set_win_config,
+get/set/put_clocks, dev, plus the decon_kms_* layer A entry points and the
+weak decon_kms_attach().
+
+Build: drivers/video/exynos/decon_7580/ 0 errors, no new warnings (the
+-Wint-in-bool-context warning at decon_core.c and the unused exynos5_dsim[]
+table in dsim_drv.c are pre-existing and untouched).
+Probe failure reporting
+  Four probe paths returned 0 after a failure (regs mapping, debugfs root,
+  ion_client_create, missing media device).  decon_kms_get() must be able to
+  fail so the fbdev fallback can bind, so those paths now set ret = -ENODEV
+  before their existing unwind.  The success path is untouched.
+
+---
+
+ include/linux/exynos_decon_kms.h                   | 475 ++++++++++++++++
+ drivers/video/exynos/decon_7580/Makefile           |   2 +-
+ drivers/video/exynos/decon_7580/decon-int_drv.c    |  11 +
+ drivers/video/exynos/decon_7580/decon.h            |  51 ++
+ drivers/video/exynos/decon_7580/decon_core.c       | 361 ++++++++-
+ drivers/video/exynos/decon_7580/decon_kms_api.c    | 827 +++++++++++++++++++++
+ 6 files changed, 1707 insertions(+), 20 deletions(-)
+ create mode 100644 include/linux/exynos_decon_kms.h
+ create mode 100644 drivers/video/exynos/decon_7580/decon_kms_api.c
+
+diff --git a/drivers/video/exynos/decon_7580/Makefile b/drivers/video/exynos/decon_7580/Makefile
+index 17e7478..af6dc17 100644
+--- a/drivers/video/exynos/decon_7580/Makefile
++++ b/drivers/video/exynos/decon_7580/Makefile
+@@ -8,6 +8,6 @@
+ obj-$(CONFIG_EXYNOS_MIPI_DSI) += dsim.o
+ dsim-y += dsim_drv.o dsim_reg_7580.o
+ obj-$(CONFIG_EXYNOS_DECON_EXYNOS7580) += decon.o
+-decon-y += decon_core.o decon-int_drv.o decon_helper.o decon_reg_7580.o decon_board.o
++decon-y += decon_core.o decon-int_drv.o decon_helper.o decon_reg_7580.o decon_board.o decon_kms_api.o
+ obj-$(CONFIG_EXYNOS_DECON_DPU) += dpu_reg_7580.o
+ obj-y += panels/
+diff --git a/drivers/video/exynos/decon_7580/decon-int_drv.c b/drivers/video/exynos/decon_7580/decon-int_drv.c
+index 27375b6..762b0cd 100644
+--- a/drivers/video/exynos/decon_7580/decon-int_drv.c
++++ b/drivers/video/exynos/decon_7580/decon-int_drv.c
+@@ -79,6 +79,7 @@ irqreturn_t decon_int_irq_handler(int irq, void *dev_data)
+ 	u32 irq_sts_reg;
+ 	ktime_t timestamp;
+ 	u32 fifo_level;
++	bool kms_frame = false;
+ 
+ 	timestamp = ktime_get();
+ 
+@@ -96,6 +97,7 @@ irqreturn_t decon_int_irq_handler(int irq, void *dev_data)
+ 			VIDINTCON1_INT_FRAME);
+ 		decon->vsync_info.timestamp = timestamp;
+ 		wake_up_interruptible_all(&decon->vsync_info.wait);
++		kms_frame = true;
+ 	}
+ 	if (irq_sts_reg & VIDINTCON1_INT_FIFO) {
+ 		/* TODO: false underrun check only for EVT0. This will be removed in EVT1 */
+@@ -124,6 +126,15 @@ irqreturn_t decon_int_irq_handler(int irq, void *dev_data)
+ irq_end:
+ 	spin_unlock(&decon->slock);
+ 
++	/*
++	 * KMS clients (drm_crtc_handle_vblank via exynos7580_vblank_irq) get the
++	 * frame-done edge outside decon->slock: the DRM vblank code takes its own
++	 * locks, and no path takes them before decon->slock, so the order is
++	 * acyclic.
++	 */
++	if (kms_frame && decon->kms_vblank_cb)
++		decon->kms_vblank_cb(decon->kms_vblank_data);
++
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/drivers/video/exynos/decon_7580/decon.h b/drivers/video/exynos/decon_7580/decon.h
+index 5168cd8..6656176 100644
+--- a/drivers/video/exynos/decon_7580/decon.h
++++ b/drivers/video/exynos/decon_7580/decon.h
+@@ -719,6 +719,22 @@ struct decon_device {
+ 	unsigned int force_fullupdate;
+ 	int		trigger_enable;
+ 
++	/*
++	 * KMS shim (decon_kms_api.c): frame-done callback registered through
++	 * decon_kms_register_vblank_cb().  Runs in hard IRQ context.
++	 */
++	void		(*kms_vblank_cb)(void *data);
++	void		*kms_vblank_data;
++
++	/*
++	 * The DECON context was created by the KMS attach path
++	 * (decon_probe_common(pdev, true)) instead of the vendor probe, and
++	 * whether /dev/fb0 was registered for it.  Both are cleared by
++	 * decon_kms_put() so the vendor fbdev probe can bind afterwards.
++	 */
++	bool		kms_owned;
++	bool		fb_registered;
++
+ #if defined(CONFIG_EXYNOS_DECON_DPU)
+ 	struct dentry			*dpu_set;
+ 	struct dpu			dpu_save;
+@@ -771,6 +787,7 @@ int decon_int_register_irq(struct platform_device *pdev, struct decon_device *de
+ irqreturn_t decon_int_irq_handler(int irq, void *dev_data);
+ int decon_int_get_clocks(struct decon_device *decon);
+ void decon_int_set_clocks(struct decon_device *decon);
++void decon_put_clocks(struct decon_device *decon);
+ int decon_int_register_lpd_work(struct decon_device *decon);
+ int decon_exit_lpd(struct decon_device *decon);
+ int decon_lpd_block_exit(struct decon_device *decon);
+@@ -812,6 +829,40 @@ void decon_reg_set_tui_va(u32 id, u32 va);
+ void decon_set_qos(struct decon_device *decon, struct decon_reg_data *regs,
+ 			bool is_after, bool is_default_qos);
+ 
++/*
++ * Entry points that used to be file-static and are now shared between
++ * decon_core.c and the KMS shim (decon_kms_api.c).  They are internal to the
++ * DECON driver: the DRM side only ever calls the decon_export_*() /
++ * decon_kms_*() API of <linux/exynos_decon_kms.h>.
++ */
++void decon_to_regs_param(struct decon_regs_data *win_regs,
++		struct decon_reg_data *regs, int idx);
++void decon_activate_vsync(struct decon_device *decon);
++void decon_deactivate_vsync(struct decon_device *decon);
++int decon_set_win_buffer(struct decon_device *decon, struct decon_win *win,
++		struct decon_win_config *win_config, struct decon_reg_data *regs);
++void decon_update_regs(struct decon_device *decon, struct decon_reg_data *regs);
++void decon_release_windows(struct decon_win *win);
++int decon_acquire_windows(struct decon_device *decon, int idx);
++void decon_unregister_entity(struct decon_device *decon);
++enum decon_pixel_format decon_fourcc_to_format(u32 fourcc);
++
++/*
++ * Probe body shared by the vendor platform driver (which registers fb0) and
++ * the KMS attach path (which does not).  @register_fb == false leaves the
++ * panel without /dev/fb0, to be owned by the DRM/KMS driver instead.
++ * Process context, may sleep, allocates.
++ */
++int decon_probe_common(struct platform_device *pdev, bool register_fb);
++
++/*
++ * KMS hand-off, implemented by the DRM/KMS driver (weak stub in
++ * decon_kms_api.c returns -ENODEV).  Called from the tail of the vendor
++ * probe when CONFIG_EXYNOS_DECON_7580_KMS is set; returns 0 when KMS owns
++ * the pipe and fb0 must not be registered.
++ */
++int decon_kms_attach(struct decon_device *decon);
++
+ /* LPD related */
+ static inline void decon_lpd_block(struct decon_device *decon)
+ {
+diff --git a/drivers/video/exynos/decon_7580/decon_core.c b/drivers/video/exynos/decon_7580/decon_core.c
+index 742f8c9..54854ae 100644
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -32,6 +32,8 @@
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/of_gpio.h>
++#include <linux/exynos_decon_kms.h>
++#include <uapi/drm/drm_fourcc.h>
+ 
+ #include <mach/regs-clock.h>
+ #include <mach/exynos-pm.h>
+@@ -116,7 +118,7 @@ void decon_extra_vsync_wait_add(int skip_count)
+ #endif /* CONFIG_USE_VSYNC_SKIP */
+ 
+ /* ---------- CHECK FUNCTIONS ----------- */
+-static void decon_to_regs_param(struct decon_regs_data *win_regs,
++void decon_to_regs_param(struct decon_regs_data *win_regs,
+ 		struct decon_reg_data *regs, int idx)
+ {
+ 	win_regs->wincon = regs->wincon[idx];
+@@ -1174,7 +1176,7 @@ blank_exit:
+ }
+ 
+ /* ---------- FB_IOCTL INTERFACE ----------- */
+-static void decon_activate_vsync(struct decon_device *decon)
++void decon_activate_vsync(struct decon_device *decon)
+ {
+ 	struct decon_psr_info psr;
+ 	int prev_refcount, ret;
+@@ -1198,7 +1200,7 @@ static void decon_activate_vsync(struct decon_device *decon)
+ 	mutex_unlock(&decon->vsync_info.irq_lock);
+ }
+ 
+-static void decon_deactivate_vsync(struct decon_device *decon)
++void decon_deactivate_vsync(struct decon_device *decon)
+ {
+ 	struct decon_psr_info psr;
+ 	int new_refcount, ret;
+@@ -1513,7 +1515,7 @@ static inline int decon_set_alpha_blending(struct decon_win_config *win_config,
+ 	return 0;
+ }
+ 
+-static int decon_set_win_buffer(struct decon_device *decon, struct decon_win *win,
++int decon_set_win_buffer(struct decon_device *decon, struct decon_win *win,
+ 		struct decon_win_config *win_config, struct decon_reg_data *regs)
+ {
+ 	struct ion_handle *handle;
+@@ -2063,7 +2065,7 @@ wait_done:
+ 	return 0;
+ }
+ 
+-static void decon_update_regs(struct decon_device *decon, struct decon_reg_data *regs)
++void decon_update_regs(struct decon_device *decon, struct decon_reg_data *regs)
+ {
+ 	struct decon_dma_buf_data old_dma_bufs[decon->pdata->max_win][MAX_BUF_PLANE_CNT];
+ 	int i, j;
+@@ -2357,6 +2359,274 @@ err:
+ 	return ret;
+ }
+ 
++/* ---------- KMS EXPORT API, address path (see exynos_decon_kms.h) ------ */
++
++/*
++ * DRM fourcc -> DECON pixel format.  The supported set is exactly what
++ * decon_get_memory_plane_cnt() accepts (decon_core.c:1369); 3.10's fourcc
++ * header has no *M variants for the multi-plane formats, so NV12/NV21 are
++ * the only two-plane formats a DRM client can ask for.
++ */
++enum decon_pixel_format decon_fourcc_to_format(u32 fourcc)
++{
++	switch (fourcc) {
++	case DRM_FORMAT_ARGB8888:
++		return DECON_PIXEL_FORMAT_ARGB_8888;
++	case DRM_FORMAT_ABGR8888:
++		return DECON_PIXEL_FORMAT_ABGR_8888;
++	case DRM_FORMAT_RGBA8888:
++		return DECON_PIXEL_FORMAT_RGBA_8888;
++	case DRM_FORMAT_BGRA8888:
++		return DECON_PIXEL_FORMAT_BGRA_8888;
++	case DRM_FORMAT_XRGB8888:
++		return DECON_PIXEL_FORMAT_XRGB_8888;
++	case DRM_FORMAT_XBGR8888:
++		return DECON_PIXEL_FORMAT_XBGR_8888;
++	case DRM_FORMAT_RGBX8888:
++		return DECON_PIXEL_FORMAT_RGBX_8888;
++	case DRM_FORMAT_BGRX8888:
++		return DECON_PIXEL_FORMAT_BGRX_8888;
++	case DRM_FORMAT_RGBA5551:
++		return DECON_PIXEL_FORMAT_RGBA_5551;
++	case DRM_FORMAT_RGB565:
++		return DECON_PIXEL_FORMAT_RGB_565;
++	case DRM_FORMAT_NV12:
++		return DECON_PIXEL_FORMAT_NV12;
++	case DRM_FORMAT_NV21:
++		return DECON_PIXEL_FORMAT_NV21;
++	default:
++		return DECON_PIXEL_FORMAT_MAX;
++	}
++}
++
++/*
++ * Bits per pixel of a DECON pixel format: the same arithmetic the fb var fill
++ * in decon_set_win_buffer() uses.  RGB formats are the component sum plus
++ * padding; the planar YUV formats are addressed as 12 bpp.
++ */
++static u32 decon_format_bpp(enum decon_pixel_format format)
++{
++	if (format > DECON_PIXEL_FORMAT_RGB_565)
++		return 12;
++
++	return decon_red_length(format) + decon_green_length(format) +
++		decon_blue_length(format) + decon_transp_length(format) +
++		decon_padding(format);
++}
++
++/*
++ * Program one window from DMA addresses the caller already owns.  This is the
++ * exporter-agnostic half of decon_set_win_buffer(): it performs the same
++ * validation and fills the same struct decon_reg_data fields
++ * (decon_core.c:1550-1701), but no fb_info, no ION handle and no dma-buf
++ * ownership is involved, so a dma-buf from any exporter can be scanned out.
++ */
++int decon_export_regs_param_addr(struct decon_device *decon,
++				 struct decon_reg_data *regs,
++				 unsigned int win_idx,
++				 const struct decon_kms_win *win)
++{
++	struct decon_win_config config;
++	enum decon_pixel_format format;
++	u32 bpp, transp_len;
++	int plane_cnt, i;
++
++	if (!decon || !regs || !win || !decon->pdata)
++		return -EINVAL;
++	if (win_idx >= decon->pdata->max_win)
++		return -EINVAL;
++	if (win->state != DECON_KMS_WIN_BUFFER)
++		return -EINVAL;
++
++	format = decon_fourcc_to_format(win->fourcc);
++	if (format >= DECON_PIXEL_FORMAT_MAX) {
++		decon_err("unsupported fourcc 0x%08x on win[%u]\n",
++			  win->fourcc, win_idx);
++		return -EINVAL;
++	}
++
++	if ((int)win->blending >= (int)DECON_BLENDING_MAX) {
++		decon_err("unknown blending %u\n", win->blending);
++		return -EINVAL;
++	}
++
++	if (win_idx == 0 && (int)win->blending != (int)DECON_BLENDING_NONE) {
++		decon_err("blending not allowed on window 0\n");
++		return -EINVAL;
++	}
++
++	if (!win->dst.w || !win->dst.h || win->dst.x < 0 || win->dst.y < 0) {
++		decon_err("win[%u] size is abnormal (w:%u, h:%u, x:%d, y:%d)\n",
++			  win_idx, win->dst.w, win->dst.h,
++			  win->dst.x, win->dst.y);
++		return -EINVAL;
++	}
++
++	plane_cnt = decon_get_memory_plane_cnt(format);
++	if (plane_cnt <= 0 || plane_cnt > MAX_BUF_PLANE_CNT)
++		return -EINVAL;
++
++	bpp = decon_format_bpp(format);
++	transp_len = decon_transp_length(format);
++
++	if (win->dst.w * bpp / 8 < 128) {
++		decon_err("window wide < 128bytes, width = %u, bpp = %u\n",
++			  win->dst.w, bpp);
++		return -EINVAL;
++	}
++
++	if (win->src.f_w < win->dst.w) {
++		decon_err("f_width(%u) < width(%u), bpp = %u\n",
++			  win->src.f_w, win->dst.w, bpp);
++		return -EINVAL;
++	}
++
++	if (format <= DECON_PIXEL_FORMAT_RGB_565 &&
++	    !decon_validate_x_alignment(decon, win->dst.x, win->dst.w, bpp))
++		return -EINVAL;
++
++	memset(&config, 0, sizeof(config));
++	config.state = DECON_WIN_STATE_BUFFER;
++	config.format = format;
++	config.idma_type = win->idma_type;
++	config.blending = win->blending;
++	config.plane_alpha = win->plane_alpha;
++	config.protection = win->protection;
++	config.src.x = win->src.x;
++	config.src.y = win->src.y;
++	config.src.w = win->src.w;
++	config.src.h = win->src.h;
++	config.src.f_w = win->src.f_w;
++	config.src.f_h = win->src.f_h;
++	config.dst.x = win->dst.x;
++	config.dst.y = win->dst.y;
++	config.dst.w = win->dst.w;
++	config.dst.h = win->dst.h;
++	config.dst.f_w = win->dst.f_w;
++	config.dst.f_h = win->dst.f_h;
++	config.block_area.x = win->block_area.x;
++	config.block_area.y = win->block_area.y;
++	config.block_area.w = win->block_area.w;
++	config.block_area.h = win->block_area.h;
++
++	for (i = 0; i < plane_cnt; i++)
++		regs->dma_buf_data[win_idx][i].dma_addr = win->addr[i];
++
++	if (decon_is_plane_offset_calc_required(format))
++		decon_calc_plane_offset(&config,
++					&regs->dma_buf_data[win_idx][0]);
++
++	regs->buf_start[win_idx] = win->addr[0];
++	regs->vidosd_a[win_idx] = vidosd_a(win->dst.x, win->dst.y);
++	regs->vidosd_b[win_idx] = vidosd_b(win->dst.x, win->dst.y,
++					  win->dst.w, win->dst.h);
++	regs->whole_w[win_idx] = win->src.f_w;
++	regs->whole_h[win_idx] = win->src.f_h;
++	regs->offset_x[win_idx] = win->src.x;
++	regs->offset_y[win_idx] = win->src.y;
++	regs->wincon[win_idx] = wincon(bpp, transp_len, format) |
++				decon_rgborder(format);
++	regs->protection[win_idx] = win->protection;
++
++	decon_set_alpha_blending(&config, regs, win_idx, transp_len);
++	/* decon_set_alpha_blending() may rewrite PREMULT to COVERAGE */
++	regs->win_config[win_idx] = config;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(decon_export_regs_param_addr);
++
++/*
++ * Translate one frame descriptor set into struct decon_reg_data: window
++ * enable bits, colour/alpha setup, geometry validation and the bandwidth vote.
++ * Buffers must already be in @regs (decon_export_regs_param_addr()); nothing
++ * here owns or resolves a buffer, which is what makes it fb-free.
++ */
++int decon_export_set_win_config(struct decon_device *decon,
++				struct decon_reg_data *regs,
++				const struct decon_win_config *cfg,
++				unsigned int nr_win)
++{
++	struct decon_win_config config;
++	u64 bw = 0;
++	unsigned int i;
++
++	if (!decon || !regs || !decon->pdata || !decon->lcd_info)
++		return -EINVAL;
++	if (!cfg || nr_win > decon->pdata->max_win)
++		return -EINVAL;
++
++	for (i = 0; i < decon->pdata->max_win; i++) {
++		bool enabled = false;
++		u32 color_map = WIN_MAP_MAP | WIN_MAP_MAP_COLOUR(0);
++
++		memset(&config, 0, sizeof(config));
++		if (i < nr_win)
++			config = cfg[i];
++
++		switch (config.state) {
++		case DECON_WIN_STATE_BUFFER:
++			if (does_layer_need_scale(&config)) {
++				decon_err("ERROR: layer(%u) needs scaling(%u,%u) -> (%u,%u)\n",
++					  i, config.src.w, config.dst.w,
++					  config.src.h, config.dst.h);
++				return -EINVAL;
++			}
++			if (decon_get_memory_plane_cnt(config.format) < 0) {
++				decon_err("unsupported format %d on win[%u]\n",
++					  config.format, i);
++				return -EINVAL;
++			}
++			if (!config.dst.w || !config.dst.h ||
++			    config.dst.x < 0 || config.dst.y < 0) {
++				decon_err("win[%u] size is abnormal\n", i);
++				return -EINVAL;
++			}
++			/* registers were filled by regs_param_addr() */
++			enabled = true;
++			color_map = 0;
++			bw += decon_calc_bandwidth(config.dst.w, config.dst.h,
++				DIV_ROUND_UP(decon_format_bpp(config.format), 8),
++				decon->lcd_info->fps);
++			regs->num_of_window++;
++			break;
++		case DECON_WIN_STATE_COLOR:
++			if (does_layer_need_scale(&config))
++				return -EINVAL;
++			enabled = true;
++			color_map |= WIN_MAP_MAP_COLOUR(config.color);
++			regs->vidosd_a[i] = vidosd_a(config.dst.x, config.dst.y);
++			regs->vidosd_b[i] = vidosd_b(config.dst.x, config.dst.y,
++						    config.dst.w, config.dst.h);
++			decon_set_alpha_blending(&config, regs, i, 0);
++			break;
++		case DECON_WIN_STATE_DISABLED:
++			break;
++		default:
++			decon_err("unrecognized window state %u\n", config.state);
++			return -EINVAL;
++		}
++
++		if (enabled)
++			regs->wincon[i] |= WINCON_ENWIN;
++		else
++			regs->wincon[i] &= ~WINCON_ENWIN;
++
++		/*
++		 * BURSTLEN has no shadow register and exynos7580 must keep it
++		 * at 16 words (see decon_set_win_config()).
++		 */
++		regs->wincon[i] |= WINCON_BURSTLEN_16WORD;
++		regs->winmap[i] = color_map;
++		regs->win_config[i] = config;
++	}
++
++	regs->bandwidth = bw;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(decon_export_set_win_config);
++
+ static ssize_t decon_fb_read(struct fb_info *info, char __user *buf,
+ 		size_t count, loff_t *ppos)
+ {
+@@ -2679,7 +2949,7 @@ static int decon_create_links(struct decon_device *decon,
+ 	return create_link_mipi(decon);
+ }
+ 
+-static void decon_unregister_entity(struct decon_device *decon)
++void decon_unregister_entity(struct decon_device *decon)
+ {
+ 	v4l2_device_unregister_subdev(&decon->sd);
+ }
+@@ -2730,7 +3000,7 @@ static int decon_register_entity(struct decon_device *decon)
+ 	return find_subdev_mipi(decon);
+ }
+ 
+-static void decon_release_windows(struct decon_win *win)
++void decon_release_windows(struct decon_win *win)
+ {
+ 	if (win->fbinfo)
+ 		framebuffer_release(win->fbinfo);
+@@ -2833,7 +3103,7 @@ static void decon_missing_pixclock(struct decon_fb_videomode *win_mode)
+ 	win_mode->videomode.pixclock = pixclk;
+ }
+ 
+-static int decon_acquire_windows(struct decon_device *decon, int idx)
++int decon_acquire_windows(struct decon_device *decon, int idx)
+ {
+ 	struct decon_win *win;
+ 	struct fb_info *fbinfo;
+@@ -4382,7 +4652,14 @@ int decon_tui_protection(struct decon_device *decon, bool tui_en)
+ 
+ 
+ /* --------- DRIVER INITIALIZATION ---------- */
+-static int decon_probe(struct platform_device *pdev)
++/*
++ * Shared probe body.  @register_fb == true is the vendor fbdev driver: it
++ * creates /dev/fb0.  @register_fb == false is the KMS attach path
++ * (decon_kms_get()): the same hardware, clocks, IRQs, media entity, windows
++ * and kthread are brought up, but no framebuffer is registered; the DRM driver
++ * owns the pipe instead.
++ */
++int decon_probe_common(struct platform_device *pdev, bool register_fb)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct decon_device *decon;
+@@ -4410,6 +4687,7 @@ static int decon_probe(struct platform_device *pdev)
+ 
+ 	/* setup pointer to master device */
+ 	decon->dev = dev;
++	decon->kms_owned = !register_fb;
+ 	decon->pdata = devm_kzalloc(dev, sizeof(struct exynos_decon_platdata),
+ 						GFP_KERNEL);
+ 	if (!decon->pdata) {
+@@ -4431,6 +4709,8 @@ static int decon_probe(struct platform_device *pdev)
+ 	decon->regs = devm_request_and_ioremap(dev, res);
+ 	if (decon->regs == NULL) {
+ 		decon_err("failed to claim register region\n");
++		/* a probe that cannot map its registers must not report success */
++		ret = -ENODEV;
+ 		goto fail_kfree;
+ 	}
+ 
+@@ -4464,12 +4744,15 @@ static int decon_probe(struct platform_device *pdev)
+ 	decon->debug_root = debugfs_create_dir(debug_name, NULL);
+ 	if (!decon->debug_root) {
+ 		decon_err("failed to create debugfs root directory.\n");
++		ret = -ENODEV;
+ 		goto fail_lpd_work;
+ 	}
+ 
+ 	decon->ion_client = ion_client_create(ion_exynos, device_name);
+ 	if (IS_ERR(decon->ion_client)) {
+ 		decon_err("failed to ion_client_create\n");
++		ret = -ENODEV;
++		decon->ion_client = NULL;
+ 		goto fail_lpd_work;
+ 	}
+ 
+@@ -4571,6 +4854,7 @@ static int decon_probe(struct platform_device *pdev)
+ 	md = (struct exynos_md *)module_name_to_driver_data(MDEV_MODULE_NAME);
+ 	if (!md) {
+ 		decon_err("failed to get output media device\n");
++		ret = -ENODEV;
+ 		goto fail_iovmm;
+ 	}
+ 
+@@ -4585,15 +4869,6 @@ static int decon_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto fail_iovmm;
+ 
+-
+-	/* register framebuffer */
+-	fbinfo = decon->windows[decon->pdata->default_win]->fbinfo;
+-	ret = register_framebuffer(fbinfo);
+-	if (ret < 0) {
+-		decon_err("failed to register framebuffer\n");
+-		goto fail_iovmm;
+-	}
+-
+ 	/* mutex mechanism */
+ 	mutex_init(&decon->output_lock);
+ 	mutex_init(&decon->mutex);
+@@ -4769,6 +5044,40 @@ decon_init_done:
+ #endif
+ 	decon_esd_enable_interrupt(decon);
+ 
++	/*
++	 * fb0 is registered at the very end of probe, after the update
++	 * kthread, pm_runtime_enable() and the panel hand-off: everything the
++	 * window API needs must exist before /dev/fb0 is visible, otherwise a
++	 * client that opens it immediately races with probe.
++	 *
++	 * In KMS mode (register_fb == false) the DRM driver owns the pipe and
++	 * no fb0 is created; the DRM fbdev emulation reintroduces it.
++	 */
++	if (register_fb) {
++		bool kms_owned = false;
++
++#ifdef CONFIG_EXYNOS_DECON_7580_KMS
++		/*
++		 * Coexistence option A (decon-kms-coexist.md section 6): the
++		 * vendor probe hands the live DECON to the DRM driver, which
++		 * then owns card0 and does not need fb0.  The weak
++		 * decon_kms_attach() stub returns -ENODEV when the KMS driver
++		 * is not built in, so this branch is a no-op for a plain fbdev
++		 * image and fb0 stays registered.
++		 */
++		kms_owned = !decon_kms_attach(decon);
++#endif
++		if (!kms_owned) {
++			fbinfo = decon->windows[decon->pdata->default_win]->fbinfo;
++			ret = register_framebuffer(fbinfo);
++			if (ret < 0) {
++				decon_err("failed to register framebuffer\n");
++				goto fail_thread;
++			}
++			decon->fb_registered = true;
++		}
++	}
++
+ 	decon_info("decon registered successfully\n");
+ 
+ 	return 0;
+@@ -4816,6 +5125,11 @@ fail_kfree:
+ 	return ret;
+ }
+ 
++static int decon_probe(struct platform_device *pdev)
++{
++	return decon_probe_common(pdev, true);
++}
++
+ static int decon_remove(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -4826,7 +5140,16 @@ static int decon_remove(struct platform_device *pdev)
+ 	decon_put_clocks(decon);
+ 
+ 	iovmm_deactivate(dev);
+-	unregister_framebuffer(decon->windows[0]->fbinfo);
++	/*
++	 * fb0 may not exist: it is only registered when the vendor probe owned
++	 * the pipe (KMS mode attaches without a framebuffer, and the
++	 * coexistence hand-off unregisters it).
++	 */
++	if (decon->fb_registered) {
++		unregister_framebuffer(
++			decon->windows[decon->pdata->default_win]->fbinfo);
++		decon->fb_registered = false;
++	}
+ 
+ 	if (decon->update_regs_thread)
+ 		kthread_stop(decon->update_regs_thread);
+diff --git a/drivers/video/exynos/decon_7580/decon_kms_api.c b/drivers/video/exynos/decon_7580/decon_kms_api.c
+new file mode 100644
+index 0000000..8097f90
+--- /dev/null
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -0,0 +1,827 @@
++/*
++ * decon_kms_api.c - reuse shim between the vendor DECON window engine and the
++ * DECON DRM/KMS subdriver.
++ *
++ * Interface: <linux/exynos_decon_kms.h> (contract, slice DeconApi).
++ *
++ * Nothing in here changes vendor behaviour: every entry point either wraps an
++ * existing vendor function or performs the same steps the vendor probe/fbdev
++ * paths perform.  The vendor fbdev driver keeps working untouched when no DRM
++ * client calls this file.
++ *
++ * Two layers:
++ *
++ *   layer A (decon_kms_*)   the stable, fb-free surface: attach/detach the
++ *                           DECON, enable/disable the pipe, commit one frame
++ *                           from DMA addresses, vblank, runtime PM, dma-buf
++ *                           mapping.  This is what the DRM subdriver uses.
++ *   layer B (decon_export_*) raw vendor symbols for callers that need to drive
++ *                           the register-level API themselves.
++ *
++ * Locking.  The vendor code has three locks and this file respects them
++ * without adding an order of its own:
++ *
++ *   decon->output_lock   serialises enable/disable and the frame commit; taken
++ *                        by decon_enable()/decon_disable() themselves and by
++ *                        decon_kms_commit()/decon_kms_commit_async() around
++ *                        the register programming.
++ *   decon->mutex         of the update kthread, only touched by pm_runtime.
++ *   kms_lock             this file's own mutex: protects the single-instance
++ *                        handle, its refcount and the dma-buf mapping list.
++ *                        It is never held while taking a DRM modeset lock, so
++ *                        the only nesting is  drm modeset lock -> kms_lock ->
++ *                        decon->output_lock, which cannot cycle.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/pm_runtime.h>
++#include <linux/ion.h>
++#include <linux/exynos_ion.h>
++#include <linux/exynos_iovmm.h>
++#include <linux/fb.h>
++#include <linux/debugfs.h>
++#include <linux/v4l2-subdev.h>
++#include <linux/exynos_decon_kms.h>
++
++#include "../../../staging/android/sw_sync.h"
++
++#include "decon.h"
++
++struct decon_kms_dev {
++	struct decon_device	*decon;
++	struct decon_kms_caps	caps;
++	decon_kms_vblank_cb	vblank_cb;
++	void			*vblank_data;
++	unsigned int		refcount;
++};
++
++/* DECON is a single-instance driver (get_decon_drvdata() ignores its id). */
++static struct decon_kms_dev *kms_instance;
++static DEFINE_MUTEX(kms_lock);
++
++/* ------------------------------------------------------------------------ */
++/* helpers                                                                  */
++/* ------------------------------------------------------------------------ */
++
++static int decon_kms_to_vendor(const struct decon_kms_win *win,
++			       struct decon_win_config *cfg)
++{
++	enum decon_pixel_format format;
++
++	memset(cfg, 0, sizeof(*cfg));
++
++	switch (win->state) {
++	case DECON_KMS_WIN_DISABLED:
++		cfg->state = DECON_WIN_STATE_DISABLED;
++		return 0;
++	case DECON_KMS_WIN_COLOR:
++		cfg->state = DECON_WIN_STATE_COLOR;
++		cfg->color = win->color;
++		break;
++	case DECON_KMS_WIN_BUFFER:
++		format = decon_fourcc_to_format(win->fourcc);
++		if (format >= DECON_PIXEL_FORMAT_MAX) {
++			decon_err("unsupported fourcc 0x%08x\n", win->fourcc);
++			return -EINVAL;
++		}
++		cfg->state = DECON_WIN_STATE_BUFFER;
++		cfg->format = format;
++		cfg->fd_idma[0] = -1;
++		cfg->fd_idma[1] = -1;
++		cfg->fd_idma[2] = -1;
++		cfg->fence_fd = -1;
++		cfg->plane_alpha = win->plane_alpha;
++		cfg->blending = win->blending;
++		cfg->idma_type = win->idma_type;
++		cfg->block_area.x = win->block_area.x;
++		cfg->block_area.y = win->block_area.y;
++		cfg->block_area.w = win->block_area.w;
++		cfg->block_area.h = win->block_area.h;
++		cfg->src.x = win->src.x;
++		cfg->src.y = win->src.y;
++		cfg->src.w = win->src.w;
++		cfg->src.h = win->src.h;
++		cfg->src.f_w = win->src.f_w;
++		cfg->src.f_h = win->src.f_h;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	cfg->dst.x = win->dst.x;
++	cfg->dst.y = win->dst.y;
++	cfg->dst.w = win->dst.w;
++	cfg->dst.h = win->dst.h;
++	cfg->dst.f_w = win->dst.f_w;
++	cfg->dst.f_h = win->dst.f_h;
++	cfg->protection = win->protection;
++
++	return 0;
++}
++
++/*
++ * Build one frame in @regs.  Shared by the synchronous and the queued commit.
++ * The caller holds decon->output_lock.
++ */
++static int decon_kms_program(struct decon_device *decon,
++			     struct decon_reg_data *regs,
++			     const struct decon_kms_win *wins,
++			     unsigned int nr_wins)
++{
++	struct decon_win_config cfg[MAX_DECON_WIN];
++	unsigned int i;
++	int ret;
++
++	if (!nr_wins || nr_wins > decon->pdata->max_win)
++		return -EINVAL;
++
++	for (i = 0; i < decon->pdata->max_win; i++) {
++		if (i >= nr_wins) {
++			memset(&cfg[i], 0, sizeof(cfg[i]));
++			cfg[i].state = DECON_WIN_STATE_DISABLED;
++			continue;
++		}
++
++		ret = decon_kms_to_vendor(&wins[i], &cfg[i]);
++		if (ret)
++			return ret;
++
++		if (wins[i].state == DECON_KMS_WIN_BUFFER) {
++			ret = decon_export_regs_param_addr(decon, regs, i,
++							   &wins[i]);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return decon_export_set_win_config(decon, regs, cfg,
++					   decon->pdata->max_win);
++}
++
++/* ------------------------------------------------------------------------ */
++/* dma-buf mapping (exporter agnostic; the vendor path is ION-only)          */
++/* ------------------------------------------------------------------------ */
++
++struct decon_kms_map {
++	struct list_head	list;
++	struct dma_buf		*buf;
++	struct dma_buf_attachment *att;
++	struct sg_table		*sgt;
++	dma_addr_t		addr;
++	bool			iommu_mapped;
++};
++
++static LIST_HEAD(kms_maps);
++
++int decon_kms_map_dmabuf(struct decon_kms_dev *d, struct dma_buf *buf,
++			 unsigned int id, size_t size, dma_addr_t *addr,
++			 void **cookie)
++{
++	struct decon_kms_map *m;
++	struct sg_table *sgt;
++	struct dma_buf_attachment *att;
++	size_t len;
++	int ret;
++
++	if (!d || !buf || !addr || !cookie)
++		return -EINVAL;
++
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!m)
++		return -ENOMEM;
++
++	att = dma_buf_attach(buf, d->decon->dev);
++	if (IS_ERR(att)) {
++		ret = PTR_ERR(att);
++		goto err_free;
++	}
++
++	sgt = dma_buf_map_attachment(att, DMA_TO_DEVICE);
++	if (IS_ERR(sgt)) {
++		ret = PTR_ERR(sgt);
++		goto err_detach;
++	}
++
++	len = size ? size : buf->size;
++
++	m->addr = iovmm_map(d->decon->dev, sgt->sgl, 0, len,
++			    DMA_TO_DEVICE, id);
++	if (IS_ERR_VALUE(m->addr)) {
++		/*
++		 * No IOMMU domain on this device: fall back to the physical
++		 * address of the first chunk, which is what the hardware sees
++		 * when the DECON is not behind a sysmmu.
++		 */
++		if ((long)m->addr == -ENOSYS || (long)m->addr == -ENODEV) {
++			m->addr = sg_dma_address(sgt->sgl);
++			m->iommu_mapped = false;
++		} else {
++			ret = (int)m->addr;
++			goto err_unmap;
++		}
++	} else {
++		m->iommu_mapped = true;
++	}
++
++	/*
++	 * Keep the buffer alive for as long as the mapping exists: a caller may
++	 * drop its own reference right after the commit.
++	 */
++	get_dma_buf(buf);
++
++	m->buf = buf;
++	m->att = att;
++	m->sgt = sgt;
++
++	mutex_lock(&kms_lock);
++	list_add_tail(&m->list, &kms_maps);
++	mutex_unlock(&kms_lock);
++
++	*addr = m->addr;
++	*cookie = m;
++
++	return 0;
++
++err_unmap:
++	dma_buf_unmap_attachment(att, sgt, DMA_TO_DEVICE);
++err_detach:
++	dma_buf_detach(buf, att);
++err_free:
++	kfree(m);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(decon_kms_map_dmabuf);
++
++void decon_kms_unmap_dmabuf(struct decon_kms_dev *d, void *cookie)
++{
++	struct decon_kms_map *m = cookie;
++
++	if (!d || !m)
++		return;
++
++	mutex_lock(&kms_lock);
++	list_del(&m->list);
++	mutex_unlock(&kms_lock);
++
++	if (m->iommu_mapped)
++		iovmm_unmap(d->decon->dev, m->addr);
++
++	dma_buf_unmap_attachment(m->att, m->sgt, DMA_TO_DEVICE);
++	dma_buf_detach(m->buf, m->att);
++	dma_buf_put(m->buf);
++	kfree(m);
++}
++EXPORT_SYMBOL_GPL(decon_kms_unmap_dmabuf);
++
++/* ------------------------------------------------------------------------ */
++/* attach / detach                                                          */
++/* ------------------------------------------------------------------------ */
++
++const struct decon_kms_caps *decon_kms_caps(struct decon_kms_dev *d)
++{
++	return d ? &d->caps : NULL;
++}
++EXPORT_SYMBOL_GPL(decon_kms_caps);
++
++struct decon_kms_dev *decon_kms_get(struct device *decon_dev)
++{
++	struct platform_device *pdev;
++	struct decon_device *decon;
++	struct decon_kms_dev *d;
++	int ret;
++
++	if (!decon_dev || !decon_dev->of_node)
++		return ERR_PTR(-ENODEV);
++
++	pdev = to_platform_device(decon_dev);
++
++	mutex_lock(&kms_lock);
++
++	d = kms_instance;
++	if (d) {
++		if (d->decon->dev != decon_dev) {
++			mutex_unlock(&kms_lock);
++			return ERR_PTR(-EBUSY);
++		}
++		d->refcount++;
++		mutex_unlock(&kms_lock);
++		return d;
++	}
++
++	decon = platform_get_drvdata(pdev);
++	if (decon && !decon->kms_owned) {
++		/*
++		 * The vendor fbdev probe already owns the pipe (coexistence
++		 * fallback).  Two owners of one DECON is exactly what
++		 * decon-kms-coexist.md forbids.
++		 */
++		dev_err(decon_dev, "DECON already owned by the fbdev driver\n");
++		mutex_unlock(&kms_lock);
++		return ERR_PTR(-EBUSY);
++	}
++
++	if (!decon) {
++		/*
++		 * KMS binds samsung,exynos5-decon_driver itself, so the vendor
++		 * probe never ran: bring the controller up here with the shared
++		 * probe body (clocks, IRQ, media entity, windows, kthread,
++		 * pm_runtime) and without a framebuffer.
++		 */
++		ret = decon_probe_common(pdev, false);
++		if (ret) {
++			dev_err(decon_dev, "DECON KMS bring-up failed: %d\n", ret);
++			mutex_unlock(&kms_lock);
++			return ERR_PTR(ret);
++		}
++
++		decon = platform_get_drvdata(pdev);
++		if (!decon) {
++			mutex_unlock(&kms_lock);
++			return ERR_PTR(-ENODEV);
++		}
++	}
++
++	d = kzalloc(sizeof(*d), GFP_KERNEL);
++	if (!d) {
++		mutex_unlock(&kms_lock);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	d->decon = decon;
++	d->refcount = 1;
++	d->caps.max_win = decon->pdata->max_win;
++	d->caps.default_win = decon->pdata->default_win;
++	d->caps.video_mode = (decon->pdata->psr_mode == DECON_VIDEO_MODE);
++	d->caps.sw_trigger = (decon->pdata->trig_mode == DECON_SW_TRIG);
++
++	kms_instance = d;
++
++	mutex_unlock(&kms_lock);
++
++	dev_info(decon_dev, "DECON handed to KMS (%ux%u, %u windows)\n",
++		 decon->lcd_info ? decon->lcd_info->xres : 0,
++		 decon->lcd_info ? decon->lcd_info->yres : 0,
++		 d->caps.max_win);
++
++	return d;
++}
++EXPORT_SYMBOL_GPL(decon_kms_get);
++
++/*
++ * Tear down what decon_kms_get() built.  Mirrors the unwind of the vendor
++ * probe (decon_core.c fail_* labels) so that the vendor fbdev driver can bind
++ * the same device afterwards if the DRM probe fails.
++ */
++static void decon_kms_teardown(struct decon_kms_dev *d)
++{
++	struct decon_device *decon = d->decon;
++	struct platform_device *pdev = to_platform_device(decon->dev);
++	struct decon_kms_map *m, *tmp;
++
++	mutex_lock(&kms_lock);
++	list_for_each_entry_safe(m, tmp, &kms_maps, list) {
++		list_del(&m->list);
++		if (m->iommu_mapped)
++			iovmm_unmap(decon->dev, m->addr);
++		dma_buf_unmap_attachment(m->att, m->sgt, DMA_TO_DEVICE);
++		dma_buf_detach(m->buf, m->att);
++		dma_buf_put(m->buf);
++		kfree(m);
++	}
++	mutex_unlock(&kms_lock);
++
++	if (decon->state != DECON_STATE_OFF)
++		decon_disable(decon);
++
++	if (decon->update_regs_thread)
++		kthread_stop(decon->update_regs_thread);
++
++	decon_unregister_entity(decon);
++
++	if (decon->ion_client)
++		ion_client_destroy(decon->ion_client);
++
++	if (decon->lpd_wq) {
++		destroy_workqueue(decon->lpd_wq);
++		decon->lpd_wq = NULL;
++	}
++
++	decon_int_destroy_psr_thread(decon);
++
++	if (decon->vsync_info.thread)
++		kthread_stop(decon->vsync_info.thread);
++	decon_int_destroy_vsync_thread(decon);
++
++	decon_put_clocks(decon);
++	iovmm_deactivate(decon->dev);
++
++	pm_runtime_put_sync(decon->dev);
++	pm_runtime_disable(decon->dev);
++
++	debugfs_remove_recursive(decon->debug_root);
++	decon->debug_root = NULL;
++
++	platform_set_drvdata(pdev, NULL);
++	if (decon_int_drvdata == decon)
++		decon_int_drvdata = NULL;
++
++	decon_info("DECON released by KMS\n");
++}
++
++void decon_kms_put(struct decon_kms_dev *d)
++{
++	if (!d)
++		return;
++
++	mutex_lock(&kms_lock);
++	if (WARN_ON(!d->refcount)) {
++		mutex_unlock(&kms_lock);
++		return;
++	}
++	if (--d->refcount) {
++		mutex_unlock(&kms_lock);
++		return;
++	}
++	kms_instance = NULL;
++	mutex_unlock(&kms_lock);
++
++	decon_kms_teardown(d);
++	kfree(d);
++}
++EXPORT_SYMBOL_GPL(decon_kms_put);
++
++/*
++ * Coexistence hand-off (decon-kms-coexist.md section 6, option A): called from
++ * the tail of the vendor probe.  The DRM/KMS driver overrides this weak
++ * definition; when it is not built in, the vendor probe registers fb0 as
++ * always.
++ */
++int __weak decon_kms_attach(struct decon_device *decon)
++{
++	return -ENODEV;
++}
++EXPORT_SYMBOL_GPL(decon_kms_attach);
++
++/* ------------------------------------------------------------------------ */
++/* layer A: enable / disable / commit                                        */
++/* ------------------------------------------------------------------------ */
++
++int decon_kms_enable(struct decon_kms_dev *d)
++{
++	struct decon_device *decon;
++	int ret;
++
++	if (!d)
++		return -ENODEV;
++
++	decon = d->decon;
++
++	mutex_lock(&kms_lock);
++
++	if (decon->state == DECON_STATE_ON) {
++		mutex_unlock(&kms_lock);
++		return 0;
++	}
++
++	/*
++	 * decon_probe() leaves the pipe running in DECON_STATE_INIT, and the
++	 * vendor decon_enable() short-circuits that state without programming
++	 * anything (decon_core.c:901-906).  A KMS modeset must always run the
++	 * full sequence (decon-kms-dsi.md 2.3: "Do not copy the vendor's
++	 * DECON_STATE_INIT short-circuit"), so drop to OFF first.
++	 */
++	if (decon->state == DECON_STATE_INIT)
++		decon->state = DECON_STATE_OFF;
++
++	ret = decon_enable(decon);
++
++	mutex_unlock(&kms_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(decon_kms_enable);
++
++int decon_kms_disable(struct decon_kms_dev *d)
++{
++	struct decon_device *decon;
++	int ret;
++
++	if (!d)
++		return -ENODEV;
++
++	decon = d->decon;
++
++	mutex_lock(&kms_lock);
++	if (decon->state == DECON_STATE_OFF) {
++		mutex_unlock(&kms_lock);
++		return 0;
++	}
++
++	ret = decon_disable(decon);
++	mutex_unlock(&kms_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(decon_kms_disable);
++
++int decon_kms_commit(struct decon_kms_dev *d,
++		     const struct decon_kms_win *wins, unsigned int nr_wins)
++{
++	struct decon_device *decon;
++	struct decon_reg_data *regs;
++	int ret;
++
++	if (!d || !wins || !nr_wins)
++		return -EINVAL;
++
++	decon = d->decon;
++
++	if (decon->state != DECON_STATE_ON)
++		return -EAGAIN;
++
++	regs = decon_export_regs_alloc();
++	if (!regs)
++		return -ENOMEM;
++
++	/*
++	 * The vendor commit body (decon_update_regs) waits for the vsync and for
++	 * the shadow update, i.e. it sleeps for up to ~600 ms: this is the
++	 * atomic-commit tail, never an IRQ or atomic context.
++	 */
++	mutex_lock(&decon->output_lock);
++
++	ret = decon_kms_program(decon, regs, wins, nr_wins);
++	if (!ret)
++		decon_export_update_regs(decon, regs);
++
++	mutex_unlock(&decon->output_lock);
++
++	decon_export_regs_free(regs);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(decon_kms_commit);
++
++int decon_kms_commit_async(struct decon_kms_dev *d,
++			   const struct decon_kms_win *wins,
++			   unsigned int nr_wins, int *fence_fd)
++{
++	struct decon_device *decon;
++	struct decon_reg_data *regs;
++	struct sync_fence *fence;
++	struct sync_pt *pt;
++	int fd, ret;
++
++	if (!d || !wins || !nr_wins || !fence_fd)
++		return -EINVAL;
++
++	decon = d->decon;
++
++	mutex_lock(&decon->output_lock);
++
++	fd = get_unused_fd();
++	if (fd < 0) {
++		mutex_unlock(&decon->output_lock);
++		return -EINVAL;
++	}
++
++	/*
++	 * Vendor behaviour (decon_core.c:2218-2228): a commit while the pipe is
++	 * off returns a pre-signalled fence and programs nothing.  Keep it - the
++	 * fd ABI cannot express an error - and let callers gate on
++	 * decon_kms_enable().
++	 */
++	if ((decon->state == DECON_STATE_OFF) || (decon->ignore_vsync == true) ||
++	    (decon->out_type == DECON_OUT_TUI)) {
++		decon->timeline_max++;
++		pt = sw_sync_pt_create(decon->timeline, decon->timeline_max);
++		fence = sync_fence_create("display", pt);
++		sync_fence_install(fence, fd);
++		*fence_fd = fd;
++		sw_sync_timeline_inc(decon->timeline, 1);
++		mutex_unlock(&decon->output_lock);
++		return 0;
++	}
++
++	regs = decon_export_regs_alloc();
++	if (!regs) {
++		put_unused_fd(fd);
++		mutex_unlock(&decon->output_lock);
++		return -ENOMEM;
++	}
++
++	ret = decon_kms_program(decon, regs, wins, nr_wins);
++	if (ret) {
++		decon_export_regs_free(regs);
++		put_unused_fd(fd);
++		mutex_unlock(&decon->output_lock);
++		return ret;
++	}
++
++	decon->timeline_max++;
++	pt = sw_sync_pt_create(decon->timeline, decon->timeline_max);
++	fence = sync_fence_create("display", pt);
++	sync_fence_install(fence, fd);
++	*fence_fd = fd;
++
++	decon_lpd_block(decon);
++	mutex_lock(&decon->update_regs_list_lock);
++	list_add_tail(&regs->list, &decon->update_regs_list);
++	mutex_unlock(&decon->update_regs_list_lock);
++	queue_kthread_work(&decon->update_regs_worker, &decon->update_regs_work);
++
++	mutex_unlock(&decon->output_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(decon_kms_commit_async);
++
++/* ------------------------------------------------------------------------ */
++/* layer A: vblank                                                          */
++/* ------------------------------------------------------------------------ */
++
++int decon_kms_register_vblank_cb(struct decon_kms_dev *d,
++				 decon_kms_vblank_cb cb, void *data)
++{
++	struct decon_device *decon;
++
++	if (!d)
++		return -ENODEV;
++
++	decon = d->decon;
++
++	mutex_lock(&kms_lock);
++
++	d->vblank_cb = cb;
++	d->vblank_data = data;
++	decon->kms_vblank_cb = cb;
++	decon->kms_vblank_data = data;
++
++	/*
++	 * decon_activate_vsync()/decon_deactivate_vsync() refcount the FRAME
++	 * interrupt and the DSIM vsync source, so they stay the only owners of
++	 * VIDINTCON1 - DRM code must never touch it (decon-kms-dsi.md 1.6).
++	 */
++	if (cb)
++		decon_activate_vsync(decon);
++	else
++		decon_deactivate_vsync(decon);
++
++	mutex_unlock(&kms_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(decon_kms_register_vblank_cb);
++
++int decon_kms_wait_vblank(struct decon_kms_dev *d, unsigned int timeout_ms)
++{
++	if (!d)
++		return -ENODEV;
++
++	return decon_wait_for_vsync(d->decon, timeout_ms);
++}
++EXPORT_SYMBOL_GPL(decon_kms_wait_vblank);
++
++/* ------------------------------------------------------------------------ */
++/* layer A: runtime PM                                                      */
++/* ------------------------------------------------------------------------ */
++
++int decon_kms_power_get(struct decon_kms_dev *d)
++{
++	if (!d)
++		return -ENODEV;
++
++	return pm_runtime_get_sync(d->decon->dev);
++}
++EXPORT_SYMBOL_GPL(decon_kms_power_get);
++
++void decon_kms_power_put(struct decon_kms_dev *d)
++{
++	if (d)
++		pm_runtime_put_sync(d->decon->dev);
++}
++EXPORT_SYMBOL_GPL(decon_kms_power_put);
++
++/* ------------------------------------------------------------------------ */
++/* layer B: raw vendor symbols                                              */
++/* ------------------------------------------------------------------------ */
++
++int decon_export_acquire_windows(struct decon_device *decon)
++{
++	int i, ret;
++
++	for (i = 0; i < decon->n_sink_pad; i++) {
++		ret = decon_acquire_windows(decon, i);
++		if (ret) {
++			decon_err("failed to create decon window[%d]\n", i);
++			for (; i >= 0; i--)
++				decon_release_windows(decon->windows[i]);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(decon_export_acquire_windows);
++
++void decon_export_release_windows(struct decon_device *decon)
++{
++	int i;
++
++	if (!decon)
++		return;
++
++	for (i = 0; i < decon->pdata->max_win; i++)
++		decon_release_windows(decon->windows[i]);
++}
++EXPORT_SYMBOL_GPL(decon_export_release_windows);
++
++struct decon_reg_data *decon_export_regs_alloc(void)
++{
++	/* ~3 KB on arm64: never put this on the kernel stack */
++	return kzalloc(sizeof(struct decon_reg_data), GFP_KERNEL);
++}
++EXPORT_SYMBOL_GPL(decon_export_regs_alloc);
++
++void decon_export_regs_free(struct decon_reg_data *regs)
++{
++	kfree(regs);
++}
++EXPORT_SYMBOL_GPL(decon_export_regs_free);
++
++int decon_export_set_win_buffer(struct decon_device *decon,
++				struct decon_win_config *cfg,
++				struct decon_reg_data *regs,
++				unsigned int win_idx)
++{
++	if (!decon || !cfg || !regs || win_idx >= decon->pdata->max_win)
++		return -EINVAL;
++
++	return decon_set_win_buffer(decon, decon->windows[win_idx], cfg, regs);
++}
++EXPORT_SYMBOL_GPL(decon_export_set_win_buffer);
++
++void decon_export_regs_param(struct decon_device *decon,
++			     struct decon_reg_data *regs,
++			     unsigned int win_idx)
++{
++	struct decon_regs_data win_regs;
++
++	if (!decon || !regs || win_idx >= decon->pdata->max_win)
++		return;
++
++	memset(&win_regs, 0, sizeof(win_regs));
++	decon_to_regs_param(&win_regs, regs, win_idx);
++	decon_reg_set_regs_data(DECON_INT, win_idx, &win_regs);
++}
++EXPORT_SYMBOL_GPL(decon_export_regs_param);
++
++void decon_export_update_regs(struct decon_device *decon,
++			      struct decon_reg_data *regs)
++{
++	if (!decon || !regs)
++		return;
++
++	decon_update_regs(decon, regs);
++}
++EXPORT_SYMBOL_GPL(decon_export_update_regs);
++
++int decon_export_get_clocks(struct decon_device *decon)
++{
++	if (!decon)
++		return -ENODEV;
++
++	return decon_int_get_clocks(decon);
++}
++EXPORT_SYMBOL_GPL(decon_export_get_clocks);
++
++void decon_export_set_clocks(struct decon_device *decon)
++{
++	if (decon)
++		decon_int_set_clocks(decon);
++}
++EXPORT_SYMBOL_GPL(decon_export_set_clocks);
++
++void decon_export_put_clocks(struct decon_device *decon)
++{
++	if (decon)
++		decon_put_clocks(decon);
++}
++EXPORT_SYMBOL_GPL(decon_export_put_clocks);
++
++struct decon_device *decon_export_dev(void)
++{
++	return decon_int_drvdata;
++}
++EXPORT_SYMBOL_GPL(decon_export_dev);
+diff --git a/include/linux/exynos_decon_kms.h b/include/linux/exynos_decon_kms.h
+new file mode 100644
+index 0000000..e8d7ffc
+--- /dev/null
++++ b/include/linux/exynos_decon_kms.h
+@@ -0,0 +1,475 @@
++/*
++ * exynos_decon_kms.h - reuse contract for the vendor DECON window engine
++ *
++ * Install path in the kernel tree: include/linux/exynos_decon_kms.h
++ * Source of the implementation:    drivers/video/exynos/decon_7580/
++ *
++ * Copyright (c) 2026
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This header is the ONLY interface between a KMS/atomic subdriver and the
++ * vendor fbdev DECON driver (drivers/video/exynos/decon_7580/).  The subdriver
++ * never includes "decon.h": every structure below is opaque or fb-free, and
++ * nothing here mentions struct fb_info, struct fb_var_screeninfo, ION or
++ * Android sync fences.
++ *
++ * Rationale, the per-function locking/PM table and the exact
++ * EXPORT_SYMBOL() list: docs/reports/decon-kms-api.md.
++ *
++ * Two layers are exported.  A subdriver should use layer A; layer B exists so
++ * that the plane/fence/fbdev slices can reach the register-level primitives
++ * without another round of refactoring, and layer B is what the shim patch
++ * makes callable (those functions are static in the vendor tree today).
++ *
++ *  layer A: struct decon_kms_dev + decon_kms_*_() entry points (ABI-stable)
++ *  layer B: raw vendor symbols, prototypes below, no struct layouts exposed
++ *
++ * Context rules, applying to every entry point unless stated otherwise:
++ *
++ *  - All entry points may sleep and MUST be called from process context, with
++ *    the DECON power domain (pd_disp) and DECON clocks on.  The shim takes
++ *    pm_runtime_get_sync()/put() around the calls that touch SFRs, so callers
++ *    do not need to touch runtime PM themselves.  They MUST NOT be called from
++ *    atomic context, from an IRQ handler, or from a spinlock.
++ *  - The vblank callback is the single exception: it runs in hard IRQ context
++ *    (DECON FRAME interrupt) with decon->slock held.  It must be lock-free,
++ *    must not sleep and must not call back into this API.
++ *  - Only one client may hold struct decon_kms_dev at a time: the DECON
++ *    driver is single-instance (global decon_int_drvdata, decon.h:36) and the
++ *    shim keeps a single-owner flag, so a second decon_kms_get() returns
++ *    -EBUSY until the first handle is put.
++ */
++#ifndef _LINUX_EXYNOS_DECON_KMS_H
++#define _LINUX_EXYNOS_DECON_KMS_H
++
++#include <linux/types.h>
++
++struct device;
++struct dma_buf;
++
++/* Bump when a struct layout or a semantic below changes. */
++#define DECON_KMS_API_VERSION		1
++
++/*
++ * Opaque handle.  Points at the vendor struct decon_device; the subdriver
++ * must never dereference it.
++ */
++struct decon_kms_dev;
++
++/* ------------------------------------------------------------------------
++ * layer A: fb-free data transfer objects
++ * ------------------------------------------------------------------------ */
++
++/* Same values as enum decon_idma_type (decon_common.h). */
++enum decon_kms_idma {
++	DECON_KMS_IDMA_G0 = 0,
++	DECON_KMS_IDMA_G1,
++	DECON_KMS_IDMA_VG0,
++	DECON_KMS_IDMA_VG1,
++	DECON_KMS_IDMA_VGR0,
++	DECON_KMS_IDMA_VGR1,
++	DECON_KMS_IDMA_G2,
++	DECON_KMS_IDMA_G3,
++	DECON_KMS_IDMA_MAX,
++};
++
++/* Same values as enum decon_blending (decon.h). */
++enum decon_kms_blending {
++	DECON_KMS_BLENDING_NONE = 0,
++	DECON_KMS_BLENDING_PREMULT = 1,
++	DECON_KMS_BLENDING_COVERAGE = 2,
++};
++
++/* Same values as the DECON_WIN_STATE_* union in struct decon_win_config. */
++enum decon_kms_win_state {
++	DECON_KMS_WIN_DISABLED = 0,
++	DECON_KMS_WIN_COLOR,
++	DECON_KMS_WIN_BUFFER,
++};
++
++struct decon_kms_rect {
++	__s32 x;
++	__s32 y;
++	__u32 w;
++	__u32 h;
++};
++
++/*
++ * Source and destination geometry of one window.  Mirrors struct decon_frame
++ * exactly: (x,y) is the top-left offset inside the buffer/stride (src) or the
++ * screen (dst), (f_w,f_h) is the full stride/size of the buffer, (w,h) is the
++ * visible size.  The hardware cannot scale: src.w == dst.w and src.h == dst.h.
++ */
++struct decon_kms_frame {
++	__s32 x;
++	__s32 y;
++	__u32 w;
++	__u32 h;
++	__u32 f_w;
++	__u32 f_h;
++};
++
++/*
++ * One window of one frame.  Array index == DECON window number.
++ *
++ * @state:     DISABLED, COLOR (solid fill) or BUFFER (scan out @addr).
++ * @color:     COLOR only, 0x00RRGGBB.
++ * @fourcc:    BUFFER only, DRM_FORMAT_* (see include/uapi/drm/drm_fourcc.h).
++ *             The shim owns the fourcc -> enum decon_pixel_format table and
++ *             rejects anything it cannot program with -EINVAL.  Supported on
++ *             exynos7580: ARGB8888, ABGR8888, RGBA8888, BGRA8888, XRGB8888,
++ *             XBGR8888, RGBX8888, BGRX8888, RGBA5551, RGB565, NV12, NV21.
++ * @idma_type:which DMA channel feeds the window.  Window 0 must use the
++ *             channel the bootloader/vendor driver left on it (G0 on J7).
++ *             Two enabled windows must not share a channel: the shim drops the
++ *             second one as the vendor code does (decon_reg_chmap_validate()).
++ * @blending:  must be NONE on window 0.
++ * @plane_alpha: 0..255; 0/255 mean "no per-plane alpha".
++ * @addr:      DECON IOVAs, plane_cnt of them per @fourcc.  Obtain them from
++ *             decon_kms_map_dmabuf(); for a 2-plane format addr[1] may be left
++ *             0 when the planes are contiguous (the shim computes the plane
++ *             offset exactly like decon_calc_plane_offset()).
++ * @protection: window carries protected (DRM) content; aggregated per commit
++ *             and pushed through exynos_smc() by the shim.
++ */
++struct decon_kms_win {
++	enum decon_kms_win_state	state;
++	__u32				color;
++	__u32				fourcc;
++	enum decon_kms_idma		idma_type;
++	enum decon_kms_blending		blending;
++	int				plane_alpha;
++	dma_addr_t			addr[3];
++	struct decon_kms_frame		src;
++	struct decon_kms_frame		dst;
++	struct decon_kms_rect		block_area;
++	bool				protection;
++};
++
++/* Read-only description of the bound DECON instance. */
++struct decon_kms_caps {
++	unsigned int	max_win;	/* windows the DT exposes (7 on J7) */
++	unsigned int	default_win;	/* window the fbdev driver owns */
++	bool		video_mode;	/* psr_mode == DECON_VIDEO_MODE (true on J7) */
++	bool		sw_trigger;	/* trig_mode == DECON_SW_TRIG (true on J7) */
++};
++
++/* ------------------------------------------------------------------------
++ * layer A: entry points
++ * ------------------------------------------------------------------------ */
++
++/*
++ * decon_kms_get - obtain a handle on the probed DECON instance
++ * @decon_dev: the DECON platform device (&pdev->dev).
++ *
++ * In the recommended binding (decon-kms-api.md 6, option A) nobody calls this
++ * from outside: the vendor decon_probe() calls decon_kms_attach() itself, in
++ * the same context, right where it would have called register_framebuffer().
++ * A caller that has to look the device up instead can use
++ *     of_find_device_by_node(of_find_compatible_node(NULL, NULL,
++ *                             "samsung,exynos5-decon_driver"))
++ * but that variant has the lifetime and dual-ownership failure modes listed in
++ * the report; prefer the in-probe hand-off.
++ *
++ * Returns the handle or an ERR_PTR(): -ENODEV when the DECON driver is not
++ * compiled in / has not probed, -EBUSY if another client holds it.
++ * Does not touch the hardware, does not register anything, and may be called
++ * before the panel is on.  Process context, may sleep.
++ */
++struct decon_kms_dev *decon_kms_get(struct device *decon_dev);
++
++/* Drop the handle.  Does not power anything down; the caller is expected to
++ * have blanked the display first.  Process context. */
++void decon_kms_put(struct decon_kms_dev *d);
++
++/* Read-only capabilities of the handle; the pointer is owned by @d and stays
++ * valid until decon_kms_put().  Safe to call at any time, from any context. */
++const struct decon_kms_caps *decon_kms_caps(struct decon_kms_dev *d);
++
++/*
++ * decon_kms_enable - put the DECON in the "on" state and start scanout
++ *
++ * Equivalent to the vendor decon_enable(): pm_runtime_get_sync(), DSIM
++ * s_stream(1) on the vendor v4l2 subdev, iovmm_activate(), decon_reg_init(),
++ * decon_reg_start().  The panel must already be powered and initialised by the
++ * DSI side; this call does not run the panel power/reset lists.
++ *
++ * Takes decon->output_lock internally.  Process context, may sleep, can take
++ * tens of ms (DSIM command traffic).  Idempotent: a second call returns 0.
++ * A DSIM error is returned as-is (-EIO/-ENODEV from the vendor
++ * v4l2_subdev_call() on s_stream).
++ */
++int decon_kms_enable(struct decon_kms_dev *d);
++
++/*
++ * decon_kms_disable - flush pending commits, stop scanout, drop the clocks
++ *
++ * Wraps the vendor decon_disable() including its LPD branches (unreachable on
++ * a video-mode panel like the J7's, see decon-kms-api.md 7.7).
++ * Flushes the update kthread worker,
++ * disables the FRAME interrupt, stops the DECON, DSIM s_stream(0),
++ * pm_runtime_put_sync().  Idempotent.  Process context, may sleep.
++ *
++ * Must be called before decon_kms_put() if a commit happened; otherwise the
++ * update worker may still reference the window buffers this driver mapped.
++ */
++int decon_kms_disable(struct decon_kms_dev *d);
++
++/*
++ * decon_kms_commit - program exactly one frame, synchronously
++ *
++ * @wins: array of @nr_wins descriptors, index == window number; windows at
++ *        index >= @nr_wins are programmed as DISABLED.
++ *
++ * Sequence performed by the shim (the vendor decon_update_regs() body):
++ * wait in-fences, exynos_smc() protection change, HW-trigger mask, shadow
++ * protect all windows, program WINCON/WIN_MAP/VIDOSD_x/VIDW_ADDx/WHOLE/OFFSET/
++ * BLENDEQ, shadow unprotect, decon_reg_start(), wait for vsync, poll
++ * DECON_UPDATE for completion, release the previous buffers.
++ *
++ * Blocking: waits up to 300 ms for the vsync and 300 ms for the shadow update
++ * to land, so this is the atomic-commit tail, not a fast path.  It must be
++ * called with the DECON enabled.  Takes decon->output_lock and
++ * decon->mutex internally.  Process context; sleeps; signals do not abort the
++ * wait (the vendor wait_event_interruptible() path returns "success" on
++ * -ERESTARTSYS, so EINTR is not propagated).
++ *
++ * Errors: -EAGAIN when the DECON is not in the ON state, -EINVAL for
++ * geometry/format/blending the hardware cannot express (no scaling, window
++ * width < 128 bytes, x-alignment, blending on window 0), -ENOMEM on
++ * allocation failure.  All of these are detected before any shadow register is
++ * reopened, so the previous frame stays on screen.
++ *
++ * A shadow-update timeout is NOT propagated: the vendor commit body logs it
++ * and calls decon_dump() (decon_core.c:2126-2130) and returns void, so the
++ * frame may be stale while decon_kms_commit() reports success.  Watch for
++ * "timeout of updating decon registers" in dmesg.
++ *
++ * Buffer lifetime: after a successful return the shim has released its
++ * references (it cached them for the current frame).  Releasing the dma-buf
++ * that is on screen is safe only after the next successful commit or after
++ * decon_kms_disable().
++ */
++int decon_kms_commit(struct decon_kms_dev *d,
++		     const struct decon_kms_win *wins, unsigned int nr_wins);
++
++/*
++ * decon_kms_commit_async - queue a frame and return a vendor completion fence
++ *
++ * Same programming as decon_kms_commit() but runs in the driver's kthread and
++ * returns @fence_fd, an fd for an Android sync_fence (sw_sync timeline owned by
++ * the DECON driver) that fires when the frame has been latched.  This is the
++ * vendor S3CFB_WIN_CONFIG ABI, NOT a dma_fence; a KMS subdriver that needs a
++ * dma_fence must attach its own fence to the vblank callback instead.
++ *
++ * Caller owns @fence_fd and must close it.  When the DECON is off or in TUI
++ * mode the vendor code returns 0 and a *pre-signalled* fence without
++ * programming anything (decon_core.c:2218-2228); the shim keeps that behaviour
++ * rather than invent an error the fd/ioctl ABI cannot express, so callers must
++ * gate on decon_kms_enable() themselves.
++ *
++ * Needs a live fd table (get_unused_fd(), decon_core.c:2199).  Process
++ * context, may sleep, may be called from an ioctl; NOT from a worker thread
++ * that has no ->files.
++ */
++int decon_kms_commit_async(struct decon_kms_dev *d,
++			   const struct decon_kms_win *wins,
++			   unsigned int nr_wins, int *fence_fd);
++
++/*
++ * decon_kms_register_vblank_cb - get the DECON FRAME interrupt
++ *
++ * @cb runs in hard IRQ context on every frame-done interrupt of the DECON
++ * (video mode: IRQ resource 2; command mode: the I80 IRQ and the TE GPIO IRQ).
++ * It is exactly the point where the vendor driver updates
++ * vsync_info.timestamp; a KMS subdriver calls drm_crtc_handle_vblank() from
++ * it.  Only one callback is supported; registering again replaces it.
++ * Passing @cb == NULL unregisters.  The callback must not sleep and must not
++ * call back into this API.
++ *
++ * The shim enables the FRAME interrupt while a callback is registered
++ * (decon_reg_set_int()) and leaves the vendor refcounting in
++ * decon_activate_vsync() alone for the fbdev path.
++ *
++ * Process context (register/unregister), the callback itself runs in IRQ.
++ */
++typedef void (*decon_kms_vblank_cb)(void *data);
++
++int decon_kms_register_vblank_cb(struct decon_kms_dev *d,
++				 decon_kms_vblank_cb cb, void *data);
++
++/*
++ * decon_kms_wait_vblank - block for the next frame-done interrupt
++ *
++ * Wraps decon_wait_for_vsync().  @timeout_ms == 0 waits forever.  Process
++ * context only (the vendor path takes vsync_info.irq_lock and enables/disables
++ * the FRAME interrupt around the wait).  Returns -ETIMEDOUT, or 0.  Do not use
++ * this in the same commit as decon_kms_commit(): that call already waits.
++ */
++int decon_kms_wait_vblank(struct decon_kms_dev *d, unsigned int timeout_ms);
++
++/*
++ * decon_kms_power_get/put - runtime PM of the DECON platform device
++ *
++ * The vendor probe already enabled pm_runtime; decon_kms_enable() performs its
++ * own get_sync/put_sync pair, so a KMS subdriver needs these only to keep the
++ * DECON clocked across a longer sequence (e.g. re-reading state after a
++ * modeset).  Nests; process context, may sleep.
++ */
++int decon_kms_power_get(struct decon_kms_dev *d);
++void decon_kms_power_put(struct decon_kms_dev *d);
++
++/*
++ * decon_kms_map_dmabuf - map a dma-buf into the DECON's IOVA space
++ *
++ * The exporter-agnostic replacement for the vendor ION path.  The vendor
++ * decon_map_ion_handle() calls ion_iovmm_map(), which BUG_ON()s on any dma-buf
++ * whose ops are not ION's (drivers/staging/android/ion/ion.c:2643), so a
++ * panfrost/GEM buffer would panic the kernel if it went through
++ * decon_set_win_buffer().  This entry point does:
++ *
++ *     dma_buf_attach(buf, decon->dev) -> dma_buf_map_attachment(DMA_TO_DEVICE)
++ *     -> iovmm_map(decon->dev, sg, 0, size, DMA_TO_DEVICE, id)   (IOMMU on)
++ *     or the contiguous phys address of the buffer                (IOMMU off)
++ *     -> exynos_ion_sync_dmabuf_for_device() when the exporter is ION
++ *
++ * @id is the iovmm region id, use the DECON window number as the vendor code
++ * does.  On success *@addr is the address to put in decon_kms_win.addr[0] and
++ * *@cookie is an opaque handle for decon_kms_unmap_dmabuf().  @size is 0 for
++ * the whole buffer.  Process context, may sleep.
++ *
++ * The mapping stays valid until decon_kms_unmap_dmabuf(); the shim refcounts
++ * per (dma_buf, window) pair so two frames may reference the same mapping.
++ */
++int decon_kms_map_dmabuf(struct decon_kms_dev *d, struct dma_buf *buf,
++			 unsigned int id, size_t size,
++			 dma_addr_t *addr, void **cookie);
++void decon_kms_unmap_dmabuf(struct decon_kms_dev *d, void *cookie);
++
++/* ------------------------------------------------------------------------
++ * layer B: raw vendor symbols
++ *
++ * Two groups.
++ *
++ * 1) Already global in the vendor tree, nothing to patch, no struct layout
++ *    needed beyond the incomplete types below.  Declared by
++ *    drivers/video/exynos/decon_7580/decon_common.h, which is fb-free (it only
++ *    includes panels/decon_lcd.h):
++ *
++ *      void decon_reg_init(u32 id, enum decon_dsi_mode, struct decon_init_param *);
++ *      void decon_reg_start(u32 id, enum decon_dsi_mode, struct decon_psr_info *);
++ *      int  decon_reg_stop(u32 id, enum decon_dsi_mode, struct decon_psr_info *);
++ *      void decon_reg_set_regs_data(u32 id, int win_idx, struct decon_regs_data *);
++ *      void decon_reg_set_int(u32 id, struct decon_psr_info *, enum decon_dsi_mode, u32 en);
++ *      void decon_reg_set_trigger(u32 id, enum decon_dsi_mode, enum decon_trig_mode, enum decon_set_trig);
++ *      int  decon_reg_wait_for_update_timeout(u32 id, unsigned long timeout);
++ *      void decon_reg_shadow_protect_win(u32 id, u32 win_idx, u32 protect);
++ *      void decon_reg_activate_window(u32 id, u32 index);
++ *      void decon_enable_eclk_idle_gate(u32 id, enum decon_set_eclk_idle_gate);
++ *
++ *    Every one of them resolves `id` through get_decon_drvdata(), a static
++ *    inline in decon.h returning the global decon_int_drvdata, i.e. these are
++ *    single-instance and lock-free: the caller owns serialisation.
++ *
++ * 2) Static today; the shim patch turns each into a decon_export_* wrapper
++ *    (same code, new name, non-static, EXPORT_SYMBOL) so that the vendor
++ *    struct layouts do not become part of the interface.  Prototypes below.
++ * ------------------------------------------------------------------------ */
++
++struct decon_device;		/* drivers/video/exynos/decon_7580/decon.h */
++struct decon_reg_data;		/* same */
++struct decon_win_config;	/* same */
++struct decon_win_config_data;	/* same */
++
++/*
++ * Window bookkeeping without register access, wrapping
++ * decon_acquire_window()/decon_release_windows() (decon_core.c:2836/:2733).
++ * Allocates one framebuffer_alloc() scratch fb_info per window -- that
++ * allocation is a driver-internal detail, the fb_info is never registered and
++ * no /dev/fb0 appears because of it.  Process context, may sleep, allocates.
++ */
++int decon_export_acquire_windows(struct decon_device *decon);
++void decon_export_release_windows(struct decon_device *decon);
++
++/* kzalloc/kfree of struct decon_reg_data (decon.h:389; ~3 KB on arm64, too
++ * big for the kernel stack).  New code in the shim, wraps nothing. */
++struct decon_reg_data *decon_export_regs_alloc(void);
++void decon_export_regs_free(struct decon_reg_data *regs);
++
++/*
++ * Wraps decon_set_win_buffer() (decon_core.c:1516).  @cfg->fd_idma[] are ION
++ * dma-buf fds, exactly the vendor ABI; this is the fbdev/ION path and is
++ * exported for the fbdev-emulation slice only -- the KMS path must not use it
++ * (see decon_kms_map_dmabuf() for why).  Fills regs->dma_buf_data[win_idx],
++ * buf_start/vidosd/whole/offset/wincon/blendeq and writes the window's
++ * fb_info var; process context, sleeps in iovmm_map(), -EINVAL on bad geometry.
++ */
++int decon_export_set_win_buffer(struct decon_device *decon,
++				struct decon_win_config *cfg,
++				struct decon_reg_data *regs,
++				unsigned int win_idx);
++
++/*
++ * Wraps decon_to_regs_param() + decon_reg_set_regs_data() (decon_core.c:119,
++ * decon_reg_7580.c:529): program one window from a resolved regs entry, with
++ * no buffer ownership and no fb_info involvement.  This is the fb-free half of
++ * decon_set_win_buffer() and the primitive the KMS plane wants.  Context: the
++ * caller must already have shadow-protected the window.
++ */
++void decon_export_regs_param(struct decon_device *decon,
++			     struct decon_reg_data *regs,
++			     unsigned int win_idx);
++
++/*
++ * Same register fill, but the DMA addresses come from the caller
++ * (decon_kms_win.addr[]) instead of an ION fd.  This is the missing half of
++ * decon_set_win_buffer() and the primitive the KMS plane path uses; it mirrors
++ * decon_core.c:1690-1701 (buf_start / whole_w / whole_h / offset_x / offset_y /
++ * wincon / blendeq / vidosd_a..b / dma_buf_data) and performs the same
++ * validation (format < MAX, blending < MAX, no blending on window 0, non-zero
++ * and non-negative dst, dst.w * bpp / 8 >= 128 bytes, src.f_w >= dst.w,
++ * decon_validate_x_alignment()).  Process context, no sleeping, needs the
++ * window shadow-protected by the caller only if it is called outside
++ * decon_export_update_regs().  Returns 0 or -EINVAL.
++ */
++int decon_export_regs_param_addr(struct decon_device *decon,
++				 struct decon_reg_data *regs,
++				 unsigned int win_idx,
++				 const struct decon_kms_win *win);
++
++/*
++ * Wraps decon_update_regs() (decon_core.c:2066) and __decon_update_regs()
++ * (decon_core.c:1916): the whole commit sequence described under
++ * decon_kms_commit(), synchronously, in the caller's context.  Blocking, up to
++ * ~600 ms, takes no locks of its own (the vendor decon_set_win_config() holds
++ * decon->output_lock around it) so the caller must serialise.
++ */
++void decon_export_update_regs(struct decon_device *decon,
++			      struct decon_reg_data *regs);
++
++/*
++ * Wraps the descriptor-translation loop of decon_set_win_config()
++ * (decon_core.c:2185) without the fd/ion/sw_sync parts: for each window, takes
++ * @cfg[i] (vendor layout, fb-free), computes wincon/winmap/vidosd/blendeq and
++ * bandwidth, validates geometry and rejects scaling.  Buffers must already be
++ * in regs (decon_export_regs_param() path).  Returns 0 or -EINVAL.
++ */
++int decon_export_set_win_config(struct decon_device *decon,
++				struct decon_reg_data *regs,
++				const struct decon_win_config *cfg,
++				unsigned int nr_win);
++
++/* Clocks / PM, wrapping decon_int_get_clocks() (decon-int_drv.c:130),
++ * decon_int_set_clocks() (:177), decon_put_clocks() (decon_core.c:2532).
++ * Process context; get/set_clocks program dividers and muxes, so the display
++ * must be off. */
++int decon_export_get_clocks(struct decon_device *decon);
++void decon_export_set_clocks(struct decon_device *decon);
++void decon_export_put_clocks(struct decon_device *decon);
++
++/* The bound instance, or NULL.  Single-instance driver. */
++struct decon_device *decon_export_dev(void);
++
++#endif /* _LINUX_EXYNOS_DECON_KMS_H */
