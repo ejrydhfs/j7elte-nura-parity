@@ -1,0 +1,317 @@
+# DECON KMS M0 — atomic core backport (3.10.108) — report
+
+Status: **complete for M0 (build-only)**. Atomic core present, compiles and links
+with the tree's config and toolchain; **no in-tree driver uses it yet** (that is
+M1). Device boot was not part of this seat.
+
+Patch series: `patches/drm-atomic/` (4 patches, apply in order).
+Build tree used for verification: hardlink clone of the pristine tree with only
+these patches applied (`km0-pristine`), never the shared tree.
+
+## 1. Upstream version correction (important)
+
+The milestone text said "3.14/3.15 atomic core". That is not what upstream
+contains; verified against `torvalds/linux` tags via the GitHub API/raw URLs:
+
+| Piece | First upstream tag | Evidence |
+|---|---|---|
+| `drm_rect.[ch]` | v3.14 | `include/drm/drm_rect.h` exists in v3.14 |
+| `drm_plane_helper.[ch]` | v3.15 | `include/drm/drm_plane_helper.h` 200 in v3.15, 404 in v3.14 |
+| `drm_modeset_lock.[ch]` | v3.16 | `include/drm/drm_modeset_lock.h` 404 in v3.15 |
+| **`drm_atomic.[ch]`, `drm_atomic_helper.[ch]`** | **v3.19** | 404 in v3.18, present in v3.19 |
+| `DRM_IOCTL_MODE_ATOMIC`, `DRM_CLIENT_CAP_ATOMIC`, `struct drm_mode_atomic`, SRC_*/CRTC_*/FB_ID/CRTC_ID/ACTIVE props | **v4.0** | `drm_mode.h` has no `drm_mode_atomic` in v3.19; present in v4.0 |
+| `drm_plane.c` / `drm_framebuffer.c` split out of `drm_crtc.c` | v4.9 | no such files through v4.8 |
+
+So the backport is sourced from **3.19 atomic core + 4.0 atomic uapi/ioctl/
+properties**, adapted to the 3.10 API. Using 3.14/3.15 would have produced a
+non-existent API.
+
+## 2. What the tree actually provides (and the consequences)
+
+Facts checked in the pristine tree:
+
+- **No `ww_mutex`** anywhere (`include/linux/ww_mutex.h` absent, no `struct
+  ww_mutex`). → `drm_modeset_lock` is a plain `struct mutex`; the acquire
+  context only does bookkeeping. All acquire-context users also hold the legacy
+  `mode_config.mutex` (legacy entry points via `drm_modeset_lock_all()`, the
+  atomic ioctl explicitly), so there is a single global lock order and no
+  deadlock to detect. `-EDEADLK` never occurs; the backoff API is present for
+  source compatibility and drivers.
+- **No `struct drm_crtc_state` / `drm_plane_state` / `drm_connector_state` /
+  `drm_atomic_state`** → added (3.19/4.0 layout) in `drm_crtc.h`.
+- **No `struct fence` / reservation object** → `plane_state->fence` and
+  `wait_for_fences()` are omitted; in-fence waiting is M2 (`patches/drm-backport`
+  provides dma-fence/dma-resv; panfrost uses it, KMS does not yet).
+- **No `drm_bridge`** (`struct drm_encoder` has no `bridge`) → all bridge hooks
+  are stripped from the atomic helper.
+- **Old vblank model**: no `struct drm_vblank_crtc`, no
+  `drm_crtc_vblank_get/put`, no `drm_crtc_wait_one_vblank`; the tree has
+  `dev->vbl_queue[]` + `drm_vblank_get/put(dev, idx)` + `drm_vblank_count()`.
+- **No `DRM_IOCTL_SET_CLIENT_CAP` / `DRM_CLIENT_CAP_*` / `DRM_MODE_OBJECT_ANY` /
+  property helpers / index helpers / `DRM_MODE_PROP_ATOMIC`** → added.
+- `drm_plane_init(..., bool priv)` and a legacy `drm_crtc_init()` (no primary
+  plane) are 3.10-only APIs; both are preserved verbatim for exynos.
+- The ioctl table lives in `drm_drv.c` (not `drm_ioctl.c`) in this tree.
+- `struct drm_encoder`/`drm_connector` have no `name` field → debug prints use
+  `drm_get_encoder_name()` / `drm_get_connector_name()`.
+- `DRM_MODE_CONNECTOR_DSI` and `DRM_MODE_ENCODER_DSI` were missing from the 3.10
+  UAPI, although the display stack needs them. Added with upstream values
+  (`CONNECTOR_DSI=16`, `ENCODER_DSI=6`) plus the matching
+  `drm_connector_enum_list[]`/`drm_encoder_enum_list[]` entries (the connector
+  list is indexed by connector type, so a missing entry would be an OOB write).
+
+## 3. Patch inventory
+
+| # | Patch | Files | sha256 |
+|---|---|---|---|
+| 1 | `0001-drm-add-atomic-modeset-headers-state-structs-and-uap.patch` | 5 new headers, `drm_crtc.h`, `drm_crtc_helper.h`, `drmP.h`, uapi `drm.h`, uapi `drm_mode.h` | `cdf1a9d17cba646ecea8be08fbfe09f8c4761b86a9c3c9b6e2b24f64504be432` |
+| 2 | `0002-drm-add-atomic-core-modeset-locking-and-split-plane-.patch` | new `drm_rect.c`, `drm_modeset_lock.c`, `drm_atomic.c`, `drm_plane.c`, `drm_framebuffer.c`, `drm_crtc_internal.h`; modified `drm_crtc.c` | `1f146398671ad5f5613365b109307b439aa7551bf5ecbd03c0945a5cefb6cb4c` |
+| 3 | `0003-drm-add-atomic-and-plane-helpers-wire-build.patch` | new `drm_atomic_helper.c`, `drm_plane_helper.c`; `Makefile` | `d5c1bed323ef656cf6bec03f326e9c2673d1336bc620f753c60029c126b70b0f` |
+| 4 | `0004-drm-wire-DRM_IOCTL_MODE_ATOMIC-and-DRM_CLIENT_CAP_AT.patch` | `drm_ioctl.c`, `drm_drv.c` | `1b6851f992b4b3ad49a2e48503d1e08edf2707f821b08f974d542f4d70f31796` |
+
+Lines: 1457 + 3784 + 2812 + 76 = 8129.
+
+Apply order matters only in that the patches share no files, so each one
+`git apply --check`s clean against a pristine tree (verified individually and as
+a sequence). New-file hunk counts are generated by `git format-patch`, not
+hand-written.
+
+## 4. File/function map → upstream origin
+
+### 4.1 New files
+
+| File | Function | Upstream origin |
+|---|---|---|
+| `include/drm/drm_rect.h`, `drivers/gpu/drm/drm_rect.c` | `drm_rect_intersect`, `drm_rect_clip_scaled`, `drm_rect_calc_hscale`, `drm_rect_calc_vscale`, `drm_rect_calc_hscale_relaxed`, `drm_rect_calc_vscale_relaxed`, `drm_rect_debug_print`, `drm_rect_rotate`, `drm_rect_rotate_inv` (+ inline helpers) | 3.19 `drivers/gpu/drm/drm_rect.c` / `include/drm/drm_rect.h`, verbatim |
+| `include/drm/drm_modeset_lock.h`, `drivers/gpu/drm/drm_modeset_lock.c` | `drm_modeset_acquire_init`, `_fini`, `drm_modeset_drop_locks`, `drm_modeset_backoff`, `_interruptible`, `drm_modeset_lock`, `_interruptible`, `drm_modeset_unlock`, `drm_modeset_lock_all_crtcs`, `drm_modeset_lock_crtc`, `drm_modeset_unlock_crtc`, `drm_modeset_legacy_acquire_ctx` | 3.19 `drm_modeset_lock.c`, with `ww_mutex` replaced by plain mutex (see §5) |
+| | `modeset_lock_is_held` | new: replaces `ww_mutex`'s `-EALREADY` handling |
+| `include/drm/drm_atomic.h`, `drivers/gpu/drm/drm_atomic.c` | `drm_atomic_state_alloc/clear/free`, `drm_atomic_get_{crtc,plane,connector}_state`, `drm_atomic_{crtc,plane,connector}_set_property`, `{crtc,plane,connector}_get_property`, `drm_atomic_set_crtc_for_plane`, `drm_atomic_set_fb_for_plane`, `drm_atomic_set_crtc_for_connector`, `drm_atomic_add_affected_connectors`, `drm_atomic_connectors_for_crtc`, `drm_atomic_legacy_backoff`, `drm_atomic_check_only`, `drm_atomic_commit`, `drm_atomic_async_commit`, `drm_mode_atomic_ioctl`, `create_vblank_event`, `destroy_vblank_event`, `atomic_set_prop`, static `kfree_state`, `drm_atomic_{crtc,plane}_check` | 4.0 `drivers/gpu/drm/drm_atomic.c` (3.19 subset included) |
+| `include/drm/drm_atomic_helper.h`, `drivers/gpu/drm/drm_atomic_helper.c` | `drm_atomic_helper_check`, `_check_modeset`, `_check_planes`, `_commit`, `_commit_pre_planes`, `_commit_post_planes`, `_wait_for_vblanks`, `_prepare_planes`, `_commit_planes`, `_cleanup_planes`, `_swap_state`, `_update_plane`, `_disable_plane`, `_set_config`, `_crtc_set_property`, `_plane_set_property`, `_connector_set_property`, `_page_flip`, `_connector_dpms`, `_crtc_reset`, `_crtc_duplicate_state`, `_crtc_destroy_state`, `_plane_reset`, `_plane_duplicate_state`, `_plane_destroy_state`, `_connector_reset`, `_connector_duplicate_state`, `_connector_destroy_state`; static `drm_atomic_helper_plane_changed`, `get_current_crtc_for_encoder`, `steal_encoder`, `update_connector_routing`, `mode_fixup`, `needs_modeset`, `disable_outputs`, `set_routing_links`, `crtc_set_mode`, `framebuffer_changed`, `update_output_state` | 4.0 `drivers/gpu/drm/drm_atomic_helper.c` |
+| `include/drm/drm_plane_helper.h`, `drivers/gpu/drm/drm_plane_helper.c` | `drm_plane_helper_check_update`, `drm_primary_helper_update`, `_disable`, `_destroy`, `drm_primary_helper_funcs`, `drm_primary_helper_create_plane`, `drm_plane_helper_commit`, `drm_plane_helper_update`, `_disable`; static `get_connectors_for_crtc`, `safe_modeset_formats` | 4.0 `drivers/gpu/drm/drm_plane_helper.c` (3.15 API + 3.19 atomic bits) |
+| `drivers/gpu/drm/drm_plane.c` | `drm_universal_plane_init`, `drm_plane_init`, `drm_plane_cleanup`, `drm_plane_index` | 4.0 `drm_crtc.c` (`drm_universal_plane_init`/`drm_plane_cleanup`/`drm_plane_index`); `drm_plane_init` body is the 3.10 `drm_crtc.c` version, signature `bool priv` preserved |
+| | static `drm_plane_init_common` | new factoring of the 3.10 `drm_plane_init` body + 4.0 init sequence |
+| `drivers/gpu/drm/drm_framebuffer.c` | `drm_framebuffer_init`, `drm_framebuffer_free`, `__drm_framebuffer_lookup`, `drm_framebuffer_lookup`, `_unreference`, `_reference`, `__drm_framebuffer_unregister`, `drm_framebuffer_unregister_private`, `_cleanup`, `_remove` | moved verbatim from 3.10 `drm_crtc.c:331-588` (split matches upstream 4.9); only `__drm_framebuffer_{lookup,unregister}` lost `static` so `drm_crtc.c` can keep using them |
+| `drivers/gpu/drm/drm_crtc_internal.h` | `drm_mode_object_get/put`, `__drm_framebuffer_lookup/unregister` | new internal header (upstream `drm_crtc_internal.h` pattern) |
+
+### 4.2 Modified files
+
+| File | Addition | Upstream origin |
+|---|---|---|
+| `include/drm/drm_crtc.h` | `struct drm_crtc_state`, `drm_connector_state`, `drm_plane_state`, `drm_atomic_state`; `enum drm_plane_type`; `DRM_ROTATE_*`/`DRM_REFLECT_*`; `DRM_MODE_OBJECT_ANY`; `U642I64`/`I642U64`; atomic funcs in `drm_crtc_funcs`/`drm_connector_funcs`/`drm_plane_funcs`; `crtc->{modeset_lock,state,acquire_ctx,primary,cursor}`, `plane->{modeset_lock,state,old_fb,type}`, `connector->{modeset_lock,state}`; `mode_config.{connection_mutex,acquire_ctx,num_overlay_plane,num_total_plane,plane_type_property,prop_*,async_page_flip}`; `mode_config_funcs.atomic_check/atomic_commit`; `drm_crtc_index/mask`, `drm_plane_index`, `drm_connector_index`, `drm_for_each_plane_mask`, `drm_property_type_is/valid`; prototypes | 4.0 `include/drm/drm_crtc.h` (+3.19) |
+| `include/drm/drm_crtc_helper.h` | `drm_crtc_helper_funcs.{enable,mode_set_nofb,atomic_check,atomic_begin,atomic_flush}`, `drm_encoder_helper_funcs.{enable,atomic_check}` | 4.0 `include/drm/drm_crtc_helper.h` |
+| `include/drm/drmP.h` | `DRIVER_ATOMIC 0x8000`; `drm_file.{stereo_allowed,universal_planes,atomic}`; `drm_setclientcap` prototype; removed the dead 3.10 `drm_modeset_is_locked(dev)` helper (no in-tree callers, name now taken by the per-lock upstream helper) | 4.0 `drmP.h`/`drm_ioctl.c` |
+| `include/uapi/drm/drm.h` | `DRM_CLIENT_CAP_STEREO_3D/UNIVERSAL_PLANES/ATOMIC`, `struct drm_set_client_cap`, `DRM_IOCTL_SET_CLIENT_CAP` (0x0d), `DRM_IOCTL_MODE_ATOMIC` (0xBC) | 4.0 UAPI; 0xBC kept (0xBB is `MODE_CURSOR2`, absent here) |
+| `include/uapi/drm/drm_mode.h` | property extended-type/OBJECT/SIGNED_RANGE/ATOMIC, `DRM_MODE_PAGE_FLIP_ASYNC`, `DRM_MODE_ATOMIC_*`, `struct drm_mode_atomic`; DSI connector/encoder ids | 4.0 UAPI (+DSI from 3.15+) |
+| `drivers/gpu/drm/drm_crtc.c` | `drm_modeset_lock_all/_unlock_all` extended with acquire ctx + `connection_mutex` + all crtc/plane modeset locks; `drm_mode_object_find` ANY support; `drm_crtc_index`, `drm_connector_index`, `drm_crtc_find`; `drm_crtc_init_with_planes` (legacy `drm_crtc_init` now wraps it with NULL planes); `drm_property_create_signed_range/object/bool`, `drm_property_find`, `drm_property_change_valid_get/put`; `drm_property_create` sets `property->dev`; standard-property creation extended with plane-type + 11 atomic props; property attach in crtc/connector init; lock init in crtc/connector init; plane reset loop in `drm_mode_config_reset`; crtc/connector state destroy in `drm_crtc_cleanup`/`drm_connector_cleanup`; `num_plane`→`num_total_plane`; fb/plane blocks removed (moved) | 4.0 `drm_crtc.c` |
+| `drivers/gpu/drm/drm_ioctl.c` | `drm_setclientcap` (ATOMIC gated on `DRIVER_ATOMIC`; sets `file_priv->atomic` and `universal_planes`) | 4.0 `drm_ioctl.c`, minus the `drm.atomic` module parameter |
+| `drivers/gpu/drm/drm_drv.c` | ioctl-table entries `DRM_IOCTL_SET_CLIENT_CAP` and `DRM_IOCTL_MODE_ATOMIC` (`DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED`) | 4.0 `drm_ioctl.c` table |
+| `drivers/gpu/drm/Makefile` | `drm-y += drm_modeset_lock.o drm_atomic.o drm_plane.o drm_framebuffer.o`; `drm_kms_helper-y += drm_rect.o drm_atomic_helper.o drm_plane_helper.o` | 3.19/4.0 Makefiles |
+
+## 5. Deltas from upstream (all intentional)
+
+1. **Modeset locking**: no `ww_mutex` in 3.10. `struct drm_modeset_lock` wraps a
+   plain `mutex`; `drm_modeset_acquire_ctx` keeps the `locked`/`contended`/
+   `trylock_only` bookkeeping and the API returns 0/`-EBUSY`; it never returns
+   `-EDEADLK`. Correctness argument: every acquire-ctx path holds
+   `mode_config.mutex` for its whole duration (legacy via the extended
+   `drm_modeset_lock_all()`, the atomic ioctl explicitly), so only one context
+   can be acquiring at a time and the lock order is trivially consistent.
+   `drm_atomic_legacy_backoff()`/`drm_modeset_backoff()` remain for drivers.
+2. **Lock naming**: the backport uses a new `modeset_lock` field on
+   crtc/plane/connector instead of re-typing the legacy `crtc->mutex`. The
+   legacy mutex and all its users are untouched (i915/omap/vmwgfx are not built
+   in this config and were not modified). `drm_modeset_lock_all()` now takes
+   both the legacy crtc mutex and the per-object modeset locks.
+3. **No fences**: `drm_plane_state.fence` and `wait_for_fences()` omitted
+   (`M2`); the commit sequence therefore starts at
+   `drm_atomic_helper_commit_pre_planes()`.
+4. **No bridges**: `encoder->bridge` blocks removed from `mode_fixup`,
+   `disable_outputs`, `crtc_set_mode`, `commit_post_planes`.
+5. **No `name` fields**: debug strings use `drm_get_encoder_name()`/
+   `drm_get_connector_name()`.
+6. **Vblank**: `drm_vblank_get/put(dev, idx)` + `dev->vbl_queue[idx]` with a
+   50 ms timeout instead of `drm_crtc_vblank_*`/`dev->vblank[i].queue`; the
+   plane helper's one-vblank wait is open-coded.
+7. **`mode_set_nofb` fallback**: if the driver has no `->mode_set_nofb`,
+   `crtc_set_mode()` calls `->mode_set(crtc, mode, adjusted, x, y, NULL)`.
+   `->enable` falls back to `->commit` (as upstream does).
+8. **`drm_crtc_init()` stays in `drm_crtc.c`** and keeps its 3.10 behaviour
+   (no auto primary plane). The duplicate 4.0 definition in
+   `drm_plane_helper.c` was removed; drivers that want the helper plane use
+   `drm_primary_helper_create_plane()` + `drm_crtc_init_with_planes()`.
+9. **`drm_plane_init(..., bool priv)`** keeps the 3.10 signature and private
+   plane semantics; `drm_universal_plane_init()` is the new entry point.
+   Private planes are not listed and get no properties.
+10. **Atomic ioctl serialization**: `drm_mode_atomic_ioctl()` takes
+    `mode_config.mutex` for its whole run (upstream relies on w/w per-object
+    locks alone). This is what makes it mutually exclusive with all legacy KMS
+    ioctls on 3.10.
+11. **`drm_modeset_is_locked(dev)`** (dead 3.10 helper) removed; the upstream
+    per-lock `drm_modeset_is_locked(lock)` is provided instead.
+12. **Legacy page-flip vfunc**: `drm_crtc_funcs.page_flip` keeps the 3.10
+    3-argument signature, so `drm_atomic_helper_page_flip(crtc, fb, event,
+    flags)` is exported but **cannot be assigned directly**; a thin adapter is
+    M1 work. `DRM_MODE_PAGE_FLIP_FLAGS` is left unchanged so legacy page flips
+    still reject ASYNC.
+13. **No `drm.atomic` module parameter**: `DRM_CLIENT_CAP_ATOMIC` is gated only
+    on `DRIVER_ATOMIC` (+ the per-file cap).
+14. **Properties are gated on `DRIVER_ATOMIC`**: `drm_mode_create_standard_properties()`
+    returns after EDID/DPMS for non-atomic devices, so legacy userspace sees
+    exactly the same property set as before this series (upstream 4.0 creates
+    them unconditionally). They are attached to CRTC/connector/plane only for
+    atomic devices. Rotation property/state dropped (not needed for M0/M1;
+    `drm_rect` rotation math kept, with the `DRM_ROTATE_*` constants).
+15. **DSI ids** added to the 3.10 UAPI with upstream values, plus the
+    corresponding enum-name table entries.
+16. **Null-helper guards**: `prepare_planes`/`cleanup_planes` tolerate a plane
+    without `drm_plane_helper_funcs`; `drm_atomic_helper_commit_planes` keeps
+    upstream's `funcs` check.
+
+## 6. Verification performed
+
+### 6.1 Apply check (pristine tree)
+
+Private hardlink clone of the read-only vendor tree (`km0-pristine`, git-init),
+no patch applied:
+
+```
+0001-...patch: CHECK-OK
+0002-...patch: CHECK-OK
+0003-...patch: CHECK-OK
+0004-...patch: CHECK-OK
+```
+then `git apply` 1→4: all applied, no fuzz, no rejects. `git apply --check` was
+run on each patch against the pristine tree (the patches share no files, so each
+is independently applicable).
+
+### 6.2 Build: core DRM subsystem with the tree's own config
+
+```
+make -C <km0-pristine> ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     KCFLAGS=-Wno-error -j12 drivers/gpu/drm/
+```
+
+- exit status **0**, **0 errors**, `drivers/gpu/drm/built-in.o` and
+  `drivers/gpu/drm/exynos/built-in.o` linked.
+- 11 warning lines: **10 are pre-existing in `drivers/gpu/drm/exynos/`**
+  (untouched by this series) and one is Kconfig lint on the pre-existing
+  duplicate `CONFIG_DMA_SHARED_BUFFER=y` lines in the vendor `.config`
+  (`warning: override: reassigning to symbol DMA_SHARED_BUFFER`). The exynos
+  warnings are: `exynos_drm_fb.h:14` header-guard ×4, `exynos_drm_dmabuf.c:289`
+  `%x`/`dma_addr_t`, `exynos_drm_g2d.c:1156,1174` int-to-pointer,
+  `exynos_drm_gem.c:211,476,483` pointer/int casts.
+- **Zero warnings in every file added or touched by this series.**
+- Without `KCFLAGS=-Wno-error` the tree fails only on the pre-existing
+  `-Werror=header-guard` in `exynos_drm_fb.h` (GCC 16 default). This is why
+  `build.sh` sets `KCFLAGS="-Wno-error"`; it is not caused by this series (no
+  patch touches `drivers/gpu/drm/exynos/`).
+- Objects rebuilt for this series: `drm_modeset_lock.o`, `drm_atomic.o`,
+  `drm_plane.o`, `drm_framebuffer.o`, `drm_rect.o`, `drm_atomic_helper.o`,
+  `drm_plane_helper.o`, plus `drm_crtc.o`, `drm_ioctl.o`, `drm_drv.o`, and the
+  whole exynos subdir.
+- No duplicate definitions: `nm --defined-only drivers/gpu/drm/built-in.o`
+  has no duplicated global symbol; the moved symbols
+  (`drm_framebuffer_*`, `drm_plane_init/cleanup`, `drm_crtc_init`,
+  `drm_mode_object_get/put`, `drm_modeset_lock_all/unlock_all`) each resolve
+  exactly once.
+
+### 6.3 Build with panfrost7580 applied on top
+
+Private clone `km0-panfrost`: series 1–4 + `patches/drm-backport/0001..0005`
+(dma-fence/dma-resv/drm_syncobj/drm_sched shims) +
+`code/gpu31/driver/0001-panfrost7580-driver-sources.patch` +
+`0002-panfrost7580-build-wiring.patch` +
+`code/gpu31/dmabuf/0001-drm-gem-cma-use-dma-attrs-writecombine.patch`
+(required: the stock CMA helper uses the 32-bit-only
+`dma_alloc_writecombine`), then `CONFIG_DRM_PANFROST7580=y` and a
+**scratch-only** `#define DRIVER_RENDER_ONLY 0x10000` (that bit comes from the
+kms Mode-B/display patch, not from this series).
+
+```
+make ... -j12 drivers/gpu/drm/    → exit 0, 0 errors
+LD drivers/gpu/drm/panfrost/panfrost7580.o
+LD drivers/gpu/drm/panfrost/built-in.o
+LD drivers/gpu/drm/exynos/exynosdrm.o
+LD drivers/gpu/drm/built-in.o
+```
+
+Warnings: only pre-existing ones (exynos set above, `drm_gem_cma_helper.c`
+format/`%Zx`, `panfrost7580_submit.c` 2256-byte frame). Nothing in this series.
+
+Note on ordering: the series and the drm-backport/panfrost series both touch
+`drivers/gpu/drm/Makefile` and `drmP.h`; they must be integrated in one tree
+(the Makefile edits are additive and can be rebased by re-running the series
+generation, as the drm-backport README already warns).
+
+### 6.4 Host-side ABI + API tests
+
+- UAPI ABI test (host x86 gcc, `-Wall -Wextra -Werror`, our `drm.h`/`drm_mode.h`):
+  asserts `DRM_IOCTL_MODE_ATOMIC == _IOWR('d',0xBC,struct drm_mode_atomic)` =
+  `0xc03864bc`, `DRM_IOCTL_SET_CLIENT_CAP`, `DRM_CLIENT_CAP_ATOMIC==3`,
+  `DRM_MODE_CONNECTOR_DSI==16`, `DRM_MODE_ENCODER_DSI==6`,
+  `DRM_MODE_PROP_ATOMIC==0x80000000`, the three `DRM_MODE_ATOMIC_*` flags,
+  `sizeof(struct drm_mode_atomic)==56` and field offsets 4/8/40/48.
+  Output: `uapi atomic ABI ok: atomic ioctl=0xc03864bc,
+  sizeof(drm_mode_atomic)=56`.
+- Kernel-side API test (same file compiled with the exact aarch64 kbuild flags
+  used for `drm_atomic.o`): allocates a `drm_atomic_state`, uses
+  `drm_modeset_acquire_init`, `drm_atomic_get_{crtc,plane,connector}_state`,
+  `drm_atomic_set_crtc_for_plane/connector`, `drm_atomic_set_fb_for_plane`,
+  `drm_atomic_helper_check`, `drm_atomic_commit`,
+  `drm_primary_helper_create_plane`, `drm_plane_helper_add/update`.
+  Compile: 0 errors, 0 warnings.
+
+## 7. What is NOT yet wired
+
+- **No driver sets `DRIVER_ATOMIC`** in this tree. exynos stays legacy; the
+  panfrost7580 driver is render-only. Until M1, `DRM_CLIENT_CAP_ATOMIC` returns
+  `-EINVAL` for every device and `DRM_IOCTL_MODE_ATOMIC` is unreachable in
+  practice (present and compiled, gated by `DRIVER_ATOMIC`).
+- **No CRTC/plane/connector implements the atomic callbacks** (`atomic_check`,
+  `atomic_duplicate_state`, `atomic_destroy_state`, `atomic_begin/update/flush`);
+  the helper library is compiled but unused at runtime.
+- **No KMS node / card0**: this is M1.
+- **No fence/reservation waits**: `plane_state->fence` does not exist; in-fence
+  handling is M2 (dma-fence/dma-resv series is in `patches/drm-backport/`).
+- **No async commit**: `drm_atomic_helper_commit(async=true)` returns `-EBUSY`.
+- **No `drm_atomic_helper_suspend/resume` and no `drm_atomic_helper_disable_all`**
+  (different upstream eras). Suspend must be implemented as: take all locks,
+  atomic commit with CRTCs inactive and planes off, drop the runtime-PM
+  reference; resume = take reference, re-commit cached state. All-off at unload
+  must be an explicit atomic commit (or the driver's legacy disable path).
+  (Reported to `DispPower`.)
+- **Legacy `page_flip` hook is not redirected** to the atomic helper (signature
+  mismatch, see §5.12).
+- **No fbdev emulation on KMS** and no fb0 coexistence changes (M3).
+- Runtime behaviour, boot on the phone, and actual atomic userspace
+  (`modetest`/kmscube) are **not tested** — M0 is build-only. M0 acceptance also
+  asked for "boot on the phone with same fb0/UI"; with no driver setting
+  `DRIVER_ATOMIC` and only additive core code plus a changed lock_all (which now
+  takes a few extra locks), the expectation is no behavioural change, but that is
+  an M1/boot-slot check, not verified here.
+
+## 8. Integration seat: apply + build recipe
+
+```sh
+K=/path/to/android_kernel_samsung_universal7580   # pristine copy/worktree
+cd "$K"
+for p in /tmp/j7repo/patches/drm-atomic/000[1-4]-*.patch; do
+    git apply --check -v "$p" || exit 1      # each is independently applicable
+    git apply "$p"
+done
+
+# core DRM subsystem (matches build.sh's production flags: KCFLAGS=-Wno-error
+# is required because GCC >= 14 makes the pre-existing exynos header-guard a
+# -Werror=header-guard error even on the unmodified tree):
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error \
+     -j"$(nproc)" drivers/gpu/drm/
+
+# optional: with the GPU stack, Makefile edits are additive; apply the
+# drm-backport and panfrost7580 series first (or rebase the two Makefile
+# hunks) — see §6.3 for the exact combination that was link-verified.
+```
+
+Rollback: none needed for legacy behaviour — the series only adds core code and
+makes `drm_modeset_lock_all()` take the extra per-object modeset locks it now
+owns. With no `DRIVER_ATOMIC` driver, the new ioctls return `-EINVAL` exactly
+like an unknown ioctl before.
