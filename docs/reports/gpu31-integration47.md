@@ -207,6 +207,27 @@ partition.
    race-fix-only acceptance record; int47 supersedes it for behaviour
    (fps + race fix together).
 
+## 5a. Silicon result (int47 flashed, G31_MMLock report e4c4d74 §5.5)
+
+Fresh boot (`#37 19:33:43`), 3 × 300 f @ 256² no-readback:
+**107.2 / 108.0 / 104.7 fps** (2.799 / 2.777 / 2.865 s), ERR/TIMEOUT
+0/0/0, `Shmem` +56/+36/+44 kB per run — flat. WAIT_BO raw UAPI on an
+idle, never-submitted BO: 0-jiffy poll now **rc=0** (was -ETIMEDOUT) and
++100 ms still rc=0, so 6ah's contract holds on silicon. Churn 4×250
+still SIGSEGVs in userspace with a clean kernel log (the separate item).
+
+Verdict: the shim fix is **correct and necessary but not the dominant
+cost** — 101 → 105–108 fps (~5%), not the 45% gap. The poll lie is gone;
+what remains is the ~5.2 ms/frame client system time plus the
+resolution-scaling GPU term. **The ≥150 fps target is not reached by
+04db08d or int47.**
+
+One new datum for the storm ticket: 512² readback ×30 shows **2
+ERR/TIMEOUT** (the int41 silent-0x08 signature, unrelated to the shim);
+×10 (13.1 fps) was clean. That is the long-standing storm, not a
+regression from this image, but it is the first time it reproduces on
+the fixed race path and should be folded into that ticket's record.
+
 ## 6. Script notes
 
 - **5950b7e did not build as committed.** It added 18 lines to
