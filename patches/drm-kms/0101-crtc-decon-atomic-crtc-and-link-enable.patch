@@ -49,15 +49,15 @@ Build (with build-only -ENOSYS stubs for the sibling slices):
   drivers/gpu/drm/ 0 errors, no warnings in this file.
 ---
 
- drivers/gpu/drm/exynos/exynos_drm7580_crtc.c | 538 +++++++++++++++++++++
+ drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c | 538 +++++++++++++++++++++
  1 file changed, 538 insertions(+)
- create mode 100644 drivers/gpu/drm/exynos/exynos_drm7580_crtc.c
+ create mode 100644 drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
 
-diff --git a/drivers/gpu/drm/exynos/exynos_drm7580_crtc.c b/drivers/gpu/drm/exynos/exynos_drm7580_crtc.c
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
 new file mode 100644
 index 0000000..f2bb7bc
 --- /dev/null
-+++ b/drivers/gpu/drm/exynos/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
 @@ -0,0 +1,538 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*

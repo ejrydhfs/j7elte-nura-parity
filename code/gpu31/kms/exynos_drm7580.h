@@ -63,6 +63,13 @@ int exynos7580_crtc_init(struct exynos7580_device *ex);
  * the DECON pm_runtime reference (DsiPanel/DispPower contracts). */
 int exynos7580_crtc_enable_link(struct exynos7580_device *ex);
 void exynos7580_crtc_disable_link(struct exynos7580_device *ex);
+/* mode_config funcs (KmsAssemble: folded in from 0200's local declarations).
+ * atomic_check validates the whole state; atomic_commit arms the flip and
+ * runs the CRTC/plane tail. Both are implemented by the CRTC slice. */
+int exynos7580_atomic_check(struct drm_device *drm,
+			    struct drm_atomic_state *state);
+int exynos7580_atomic_commit(struct drm_device *drm,
+			     struct drm_atomic_state *state, bool async);
 
 /* ---- DeconPlane --------------------------------------------------------- */
 /* Registers primary + overlay planes bound to the vendor window API. */

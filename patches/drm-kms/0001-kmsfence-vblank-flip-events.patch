@@ -9,15 +9,15 @@ after the (synchronous) DECON commit, deliver it exactly once from the
 vblank IRQ via the 3.10 drm_handle_vblank() path, and complete it
 immediately when the pipe is off or no vblank can be enabled.
 ---
- drivers/gpu/drm/exynos/exynos_drm7580_fence.c | 324 ++++++++++++++++++
+ drivers/gpu/drm/exynos7580/exynos_drm7580_fence.c | 324 ++++++++++++++++++
  1 file changed, 324 insertions(+)
- create mode 100644 drivers/gpu/drm/exynos/exynos_drm7580_fence.c
+ create mode 100644 drivers/gpu/drm/exynos7580/exynos_drm7580_fence.c
 
-diff --git a/drivers/gpu/drm/exynos/exynos_drm7580_fence.c b/drivers/gpu/drm/exynos/exynos_drm7580_fence.c
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_fence.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_fence.c
 new file mode 100644
 index 0000000..3f9c347
 --- /dev/null
-+++ b/drivers/gpu/drm/exynos/exynos_drm7580_fence.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_fence.c
 @@ -0,0 +1,324 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*

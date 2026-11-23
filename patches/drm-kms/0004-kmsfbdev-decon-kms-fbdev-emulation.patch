@@ -28,50 +28,15 @@ cross-slice global is allowed) and is released through a devres action.
 ---
  drivers/gpu/drm/exynos/Kconfig                |  16 ++
  drivers/gpu/drm/exynos/Makefile               |   1 +
- drivers/gpu/drm/exynos/exynos_drm7580_fbdev.c | 248 ++++++++++++++++++
+ drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c | 248 ++++++++++++++++++
  3 files changed, 265 insertions(+)
- create mode 100644 drivers/gpu/drm/exynos/exynos_drm7580_fbdev.c
+ create mode 100644 drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
 
-diff --git a/drivers/gpu/drm/exynos/Kconfig b/drivers/gpu/drm/exynos/Kconfig
-index 772c62a..94ede4b 100644
---- a/drivers/gpu/drm/exynos/Kconfig
-+++ b/drivers/gpu/drm/exynos/Kconfig
-@@ -71,3 +71,19 @@ config DRM_EXYNOS_GSC
- 	depends on DRM_EXYNOS_IPP && ARCH_EXYNOS5
- 	help
- 	  Choose this option if you want to use Exynos GSC for DRM.
-+
-+config DRM_EXYNOS7580_FBDEV
-+	bool "Exynos 7580 DECON KMS framebuffer emulation (/dev/fb0)"
-+	depends on DRM_EXYNOS7580
-+	select DRM_KMS_CMA_HELPER
-+	default y
-+	help
-+	  Register /dev/fb0 on top of the DECON KMS device (card0) through
-+	  drm_fbdev_cma. fb0 is backed by a CMA buffer sized to the panel mode
-+	  (720x1280, 32 bpp) and is what the X11/nura-shell fallback and the
-+	  framebuffer console use.
-+
-+	  The DECON KMS driver must be the display owner
-+	  (EXYNOS7580_DISPLAY_KMS); with this enabled the vendor DECON fbdev
-+	  driver does not register a second fb0. Say N to expose card0 without
-+	  any fbdev.
-diff --git a/drivers/gpu/drm/exynos/Makefile b/drivers/gpu/drm/exynos/Makefile
-index 639b49e..66b4924 100644
---- a/drivers/gpu/drm/exynos/Makefile
-+++ b/drivers/gpu/drm/exynos/Makefile
-@@ -20,5 +20,6 @@ exynosdrm-$(CONFIG_DRM_EXYNOS_IPP)	+= exynos_drm_ipp.o
- exynosdrm-$(CONFIG_DRM_EXYNOS_FIMC)	+= exynos_drm_fimc.o
- exynosdrm-$(CONFIG_DRM_EXYNOS_ROTATOR)	+= exynos_drm_rotator.o
- exynosdrm-$(CONFIG_DRM_EXYNOS_GSC)	+= exynos_drm_gsc.o
-+exynosdrm-$(CONFIG_DRM_EXYNOS7580_FBDEV) += exynos_drm7580_fbdev.o
- 
- obj-$(CONFIG_DRM_EXYNOS)		+= exynosdrm.o
-diff --git a/drivers/gpu/drm/exynos/exynos_drm7580_fbdev.c b/drivers/gpu/drm/exynos/exynos_drm7580_fbdev.c
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
 new file mode 100644
 index 0000000..eca3827
 --- /dev/null
-+++ b/drivers/gpu/drm/exynos/exynos_drm7580_fbdev.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
 @@ -0,0 +1,248 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
