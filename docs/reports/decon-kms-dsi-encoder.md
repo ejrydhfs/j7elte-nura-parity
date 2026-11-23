@@ -107,7 +107,7 @@ Sources: `ea8061_wxga` panel node (`…rev00.dts:1048-1061`) as parsed by
 | flags | 0 | video-mode DSI is defined by porches; DSIM does not carry sync polarity |
 | `type` | `DRIVER \| PREFERRED` | fixed panel |
 | `name` | `720x1280` | `drm_mode_set_name()` |
-| `vrefresh` | 60 | `drm_mode_vrefresh()`; the exact rate is 64 500 000/(828·1300) = **59.92 Hz** |
+| `vrefresh` | 60 | `drm_mode_vrefresh()`; the exact rate is 64 500 000/(828·1300) = **59.92 Hz** (the DSI report §1.8 writes 59.93; 59.9222 rounds to 59.92 — no other number differs) |
 | mm size | 68 × 121 | `size` → `display_info` |
 
 The same values are what DSIM programs (`dsim_reg_set_porch()`,
