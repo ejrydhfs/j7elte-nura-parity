@@ -24,18 +24,19 @@ gem.c `+1,1807`, gem.h `+294`, ioctl.c `+401`, submit.c `+2258`
 unchanged.
 
 
-> **STATUS (superseded, do not flash from this report's §4 as-is).** While
-> this build ran, G31_FpsSplit landed uncommitted changes to
-> `patches/drm-backport/0001-dma-fence-minimal-subset.patch` (mtime
-> 19:07:56) and `0002-dma-resv-shim.patch` (mtime 19:12:34); the scratch
-> tree was created at 19:06:51 and the shims are applied seconds later,
-> so the Image below was built from the **pre-change shims**. It carries
-> G31_MMLock's owner-manager fix (04db08d) and its 30/30 gates are valid
-> for that commit, but it does **not** contain the fpssplit/dma-fence
-> change. Per Main's rule, no build starts from a dirty tree: the rebuild
-> (int46 again, or int47 if the race fix is accepted separately) happens
-> only after G31_FpsSplit commits the shims. The §4 sha256 values stay
-> here as the record of the 04db08d race-fix build.
+> **STATUS — provenance, accepted as the race-fix image; fps data on it is void.**
+> This Image was built from a clean tree at build start: driver 04db08d
+> plus the shim patches **as committed at that moment**. While the build
+> ran, G31_FpsSplit edited `patches/drm-backport/0001-dma-fence-minimal-subset.patch`
+> (mtime 19:07:56) and `0002-dma-resv-shim.patch` (19:12:34), i.e. after
+> the scratch tree (19:06:51) had applied the shims. The artifacts below
+> are therefore a faithful build of `04db08d` + the then-committed
+> shims, and contain **none** of the fps/flush change; they are not
+> superseded as a race-fix build, but they must not be used to measure
+> 300-frame fps (that needs the fpssplit shim, which lands as int47 with
+> a fresh 3x300 per G31_MMLock). No build is started from a dirty tree
+> (Main's rule), so this report is not rebuilt while patches/ is
+> modified.
 
 ## 0. TL;DR
 
