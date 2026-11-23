@@ -191,6 +191,12 @@ partition.
    (int41 154–160; int45 101.5; int46prof measured the 4.9 ms/frame
    WAIT_BO cost). Expect `ERR=0`, `TIMEOUT=0`, `EVRING=0` and
    `Shmem:` flat across the 3 runs (int46prof grew +235 MB/run).
+0. **Arm the capture on any repro run**: `echo 1 >
+   /sys/kernel/debug/p7580/ev_arm` before boot-window/contended
+   300-frame runs and before any readback run that might hit the silent
+   0x08. A submit error after recovery then lands next to the
+   EVRING/PAGEDUMP of the fault that caused it (Main's rule; costs
+   nothing when no fault occurs).
 2. **WAIT_BO semantics**: raw UAPI probe on a fresh BO — a 0-jiffy poll
    of an idle BO must return success (rc=0); after submitting and
    without waiting, a 0-jiffy poll of a pending BO must return
