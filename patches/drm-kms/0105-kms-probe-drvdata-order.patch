@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsDrvdata <kmsdrvdata@local>
+Date: Mon, 23 Nov 2026 15:55:00 
+Subject: [PATCH 0105] gpu31-kms: publish drvdata only after decon_kms_get (int62)
+
+int60/int61 came up headless because the KMS probe installed its own
+platform drvdata before calling the shim:
+
+    ex->dev = dev;
+    platform_set_drvdata(pdev, ex);     <-- struct exynos7580_device
+    ...
+    ex->decon = decon_kms_get(dev);     <-- reads platform_get_drvdata()
+                                            and expects struct decon_device
+
+decon_kms_get() then read a bogus decon->kms_owned out of our struct and
+returned -EBUSY ("DECON already owned by the fbdev driver").  The vendor
+probe was not involved: int61's vmlinux disassembly is exactly
+
+    decon_probe:
+        mov w0, #0xffffffed          // -ENODEV
+        ret
+
+and .config/autoconf had CONFIG_EXYNOS7580_DISPLAY_KMS=y, so 0103's guard was
+active and the vendor never took the device.
+
+Fix: call decon_kms_get() while the platform drvdata is still NULL (or the
+vendor decon_device, as the shim expects), and install struct
+exynos7580_device only after the handle is obtained, before
+drm_platform_init() (->load() needs it).  On a failed hand-off the error path
+still clears the drvdata, so a retry starts from NULL.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+@@ -458,7 +458,6 @@
+ 		return -ENOMEM;
+ 
+ 	ex->dev = dev;
+-	platform_set_drvdata(pdev, ex);
+ 
+ 	dev_info(dev, "exynos7580: probe entry (DECON node %s), binding card0\n",
+ 		 of_node_full_name(dev->of_node));
+@@ -486,6 +485,15 @@
+ 	caps = decon_kms_caps(ex->decon);
+ 	dev_info(dev, "exynos7580: probe: decon_kms_get ok (%u windows, default %u)\n",
+ 		 caps ? caps->max_win : 0, caps ? caps->default_win : 0);
++	/*
++	 * Publish our own drvdata only now.  decon_kms_get() reads
++	 * platform_get_drvdata() and expects the vendor decon_device (or
++	 * NULL): installing struct exynos7580_device before the call made it
++	 * read a bogus kms_owned and reject the hand-off with -EBUSY
++	 * ("DECON already owned by the fbdev driver").
++	 */
++	platform_set_drvdata(pdev, ex);
++	dev_info(dev, "exynos7580: probe: decon ok, drvdata published\n");
+ 
+ 	dev_info(dev, "exynos7580: probe: calling drm_platform_init()\n");
+ 	ret = drm_platform_init(&exynos7580_drm_driver, pdev);

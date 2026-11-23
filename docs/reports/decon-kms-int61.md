@@ -1,5 +1,10 @@
 # int61: KMS binds at `late_initcall_sync`, defers on missing DSIM, logs every step
 
+> **Superseded by int62** (`docs/reports/decon-kms-int62.md`): the
+> `-EBUSY` this image reported came from the probe publishing its own
+> `platform drvdata` before `decon_kms_get()`, not from the vendor probe;
+> `0105` moves the publication after the hand-off.
+
 int60 booted headless: the vendor DECON refused correctly (`-ENODEV`), but the
 KMS probe ran at the plain `late_initcall` level and produced no `card0`; the
 early log was gone.  int61 keeps int60's shape and changes three things, all in
