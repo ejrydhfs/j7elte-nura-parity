@@ -78,7 +78,11 @@ DRM-order; the two must not be equated by name.
 
 `decon_get_memory_plane_cnt()` (`decon_core.c:1369-1409`) returns -1 for
 anything outside this set, and `wincon()` (`:175-208`) has no `WINCON` encoding
-for other RGB depths, so nothing else is advertised.
+for other RGB depths, so nothing else is advertised.  The register layer adds
+no further filtering: `decon_reg_set_regs_data()` writes `regs->wincon`
+unchanged into `WINCON(win_idx)` (`decon_reg_7580.c:529-566`), so the format is
+entirely decided by the `WINCON_BPPMODE_*` values in `regs-decon.h:76-91`
+(`NV21` = `0x18 << 2`, `NV12` = `0x19 << 2`, `RGB565` = `0x8 << 2`).
 
 **YUV420 plumbing status (integration note).**  `NV12`/`NV21` are
 semi-planar in the vendor engine: `decon_get_memory_plane_cnt()` returns 1 and
