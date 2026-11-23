@@ -1,47 +1,44 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: KmsModule <kmsmodule@local>
 Date: Mon, 23 Nov 2026 12:10:00 
-Subject: [PATCH 0102] gpu31-kms: build the KMS driver as a loadable module (int53)
+Subject: [PATCH 0102] gpu31-kms: loadable module plumbing + unbind-safe vendor remove
 
-int53 keeps the source series unchanged and adds the module plumbing so the
-KMS driver can be loaded by hand on a running device instead of replacing the
-vendor display stack at boot:
+int53/int59 keep the source series unchanged and add the module plumbing so
+the KMS driver can be loaded by hand on a running device instead of replacing
+the vendor display stack at boot:
 
   - DRM_EXYNOS7580 becomes tristate.  The KMS choice still gates it and the
-    vendor DECON fbdev stack stays built in (EXYNOS_DECON_EXYNOS7580=y), so
-    /dev/fb0 always exists; a failed load is reversible with rmmod or a
-    reboot.
-  - The shipping config has CONFIG_MODULES unset, so the module build
-    enables CONFIG_MODULES=y + CONFIG_MODULE_UNLOAD=y (the only config delta
-    besides the KMS symbol).  DRM_KMS_HELPER is selected by our symbol and
-    is a promptless tristate, so it resolves to =m as well: the loadable set
-    is exactly drm_kms_helper.ko + exynos-drm7580.ko, load order
-    drm_kms_helper first.  Everything else the driver uses (DRM core, the
-    vendor decon stack, IOVMM) stays built in.
-  - Built as a module the driver registers with module_init/module_exit; the
-    built-in late_initcall path is untouched, so int52 and a shipping
-    built-in KMS image are unchanged.
-  - The module is never auto-loaded: no MODULE_ALIAS/softdep, no
-    modules.alias on the device, device tree untouched.  The test unbinds
-    the vendor driver and insmods the .ko:
-      echo 14830000.decon_fb > /sys/bus/platform/drivers/decon/unbind
-      insmod drm_kms_helper.ko
-      insmod exynos-drm7580.ko
-  - vendor decon_remove() now clears the platform drvdata, the exported
-    decon_int_drvdata and unregisters the V4L2 subdev before freeing the
-    decon_device: the stock remove leaves all three dangling, so an unbind
-    followed by the module probe would read freed memory.
-  - exports: the only imports modpost cannot resolve from the built-in tree
-    are iovmm_map()/iovmm_unmap() (drivers/iommu/exynos-iovmm-v6.c); they
-    are EXPORT_SYMBOL_GPL now.  decon_kms_* are already exported by
-    0100-decon-export-shim.patch.  The full import list is recorded in
-    docs/reports/decon-kms-module.md.
+    vendor DECON fbdev stack stays built in, so /dev/fb0 always exists and a
+    failed load is reversible with rmmod or a reboot.
+  - Module build: CONFIG_MODULES=y + CONFIG_MODULE_UNLOAD=y (the shipping
+    config had modules off), module_init/module_exit instead of the built-in
+    late_initcall (int58 proved the vendor late_initcall_sync move bootloops,
+    so int59 keeps the vendor DECON at the stock late_initcall).  The
+    built-in path is untouched.
+  - Loadable set: DRM_KMS_HELPER is a promptless tristate selected by our
+    symbol, so it resolves to =m; the two objects are drm_kms_helper.ko and
+    exynos-drm7580.ko (helper first).  Everything else the driver uses (DRM
+    core, vendor decon stack, IOVMM) stays built in.  Never auto-loaded: no
+    MODULE_ALIAS/softdep, no modules.alias on the device, DT untouched.
+  - Vendor unbind is now safe and the device is re-bindable:
+      * decon_remove() mirrors the probe unwind: pipe disabled (state != OFF),
+        update/psr/vsync threads stopped, lpd workqueue destroyed, ion client
+        destroyed, framebuffers released, media entity unregistered, and the
+        platform drvdata + exported decon_int_drvdata cleared;
+      * decon and decon->pdata are devm allocations, so the stock kfree() of
+        both is gone from ->remove and from the probe fail_kfree label (the
+        stock code double-freed them on unbind or probe failure, which the
+        KMS module probe would hit: it calls decon_probe_common()).  Devres
+        releases them (and the devm IRQs) after ->remove returns, i.e. IRQs
+        before the structs.
+      This is what makes `unbind' -> insmod -> rmmod -> rebound work.
+  - Exports: the only imports modpost cannot resolve from the built-in tree
+    were iovmm_map()/iovmm_unmap() (drivers/iommu/exynos-iovmm-v6.c); they are
+    EXPORT_SYMBOL_GPL now.  decon_kms_* are already exported by 0100.  The
+    full import list is in docs/reports/decon-kms-module.md.
 
-No device tree hunks.  rmmod runs the same unload path as the built-in
-remove (drm_put_dev -> fbdev + drm cleanup -> decon_kms_put) as long as no
-DRM client holds card0 open; the module cannot be unloaded while it is
-bound, and after rmmod the DECON device is free for the vendor driver again
-(a manual bind, or reboot).
+No device tree hunks.  rmmod runs the unload path (drm_put_dev -> fbdev +
+drm cleanup -> decon_kms_put) as long as no DRM client holds card0 open.
 
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: KmsModule <kmsmodule@local>
@@ -139,26 +136,101 @@ DRM client holds card0 open.
  MODULE_DESCRIPTION(DRIVER_DESC);
 --- a/drivers/video/exynos/decon_7580/decon_core.c
 +++ b/drivers/video/exynos/decon_7580/decon_core.c
-@@ -5143,6 +5143,19 @@
+@@ -4692,7 +4692,7 @@
+ 						GFP_KERNEL);
+ 	if (!decon->pdata) {
+ 		decon_err("no memory for DECON platdata\n");
+-		kfree(decon);
++		/* decon is a devm allocation: devres frees it. */
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -5103,9 +5103,12 @@
+ 	mutex_destroy(&decon->vsync_info.irq_lock);
+ 
+ fail_kfree:
+-	kfree(decon->pdata);
+-	kfree(decon);
+-
++	/*
++	 * decon and decon->pdata are devm allocations (probe_common): the
++	 * driver core frees them after a failed probe/bind, so they must not
++	 * be freed here as well (the stock code double-freed on probe failure,
++	 * which matters because the KMS module probe calls this body).
++	 */
+ 	decon_err("decon probe fail");
+ 	return ret;
+ }
+@@ -5121,15 +5124,28 @@
+ 	struct decon_device *decon = platform_get_drvdata(pdev);
+ 	int i;
+ 
++	if (!decon)
++		return 0;
++
++	/*
++	 * int53: the vendor driver never supported unbind.  The stock remove
++	 * only stopped the update thread, released the framebuffers and
++	 * kfree()d the devm-allocated decon_device (double free when the
++	 * driver core releases devres after ->remove), and it left the
++	 * psr/vsync threads, the lpd workqueue, the ion client and the V4L2
++	 * subdev alive against freed memory.  Unbind is a supported operation
++	 * for the module test, so mirror the probe unwind (fail_* labels) and
++	 * decon_kms_teardown(); decon and decon->pdata stay devm allocations
++	 * and are released by the driver core after this returns.
++	 */
++	if (decon->state != DECON_STATE_OFF)
++		decon_disable(decon);
++
+ 	pm_runtime_disable(dev);
+ 	decon_put_clocks(decon);
++	iovmm_deactivate(dev);
+ 
+-	iovmm_deactivate(dev);
+-	/*
+-	 * fb0 may not exist: it is only registered when the vendor probe owned
+-	 * the pipe (KMS mode attaches without a framebuffer, and the
+-	 * coexistence hand-off unregisters it).
+-	 */
++	/* fb0 may not exist (KMS stand-up never registered one). */
+ 	if (decon->fb_registered) {
+ 		unregister_framebuffer(
+ 			decon->windows[decon->pdata->default_win]->fbinfo);
+@@ -5139,11 +5155,33 @@
+ 	if (decon->update_regs_thread)
+ 		kthread_stop(decon->update_regs_thread);
+ 
++	decon_int_destroy_psr_thread(decon);
++
++	if (decon->vsync_info.thread)
++		kthread_stop(decon->vsync_info.thread);
++	decon_int_destroy_vsync_thread(decon);
++
++	if (decon->ion_client) {
++		ion_client_destroy(decon->ion_client);
++		decon->ion_client = NULL;
++	}
++
++	if (decon->lpd_wq) {
++		destroy_workqueue(decon->lpd_wq);
++		decon->lpd_wq = NULL;
++	}
++
+ 	for (i = 0; i < decon->pdata->max_win; i++)
  		decon_release_windows(decon->windows[i]);
  
  	debugfs_remove_recursive(decon->debug_root);
+-	kfree(decon);
++	decon->debug_root = NULL;
 +
-+	/*
-+	 * int53: leave the device re-bindable.  The stock remove leaves the
-+	 * platform drvdata and the exported decon_int_drvdata pointing at the
-+	 * freed decon_device and the V4L2 subdev registered, so a later probe
-+	 * (the KMS module after `unbind', or a rebind of this driver) would
-+	 * see a dangling pointer.  Mirror what decon_kms_teardown() does.
-+	 */
 +	decon_unregister_entity(decon);
++
 +	platform_set_drvdata(pdev, NULL);
 +	if (decon_int_drvdata == decon)
 +		decon_int_drvdata = NULL;
-+
- 	kfree(decon);
  
  	decon_info("remove sucessful\n");
+ 	return 0;
 --- a/drivers/iommu/exynos-iovmm-v6.c
 +++ b/drivers/iommu/exynos-iovmm-v6.c
 @@ -13,6 +13,7 @@
