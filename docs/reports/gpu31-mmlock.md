@@ -249,6 +249,26 @@ a candidate.
   the next step is instrumentation of the client's 5.2 ms sys/frame
   (§6.2), not more teardown micro-optimization.
 
+### 5.4 The leading fps hypothesis is BO re-fetch, not teardown (G31_FpsSplit / int46 input)
+
+The fpssplit slice reports that the 0002 dma-resv shim's
+`dfence_wait_timeout()` returns `timeout` (0) for an already-signaled
+fence, i.e. a 0-jiffy poll on an idle BO. Driver 98640d5 maps a 0-jiffy
+return to `-ETIMEDOUT` (gpu31-storm58: “Mesa's BO-cache poll was always
+told ready”). If the shim returns 0 for a signaled fence, that mapping
+makes **every** Mesa BO-cache poll report "busy", so Mesa never re-fetches
+a cached BO and allocates a fresh one every frame. That matches the
+measurements above exactly: ~3 fresh CREATE_BO per frame, `Shmem`
++1.3 MB/frame while the client runs, `pgfree` +437 pages/frame, and
+5.2 ms/frame of client sys time — the allocation half
+(`p7580_shmem_alloc`: 288 × page-alloc + `clear_highpage` +
+`__flush_dcache_area`, then offset + IOVA alloc), not the free half
+(0.57 ms/frame, measured). The 32² (161 fps, small BOs) vs 256²
+(101 fps, 1.15 MB/frame) scaling is consistent with per-byte allocation
+cost. This is a hypothesis until the shim fix is measured; it does not
+change §5.1–§5.3, and it makes the teardown micro-optimisations even
+less relevant.
+
 ## 6. Open items
 
 1. **Churn SIGSEGV on the fixed image** (the only blocker for the
@@ -271,8 +291,12 @@ a candidate.
    records 154–160 fps for plain runs).
 3. **fps acceptance (≥150 at 256²) is not reached** by this change:
    clean runs are 94–103 fps, `serialize_fs=1` 112. The teardown is not
-   the cause (§5); the gap must be closed from the client-side sys time
-   and the GPU/pixel term, or the 155 basis must be re-derived.
+   the cause (§5); per §5.4 the likely cause is the 0002 shim's
+   0-jiffy signaled-fence return making Mesa re-fetch BOs every frame
+   (fix owned by G31_FpsSplit; uncommitted shim edits were in the tree
+   during the int46 build, so int46's fps datum must not be quoted
+   until a rebuild). If §5.4 holds, the 155 basis is a BO-reuse frame
+   and the acceptance target is reachable without any driver change.
 
 ## 7. Device state
 
