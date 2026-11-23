@@ -4,7 +4,7 @@ Status: **complete for M0 (build-only)**. Atomic core present, compiles and link
 with the tree's config and toolchain; **no in-tree driver uses it yet** (that is
 M1). Device boot was not part of this seat.
 
-Patch series: `patches/drm-atomic/` (4 patches, apply in order).
+Patch series: `patches/drm-atomic/` (5 patches, apply in order).
 Build tree used for verification: hardlink clone of the pristine tree with only
 these patches applied (`km0-pristine`), never the shared tree.
 
@@ -68,8 +68,9 @@ Facts checked in the pristine tree:
 | 2 | `0002-drm-add-atomic-core-modeset-locking-and-split-plane-.patch` | new `drm_rect.c`, `drm_modeset_lock.c`, `drm_atomic.c`, `drm_plane.c`, `drm_framebuffer.c`, `drm_crtc_internal.h`; modified `drm_crtc.c` | `1f146398671ad5f5613365b109307b439aa7551bf5ecbd03c0945a5cefb6cb4c` |
 | 3 | `0003-drm-add-atomic-and-plane-helpers-wire-build.patch` | new `drm_atomic_helper.c`, `drm_plane_helper.c`; `Makefile` | `d5c1bed323ef656cf6bec03f326e9c2673d1336bc620f753c60029c126b70b0f` |
 | 4 | `0004-drm-wire-DRM_IOCTL_MODE_ATOMIC-and-DRM_CLIENT_CAP_AT.patch` | `drm_ioctl.c`, `drm_drv.c` | `1b6851f992b4b3ad49a2e48503d1e08edf2707f821b08f974d542f4d70f31796` |
+| 5 | `0005-drm-add-4-argument-atomic_set_property-helper-hooks.patch` | `drm_atomic_helper.h`, `drm_atomic_helper.c` | `31e1a141567fd54417dc541eae603c629f72209a59c301fea11b734d6aa4bfb0` |
 
-Lines: 1457 + 3784 + 2812 + 76 = 8129.
+Lines: 1457 + 3784 + 2812 + 76 + 153 = 8282.
 
 Apply order matters only in that the patches share no files, so each one
 `git apply --check`s clean against a pristine tree (verified individually and as
@@ -86,7 +87,7 @@ hand-written.
 | `include/drm/drm_modeset_lock.h`, `drivers/gpu/drm/drm_modeset_lock.c` | `drm_modeset_acquire_init`, `_fini`, `drm_modeset_drop_locks`, `drm_modeset_backoff`, `_interruptible`, `drm_modeset_lock`, `_interruptible`, `drm_modeset_unlock`, `drm_modeset_lock_all_crtcs`, `drm_modeset_lock_crtc`, `drm_modeset_unlock_crtc`, `drm_modeset_legacy_acquire_ctx` | 3.19 `drm_modeset_lock.c`, with `ww_mutex` replaced by plain mutex (see §5) |
 | | `modeset_lock_is_held` | new: replaces `ww_mutex`'s `-EALREADY` handling |
 | `include/drm/drm_atomic.h`, `drivers/gpu/drm/drm_atomic.c` | `drm_atomic_state_alloc/clear/free`, `drm_atomic_get_{crtc,plane,connector}_state`, `drm_atomic_{crtc,plane,connector}_set_property`, `{crtc,plane,connector}_get_property`, `drm_atomic_set_crtc_for_plane`, `drm_atomic_set_fb_for_plane`, `drm_atomic_set_crtc_for_connector`, `drm_atomic_add_affected_connectors`, `drm_atomic_connectors_for_crtc`, `drm_atomic_legacy_backoff`, `drm_atomic_check_only`, `drm_atomic_commit`, `drm_atomic_async_commit`, `drm_mode_atomic_ioctl`, `create_vblank_event`, `destroy_vblank_event`, `atomic_set_prop`, static `kfree_state`, `drm_atomic_{crtc,plane}_check` | 4.0 `drivers/gpu/drm/drm_atomic.c` (3.19 subset included) |
-| `include/drm/drm_atomic_helper.h`, `drivers/gpu/drm/drm_atomic_helper.c` | `drm_atomic_helper_check`, `_check_modeset`, `_check_planes`, `_commit`, `_commit_pre_planes`, `_commit_post_planes`, `_wait_for_vblanks`, `_prepare_planes`, `_commit_planes`, `_cleanup_planes`, `_swap_state`, `_update_plane`, `_disable_plane`, `_set_config`, `_crtc_set_property`, `_plane_set_property`, `_connector_set_property`, `_page_flip`, `_connector_dpms`, `_crtc_reset`, `_crtc_duplicate_state`, `_crtc_destroy_state`, `_plane_reset`, `_plane_duplicate_state`, `_plane_destroy_state`, `_connector_reset`, `_connector_duplicate_state`, `_connector_destroy_state`; static `drm_atomic_helper_plane_changed`, `get_current_crtc_for_encoder`, `steal_encoder`, `update_connector_routing`, `mode_fixup`, `needs_modeset`, `disable_outputs`, `set_routing_links`, `crtc_set_mode`, `framebuffer_changed`, `update_output_state` | 4.0 `drivers/gpu/drm/drm_atomic_helper.c` |
+| `include/drm/drm_atomic_helper.h`, `drivers/gpu/drm/drm_atomic_helper.c` | `drm_atomic_helper_check`, `_check_modeset`, `_check_planes`, `_commit`, `_commit_pre_planes`, `_commit_post_planes`, `_wait_for_vblanks`, `_prepare_planes`, `_commit_planes`, `_cleanup_planes`, `_swap_state`, `_update_plane`, `_disable_plane`, `_set_config`, `_crtc_set_property`, `_plane_set_property`, `_connector_set_property`, `_crtc_atomic_set_property`, `_plane_atomic_set_property`, `_connector_atomic_set_property`, `_page_flip`, `_connector_dpms`, `_crtc_reset`, `_crtc_duplicate_state`, `_crtc_destroy_state`, `_plane_reset`, `_plane_duplicate_state`, `_plane_destroy_state`, `_connector_reset`, `_connector_duplicate_state`, `_connector_destroy_state`; static `drm_atomic_helper_plane_changed`, `get_current_crtc_for_encoder`, `steal_encoder`, `update_connector_routing`, `mode_fixup`, `needs_modeset`, `disable_outputs`, `set_routing_links`, `crtc_set_mode`, `framebuffer_changed`, `update_output_state` | 4.0 `drivers/gpu/drm/drm_atomic_helper.c`; the three `*_atomic_set_property` wrappers are new (no upstream helper fills `->atomic_set_property`; signature is the 4.0 hook `(obj, state, property, val)`) |
 | `include/drm/drm_plane_helper.h`, `drivers/gpu/drm/drm_plane_helper.c` | `drm_plane_helper_check_update`, `drm_primary_helper_update`, `_disable`, `_destroy`, `drm_primary_helper_funcs`, `drm_primary_helper_create_plane`, `drm_plane_helper_commit`, `drm_plane_helper_update`, `_disable`; static `get_connectors_for_crtc`, `safe_modeset_formats` | 4.0 `drivers/gpu/drm/drm_plane_helper.c` (3.15 API + 3.19 atomic bits) |
 | `drivers/gpu/drm/drm_plane.c` | `drm_universal_plane_init`, `drm_plane_init`, `drm_plane_cleanup`, `drm_plane_index` | 4.0 `drm_crtc.c` (`drm_universal_plane_init`/`drm_plane_cleanup`/`drm_plane_index`); `drm_plane_init` body is the 3.10 `drm_crtc.c` version, signature `bool priv` preserved |
 | | static `drm_plane_init_common` | new factoring of the 3.10 `drm_plane_init` body + 4.0 init sequence |
@@ -148,22 +149,34 @@ hand-written.
     ioctls on 3.10.
 11. **`drm_modeset_is_locked(dev)`** (dead 3.10 helper) removed; the upstream
     per-lock `drm_modeset_is_locked(lock)` is provided instead.
-12. **Legacy page-flip vfunc**: `drm_crtc_funcs.page_flip` keeps the 3.10
+12. **Property hooks**: the 3-argument
+    `drm_atomic_helper_{crtc,plane,connector}_set_property()` implement the
+    legacy `->set_property` hook with the unchanged 3.19/4.0 signature. The
+    4-argument `->atomic_set_property` hook is filled by the new
+    `drm_atomic_helper_{crtc,plane,connector}_atomic_set_property()` wrappers
+    (patch 0005). The hook signature is the 4.0 one,
+    `(obj, state, property, val)` (state second, matching
+    `drm_crtc_funcs`/`drm_plane_funcs`/`drm_connector_funcs` in this tree).
+    The wrappers handle only the generic core properties
+    (ACTIVE; FB_ID/CRTC_ID/CRTC_X/Y/W/H/SRC_X/Y/W/H; CRTC_ID) and return
+    `-EINVAL` for driver-private ones, so installing one never recurses back
+    into the hook. A driver with private properties wraps or replaces it.
+13. **Legacy page-flip vfunc**: `drm_crtc_funcs.page_flip` keeps the 3.10
     3-argument signature, so `drm_atomic_helper_page_flip(crtc, fb, event,
     flags)` is exported but **cannot be assigned directly**; a thin adapter is
     M1 work. `DRM_MODE_PAGE_FLIP_FLAGS` is left unchanged so legacy page flips
     still reject ASYNC.
-13. **No `drm.atomic` module parameter**: `DRM_CLIENT_CAP_ATOMIC` is gated only
+14. **No `drm.atomic` module parameter**: `DRM_CLIENT_CAP_ATOMIC` is gated only
     on `DRIVER_ATOMIC` (+ the per-file cap).
-14. **Properties are gated on `DRIVER_ATOMIC`**: `drm_mode_create_standard_properties()`
+15. **Properties are gated on `DRIVER_ATOMIC`**: `drm_mode_create_standard_properties()`
     returns after EDID/DPMS for non-atomic devices, so legacy userspace sees
     exactly the same property set as before this series (upstream 4.0 creates
     them unconditionally). They are attached to CRTC/connector/plane only for
     atomic devices. Rotation property/state dropped (not needed for M0/M1;
     `drm_rect` rotation math kept, with the `DRM_ROTATE_*` constants).
-15. **DSI ids** added to the 3.10 UAPI with upstream values, plus the
+16. **DSI ids** added to the 3.10 UAPI with upstream values, plus the
     corresponding enum-name table entries.
-16. **Null-helper guards**: `prepare_planes`/`cleanup_planes` tolerate a plane
+17. **Null-helper guards**: `prepare_planes`/`cleanup_planes` tolerate a plane
     without `drm_plane_helper_funcs`; `drm_atomic_helper_commit_planes` keeps
     upstream's `funcs` check.
 
@@ -179,8 +192,9 @@ no patch applied:
 0002-...patch: CHECK-OK
 0003-...patch: CHECK-OK
 0004-...patch: CHECK-OK
+0005-...patch: CHECK-OK
 ```
-then `git apply` 1→4: all applied, no fuzz, no rejects. `git apply --check` was
+then `git apply` 1→5: all applied, no fuzz, no rejects. `git apply --check` was
 run on each patch against the pristine tree (the patches share no files, so each
 is independently applicable).
 
@@ -201,6 +215,10 @@ make -C <km0-pristine> ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
   `%x`/`dma_addr_t`, `exynos_drm_g2d.c:1156,1174` int-to-pointer,
   `exynos_drm_gem.c:211,476,483` pointer/int casts.
 - **Zero warnings in every file added or touched by this series.**
+- Patch 0005 rebuilds `drm_atomic_helper.o` with zero warnings; a
+  compile-time test assigns the three `*_atomic_set_property` wrappers to the
+  corresponding `funcs->atomic_set_property` and the 3-argument connector
+  helper to `->set_property` (0 errors, 0 warnings).
 - Without `KCFLAGS=-Wno-error` the tree fails only on the pre-existing
   `-Werror=header-guard` in `exynos_drm_fb.h` (GCC 16 default). This is why
   `build.sh` sets `KCFLAGS="-Wno-error"`; it is not caused by this series (no
@@ -217,7 +235,7 @@ make -C <km0-pristine> ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
 
 ### 6.3 Build with panfrost7580 applied on top
 
-Private clone `km0-panfrost`: series 1–4 + `patches/drm-backport/0001..0005`
+Private clone `km0-panfrost`: series 1–5 + `patches/drm-backport/0001..0005`
 (dma-fence/dma-resv/drm_syncobj/drm_sched shims) +
 `code/gpu31/driver/0001-panfrost7580-driver-sources.patch` +
 `0002-panfrost7580-build-wiring.patch` +
@@ -258,8 +276,34 @@ generation, as the drm-backport README already warns).
   `drm_modeset_acquire_init`, `drm_atomic_get_{crtc,plane,connector}_state`,
   `drm_atomic_set_crtc_for_plane/connector`, `drm_atomic_set_fb_for_plane`,
   `drm_atomic_helper_check`, `drm_atomic_commit`,
-  `drm_primary_helper_create_plane`, `drm_plane_helper_add/update`.
+  `drm_primary_helper_create_plane`, `drm_plane_helper_add/update`, and
+  installs `drm_atomic_helper_{crtc,plane,connector}_atomic_set_property` into
+  the 4-argument `funcs->atomic_set_property` hooks.
   Compile: 0 errors, 0 warnings.
+
+### 6.5 Atomic-check installation contract (for M1)
+
+The core does call the driver check hooks; M1 must install them:
+
+- `drm_atomic_check_only()` (core, patch 0002) calls
+  `dev->mode_config.funcs->atomic_check(dev, state)` for every atomic check and
+  commit. M1 sets `mode_config.funcs.atomic_check = drm_atomic_helper_check`
+  (or a wrapper that adds driver-global checks around it).
+- `drm_atomic_helper_check()` calls `drm_atomic_helper_check_modeset()` and
+  then `drm_atomic_helper_check_planes()`. The first calls
+  `encoder->helper_private->atomic_check` (via `mode_fixup()`) and adds
+  affected connectors; the second calls
+  `crtc->helper_private->atomic_check` and
+  `plane->helper_private->atomic_check`.
+- So M1 installs: `drm_crtc_helper_funcs.atomic_check`,
+  `drm_plane_helper_funcs.atomic_check`, optional
+  `drm_encoder_helper_funcs.atomic_check`, plus the state hooks
+  (`atomic_duplicate_state`/`atomic_destroy_state`/`reset`) and, optionally,
+  the 4-argument property hooks from patch 0005. `->atomic_begin/update/flush`
+  are invoked by `drm_atomic_helper_commit_planes()` unless the driver
+  implements `mode_config.funcs.atomic_commit` itself.
+- Without a `mode_config.funcs.atomic_check`, `drm_atomic_check_only()` skips
+  the driver check and commits unchecked state; M1 must not rely on that.
 
 ## 7. What is NOT yet wired
 
@@ -295,7 +339,7 @@ generation, as the drm-backport README already warns).
 ```sh
 K=/path/to/android_kernel_samsung_universal7580   # pristine copy/worktree
 cd "$K"
-for p in /tmp/j7repo/patches/drm-atomic/000[1-4]-*.patch; do
+for p in /tmp/j7repo/patches/drm-atomic/000[1-5]-*.patch; do
     git apply --check -v "$p" || exit 1      # each is independently applicable
     git apply "$p"
 done

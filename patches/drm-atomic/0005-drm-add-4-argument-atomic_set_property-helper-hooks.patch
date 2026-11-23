@@ -1,0 +1,153 @@
+From 0c47687178088a64ed2953400c2cc1abd261d0b8 Mon Sep 17 00:00:00 2001
+From: m0 <m0@local>
+Date: Mon, 23 Nov 2026 09:32:43 -0500
+Subject: [PATCH] drm: add 4-argument atomic_set_property helper hooks
+
+drm_atomic_helper_{crtc,plane,connector}_set_property() keep their 3.19/4.0
+3-argument signature and implement the legacy ->set_property hook.  The
+->atomic_set_property hook takes 4 arguments (obj, state, property, val) in
+4.0; add *_atomic_set_property() wrappers with that exact signature so a
+driver can install them directly.  They handle only the generic core
+properties (ACTIVE; FB_ID/CRTC_ID/CRTC_X/Y/W/H/SRC_X/Y/W/H; CRTC_ID) and
+return -EINVAL for driver-private properties, which avoids recursing back
+into the hook for unknown properties.
+---
+ drivers/gpu/drm/drm_atomic_helper.c | 99 +++++++++++++++++++++++++++++
+ include/drm/drm_atomic_helper.h     | 14 ++++
+ 2 files changed, 113 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+index 59657ea..dcc7bea 100644
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -1821,6 +1821,105 @@ backoff:
+ }
+ EXPORT_SYMBOL(drm_atomic_helper_connector_set_property);
+ 
++/**
++ * drm_atomic_helper_crtc_atomic_set_property - 4-arg CRTC property hook
++ * @crtc: DRM crtc
++ * @state: the incoming atomic state for @crtc
++ * @property: DRM property
++ * @val: value of property
++ *
++ * 3.10 adaptation: this is the implementation for the 4-argument
++ * &drm_crtc_funcs.atomic_set_property hook (4.0 signature
++ * `(crtc, state, property, val)`), which the 3-argument
++ * drm_atomic_helper_crtc_set_property() legacy hook cannot fill.
++ *
++ * It handles the generic core property (ACTIVE) and returns -EINVAL for
++ * anything else, so a driver can install it directly and still implement its
++ * own private properties by not using this helper (or by wrapping it).
++ *
++ * RETURNS:
++ * Zero on success, error code on failure.
++ */
++int drm_atomic_helper_crtc_atomic_set_property(struct drm_crtc *crtc,
++					struct drm_crtc_state *state,
++					struct drm_property *property,
++					uint64_t val)
++{
++	struct drm_mode_config *config = &crtc->dev->mode_config;
++
++	if (property == config->prop_active)
++		return drm_atomic_crtc_set_property(crtc, state, property, val);
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL(drm_atomic_helper_crtc_atomic_set_property);
++
++/**
++ * drm_atomic_helper_plane_atomic_set_property - 4-arg plane property hook
++ * @plane: DRM plane
++ * @state: the incoming atomic state for @plane
++ * @property: DRM property
++ * @val: value of property
++ *
++ * Plane counterpart of drm_atomic_helper_crtc_atomic_set_property(); handles
++ * the generic FB_ID, CRTC_ID, CRTC_X/Y/W/H and SRC_X/Y/W/H properties and
++ * returns -EINVAL for driver-private ones.
++ *
++ * RETURNS:
++ * Zero on success, error code on failure.
++ */
++int drm_atomic_helper_plane_atomic_set_property(struct drm_plane *plane,
++					struct drm_plane_state *state,
++					struct drm_property *property,
++					uint64_t val)
++{
++	struct drm_mode_config *config = &plane->dev->mode_config;
++
++	if (property == config->prop_fb_id ||
++	    property == config->prop_crtc_id ||
++	    property == config->prop_crtc_x ||
++	    property == config->prop_crtc_y ||
++	    property == config->prop_crtc_w ||
++	    property == config->prop_crtc_h ||
++	    property == config->prop_src_x ||
++	    property == config->prop_src_y ||
++	    property == config->prop_src_w ||
++	    property == config->prop_src_h)
++		return drm_atomic_plane_set_property(plane, state, property, val);
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL(drm_atomic_helper_plane_atomic_set_property);
++
++/**
++ * drm_atomic_helper_connector_atomic_set_property - 4-arg connector hook
++ * @connector: DRM connector
++ * @state: the incoming atomic state for @connector
++ * @property: DRM property
++ * @val: value of property
++ *
++ * Connector counterpart of drm_atomic_helper_crtc_atomic_set_property();
++ * handles the generic CRTC_ID property and returns -EINVAL for driver-private
++ * ones.
++ *
++ * RETURNS:
++ * Zero on success, error code on failure.
++ */
++int drm_atomic_helper_connector_atomic_set_property(struct drm_connector *connector,
++					struct drm_connector_state *state,
++					struct drm_property *property,
++					uint64_t val)
++{
++	struct drm_mode_config *config = &connector->dev->mode_config;
++
++	if (property == config->prop_crtc_id)
++		return drm_atomic_connector_set_property(connector, state,
++							 property, val);
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL(drm_atomic_helper_connector_atomic_set_property);
++
+ /**
+  * drm_atomic_helper_page_flip - execute a legacy page flip
+  * @crtc: DRM crtc
+diff --git a/include/drm/drm_atomic_helper.h b/include/drm/drm_atomic_helper.h
+index 8039d54..68ef50b 100644
+--- a/include/drm/drm_atomic_helper.h
++++ b/include/drm/drm_atomic_helper.h
+@@ -78,6 +78,20 @@ int drm_atomic_helper_plane_set_property(struct drm_plane *plane,
+ int drm_atomic_helper_connector_set_property(struct drm_connector *connector,
+ 					struct drm_property *property,
+ 					uint64_t val);
++
++/* implementations for the 4-argument ->atomic_set_property hooks */
++int drm_atomic_helper_crtc_atomic_set_property(struct drm_crtc *crtc,
++					struct drm_crtc_state *state,
++					struct drm_property *property,
++					uint64_t val);
++int drm_atomic_helper_plane_atomic_set_property(struct drm_plane *plane,
++					struct drm_plane_state *state,
++					struct drm_property *property,
++					uint64_t val);
++int drm_atomic_helper_connector_atomic_set_property(struct drm_connector *connector,
++					struct drm_connector_state *state,
++					struct drm_property *property,
++					uint64_t val);
+ int drm_atomic_helper_page_flip(struct drm_crtc *crtc,
+ 				struct drm_framebuffer *fb,
+ 				struct drm_pending_vblank_event *event,
