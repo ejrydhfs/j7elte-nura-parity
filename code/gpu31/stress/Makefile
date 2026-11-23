@@ -20,6 +20,11 @@ LDLIBS = -lrt
 
 SRC = kbase-stress.c $(KBASE_DIR)/kbase.c
 
+# gpu31-fpssplit: CREATE_BO/MMAP_BO/mmap/GEM_CLOSE stress (+ a sequential
+# stale-offset check). Uses the v5.2 UAPI mirror ../gem/panfrost_drm.h and
+# ../client/drm.h. Run on the phone: ./churn 4 250 6
+CHURN_INC = -I../client -I../gem
+
 all: kbase-stress
 
 kbase-stress: $(SRC)
@@ -32,10 +37,18 @@ kbase-stress.aarch64: $(SRC)
 	@command -v aarch64-linux-gnu-strip >/dev/null 2>&1 && \
 		aarch64-linux-gnu-strip $@ || true
 
+churn: churn.c
+	$(CC) $(CFLAGS) $(CHURN_INC) -pthread -o $@ churn.c
+
+churn.aarch64: churn.c
+	$(AARCH64_CC) $(CFLAGS) $(CHURN_INC) -pthread -o $@ churn.c -static
+	@command -v aarch64-linux-gnu-strip >/dev/null 2>&1 && \
+		aarch64-linux-gnu-strip $@ || true
+
 check: kbase-stress
 	./kbase-stress --print-abi
 
 clean:
-	rm -f kbase-stress kbase-stress.aarch64
+	rm -f kbase-stress kbase-stress.aarch64 churn churn.aarch64
 
-.PHONY: all cross check clean
+.PHONY: all cross check clean churn churn.aarch64
