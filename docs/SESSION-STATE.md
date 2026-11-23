@@ -371,3 +371,21 @@ Full evidence: `docs/reports/gps-bringup.md`, tool
   but yields no `e0` banner, so the post-patch jump is the open step.
   Tools: `j7elte-gpsd --esw DIR [--glme]`, `gpsesw`; evidence in
   `docs/reports/gps-esw-upload.md`.
+
+## GPU stable at 155 fps; leak, race, and fps regression fixed (2026-11-22, int47/int48)
+Kernel **int48** (Image 911e7bf1..., boot 70345435...; driver 0001 04db08d, overlay 952ff750...).
+- BO/shmem leak: `bo_list` held a strong GEM ref whose only drop lived in `gem_free_object`,
+  so every submitted BO pinned its shmem inode for ever (~1.16 MB/frame). Entry is now weak,
+  resurrection only via `kref_get_unless_zero` under `bo_lock`; Shmem flat at 2-3 MB across runs.
+- mmap-offset race: driver-owned offset manager + one leaf lock; `.mmap` no longer calls
+  `drm_gem_mmap`; 1000-iteration churn clean (client bug in the test fixed separately).
+- fps 101 -> 155: the 3.10 `dma_fence_wait_timeout` shim returned the bare budget for a
+  *signaled* fence, so a 0-jiffy poll looked like "budget exhausted" and `WAIT_BO` (correctly)
+  said ETIMEDOUT; Mesa's BO cache never hit (794 WAIT_BO/frame, 4.1 CREATE_BO/frame).
+  After the shim fix: 4.3 WAIT_BO/frame, 1.0 CREATE_BO/frame, client sys 5.4 -> 1.7 ms/frame.
+- Silicon (locked, uncontended): 300 f at 256^2 = 155.7/155.0/157.4/154.4/158.1 fps, 0 ERR/TO;
+  512^2 30-40 f readback clean; 8x512^2x40 readback loop clean.
+- Residual: silent `js_status 0x08` timeout ~1 per 4-6 runs (750 ms + recovery). int48's
+  diagnostic overlay should name it, but `p7580/prof_arm` fails to register
+  (`debugfs_create_dir("p7580")` returns -EEXIST); int49 fixes that. `submit_err` now logs
+  `n=` and is independent of the 8-line sched_trace budget.
