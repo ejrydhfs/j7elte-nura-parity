@@ -344,21 +344,20 @@ written.
    `drivers/gpu/drm/exynos/` warnings listed in `decon-kms-m0.md` §6.2 are
    unchanged, and the run reports no Kconfig error or recursion.
 4. **Integration compile against the real sibling sources** (same fresh tree,
-   after applying `0001-dsi…`, `0001-kmsfence…`, `0001-plane…`,
-   `0004-kmsfbdev…` and copying those four files into
-   `drivers/gpu/drm/exynos7580/`; CRTC still stubbed):
-   `make … -j8 drivers/gpu/drm/` → exit 0, 0 errors,
-   `LD drivers/gpu/drm/exynos7580/exynos-drm7580.o`, and **one** warning, in a
-   sibling file:
-   `exynos_drm7580_dsi.c:300: assignment to 'struct drm_device *' from
-   incompatible pointer type 'struct drm_device **'` — `drm = &ex->drm;` is a
-   leftover from the container_of-era header and must become `drm = ex->drm;`
-   (reported to `DsiEncoder`).
+   with `0001-dsi…`, `0001-kmsfence…`, `0001-plane…`, `0004-kmsfbdev…` applied
+   and those files present in `drivers/gpu/drm/exynos7580/`; CRTC stubbed in
+   the earlier run): `make … -j8 drivers/gpu/drm/` → exit 0, 0 errors,
+   `LD drivers/gpu/drm/exynos7580/exynos-drm7580.o`.
 
-   The same run exposed the assembly mismatch this patch had already flagged:
-   the sibling patches create `drivers/gpu/drm/exynos/exynos_drm7580_*.c` and
-   `0004-kmsfbdev…` wires the fbdev file into `exynosdrm.o` through
-   `CONFIG_DRM_EXYNOS7580_FBDEV`, which then fails with
+   This run found and `DsiEncoder` fixed (`36372ed`) the one contract leftover
+   `exynos_drm7580_dsi.c:300: drm = &ex->drm;` (`struct drm_device **` after
+   `8048d08`); the DSI patch now also creates its file under
+   `drivers/gpu/drm/exynos7580/`.
+
+   It also exposed the assembly mismatch this patch had flagged: the
+   fence/plane/fbdev patches still create their sources in
+   `drivers/gpu/drm/exynos/`, and `0004-kmsfbdev…` wires the fbdev file into
+   `exynosdrm.o` through `CONFIG_DRM_EXYNOS7580_FBDEV`, which then fails with
    `fatal error: exynos_drm7580.h: No such file or directory` (the contract
    header lives in `drivers/gpu/drm/exynos7580/`). With
    `CONFIG_DRM_EXYNOS7580_FBDEV` off (or after re-pathing those files into
@@ -366,6 +365,23 @@ written.
    the build is clean. `KmsAssemble` must pick one directory for the whole
    slice set; this patch's Makefile builds all seven objects from
    `drivers/gpu/drm/exynos7580/`.
+5. **Full slice set, no stubs** (same fresh tree, the complete series of item 1
+   applied including the shim `0100`, CRTC `0101` and dmabuf, and the
+   fence/plane/fbdev sources copied into `drivers/gpu/drm/exynos7580/`):
+
+   ```
+   make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error -j8 \
+        drivers/gpu/drm/ drivers/video/exynos/decon_7580/
+   → exit 0, 0 errors
+   LD  drivers/video/exynos/decon_7580/decon.o        (vendor + export shim)
+   LD  drivers/gpu/drm/exynos7580/exynos-drm7580.o    (all seven objects)
+   ```
+
+   No warning in `drivers/gpu/drm/exynos7580/` nor in
+   `decon_kms_api.c` in this configuration (the `exynos_drm7580_dsi.c:300`
+   warning of item 4 is fixed by `DsiEncoder`'s `36372ed`). Re-run after that
+   commit: 15 patches + `0200` all `git apply` OK, build exit 0, 0 errors,
+   0 slice warnings.
 
 Not verified (out of scope for this seat): boot, `card0` node creation on the
 device, `modetest`/`kmscube`, actual atomic commits and flip events. Those are
