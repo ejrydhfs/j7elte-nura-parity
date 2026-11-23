@@ -102,9 +102,11 @@ without it, nothing ever powers the block.
 - Latency: the domain advertises 1 ms on/off (`pm_domains.c:289-290`) and a 500 µs
   restore budget (`gpd_td`, `pm_domains.c:348-353`). DECON blows through it — measured
   `decon 14830000.decon_fb: state restore latency exceeded, new value 29433808 ns`
-  (**29.4 ms** to restore the display device's state after a domain transition). Any
-  design that expects to power the display down and back up inside one frame is wrong;
-  KWin's first commit after resume will take tens of milliseconds.
+  (**29.4 ms** to restore the display device's state after a domain transition; the value
+  comes from the first restore at boot, so it includes the one-shot clock-rate dump and is
+  an upper bound, not a steady-state figure). Either way, any design that expects to power
+  the display down and back up inside one frame is wrong; KWin's first commit after resume
+  will take tens of milliseconds.
 
 ### 2.4 Who is *not* in the domain
 
@@ -422,8 +424,8 @@ modeset** (`DRM_MODE_ATOMIC_ALLOW_MODESET`), because the CRTC/plane registers ar
 2. `decon_reg_stop()` equivalent: per-frame off → wait linecnt 0 → SWRESET.
 3. DSIM stream off (LP-11), then panel off: `dsim_set_panel_power_disable`
    (reset low → LDO30 3P0 off → LDO31 1P8 off), backlight off.
-4. `iovmm_deactivate()` (the vendor keeps it active; releasing it is fine as long as the
-   sysmmu is re-attached before the next commit).
+4. `iovmm_deactivate()` — the vendor does this in `decon_disable()` too
+   (`decon_core.c:1076`); re-attach before the next commit.
 5. BTS vote → 0.
 6. `pm_runtime_put_sync()` → gates off → genpd may power `pd_disp` off.
 7. From here, **any** register read/write must be preceded by `pm_runtime_get_sync()` and
@@ -458,10 +460,12 @@ Implement it explicitly:
    rails, DPHY, panel init, DECON init, BTS).
 4. Re-arm vblank; the first frames after resume will be late (~29 ms class).
 
-Nothing in the PM core will do this for you: genpd's suspend/resume callbacks
-(`domain.c:1011-1140`) only run the iommu's save/restore ops
-(`exynos-iommu.c:2165-2173`), and DECON has no system-suspend callback of its own today
-(`decon_core.c:2589-2592`).
+Nothing in the PM core will do this for you: the DECON device carries no system-suspend
+callback of its own (`decon_core.c:2589-2592` is runtime-only), and the per-device
+callbacks that the display SYSMMU driver installs on it (`exynos-iommu.c:2165-2173`,
+observed as `exynos-iommu gpd_dev_ops inserted!`) only save/restore the SYSMMU context —
+they then chain to a driver `.suspend/.resume` that does not exist. So a system suspend
+today simply leaves `pd_disp` following whatever runtime state the driver left behind.
 
 ### 6.7 Remove / shutdown
 
@@ -521,10 +525,10 @@ On a KMS build, the power checklist:
    scanning, `suspended` after DPMS off (today: `active`, control `auto`).
 3. `dmesg | grep -c "underrun"` after 10 minutes of flips — must be 0 (§3.1 rates are the
    only knob).
-4. `modetest`-offs / `kmscube` exit → `runtime_status` back to `suspended` and rails off
-   (no `LCD_1P8`/`LCD_3P0` enable counts left over).
+4. `kmscube` exit / `modetest` CRTC disable → `runtime_status` back to `suspended` and
+   rails off (no `LCD_1P8`/`LCD_3P0` enable counts left over).
 5. Suspend smoke: `echo mem > /sys/power/state` with the CRTC off → resume → full modeset
-   redraw; expect one ~30 ms comma, no `state restore latency` explosion, no black screen.
+   redraw; expect one ~30 ms hitch, no black screen.
 6. No `can't get clock:` lines attributable to the KMS driver (that is the vendor helper's
    silent-failure signature, `decon_helper.c:60-70`).
 
