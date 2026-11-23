@@ -1,0 +1,63 @@
+From e3a4681cd0865b17d4dd4d0c637ff85310a64e42 Mon Sep 17 00:00:00 2001
+From: KmsFbdev <kmsfbdev@local>
+Date: Mon, 23 Nov 2026 09:30:36 -0500
+Subject: [PATCH] core: make drm_helper_disable_unused_functions() atomic-aware
+
+drm_fbdev_cma_init() calls drm_helper_disable_unused_functions() before the
+first modeset. That helper unconditionally dereferences
+crtc->helper_private->disable/dpms and encoder->helper_private->disable/dpms
+(drm_crtc_helper.c:255-263, 296-306 in this tree), but an atomic CRTC or
+encoder leaves the legacy callbacks NULL - or has no helper funcs at all
+before it is initialised - so registering an fbdev on an atomic driver
+NULL-derefs.
+
+Skip the legacy teardown when the callbacks are absent: an atomic driver
+disables its output from drm_atomic_helper_commit(), and at fbdev-init time
+nothing has been enabled yet. Drivers that still provide the legacy
+callbacks (vendor exynos CRTC, other in-tree users) are unaffected.
+
+Required for the DECON KMS fb0 (patches/drm-kms, KmsFbdev slice).
+---
+ drivers/gpu/drm/drm_crtc_helper.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc_helper.c b/drivers/gpu/drm/drm_crtc_helper.c
+index ed1334e..23a9a7a 100644
+--- a/drivers/gpu/drm/drm_crtc_helper.c
++++ b/drivers/gpu/drm/drm_crtc_helper.c
+@@ -256,9 +256,17 @@ drm_encoder_disable(struct drm_encoder *encoder)
+ {
+ 	struct drm_encoder_helper_funcs *encoder_funcs = encoder->helper_private;
+ 
++	/*
++	 * An atomic encoder only provides the atomic_* callbacks and leaves the
++	 * legacy ->disable/->dpms ones NULL (or has no helper funcs at all
++	 * before it is set up), so there is nothing legacy left to tear down.
++	 */
++	if (!encoder_funcs)
++		return;
++
+ 	if (encoder_funcs->disable)
+ 		(*encoder_funcs->disable)(encoder);
+-	else
++	else if (encoder_funcs->dpms)
+ 		(*encoder_funcs->dpms)(encoder, DRM_MODE_DPMS_OFF);
+ }
+ 
+@@ -297,9 +305,14 @@ void drm_helper_disable_unused_functions(struct drm_device *dev)
+ 		struct drm_crtc_helper_funcs *crtc_funcs = crtc->helper_private;
+ 		crtc->enabled = drm_helper_crtc_in_use(crtc);
+ 		if (!crtc->enabled) {
+-			if (crtc_funcs->disable)
++			/*
++			 * Atomic CRTCs leave the legacy callbacks NULL; their
++			 * output is torn down from the atomic state by
++			 * drm_atomic_helper_commit(), not from here.
++			 */
++			if (crtc_funcs && crtc_funcs->disable)
+ 				(*crtc_funcs->disable)(crtc);
+-			else
++			else if (crtc_funcs && crtc_funcs->dpms)
+ 				(*crtc_funcs->dpms)(crtc, DRM_MODE_DPMS_OFF);
+ 			crtc->fb = NULL;
+ 		}

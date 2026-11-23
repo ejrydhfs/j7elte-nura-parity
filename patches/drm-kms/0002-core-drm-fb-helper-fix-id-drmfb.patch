@@ -1,0 +1,28 @@
+From 1673cbf69232ef11d53e518eaefa899cb7c13d90 Mon Sep 17 00:00:00 2001
+From: KmsFbdev <kmsfbdev@local>
+Date: Mon, 23 Nov 2026 09:30:37 -0500
+Subject: [PATCH] core: set the drm fbdev's fix.id to "drmfb"
+
+3.10's drm_fb_helper_fill_fix() leaves fb_info->fix.id zeroed, so the DRM
+emulated fbdev shows up as an empty /sys/class/graphics/fb0/name and is not
+recognisable as a DRM fb. Later kernels set it to "drmfb"; do the same so the
+KMS image's fb0 can be identified by userspace and by the boot-log/sysfs
+checks in docs/reports/decon-kms-fbdev.md.
+
+No behaviour change for fbcon or the fbdev ioctls (nothing parses fix.id).
+---
+ drivers/gpu/drm/drm_fb_helper.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index 93b7410..a22ed61 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -981,6 +981,7 @@ static int drm_fb_helper_single_fb_probe(struct drm_fb_helper *fb_helper,
+ void drm_fb_helper_fill_fix(struct fb_info *info, uint32_t pitch,
+ 			    uint32_t depth)
+ {
++	strcpy(info->fix.id, "drmfb");
+ 	info->fix.type = FB_TYPE_PACKED_PIXELS;
+ 	info->fix.visual = depth == 8 ? FB_VISUAL_PSEUDOCOLOR :
+ 		FB_VISUAL_TRUECOLOR;

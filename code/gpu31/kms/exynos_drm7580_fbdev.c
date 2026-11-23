@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * gpu31-kms: fbdev emulation (/dev/fb0) for the DECON KMS device.
+ *
+ * KmsFbdev slice of docs/reports/decon-kms-plan.md. The KMS image does not
+ * bind the vendor DECON fbdev driver (docs/reports/decon-kms-coexist.md), so
+ * the fb0 node that X11/nura-shell and the framebuffer console need is
+ * registered here, on top of card0, through drm_fbdev_cma:
+ *
+ *   /dev/fb0 -> drm_fb_cma framebuffer -> drm_gem_cma_create() CMA buffer
+ *
+ * The fb is sized from the mode the fb helper picks, i.e. the panel mode
+ * (720x1280) exposed by the DSI connector, so the virtual resolution is
+ * 720x1280 with a 2880 byte pitch at 32 bpp.
+ *
+ * Registration happens from the KMS probe and must complete there: if it
+ * fails, the probe fails, the DECON node stays unbound and the vendor fbdev
+ * driver registers its own fb0 at late_initcall_sync (the coexistence
+ * fallback). The whole emulation is optional: CONFIG_DRM_EXYNOS7580_FBDEV
+ * and the exynosdrm.fbdev parameter both switch it off.
+ */
+
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/err.h>
+#include <linux/fb.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/types.h>
+
+#include <drm/drmP.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_fb_cma_helper.h>
+#include <drm/drm_fb_helper.h>
+
+#include "exynos_drm7580.h"
+
+/* Panel geometry fb0 must expose (see docs/reports/decon-kms-fbdev.md). */
+#define EXYNOS7580_FB0_WIDTH		720
+#define EXYNOS7580_FB0_HEIGHT		1280
+
+/* 32 bpp XRGB8888: the DECON primary window format fb0 is sized for. */
+#define EXYNOS7580_FB0_BPP		32
+
+static bool exynos7580_fbdev_enable = true;
+module_param_named(fbdev, exynos7580_fbdev_enable, bool, 0444);
+MODULE_PARM_DESC(fbdev, "Register /dev/fb0 on the DECON KMS device (default: 1)");
+
+static int exynos7580_fbdev_bpp = EXYNOS7580_FB0_BPP;
+module_param_named(fbdev_bpp, exynos7580_fbdev_bpp, int, 0444);
+MODULE_PARM_DESC(fbdev_bpp,
+		 "Preferred fb0 bits per pixel: 32, 24, 16, 15 or 8 (default: 32)");
+
+/*
+ * Handle of the single fbdev this driver owns. The contract header
+ * deliberately has no fbdev member and no new cross-slice global may be
+ * added, so it stays file-private and is released through a devres action
+ * when the DECON device goes away.
+ */
+static struct drm_fbdev_cma *exynos7580_fbdev;
+
+static int exynos7580_fbdev_bpp_or_default(int bpp)
+{
+	switch (bpp) {
+	case 32:
+	case 24:
+	case 16:
+	case 15:
+	case 8:
+		return bpp;
+	default:
+		pr_warn("exynosdrm: unsupported fbdev_bpp=%d, using %d\n",
+			bpp, EXYNOS7580_FB0_BPP);
+		return EXYNOS7580_FB0_BPP;
+	}
+}
+
+/*
+ * The KMS image owns /dev/fb0 (the vendor DECON fbdev driver does not bind), so
+ * our fb has to be node 0. Identify it by its parent device: the helper calls
+ * framebuffer_alloc(0, drm->dev), so fb_info->device is the DECON platform
+ * device (drivers/video/fbsysfs.c:39-60).
+ *
+ * 3.10's drm_fbdev_cma_init() cannot report a failing register_framebuffer():
+ * it stores drm_fb_helper_initial_config()'s boolean result in an int and only
+ * tests for a negative value, so a failure looks like success. This check is
+ * what turns that into a probe failure.
+ */
+static struct fb_info *exynos7580_fb0(struct exynos7580_device *ex)
+{
+	struct fb_info *info = registered_fb[0];
+
+	if (!info || info->node != 0 || info->device != ex->dev)
+		return NULL;
+
+	return info;
+}
+
+static void exynos7580_fbdev_devm_release(void *data)
+{
+	struct drm_fbdev_cma *fbdev = data;
+
+	if (exynos7580_fbdev != fbdev)
+		return;
+
+	exynos7580_fbdev = NULL;
+	drm_fbdev_cma_fini(fbdev);
+}
+
+/*
+ * Program the CRTC so it actually scans fb0 out. drm_fb_helper only registers
+ * the fb (drm_fb_helper_single_fb_probe() stops at register_framebuffer()), and
+ * the KMS image runs without FRAMEBUFFER_CONSOLE, so nothing else would set a
+ * mode on the CRTC (docs/reports/decon-kms-coexist.md section 4.3 item 3).
+ *
+ * drm_fbdev_cma_restore_mode() takes the modeset locks itself and goes through
+ * drm_mode_set_config_internal() -> crtc->funcs->set_config(), which the CRTC
+ * slice points at drm_atomic_helper_set_config(). It cannot report errors, so
+ * the result is verified from the atomic state afterwards.
+ */
+static int exynos7580_fbdev_start_scanout(struct exynos7580_device *ex,
+					  struct drm_fbdev_cma *fbdev)
+{
+	struct drm_device *drm = ex->drm;
+	struct drm_framebuffer *fb;
+	struct fb_info *info;
+	dma_addr_t addr;
+	int ret;
+
+	if (list_empty(&drm->mode_config.fb_list)) {
+		dev_err(ex->dev, "fb helper did not create a framebuffer\n");
+		return -ENODEV;
+	}
+
+	fb = list_first_entry(&drm->mode_config.fb_list, struct drm_framebuffer, head);
+
+	drm_fbdev_cma_restore_mode(fbdev);
+
+	info = exynos7580_fb0(ex);
+	if (!info) {
+		dev_err(ex->dev, "fb0 was not registered\n");
+		return -ENODEV;
+	}
+
+	if (ex->crtc.primary->fb != fb || !ex->crtc.state || !ex->crtc.state->enable) {
+		dev_err(ex->dev, "CRTC does not scan fb0 out\n");
+		return -EIO;
+	}
+
+	/*
+	 * The CRTC (and with it the DECON iovmm domain) is up now, so this is a
+	 * real mapping check: refuse a buffer the windows cannot scan out while
+	 * fb0 still looks healthy.
+	 */
+	ret = exynos7580_fb_scanout(fb, 0, &addr);
+	if (ret) {
+		dev_err(ex->dev, "fb0 buffer is not scannable: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(ex->dev,
+		 "fb0: drmfb %ux%u-%u, virtual %ux%u, pitch %u, scanout IOVA 0x%llx\n",
+		 info->var.xres, info->var.yres, info->var.bits_per_pixel,
+		 info->var.xres_virtual, info->var.yres_virtual,
+		 info->fix.line_length, (unsigned long long)addr);
+
+	if (info->var.xres != EXYNOS7580_FB0_WIDTH ||
+	    info->var.yres != EXYNOS7580_FB0_HEIGHT ||
+	    info->var.xres_virtual != EXYNOS7580_FB0_WIDTH ||
+	    info->var.yres_virtual != EXYNOS7580_FB0_HEIGHT)
+		dev_warn(ex->dev,
+			 "fb0 is %ux%u (virtual %ux%u), expected %ux%u (virtual %ux%u)\n",
+			 info->var.xres, info->var.yres,
+			 info->var.xres_virtual, info->var.yres_virtual,
+			 EXYNOS7580_FB0_WIDTH, EXYNOS7580_FB0_HEIGHT,
+			 EXYNOS7580_FB0_WIDTH, EXYNOS7580_FB0_HEIGHT);
+
+	return 0;
+}
+
+int exynos7580_fbdev_init(struct exynos7580_device *ex)
+{
+	struct drm_device *drm;
+	struct drm_fbdev_cma *fbdev;
+	int ret;
+
+	/* 3.10 owns the drm_device; the contract hands us the pointer. */
+	if (!ex || !ex->dev || !ex->drm || !ex->drm->dev) {
+		pr_err("exynosdrm: fbdev init without a DRM device\n");
+		return -EINVAL;
+	}
+
+	drm = ex->drm;
+
+	if (!exynos7580_fbdev_enable) {
+		dev_info(ex->dev, "fb0 emulation disabled (exynosdrm.fbdev=0)\n");
+		return 0;
+	}
+
+	if (exynos7580_fbdev)
+		return -EBUSY;
+
+	if (!drm->mode_config.num_crtc || !drm->mode_config.num_connector) {
+		dev_err(ex->dev, "no CRTC or connector, not creating fb0\n");
+		return -ENODEV;
+	}
+
+	/*
+	 * fb0 mode sets and pans go through crtc->funcs->set_config(). An atomic
+	 * CRTC must point that op at drm_atomic_helper_set_config() and must
+	 * have its primary plane registered; without either the fb would exist
+	 * but never scan out, so fail the probe and let the vendor fbdev driver
+	 * take the DECON device instead of leaving a dead /dev/fb0 behind.
+	 */
+	if (!ex->crtc.funcs || !ex->crtc.funcs->set_config || !ex->crtc.primary) {
+		dev_err(ex->dev, "CRTC lacks an atomic set_config/primary plane, not creating fb0\n");
+		return -EINVAL;
+	}
+
+	fbdev = drm_fbdev_cma_init(drm,
+				   exynos7580_fbdev_bpp_or_default(exynos7580_fbdev_bpp),
+				   drm->mode_config.num_crtc,
+				   drm->mode_config.num_connector);
+	if (IS_ERR(fbdev)) {
+		ret = PTR_ERR(fbdev);
+		dev_err(ex->dev, "drm_fbdev_cma_init failed: %d\n", ret);
+		return ret;
+	}
+
+	exynos7580_fbdev = fbdev;
+
+	ret = exynos7580_fbdev_start_scanout(ex, fbdev);
+	if (ret)
+		goto err_fini;
+
+	ret = devm_add_action(ex->dev, exynos7580_fbdev_devm_release, fbdev);
+	if (ret) {
+		dev_err(ex->dev, "cannot register the fb0 release action: %d\n", ret);
+		goto err_fini;
+	}
+
+	return 0;
+
+err_fini:
+	exynos7580_fbdev = NULL;
+	drm_fbdev_cma_fini(fbdev);
+	return ret;
+}
