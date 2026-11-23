@@ -32,13 +32,17 @@ X11 `nura-shell` on `decon_fb`, no KMS node, no swap.
 
 Two findings change the plan's assumption:
 
-1. **Plasma cannot start at all today**: `kwin_wayland` and `plasma_session` fail to
-   relocate against Qt 6.12 (`libkwin.so.6.8.3` was built against Qt 6.8). Memory
-   measurement of a live Plasma session is therefore impossible until that is fixed —
-   it belongs to the `PlasmaSession` slice, recorded here because it gates M4.
+1. **Plasma cannot start at all today**: `kwin_wayland` fails to relocate against
+   Qt 6.12 (`libkwin.so.6.8.3-r0` was built against Qt 6.8). Memory measurement of a
+   live Plasma session is therefore impossible until that is fixed — it belongs to the
+   `PlasmaSession` slice (which pins `kwin=6.8.3-r1`), recorded here because it gates
+   M4.
 2. **`MALLOC_ARENA_MAX` is inert**: the image is musl-based; the knob is a glibc
    malloc tunable. The plan's "zram + `MALLOC_ARENA_MAX`" becomes "zram + no glibc
    arenas at all".
+3. **zswap cannot be turned off at runtime** (`enabled` is a read-only module
+   parameter, `mm/zswap.c:84-85`). It must be disabled on the kernel command line, or
+   starved with `max_pool_percent=0` before zram comes up (§5.2).
 
 ---
 
@@ -46,7 +50,7 @@ Two findings change the plan's assumption:
 
 ### 2.1 Pre-flight: the Plasma stack's loadability on this image
 
-`kwin_wayland --version` and `plasma_session --version` (both 6.8.3):
+`kwin_wayland --version` (6.8.3-r0 as installed at measurement time):
 
 ```
 Error relocating /lib/libkwin.so.6:
@@ -69,11 +73,12 @@ kwin wants the same with d d d d i                               # Qt 6.8
 | Binary | Result |
 |---|---|
 | `plasmashell`, `kded6`, `ksmserver`, `plasma-mobile-envmanager`, `plasma_waitforname` | load (fail only for lack of a display) |
-| `kwin_wayland`, `plasma_session` | **relocation failure — cannot run** |
+| `kwin_wayland` (links `libkwin.so.6`) | **relocation failure — cannot run** |
+| `plasma_session` | does **not** link `libkwin` (`ldd` has no libkwin) — my probe's error text came from the `kwin_wayland_wrapper` child it execs, so `plasma_session --version` is **not** a valid health check; use `kwin_wayland --version` |
 
-Options for the owning slice: rebuild `kwin`/`plasma-workspace` against Qt 6.12, or
-pin `qt6-qtbase` to the 6.8 series the Plasma packages were built for. Until then the
-only measurable session is the X11 one below.
+Fix status: the `PlasmaSession` slice pins `kwin=6.8.3-r1`, built against Qt 6.12
+(verified from the APK); the installed package at measurement time was **6.8.3-r0**.
+Until r1 is installed the only measurable session is the X11 one below.
 
 ### 2.2 Memory map of the idle phone (first snapshot, before any host-side scanning)
 
@@ -339,29 +344,34 @@ Why these values:
   Negligible either way — which is also why the `max_comp_streams` attribute can be
   ignored on this kernel.
 
-### 5.2 zswap must be off before zram is started
+### 5.2 zswap must be off before zram is started — and cannot be turned off at runtime
 
 `/sys/module/zswap/parameters/enabled` is `Y` today with `max_pool_percent=50`,
-`zpool=zsmalloc`, `compressor=lzo`. Two ways to fix, in order of preference:
+`zpool=zsmalloc`, `compressor=lzo`. This kernel declares the switch **read-only** —
+`module_param_named(enabled, zswap_enabled, bool, 0444)` (`mm/zswap.c:84-85`), sysfs
+node `-r--r--r--`, no store handler — so `echo 0 > .../enabled` is not possible, by
+root or otherwise. Two real options:
 
-1. Kernel command line `zswap.enabled=0` (current `cmdline` is only
-   `console=ttySAC1`, so this is a boot.img change — `KmsBoot` owns it).
-2. Runtime, before the zram service runs. `postmarketos-zram-swap` has no hook for
-   this, so add a tiny service:
+1. **Correct fix — command line `zswap.enabled=0`.** The current `cmdline` is only
+   `console=ttySAC1`, so this is a boot.img change (`KmsBoot` owns it). Only this
+   actually disables the feature.
+2. **Stopgap with no flash — starve the pool.** `max_pool_percent` *is* writable
+   (`uint, 0644`, `mm/zswap.c:93-95`) and the pool is empty today
+   (`/sys/kernel/debug/zswap/pool_pages = 0`, `stored_pages = 0` — there has never
+   been a swap device):
+   `echo 0 > /sys/module/zswap/parameters/max_pool_percent`
+   `zswap_is_full()` tests `totalram_pages * max_pool_percent / 100 <
+   pool_total_size` (`mm/zswap.c:432`), so a 0 % pool accepts no further stores once
+   it holds anything. It does not tear down an existing pool (irrelevant: this one is
+   empty) and it must happen **before** `swapon /dev/zram0`.
 
-```
-# /etc/init.d/zswap-off    (chmod +x; rc-update add zswap-off default)
-#!/sbin/openrc-run
-depend() { before postmarketos-zram-swap; after modules }
-start() {
-    ebegin "Disabling zswap (zram is the swap device)"
-    echo 0 > /sys/module/zswap/parameters/enabled
-    eend $?
-}
-```
+`postmarketos-zram-swap` has no hook for either step; the session slice ships zram
+via `/etc/deviceinfo` and warns about zswap instead of pretending to disable it
+(`docs/reports/decon-kms-session.md`).
 
-Verification: `/sys/module/zswap/parameters/enabled` must read `N` before
-`/proc/swaps` shows `/dev/zram0`.
+Verification: either `enabled` reads `N` (cmdline fix), or `max_pool_percent=0` with
+`/sys/kernel/debug/zswap/stored_pages` staying 0 while `/proc/swaps` shows
+`/dev/zram0`.
 
 ### 5.3 swappiness 180, page-cluster 0, min_free_kbytes 100000
 
@@ -565,6 +575,7 @@ services (§5.6) or shrink `disksize` and accept app kills; `OOM` with
 | kwin compositor leaks (upstream reports are multi-monitor; single 720p output untested on 3.10) | unbounded growth | Gate B growth checks; `kmemleak` is not enabled on this kernel, so use RSS curves |
 | 42.2 MiB `fimc_is` ion heap held from boot | 3 % of RAM lost | release the camera heap or keep its PD off; kernel-side owner |
 | zram at 687 MiB with 2:1 → 343 MiB physical | steals RAM from the page cache | `mem_limit` (§5.1) if knee found |
+| zswap re-enabled at boot before zram (`enabled` is read-only) | pages compressed twice, pool unreclaimable | cmdline `zswap.enabled=0`; until then `max_pool_percent=0` and watch `stored_pages` (§5.2) |
 | `min_free_kbytes=100000` | 150 MiB of watermarks unavailable to apps | measured by `mem_avail_calc`; revisit to 65536 only if Gate C fails on `mem_avail_calc` while zram is still empty |
 | `/` has 69.6 MiB free (96 % used) | cannot install extra debug packages during M4 | use `/data` (4.6 GiB free) for tools/logs, as the bring-up doc already requires |
 | dmesg ring 43 s | OOM can be missed at `-i > 15` | keep `-i 5`; drop `logbookd`/fuel-gauge spam |
@@ -580,13 +591,16 @@ Device (all read-only, under `flock /tmp/gpsdev.lock`):
 (as root), `/proc/<pid>/{status,smaps,maps}`, `/etc/deviceinfo`,
 `/usr/bin/zramstart`, `/etc/init.d/postmarketos-zram-swap`, `rc-status`,
 `apk list -I`, `/etc/xdg/autostart/*`, `ldd`/`size` closures, `qmlscene` offscreen
-run, `kwin_wayland|plasma_session --version`.
+run, `kwin_wayland --version`, `ldd plasma_session`, `/sys/kernel/debug/zswap/*`
+(as root).
 
 Kernel tree (read-only):
 `drivers/block/zram/zram_drv.c:159-197,228-250,839-850,1075-1111`,
 `drivers/block/zram/zcomp.c:24-27,47-70,95-98`,
 `drivers/block/zram/zcomp_lz4.c:22-43`, `include/linux/lz4.h:12`,
 `include/linux/lzo.h:17-18`, `kernel/sysctl.c:138-139,1208-1218`,
+`mm/zswap.c:84-100,432` (`enabled` is `0444`, `max_pool_percent` is `0644`,
+`zswap_is_full()`),
 `.config` (`CONFIG_INCREASE_MAXIMUM_SWAPPINESS=y`, `CONFIG_ZRAM=y`,
 `CONFIG_ZRAM_LZ4_COMPRESS=y`, `CONFIG_ZSMALLOC=y`, `CONFIG_PGTABLE_MAPPING=y`,
 `CONFIG_ZSWAP=y`, `CONFIG_FRONTSWAP=y`, `CONFIG_CMA_SIZE_MBYTES=0`),
