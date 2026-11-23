@@ -1,0 +1,411 @@
+--- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-22 18:40:13.175324272 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-22 19:41:50.458856728 -0500
+@@ -20,6 +20,7 @@
+ #define PANFROST7580_DRV_H
+ 
+ #include <linux/atomic.h>
++#include <linux/ktime.h>
+ #include <linux/mutex.h>
+ #include <linux/list.h>
+ #include <drm_syncobj.h>		/* 0003 */
+@@ -61,6 +62,19 @@
+ 	size_t size;
+ };
+ 
++/* Perf classes (gpu31-perf overlay). Keep in sync with the dump. */
++#define P7580_PROF_CREATE	0
++#define P7580_PROF_SHMEM	1
++#define P7580_PROF_MAPBO	2
++#define P7580_PROF_SUBMIT	3
++#define P7580_PROF_MMAP		4
++#define P7580_PROF_WAIT		5
++#define P7580_PROF_FREE		6
++#define P7580_PROF_FREEJOB	7
++#define P7580_PROF_JOBSYNC	8
++#define P7580_PROF_N		9
++
++
+ struct p7580_drv {
+ 	/* MUST be first: GEM uses dev->dev_private as struct p7580_dev *. */
+ 	struct p7580_dev gd;
+@@ -76,8 +90,36 @@
+ 	struct mutex bo_lock;		/* serialises bo_list */
+ 	struct list_head bo_list;
+ 	atomic_t pm_ref;		/* live-job runtime-PM refs (see submit.c) */
++	/* gpu31-perf overlay (separate patch, after driver 0001): inert
++	 * unless prof_arm != 0. Every p7580_prof_add() call is a flag
++	 * test while unarmed; nothing is printed and nothing is
++	 * accumulated, so an unarmed kernel is byte-for-byte the int47
++	 * behaviour. prof_arm is written through debugfs p7580/prof_arm
++	 * (submit.c: p7580_prof_debugfs_init), 0600, default 0. */
++	int prof_arm;
++	struct {
++		u64 ns[P7580_PROF_N];	/* accumulated ns per class */
++		u32 n[P7580_PROF_N];	/* calls per class */
++		u32 submits;		/* SUBMIT ioctls since arm/dump */
++		u32 sub_err;		/* p7580_submit_err() calls */
++		u32 dumps;		/* windows printed */
++	} prof;
+ };
+ 
++/* 0 when unarmed: entry costs one predictable test, no ktime_get. */
++static inline u64 p7580_prof_stamp(struct p7580_drv *d)
++{
++	return (d && d->prof_arm) ? (u64)ktime_to_ns(ktime_get()) : 0;
++}
++
++static inline void p7580_prof_add(struct p7580_drv *d, int i, u64 t0)
++{
++	if (d && d->prof_arm) {
++		d->prof.ns[i] += (u64)ktime_to_ns(ktime_get()) - t0;
++		d->prof.n[i]++;
++	}
++}
++
+ /* gpu31-storm58: bounded BO-age ledger size (see p7580_drv_file). */
+ #define P7580_BO_AGE_SLOTS	64u
+ 
+@@ -151,6 +193,8 @@
+ 
+ /* Teardown guards (submit.c: PM-held wrappers around MMIO teardown).
+  * postclose/remove MUST NOT touch the AS block / slot mask dark. */
++/* gpu31-perf overlay: debugfs p7580/prof_arm (submit.c). Idempotent. */
++void p7580_prof_debugfs_init(struct p7580_drv *drv);
+ int p7580_drv_teardown_hold(struct p7580_drv *drv);
+ void p7580_drv_teardown_release(struct p7580_drv *drv);
+ /* Unmap + invalidate one BO's IOVA range (MMU-table writes are
+--- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-22 18:40:13.183497661 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-22 19:42:04.295308923 -0500
+@@ -98,6 +98,7 @@
+ #include <linux/dma-resv.h>		/* 0002 */
+ 
+ #include "panfrost7580_gem.h"
++#include "panfrost7580_drv.h"	/* gpu31-perf overlay: p7580_prof_add */
+ 
+ struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj)
+ {
+@@ -304,8 +305,26 @@
+ 	}
+ }
+ 
++static void p7580_gem_job_done_sync_body(struct drm_gem_object *obj);
++
+ void p7580_gem_job_done_sync(struct drm_gem_object *obj)
+ {
++	struct p7580_drv *pdrv = obj && obj->dev ? obj->dev->dev_private : NULL;
++
++	if (!pdrv || !pdrv->prof_arm) {
++		p7580_gem_job_done_sync_body(obj);
++		return;
++	}
++	{
++		u64 t0 = (u64)ktime_to_ns(ktime_get());
++
++		p7580_gem_job_done_sync_body(obj);
++		p7580_prof_add(pdrv, P7580_PROF_JOBSYNC, t0);
++	}
++}
++
++static void p7580_gem_job_done_sync_body(struct drm_gem_object *obj)
++{
+ 	if (!obj)
+ 		return;
+ 	/* gpu31-cachedir: completion = clean-then-invalidate. The old
+@@ -755,6 +774,8 @@
+ 	unsigned int nr = size >> PAGE_SHIFT;
+ 	struct file *filp;
+ 	struct page **pages;
++	struct p7580_drv *pdrv = dev->dev_private;
++	u64 t0 = p7580_prof_stamp(pdrv);
+ 	unsigned int i;
+ 
+ 	(void)dev;
+@@ -805,6 +826,7 @@
+ 	bo->shmem_filp = filp;
+ 	bo->pages = pages;
+ 	bo->nr_pages = nr;
++	p7580_prof_add(pdrv, P7580_PROF_SHMEM, t0);
+ 	return 0;
+ }
+ 
+@@ -840,6 +862,8 @@
+ 		     unsigned int cache_attr, struct drm_gem_object **out)
+ {
+ 	struct p7580_bo *bo;
++	struct p7580_drv *pdrv = dev ? dev->dev_private : NULL;
++	u64 t0 = p7580_prof_stamp(pdrv);
+ 	int ret;
+ 
+ 	if (!gd || !dev || !size || !out)
+@@ -896,9 +920,11 @@
+ 		goto err_offset;
+ 
+ 	*out = &bo->base;
++	p7580_prof_add(pdrv, P7580_PROF_CREATE, t0);
+ 	return 0;
+ 
+ err_offset:
++	p7580_prof_add(pdrv, P7580_PROF_CREATE, t0);
+ 	p7580_offset_free(gd, bo);
+ err_resv:
+ 	dma_resv_fini(&bo->resv);			/* 0002 */
+@@ -1116,6 +1142,8 @@
+ 	struct p7580_bo *bo = to_p7580_bo(obj);
+ 	struct p7580_dev *gd;
+ 	struct drm_device *dev = obj->dev;
++	struct p7580_drv *pdrv = dev->dev_private;
++	u64 pft0 = p7580_prof_stamp(pdrv);
+ 
+ 	/* gpu31-iova: unmap GPU PTEs + flush TLB BEFORE the IOVA is
+ 	 * reusable. p7580_gem_gpu_unmap walks the driver's bo_list
+@@ -1185,6 +1213,7 @@
+ 	else
+ 		p7580_shmem_free(bo);
+ 	kfree(bo);
++	p7580_prof_add(pdrv, P7580_PROF_FREE, pft0);
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -1361,9 +1390,15 @@
+ 	 * already dying (kref_get_unless_zero), in which case the offset
+ 	 * is stale. An offset we never handed out is not ours: keep the
+ 	 * core legacy-map fallback exactly as drm_gem_mmap() did. */
+-	obj = p7580_offset_lookup(gd, vma->vm_pgoff);
+-	if (!obj)
+-		return drm_mmap(filp, vma);
++	{
++		struct p7580_drv *pdrv = dev->dev_private;
++		u64 t0 = p7580_prof_stamp(pdrv);
++
++		obj = p7580_offset_lookup(gd, vma->vm_pgoff);
++		if (!obj)
++			return drm_mmap(filp, vma);
++			p7580_prof_add(pdrv, P7580_PROF_MMAP, t0);
++	}
+ 
+ 	vm_size = vma->vm_end - vma->vm_start;
+ 	if (vm_size > obj->size ||
+@@ -1467,15 +1502,20 @@
+ {
+ 	struct drm_gem_object *obj;
+ 	struct p7580_bo *bo;
++	struct p7580_drv *pdrv = dev->dev_private;
++	u64 t0 = p7580_prof_stamp(pdrv);
+ 	long ret;
+ 
+ 	obj = drm_gem_object_lookup(dev, file_priv, handle);
+-	if (!obj)
++	if (!obj) {
++		p7580_prof_add(pdrv, P7580_PROF_WAIT, t0);
+ 		return -ENOENT;
++	}
+ 	bo = to_p7580_bo(obj);
+ 	ret = dma_resv_wait_timeout(&bo->resv, wait_all, true,
+ 				    timeout_jiffies);
+ 	drm_gem_object_unreference_unlocked(obj);
++	p7580_prof_add(pdrv, P7580_PROF_WAIT, t0);
+ 	return ret;
+ }
+ 
+--- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-22 18:40:13.188190777 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-22 19:40:45.188562937 -0500
+@@ -611,6 +611,9 @@
+ 	if (pf7580_dvfs_init(&pdev->dev, drv->power, &drv->dvfs))
+ 		drv->dvfs = NULL;
+ 
++	/* gpu31-perf overlay: debugfs p7580/prof_arm (inert until armed). */
++	p7580_prof_debugfs_init(drv);
++
+ 	/* IRQs (shared lines tolerated on this SoC). */
+ 	ret = devm_request_irq(&pdev->dev, drv->irq_job, p7580_drv_job_irq,
+ 			       IRQF_SHARED, "panfrost7580-job", drv);
+--- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-22 18:40:13.186963406 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-22 19:42:04.296102801 -0500
+@@ -43,6 +43,7 @@
+ #include <drm/drmP.h>
+ #include <drm/drm.h>
+ 
++#include <linux/debugfs.h>	/* gpu31-perf overlay: prof_arm */
+ #include <linux/dma-fence.h>		/* 0001 */
+ #include <linux/dma-resv.h>		/* 0002 */
+ #include <drm_syncobj.h>		/* 0003 */
+@@ -134,12 +135,22 @@
+  * ioctl rc. Shares the ST budget discipline (first 8 SUBMITs print).
+  * stage is a short verb: validate/in_sync/bo/job/ops/dep/queue/
+  * out_sync. */
++static unsigned int p7580_submit_err_n;
++
+ static long p7580_submit_err(const char *stage, long err)
+ {
+-	if (p7580_sched_trace && err) {
+-		p7580_sched_trace--;
+-		pr_info("p7580_sched: submit_err stage=%s rc=%ld\n", stage, err);
+-	}
++	/* gpu31-perf overlay: error attribution must not share the 8-line
++	 * ST/trace budget -- a 300-frame run exhausts it on its first 8
++	 * (successful) SUBMITs, which is exactly why the Mesa "!ret"
++	 * asserts after a recovery had no errno in dmesg. Errors are
++	 * rare, so an error-only counter is perturbation-free; the line
++	 * keeps the original prefix and only gains n=. Independent of
++	 * ev_arm: error logging must work even when nobody armed the ring
++	 * (the EVRING/PAGEDUMP dump is one-shot per arm and may already
++	 * have been consumed by a first fault). */
++	if (err)
++		pr_info("p7580_sched: submit_err stage=%s rc=%ld n=%u\n",
++			stage, err, ++p7580_submit_err_n);
+ 	return err;
+ }
+ 
+@@ -645,6 +656,7 @@
+ 		(struct p7580_drv_file *)job->file_priv : NULL;
+ 	struct p7580_drv *drv = job ?
+ 		(struct p7580_drv *)job->drv_priv : NULL;
++	u64 t0 = p7580_prof_stamp(drv);
+ 	uint32_t i;
+ 
+ 	if (!drv && df)
+@@ -708,6 +720,7 @@
+ 	 * back-pointer) is freed. */
+ 	if (drv)
+ 		p7580_drv_job_pm_release(drv);
++	p7580_prof_add(drv, P7580_PROF_FREEJOB, t0);
+ }
+ 
+ /* Arm-time fence allocator (0004 alloc_fence hook): one fence per
+@@ -1205,8 +1218,25 @@
+  * Caller (p7580_drv_submit) holds a runtime-PM ref: the invalidate()
+  * below is MMIO on the AS block and MUST NOT run while the power
+  * domain/clocks are dark (F-SUB1 bus-hang). */
++static int p7580_drv_map_bo_body(struct p7580_drv *drv,
++				 struct drm_gem_object *obj);
++
+ static int p7580_drv_map_bo(struct p7580_drv *drv, struct drm_gem_object *obj)
+ {
++	if (!drv || !drv->prof_arm)
++		return p7580_drv_map_bo_body(drv, obj);
++	{
++		u64 t0 = (u64)ktime_to_ns(ktime_get());
++		int ret = p7580_drv_map_bo_body(drv, obj);
++
++		p7580_prof_add(drv, P7580_PROF_MAPBO, t0);
++		return ret;
++	}
++}
++
++static int p7580_drv_map_bo_body(struct p7580_drv *drv,
++				 struct drm_gem_object *obj)
++{
+ 	struct p7580_bo *bo = to_p7580_bo(obj);
+ 	unsigned int npages = p7580_bo_npages(obj);
+ 	unsigned int i;
+@@ -1747,10 +1777,110 @@
+ 	return ret;
+ }
+ 
++static int p7580_drv_submit_body(struct p7580_drv *drv, struct drm_device *dev,
++				 struct drm_file *file_priv,
++				 const struct p7580_submit *args);
++
++/* gpu31-perf overlay: print one window (averages per class) and reset.
++ * Only called from the SUBMIT wrapper while armed, so a normal kernel
++ * never reaches it. */
++static void p7580_prof_dump(struct p7580_drv *drv)
++{
++	if (!drv || !drv->prof_arm)
++		return;
++	drv->prof.dumps++;
++	pr_info("p7580prof: window=%u create=%llu/%u shmem=%llu/%u mapbo=%llu/%u submit=%llu/%u mmap=%llu/%u wait=%llu/%u free=%llu/%u freejob=%llu/%u jobsync=%llu/%u suberr=%u\n",
++		drv->prof.dumps,
++		(unsigned long long)(drv->prof.n[P7580_PROF_CREATE] ?
++			drv->prof.ns[P7580_PROF_CREATE] / drv->prof.n[P7580_PROF_CREATE] : 0),
++		drv->prof.n[P7580_PROF_CREATE],
++		(unsigned long long)(drv->prof.n[P7580_PROF_SHMEM] ?
++			drv->prof.ns[P7580_PROF_SHMEM] / drv->prof.n[P7580_PROF_SHMEM] : 0),
++		drv->prof.n[P7580_PROF_SHMEM],
++		(unsigned long long)(drv->prof.n[P7580_PROF_MAPBO] ?
++			drv->prof.ns[P7580_PROF_MAPBO] / drv->prof.n[P7580_PROF_MAPBO] : 0),
++		drv->prof.n[P7580_PROF_MAPBO],
++		(unsigned long long)(drv->prof.n[P7580_PROF_SUBMIT] ?
++			drv->prof.ns[P7580_PROF_SUBMIT] / drv->prof.n[P7580_PROF_SUBMIT] : 0),
++		drv->prof.n[P7580_PROF_SUBMIT],
++		(unsigned long long)(drv->prof.n[P7580_PROF_MMAP] ?
++			drv->prof.ns[P7580_PROF_MMAP] / drv->prof.n[P7580_PROF_MMAP] : 0),
++		drv->prof.n[P7580_PROF_MMAP],
++		(unsigned long long)(drv->prof.n[P7580_PROF_WAIT] ?
++			drv->prof.ns[P7580_PROF_WAIT] / drv->prof.n[P7580_PROF_WAIT] : 0),
++		drv->prof.n[P7580_PROF_WAIT],
++		(unsigned long long)(drv->prof.n[P7580_PROF_FREE] ?
++			drv->prof.ns[P7580_PROF_FREE] / drv->prof.n[P7580_PROF_FREE] : 0),
++		drv->prof.n[P7580_PROF_FREE],
++		(unsigned long long)(drv->prof.n[P7580_PROF_FREEJOB] ?
++			drv->prof.ns[P7580_PROF_FREEJOB] / drv->prof.n[P7580_PROF_FREEJOB] : 0),
++		drv->prof.n[P7580_PROF_FREEJOB],
++		(unsigned long long)(drv->prof.n[P7580_PROF_JOBSYNC] ?
++			drv->prof.ns[P7580_PROF_JOBSYNC] / drv->prof.n[P7580_PROF_JOBSYNC] : 0),
++		drv->prof.n[P7580_PROF_JOBSYNC],
++		drv->prof.sub_err);
++	memset(&drv->prof, 0, sizeof(drv->prof));
++}
++
++/* p7580/prof_arm: read = armed state, write 1 = reset+arm, 0 = reset+off. */
++static int p7580_prof_arm_get(void *data, u64 *val)
++{
++	struct p7580_drv *drv = data;
++
++	*val = (drv && drv->prof_arm) ? 1 : 0;
++	return 0;
++}
++
++static int p7580_prof_arm_set(void *data, u64 val)
++{
++	struct p7580_drv *drv = data;
++
++	if (!drv)
++		return -ENODEV;
++	memset(&drv->prof, 0, sizeof(drv->prof));
++	drv->prof_arm = val ? 1 : 0;
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(p7580_prof_arm_fops, p7580_prof_arm_get,
++			p7580_prof_arm_set, "%llu\n");
++
++void p7580_prof_debugfs_init(struct p7580_drv *drv)
++{
++	struct dentry *dir, *f;
++
++	if (!drv)
++		return;
++	dir = debugfs_create_dir("p7580", NULL);
++	if (IS_ERR_OR_NULL(dir))
++		return;
++	f = debugfs_create_file("prof_arm", 0600, dir, drv,
++				&p7580_prof_arm_fops);
++	if (IS_ERR_OR_NULL(f))
++		pr_info("p7580perf: prof_arm knob unavailable\n");
++}
++
+ int p7580_drv_submit(struct p7580_drv *drv, struct drm_device *dev,
+ 		     struct drm_file *file_priv,
+ 		     const struct p7580_submit *args)
+ {
++	if (!drv || !drv->prof_arm)
++		return p7580_drv_submit_body(drv, dev, file_priv, args);
++	{
++		u64 t0 = (u64)ktime_to_ns(ktime_get());
++		int ret = p7580_drv_submit_body(drv, dev, file_priv, args);
++
++		p7580_prof_add(drv, P7580_PROF_SUBMIT, t0);
++		if (++drv->prof.submits % 100 == 0)
++			p7580_prof_dump(drv);
++		return ret;
++	}
++}
++
++static int p7580_drv_submit_body(struct p7580_drv *drv, struct drm_device *dev,
++				 struct drm_file *file_priv,
++				 const struct p7580_submit *args)
++{
+ 	struct p7580_drv_file *df = file_priv->driver_priv;
+ 	struct drm_gem_object *objs[P7580_MAX_SUBMIT_BOS];
+ 	uint32_t hsave[P7580_MAX_SUBMIT_BOS];

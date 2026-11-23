@@ -306,15 +306,21 @@ measured here on a fresh boot (`#37 19:33:43`):
 | `WAIT_BO` 0-jiffy poll of an idle BO | **rc=0** (was `-ETIMEDOUT`), +100 ms still rc=0 |
 | churn 4 × 250 | SIGSEGV, kernel log clean (`poison=0`) — same userspace item as §6.1 |
 
-So the shim contract is fixed end to end (silicon-verified before/after
-on the same raw-UAPI test), but it buys **~5 %** (101 → 105–108 fps), not
-the 45 % gap. Qualification of §5.4: the poll lie was real and is now
-gone, but either Mesa 20.3 re-fetches BOs rarely enough for it not to
-dominate, or the fresh-BO cost is smaller than the `Shmem` growth
-suggested. The remaining gap is still the ~5.2 ms/frame client sys time
-plus the resolution-scaling GPU term; the per-class instrumentation
-(§6.2) is what decides it. The 150 fps target is **not** reached by
-either 04db08d or int47.
+**Correction (Main's contention-free int47 matrix, reported by
+G31_Integrator41).** The 104.7–108.0 fps series above was taken
+immediately after boot and interleaved with the readback/churn suite —
+a first-run/contended window, not steady state. The locked matrix on
+the same image is **155.7 / 107.6 / 155.0 / 157.4 / 154.4 / 158.1 fps**
+at 256² NOREAD (one first-run outlier), Shmem flat 2.2–2.5 MB,
+ERR/TIMEOUT 0, plus 512²×30 readback **57 fps** and 256²×30 readback
+**139.7 fps**, both clean. So int47's steady state is ~155 fps and the
+≥150 target **is met**; my earlier "the shim fix buys only 5 %" is
+withdrawn — it compared against a contended int45 baseline and is not a
+valid A/B. What remains worth explaining is the slow first run after
+boot and the contended window (Mesa `!ret` asserts at pan_job.c:1268
+after a silent timeout), which is exactly what the int48 overlay targets
+(error attribution that survives >8 SUBMITs, plus per-class sys-time
+counters armed only on demand).
 
 ## 6. Open items
 
@@ -351,8 +357,10 @@ either 04db08d or int47.
    exact run conditions (int42's report records `serialize_fs=1` for
    that number, which is now known to be harmful; the watchdog report
    records 154–160 fps for plain runs).
-3. **fps acceptance (≥150 at 256²) is not reached** by this change
-   (and int47's shim fix only reaches 105–108, §5.5):
+3. **fps acceptance (≥150 at 256²) is met by int47 in steady state**
+   (§5.5 correction: 155–158 fps in the locked matrix); the open item is
+   the first-run/contended window and the POST-recovery `submit_err`
+   attribution, not steady-state throughput:
    clean runs are 94–103 fps, `serialize_fs=1` 112. The teardown is not
    the cause (§5); per §5.4 the likely cause is the 0002 shim's
    0-jiffy signaled-fence return making Mesa re-fetch BOs every frame
