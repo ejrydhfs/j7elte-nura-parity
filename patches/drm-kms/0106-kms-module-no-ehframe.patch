@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsNoEhframe <kmsnoeh@local>
+Date: Mon, 23 Nov 2026 16:25:00 
+Subject: [PATCH 0106] gpu31-kms: no unwind tables in the loadable DRM modules (int64)
+
+`insmod drm_kms_helper.ko` on the 3.10 arm64 kernel failed with
+
+    module drm_kms_helper: overflow in relocation type 261 val ffffffbffc000000
+
+261 is R_AARCH64_PREL32.  Every one of them (116 in drm_kms_helper.ko, 56 in
+exynos-drm7580.ko) lives in `.rela.eh_frame`: GCC's default unwind tables put
+PC-relative 32-bit self-references into .eh_frame, and this kernel's module
+loader applies them against the runtime module base, which is far outside the
+32-bit range once the module is placed at MODULES_VADDR.  Built-in code never
+sees this (the linker resolves .eh_frame at link time); the vendor tree never
+built modules, so the loader path was never exercised.  CONFIG_ARM64_MODULE_PLTS
+does not exist in 3.10, so there is nothing to switch on.
+
+Fix: compile the module objects without unwind tables
+(`-fno-asynchronous-unwind-tables -fno-unwind-tables`), which removes
+.eh_frame's relocations entirely (verified on drm_atomic_helper.o: no
+.eh_frame, no R_AARCH64_PREL32).  The flags are applied to:
+
+  - drivers/gpu/drm/exynos7580/ (our module) unconditionally (the directory is
+    only ever built as a module in this series), and
+  - the drm_kms_helper compound objects in drivers/gpu/drm/Makefile, but only
+    when CONFIG_DRM_KMS_HELPER=m, so a built-in helper keeps the stock code
+    generation.
+
+No -mcmodel=large is needed: the failing relocation is the PREL32 in
+.eh_frame, not an ADRP range issue.  No change to the built-in image code.
+
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -28,6 +28,22 @@
+ 
+ obj-$(CONFIG_DRM_KMS_HELPER) += drm_kms_helper.o
+ 
++# int64: the 3.10 arm64 module loader rejects the PREL32 relocations that
++# GCC's default unwind tables leave in .eh_frame of a loadable module
++# ("overflow in relocation type 261 val ffffffbffc000000").  Suppress the
++# unwind tables for the helper objects when the helper is built as a module;
++# the built-in case keeps the existing code generation.
++ifeq ($(CONFIG_DRM_KMS_HELPER),m)
++CFLAGS_drm_fb_helper.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++CFLAGS_drm_crtc_helper.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++CFLAGS_drm_dp_helper.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++CFLAGS_drm_rect.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++CFLAGS_drm_atomic_helper.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++CFLAGS_drm_plane_helper.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++CFLAGS_drm_fb_cma_helper.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++CFLAGS_drm_edid_load.o += -fno-asynchronous-unwind-tables -fno-unwind-tables
++endif
++
+ CFLAGS_drm_trace_points.o := -I$(src)
+ 
+ obj-$(CONFIG_DRM)	+= drm.o
+--- a/drivers/gpu/drm/exynos7580/Makefile
++++ b/drivers/gpu/drm/exynos7580/Makefile
+@@ -6,6 +6,9 @@
+ # late_initcall_sync fallback), so its directory is on the include path.
+ #
+ ccflags-y += -I$(srctree)/drivers/video/exynos/decon_7580
++# int64: no .eh_frame PREL32 relocations in the loadable module (3.10 arm64
++# module loader cannot apply them); irrelevant for the built-in image.
++ccflags-y += -fno-asynchronous-unwind-tables -fno-unwind-tables
+ 
+ obj-$(CONFIG_DRM_EXYNOS7580) += exynos-drm7580.o
+ exynos-drm7580-y := \
