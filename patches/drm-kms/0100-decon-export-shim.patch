@@ -77,8 +77,8 @@ Probe failure reporting
  drivers/video/exynos/decon_7580/decon-int_drv.c    |  11 +
  drivers/video/exynos/decon_7580/decon.h            |  51 ++
  drivers/video/exynos/decon_7580/decon_core.c       | 361 ++++++++-
- drivers/video/exynos/decon_7580/decon_kms_api.c    | 827 +++++++++++++++++++++
- 6 files changed, 1707 insertions(+), 20 deletions(-)
+ drivers/video/exynos/decon_7580/decon_kms_api.c    | 829 +++++++++++++++++++++
+ 6 files changed, 1709 insertions(+), 20 deletions(-)
  create mode 100644 include/linux/exynos_decon_kms.h
  create mode 100644 drivers/video/exynos/decon_7580/decon_kms_api.c
 
@@ -712,10 +712,10 @@ index 742f8c9..54854ae 100644
  		kthread_stop(decon->update_regs_thread);
 diff --git a/drivers/video/exynos/decon_7580/decon_kms_api.c b/drivers/video/exynos/decon_7580/decon_kms_api.c
 new file mode 100644
-index 0000000..8097f90
+index 0000000..7e431ff
 --- /dev/null
 +++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
-@@ -0,0 +1,827 @@
+@@ -0,0 +1,829 @@
 +/*
 + * decon_kms_api.c - reuse shim between the vendor DECON window engine and the
 + * DECON DRM/KMS subdriver.
@@ -861,7 +861,9 @@ index 0000000..8097f90
 +	unsigned int i;
 +	int ret;
 +
-+	if (!nr_wins || nr_wins > decon->pdata->max_win)
++	if (!decon->pdata || !nr_wins ||
++	    nr_wins > decon->pdata->max_win ||
++	    decon->pdata->max_win > MAX_DECON_WIN)
 +		return -EINVAL;
 +
 +	for (i = 0; i < decon->pdata->max_win; i++) {

@@ -143,7 +143,9 @@ static int decon_kms_program(struct decon_device *decon,
 	unsigned int i;
 	int ret;
 
-	if (!nr_wins || nr_wins > decon->pdata->max_win)
+	if (!decon->pdata || !nr_wins ||
+	    nr_wins > decon->pdata->max_win ||
+	    decon->pdata->max_win > MAX_DECON_WIN)
 		return -EINVAL;
 
 	for (i = 0; i < decon->pdata->max_win; i++) {
