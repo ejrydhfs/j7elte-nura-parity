@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsModule <kmsmodule@local>
+Date: Mon, 23 Nov 2026 12:10:00 
+Subject: [PATCH 0102] gpu31-kms: build the KMS driver as a loadable module (int53)
+
+int53 keeps the source series unchanged and adds the module plumbing so the
+KMS driver can be loaded by hand on a running device instead of replacing the
+vendor display stack at boot:
+
+  - DRM_EXYNOS7580 becomes tristate.  The KMS choice still gates it and the
+    vendor DECON fbdev stack stays built in (EXYNOS_DECON_EXYNOS7580=y), so
+    /dev/fb0 always exists; a failed load is reversible with rmmod or a
+    reboot.
+  - The shipping config has CONFIG_MODULES unset, so the module build
+    enables CONFIG_MODULES=y + CONFIG_MODULE_UNLOAD=y (the only config delta
+    besides the KMS symbol).  DRM_KMS_HELPER is selected by our symbol and
+    is a promptless tristate, so it resolves to =m as well: the loadable set
+    is exactly drm_kms_helper.ko + exynos-drm7580.ko, load order
+    drm_kms_helper first.  Everything else the driver uses (DRM core, the
+    vendor decon stack, IOVMM) stays built in.
+  - Built as a module the driver registers with module_init/module_exit; the
+    built-in late_initcall path is untouched, so int52 and a shipping
+    built-in KMS image are unchanged.
+  - The module is never auto-loaded: no MODULE_ALIAS/softdep, no
+    modules.alias on the device, device tree untouched.  The test unbinds
+    the vendor driver and insmods the .ko:
+      echo 14830000.decon_fb > /sys/bus/platform/drivers/decon/unbind
+      insmod drm_kms_helper.ko
+      insmod exynos-drm7580.ko
+  - vendor decon_remove() now clears the platform drvdata, the exported
+    decon_int_drvdata and unregisters the V4L2 subdev before freeing the
+    decon_device: the stock remove leaves all three dangling, so an unbind
+    followed by the module probe would read freed memory.
+  - exports: the only imports modpost cannot resolve from the built-in tree
+    are iovmm_map()/iovmm_unmap() (drivers/iommu/exynos-iovmm-v6.c); they
+    are EXPORT_SYMBOL_GPL now.  decon_kms_* are already exported by
+    0100-decon-export-shim.patch.  The full import list is recorded in
+    docs/reports/decon-kms-module.md.
+
+No device tree hunks.  rmmod runs the same unload path as the built-in
+remove (drm_put_dev -> fbdev + drm cleanup -> decon_kms_put) as long as no
+DRM client holds card0 open; the module cannot be unloaded while it is
+bound, and after rmmod the DECON device is free for the vendor driver again
+(a manual bind, or reboot).
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsModule <kmsmodule@local>
+Date: Mon, 23 Nov 2026 12:10:00 
+Subject: [PATCH 0102] gpu31-kms: build the KMS driver as a loadable module (int53)
+
+int53 keeps the source series unchanged and adds the module plumbing so the
+KMS driver can be loaded by hand on a running device instead of replacing the
+vendor display stack at boot:
+
+  - DRM_EXYNOS7580 becomes tristate; the KMS choice still gates it and the
+    vendor DECON fbdev stack stays built in (EXYNOS_DECON_EXYNOS7580=y), so
+    /dev/fb0 and the hardening display are always there and a failed load is
+    reversible with rmmod or a reboot;
+  - built as a module the driver registers with module_init/module_exit
+    (module_platform_driver would pull the driver registration into probe
+    order, which does not exist for a module); the built-in late_initcall
+    path is untouched, so int52 and the shipping KMS image are unchanged;
+  - the module is never auto-loaded: no MODULE_ALIAS/softdep and no
+    modules.alias on the device, and the device tree is untouched; the test
+    unbinds the vendor driver first
+    (echo 14830000.decon_fb > /sys/bus/platform/drivers/decon/unbind)
+    and then insmods exynos-drm7580.ko;
+  - vendor decon_remove() now clears the platform drvdata, the exported
+    decon_int_drvdata and unregisters the V4L2 subdev before freeing the
+    decon_device: the stock remove leaves all three dangling, so an unbind
+    followed by the module probe would read freed memory;
+  - exports: every vendor symbol the module imports is EXPORT_SYMBOL_GPL
+    (added here next to the definition) - see the symbol list in
+    docs/reports/decon-kms-module.md.
+
+No device tree hunks.  rmmod runs the same unload path as the built-in
+remove (drm_put_dev -> fbdev + drm cleanup -> decon_kms_put), as long as no
+DRM client holds card0 open.
+
+
+--- a/drivers/gpu/drm/exynos7580/Kconfig
++++ b/drivers/gpu/drm/exynos7580/Kconfig
+@@ -1,6 +1,6 @@
+ config DRM_EXYNOS7580
+-	bool "DRM/KMS support for Samsung Exynos 7580 (DECON + MIPI DSIM)"
+-	depends on DRM=y && OF && ARM64 && ARCH_EXYNOS && EXYNOS7580_DISPLAY_KMS && EXYNOS_IOVMM_V6
++	tristate "DRM/KMS support for Samsung Exynos 7580 (DECON + MIPI DSIM)"
++	depends on DRM && OF && ARM64 && ARCH_EXYNOS && EXYNOS7580_DISPLAY_KMS && EXYNOS_IOVMM_V6
+ 	select DRM_KMS_HELPER
+ 	select DRM_KMS_CMA_HELPER
+ 	select VIDEOMODE_HELPERS
+@@ -11,7 +11,14 @@
+ 
+ 	  Provides a single CRTC with one primary plane, a DSI encoder and
+ 	  connector, CMA backed dumb buffers and fbdev emulation.  Only the
+-	  EXYNOS7580_DISPLAY_KMS choice may select it.  It must be built in
+-	  (not a module): it binds the DECON node at late_initcall, after
+-	  the vendor DSIM/panel driver, and the vendor fbdev driver binds
+-	  only at late_initcall_sync when this probe fails.
++	  EXYNOS7580_DISPLAY_KMS choice may select it.
++
++	  Built in (=y) it binds the DECON node at late_initcall, after the
++	  vendor DSIM/panel driver, and the vendor fbdev driver binds only at
++	  late_initcall_sync when this probe fails.  Built as a module (=m,
++	  int53) the vendor fbdev driver always binds at boot; the module is
++	  never auto-loaded (no modules.alias on the device) and is brought
++	  up by hand after unbinding the vendor driver:
++
++	    echo 14830000.decon_fb > /sys/bus/platform/drivers/decon/unbind
++	    insmod exynos-drm7580.ko
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+@@ -530,7 +530,26 @@
+ {
+ 	return platform_driver_register(&exynos7580_drm_platform_driver);
+ }
++
++#ifdef MODULE
++/*
++ * int53: built as a loadable module.  module_init is level 6, which is
++ * fine because nothing binds at boot: the module is only loaded by hand
++ * after the vendor fbdev driver has been unbound, i.e. after the panel
++ * driver and the vendor stack are fully up.  The built-in image keeps the
++ * level-7 late_initcall so the vendor fbdev fallback ordering is
++ * unchanged.
++ */
++static void __exit exynos7580_drm_exit(void)
++{
++	platform_driver_unregister(&exynos7580_drm_platform_driver);
++}
++
++module_init(exynos7580_drm_init);
++module_exit(exynos7580_drm_exit);
++#else
+ late_initcall(exynos7580_drm_init);
++#endif
+ 
+ MODULE_AUTHOR("gpu31-kms");
+ MODULE_DESCRIPTION(DRIVER_DESC);
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -5143,6 +5143,19 @@
+ 		decon_release_windows(decon->windows[i]);
+ 
+ 	debugfs_remove_recursive(decon->debug_root);
++
++	/*
++	 * int53: leave the device re-bindable.  The stock remove leaves the
++	 * platform drvdata and the exported decon_int_drvdata pointing at the
++	 * freed decon_device and the V4L2 subdev registered, so a later probe
++	 * (the KMS module after `unbind', or a rebind of this driver) would
++	 * see a dangling pointer.  Mirror what decon_kms_teardown() does.
++	 */
++	decon_unregister_entity(decon);
++	platform_set_drvdata(pdev, NULL);
++	if (decon_int_drvdata == decon)
++		decon_int_drvdata = NULL;
++
+ 	kfree(decon);
+ 
+ 	decon_info("remove sucessful\n");
+--- a/drivers/iommu/exynos-iovmm-v6.c
++++ b/drivers/iommu/exynos-iovmm-v6.c
+@@ -13,6 +13,7 @@
+ #endif
+ 
+ #include <linux/kernel.h>
++#include <linux/export.h>
+ #include <linux/hardirq.h>
+ #include <linux/slab.h>
+ #include <linux/scatterlist.h>
+@@ -434,6 +435,9 @@
+ 		"IOVMM: Failed to allocated VM region for %#x bytes.\n", size);
+ 	return (dma_addr_t)ret;
+ }
++/* int53: the DECON KMS module maps its scanout/overlay buffers through the
++ * vendor IOVMM; export the pair so it links against the built-in kernel. */
++EXPORT_SYMBOL_GPL(iovmm_map);
+ 
+ void iovmm_unmap(struct device *dev, dma_addr_t iova)
+ {
+@@ -491,6 +495,7 @@
+ 		dev_err(dev, "IOVMM: No IOVM region %pa to free.\n", &iova);
+ 	}
+ }
++EXPORT_SYMBOL_GPL(iovmm_unmap);
+ 
+ int iovmm_map_oto(struct device *dev, phys_addr_t phys, size_t size)
+ {
