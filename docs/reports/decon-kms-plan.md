@@ -101,3 +101,29 @@ needing boot cycles.
 Plasma Mobile 6.8 home screen runs at a usable frame rate on the J7, with `card0` (atomic)
 provided by the DECON KMS subdriver, panfrost scanout through dma-buf, and a documented
 rollback to the current X11/nura-shell image.
+
+## 6. Slice map (parallel execution)
+
+Each slice owns its files; the integration seat owns the assembled series. Kernel stays
+read-only; every slice that needs to compile works in its own copy under
+`/run/media/…/j7k/kms/<slice>/`.
+
+| # | Slice | Deliverable | Depends on |
+|---|---|---|---|
+| 1 | `DRMAtomicM0` | atomic core patch series `patches/drm-atomic/` | — |
+| 2 | `KmsReq` | KWin 6.8 capability matrix (`decon-kms-req.md`) | — |
+| 3 | `DeconApi` | window-API contract + exported shim header (`decon-kms-api.md`) | — |
+| 4 | `DsiPanel` | DSI/ea8061 inventory for the encoder (`decon-kms-dsi.md`) | — |
+| 5 | `DispPower` | clocks/pd_disp/PM ordering for the display block (`decon-kms-power.md`) | — |
+| 6 | `KmsTooling` | modetest/kmscube/libdrm build + run plan (`decon-kms-tooling.md`) | — |
+| 7 | `KmsCoexist` | DT/boot-parameter coexistence + rollback (`decon-kms-coexist.md`) | — |
+| 8 | `PlasmaSession` | lightdm/kwin/zram session enablement (`decon-kms-session.md`) | — |
+| 9 | `MemBudget` | memory budget and measurement plan (`decon-kms-memory.md`) | — |
+| 10 | `DeconCrtc` | CRTC subdriver over the window API | 1,3 |
+| 11 | `DeconPlane` | primary/overlay planes + formats | 1,3 |
+| 12 | `DsiEncoder` | encoder + connector | 1,4 |
+| 13 | `KmsFbdev` | `drm_fb_helper` emulation on KMS | 1,3 |
+| 14 | `KmsDmabuf` | dma-buf import + framebuffer/GEM | 1,3 |
+| 15 | `KmsFence` | vblank → dma_fence commit completion | 1,3 |
+| 16 | `KmsAssemble` | series assembly, gates, build script | all |
+| 17 | `KmsBoot` | int50 build/flash harness + rollback image | 16 |
