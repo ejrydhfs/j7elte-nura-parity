@@ -154,3 +154,96 @@ interpretation depends on which of a/b boots.
   absences rather than literal lines.
 - 487 warnings in both logs is the vendor ambient count; the KMS sources
   contribute none.
+
+## 8. Strict-minimal pair (int51d / int51e) — after int51a also bootlooped
+
+int51a still applied the whole series, including the vendor-DECON shim
+(`0100`), whose code runs in the **fbdev** path. So int51a did not
+isolate the atomic core. These two variants are minimal: each applies
+exactly one patch group to the pristine vendor tree, and the config is
+the stock `config-samsung-j7elte.aarch64` plus the diagnostic fragment
+noted below (nothing else).
+
+| | **int51d** | **int51e** |
+|---|---|---|
+| patches | `drm-atomic/0001..0005` only | `0100-decon-export-shim.patch` only |
+| tree otherwise | pristine vendor | pristine vendor |
+| config | stock + `CONFIG_DRM=y` + `CONFIG_PSTORE_CONSOLE=y` (atomic objects need DRM; hidden `DRM_KMS_HELPER`/`CMA_HELPER` are not user-settable and are not forced) | stock + `CONFIG_PSTORE_CONSOLE=y` (no DRM at all) |
+| KMS driver | absent | absent |
+| proves | does the 3.10 atomic core backport **alone** boot? | does the vendor DECON probe split + `register_framebuffer()`-at-tail break boot? |
+| Image | 17400992 B `ede726ceefc1af3827e6eda3b17521cf60b3242276910c54f5069e0834ced50d` | 17184904 B `c0366a22c12fbae1faa787a7d31cfdea9b1c94b6e46eedd376acf461418e8fba` |
+| boot.img | 26540032 B `b47646cd472c7f05aab9dc237b4e2efffd79008c5140aac4e6d7376202b11866` | 26324992 B `8472eff145f318273cff6bccc3bbfdbe86ce5efd6ff0356f3fc70af693d4b831` |
+
+Both: 0 errors, 487 / 486 ambient vendor warnings, 0 new warnings;
+Image and vmlinux freshness gated; patch hunk integrity checked; stock
+`dt.img` and reference ramdisk. Gates also prove isolation: d has no
+`exynos7580/` directory, no `decon_probe_common`/`decon_kms_api.c`; e has
+no `drivers/gpu/drm/drm_atomic.c` and no `exynos7580/`, while
+`decon_probe_common`, `decon_kms_get`, `fb_registered` and
+`register_framebuffer` are present.
+
+Reading it: d boots + e hangs → the shim's DECON probe changes are the
+culprit (not M0). d hangs → the atomic core impacts boot even without a
+DRM display driver. Both boot → the hang is in the 0200 wiring or the KMS
+path, and int51c (stage watchdog) is next.
+
+### 8.1 pstore/ramoops (both variants)
+
+No DT edit is needed: the vendor snapshot driver already registers a
+`ramoops` platform device on the bootloader-reserved `"log_pstore"`
+region (`drivers/trace/exynos-ss.c:ess_pstore_init`,
+`record/console/ftrace/pmsg = 512 KiB`, `dump_oops = 1`), and the stock
+config already has `CONFIG_PSTORE=y`, `CONFIG_PSTORE_RAM=y`,
+`CONFIG_EXYNOS_SNAPSHOT_PSTORE=y`. Both variants only add
+`CONFIG_PSTORE_CONSOLE=y`, so the boot console (and a panic, via
+`dump_oops`) lands in pstore. Gates: `ess_pstore_init` linked,
+`PSTORE_CONSOLE=y`, `ramoops` string in the Image. A panic with `dump_oops = 1`
+writes synchronously at panic time; the records are read from
+`/sys/fs/pstore/` by a kernel that reaches userspace. Because the region
+is RAM, a bootloop that never reaches userspace cannot be read back
+after a power cycle — the record survives only until power is removed.
+
+### 8.2 Ordering hazards before the USB gadget (0100, and 0200)
+
+- `0100` **moves `register_framebuffer()` to the very end of
+  `decon_probe_common()`** (after clocks, SFR map, IRQ, media entity,
+  windows, the update kthread, `pm_runtime_enable()` and the panel
+  hand-off), and records `decon->fb_registered`. In the vendor path
+  (`register_fb == true`) fb0 therefore appears *later* than before, and
+  the update/vsync kthreads are already running when it does. If any
+  kthread or notifier path waits on `fbinfo`/`fb_registered` (or on the
+  probe-held mutex) without a timeout, probe can deadlock before init
+  finishes — which would present exactly as "no USB gadget". That is the
+  prime suspect 51e tests.
+- `0100` also splits the vendor probe into `decon_probe_common()` and a
+  thin `decon_probe()`, and changes the remove path to unregister only
+  when `fb_registered`; error unwinding in the split is new code on the
+  vendor boot path (compiled in even with KMS off, because the shim's
+  Makefile hunk always builds `decon_kms_api.o`).
+- `decon_kms_api.c` adds **no** initcall, no device registration and no
+  global constructor; its exports are called by the KMS driver only. It
+  does, however, get linked into the vendor display image in every
+  variant that applies 0100.
+- `0200` (not in d/e) additionally moves the vendor DECON registration
+  to `late_initcall_sync` and touches `decon_core.c`; that ordering
+  change is **not** present in 51d/51e, so a 51e hang points at 0100
+  alone, and a 51e boot with int50 hanging points at 0200's wiring or the
+  KMS `->load()` path.
+- The M0 patches still contribute nothing pre-initcall (§4): no
+  initcalls, no registrations, one ioctl-table entry and a client-cap
+  bit reachable only from ioctls.
+
+### 8.3 Hashes for the d/e logs
+
+- d build `1275c4be220dad6d6959f8af7ca8daea21299d620d7728c55c75b85b55b30a20`,
+  gates `0a32044929eb83ff311ecc2ec673a5723b422f1975690c1cdc14bcdabc903833`,
+  evidence `904e5013ec1e02f45cdf403c83287859b26fe6f69151a43d05a7594dfd504838`
+- e build `8baff82b0bbbfb3624fc5977b8162d23a8308a09656a3f59650bc38cec2273de`,
+  gates `9da261599ae7a7bab81db1bc82d9d6b8525376fad0ed3673be35648caf32810c`,
+  evidence `8db4cc0a1e45dd1804c7ab051fb6751ef1316d59584485bb23b39bba6898277f`
+- script `code/gpu31/series/build-int51de.sh` (180 lines)
+  `aac8607028c320f44cc25c1e574c74a67f4181181d19135efcaf06284264dc58`
+- fragments `patches/drm-kms/diag/m0-only.fragment`
+  `9b61f6e23035069e3e22f61512cfb6c5d9587840ec149b725d6a868268534c1c`,
+  `…/shim-only.fragment`
+  `3c5cb59b4ffd3ada6454df3392ea06dd697a10ea690b35e1290d335c838a7123`

@@ -1,0 +1,5 @@
+# int51e diagnostic: pristine vendor display stack + the DECON export shim
+# (0100) only.  No DRM core, no KMS driver, no core helper fixes.
+# ramoops comes from the vendor exynos-ss driver on the bootloader
+# "log_pstore" region; enable the console capture only.
+CONFIG_PSTORE_CONSOLE=y

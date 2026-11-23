@@ -1,0 +1,12 @@
+# int51d diagnostic: the 3.10 DRM atomic core backport alone (no core
+# helper fixes, no DECON shim, no exynos7580 driver).  DRM must be on for
+# the atomic objects to build; everything display stays vendor.
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_KMS_CMA_HELPER=y
+# int51d/e diagnostic aid: the vendor exynos-ss driver already registers a
+# ramoops device on the bootloader-reserved "log_pstore" region
+# (drivers/trace/exynos-ss.c ess_pstore_init, console_size 512K), so a
+# panic/bootlog lands in pstore without any DT change.  Capture the boot
+# console as well.
+CONFIG_PSTORE_CONSOLE=y
