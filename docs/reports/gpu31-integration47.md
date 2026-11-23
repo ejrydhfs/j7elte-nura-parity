@@ -207,26 +207,40 @@ partition.
    race-fix-only acceptance record; int47 supersedes it for behaviour
    (fps + race fix together).
 
-## 5a. Silicon result (int47 flashed, G31_MMLock report e4c4d74 §5.5)
+## 5a. Silicon result (int47 flashed; MMLock e4c4d74 + Main's locked matrix)
 
-Fresh boot (`#37 19:33:43`), 3 × 300 f @ 256² no-readback:
-**107.2 / 108.0 / 104.7 fps** (2.799 / 2.777 / 2.865 s), ERR/TIMEOUT
-0/0/0, `Shmem` +56/+36/+44 kB per run — flat. WAIT_BO raw UAPI on an
-idle, never-submitted BO: 0-jiffy poll now **rc=0** (was -ETIMEDOUT) and
-+100 ms still rc=0, so 6ah's contract holds on silicon. Churn 4×250
-still SIGSEGVs in userspace with a clean kernel log (the separate item).
+**Main's locked matrix (no contention, int47):** 256² NOREAD 3×300-class
+runs **155.7 / 107.6 / 155.0 / 157.4 / 154.4 / 158.1 fps**, Shmem flat
+2.2–2.5 MB, 0 ERR/0 TIMEOUT; 512²×30 readback **57 fps clean**; 256²×30
+readback **139.7 fps clean**. So the **≥150 target is met in steady
+state**; the single 107.6 run and the Mesa asserts cluster near boot and
+under contention (G31_FpsSplit also reported a contaminated window from
+a concurrent gfdemo). The correct characterisation is *steady-state
+~155 fps, first-run-after-boot slower* — perf is not an unsolved
+regression.
 
-Verdict: the shim fix is **correct and necessary but not the dominant
-cost** — 101 → 105–108 fps (~5%), not the 45% gap. The poll lie is gone;
-what remains is the ~5.2 ms/frame client system time plus the
-resolution-scaling GPU term. **The ≥150 fps target is not reached by
-04db08d or int47.**
+**MMLock's window (report e4c4d74 §5.5, now understood as
+first-run/contended):** 107.2 / 108.0 / 104.7 fps at 256², Shmem
++36..56 kB/run, 0 ERR/TIMEOUT; their `len` per-frame sys time story
+(WAIT_BO 794 calls/frame) remains the explanation for the slow first
+run, not for steady state.
 
-One new datum for the storm ticket: 512² readback ×30 shows **2
-ERR/TIMEOUT** (the int41 silent-0x08 signature, unrelated to the shim);
-×10 (13.1 fps) was clean. That is the long-standing storm, not a
-regression from this image, but it is the first time it reproduces on
-the fixed race path and should be folded into that ticket's record.
+**Shim contract on silicon:** WAIT_BO raw UAPI on an idle,
+never-submitted BO — 0-jiffy poll now **rc=0** (was -ETIMEDOUT), +100 ms
+still rc=0. 6ah holds.
+
+**Open fault datum:** 512²×30 readback reproduced the silent-0x08 storm
+in MMLock's window (2 ERR/TIMEOUT) while Main's 512²×30 was clean, so the
+storm is intermittent and not a shim regression. MMLock's capture had
+`ev_arm=0` (no EVRING/PAGEDUMP payload); the next armed run belongs to
+the silent-0x08 ticket.
+
+**Client assert datum (Main):** 2 of 4 ×300 runs in a contended window
+died with Mesa `Assertion failed: !ret` in `panfrost_batch_submit_jobs`
+(pan_job.c:1268) after a silent timeout — SUBMIT returned an error after
+recovery. The errno is not recoverable from dmesg today because
+`p7580_submit_err()` shares the 8-line `p7580_sched_trace` budget;
+int48's overlay gives error attribution its own counter (log-only).
 
 ## 6. Script notes
 
