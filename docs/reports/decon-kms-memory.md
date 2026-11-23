@@ -121,6 +121,14 @@ understates what the session may use by ~180 MiB. Use `mem_avail_calc` instead.
 
 Both UI processes have `VmHWM == VmRSS`: no leak in the current shell.
 
+`fbwin` (`code/experience/fbwin.c`) is not part of the session — it is a DECON
+window-config probe: it allocates one `720*1280*4 = 3,686,400 B` ion buffer, fills it
+and commits it as window 0 through `S3CFB_WIN_CONFIG`. It was **not** run for this
+measurement (it takes over the display, i.e. a write, not a read), so there is no
+`ps` number for it; its steady-state cost is that 3.6 MiB dma-buf plus the mapping
+(same pages, shared) and well under 1 MiB of binary/heap. It is therefore not part of
+the baseline and must not be counted as UI headroom for the Plasma session.
+
 ### 2.4 Kernel-side and pinned memory
 
 | Item | Bytes | Meaning |
