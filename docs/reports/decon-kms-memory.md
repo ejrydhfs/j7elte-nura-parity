@@ -536,9 +536,16 @@ configured as in §5, `memwatch.sh` at `-i 5`, and `dmesg_restrict=0` (already s
 | `mem_avail_calc` minimum | **≥ 350 MiB** |
 | `plasmashell` VmHWM | **≤ 220 MiB** (flag `RSS:plasmashell` must stay clear) |
 | `kwin_wayland` VmHWM | **≤ 160 MiB** |
-| `zram_mem_used` after 5 min | **≤ 128 MiB** |
+| `zram_mem_used` (physical) after 5 min | **≤ 128 MiB** |
+| `zram_orig` (uncompressed stored) after 5 min | **≤ 400 MiB** of the 687 MiB device |
 | `oom_new`, `RESTART` | **0** |
 | `GL_RENDERER` of the session | panfrost, **not** llvmpipe (§3.3) |
+
+Reading zram against these gates: `disksize` (687 MiB) is **capacity, not usage**. The
+usage numbers are `mm_stat` field 1 (`zram_orig`, uncompressed pages a session has
+pushed out) and field 3 (`zram_mem_used`, what those pages actually cost in RAM).
+Gate A fails if the home screen — with no app open — already needs >400 MiB of swap;
+that means the session components in §4 are over budget, not that zram is too small.
 
 ### Gate B — 30 min soak (home screen; launch+close one app and screen off/on every 5 min)
 
