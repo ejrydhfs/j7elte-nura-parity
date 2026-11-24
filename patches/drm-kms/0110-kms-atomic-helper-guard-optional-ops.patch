@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsHelperGuards <kmshg@local>
+Date: Mon, 23 Nov 2026 19:40:00 
+Subject: [PATCH 0110] gpu31-kms: guard optional atomic-helper callbacks (int68, module-only)
+
+int67 hits another NULL deref, this time inside our M0 helper backport:
+
+    PC is at 0x0
+    LR is at drm_atomic_helper_commit_post_planes+0x144/0x144 [drm_kms_helper]
+
+`commit_post_planes` has the shape
+
+    if (funcs->enable)
+            funcs->enable(x);
+    else
+            funcs->commit(x);        /* commit is optional upstream */
+
+and our DSI encoder has neither .enable nor .commit (the link enable lives in
+the CRTC), so the else branch jumps to NULL.
+
+Every `funcs->X()` call site in the backport is now either guarded or on an
+operation upstream makes mandatory:
+
+  - commit_post_planes: CRTC and encoder `else -> else if (funcs->commit)`
+    (commit is optional in upstream 4.0);
+  - disable_outputs: CRTC and encoder `else -> else if (funcs->dpms)` (the
+    legacy dpms fallback is optional; the chain still prefers prepare/disable);
+  - crtc_set_mode: `if (funcs->mode_set)` around the encoder hook (int67's
+    no-op still provides it, but the helper no longer relies on that);
+  - plane commit: `else if (funcs->atomic_update)` (atomic_disable/update pair);
+  - already guarded before this patch: prepare/cleanup_fb, atomic_check,
+    atomic_begin/atomic_flush, mode_set_nofb/CRTC mode_set;
+  - still unguarded, and mandatory per upstream (documented): connector
+    .best_encoder, encoder/CRTC .mode_fixup (encoder only when .atomic_check is
+    absent), and the guarded-by-contract atomic_update on planes that do not
+    implement atomic_disable.
+
+`drivers/gpu/drm/drm_atomic_helper.c` is part of drm_kms_helper, which is a
+module in this configuration, so the built-in image is unchanged.
+
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -601,7 +601,7 @@
+ 			funcs->prepare(encoder);
+ 		else if (funcs->disable)
+ 			funcs->disable(encoder);
+-		else
++		else if (funcs->dpms)
+ 			funcs->dpms(encoder, DRM_MODE_DPMS_OFF);
+ 	}
+ 
+@@ -631,7 +631,7 @@
+ 			funcs->prepare(crtc);
+ 		else if (funcs->disable)
+ 			funcs->disable(crtc);
+-		else
++		else if (funcs->dpms)
+ 			funcs->dpms(crtc, DRM_MODE_DPMS_OFF);
+ 	}
+ }
+@@ -752,7 +752,8 @@
+ 		 * Each encoder has at most one connector (since we always steal
+ 		 * it away), so we won't call call mode_set hooks twice.
+ 		 */
+-		funcs->mode_set(encoder, mode, adjusted_mode);
++		if (funcs->mode_set)
++			funcs->mode_set(encoder, mode, adjusted_mode);
+ 	}
+ }
+ 
+@@ -810,7 +811,7 @@
+ 
+ 			if (funcs->enable)
+ 				funcs->enable(crtc);
+-			else
++			else if (funcs->commit)
+ 				funcs->commit(crtc);
+ 		}
+ 	}
+@@ -840,7 +841,7 @@
+ 		 */
+ 		if (funcs->enable)
+ 			funcs->enable(encoder);
+-		else
++		else if (funcs->commit)
+ 			funcs->commit(encoder);
+ 	}
+ }
+@@ -1168,7 +1169,7 @@
+ 		if (drm_atomic_plane_disabling(plane, old_plane_state) &&
+ 		    funcs->atomic_disable)
+ 			funcs->atomic_disable(plane, old_plane_state);
+-		else
++		else if (funcs->atomic_update)
+ 			funcs->atomic_update(plane, old_plane_state);
+ 	}
+ 
