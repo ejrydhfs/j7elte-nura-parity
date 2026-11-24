@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsFbdev <kmsfbdev@local>
+Date: Mon, 23 Nov 2026 21:35:00 
+Subject: [PATCH 0113] gpu31-kms: name the failing state when fb0 does not scan out (int70, module-only)
+
+exynos7580_fbdev_start_scanout()'s postcondition check only printed "CRTC does
+not scan fb0 out".  With the FRAME interrupt diagnostics in 0112 this now also
+prints the CRTC id, state pointer, enable flag and primary/wanted framebuffer,
+and calls the shim's decon_kms_log_state() so the register state that made the
+check fail is in dmesg.  Module-only.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
+@@ -27,6 +27,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/types.h>
++#include <linux/exynos_decon_kms.h>
+ 
+ #include <drm/drmP.h>
+ #include <drm/drm_crtc.h>
+@@ -143,7 +144,13 @@
+ 	}
+ 
+ 	if (ex->crtc.primary->fb != fb || !ex->crtc.state || !ex->crtc.state->enable) {
+-		dev_err(ex->dev, "CRTC does not scan fb0 out\n");
++		dev_err(ex->dev,
++			"CRTC does not scan fb0 out: crtc id=%u state=%p enable=%d primary->fb=%p want=%p\n",
++			ex->crtc.base.id, ex->crtc.state,
++			ex->crtc.state ? ex->crtc.state->enable : -1,
++			ex->crtc.primary->fb, fb);
++		/* int70: name the register state that made the check fail. */
++		decon_kms_log_state(ex->decon, "fbdev scanout failed");
+ 		return -EIO;
+ 	}
+ 

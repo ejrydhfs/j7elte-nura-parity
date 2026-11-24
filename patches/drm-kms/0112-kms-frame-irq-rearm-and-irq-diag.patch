@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsIrq <kmsirq@local>
+Date: Mon, 23 Nov 2026 21:30:00 
+Subject: [PATCH 0112] gpu31-kms: FRAME-irq re-arm after enable, ESD idempotency, IRQ/reg diagnostics (int70)
+
+int69 registers fb0 but the CRTC never scans out: /proc/interrupts shows the
+two DECON IRQs (fifo, frame) at 0 while DSIM's IRQ fires, the commit times out
+waiting for vsync, fbdev init fails with -EIO.
+
+Root cause: in DECON_VIDEO_MODE the FRAME interrupt is armed by
+decon_activate_vsync() (VIDINTCON0 INT_FRAME + DSIM vsync), which the shim's
+decon_kms_register_vblank_cb() calls from ->load().  decon_enable() then runs
+decon_reg_init()/decon_reg_start() *after* that and clears VIDINTCON0, and
+decon_enable()'s own interrupt setup is under
+`if (psr_mode != DECON_VIDEO_MODE)`, so nothing re-arms the FRAME interrupt on
+the KMS path (the vendor fbdev path re-arms in pan_display/set_par).
+
+Changes:
+
+  - decon_kms_enable(): log state/psr_mode/trig before, decon_enable()'s return
+    and state after, and read back VIDCON0/VIDOUTCON0/VIDINTCON0/VIDINTCON1/
+    TRIGCON; after a successful enable in VIDEO mode with a vblank callback,
+    call decon_activate_vsync() to re-arm the FRAME interrupt and log
+    VIDINTCON0 again ("FRAME irq re-armed").
+  - decon_kms_disable(): balance that with decon_deactivate_vsync().
+  - new decon_kms_log_state(d, tag) (exported): state/psr_mode/trig plus the
+    five registers, for the fbdev slice.
+  - ESD IRQs: `decon->esd_irq_on` flag (decon.h) makes
+    decon_esd_enable_interrupt()/disable idempotent, so the probe's
+    decon_init_done enable and decon_enable()'s re-enable no longer produce
+    "Unbalanced enable for IRQ 558".
+  - decon_int_irq_handler: for the first five interrupts with a KMS vblank
+    callback, log VIDINTCON1/VIDCON0/VIDINTCON0 and whether the FRAME bit is
+    set; decon_int_register_irq logs each requested IRQ number.
+  - no behaviour change for the vendor fbdev path (register_fb == true).
+
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -850,6 +850,11 @@
+ {
+ 	struct esd_protect *esd = &decon->esd;
+ 
++	/* int70: probe (decon_init_done) and decon_enable() both call this;
++	 * make it idempotent so enable_irq() stays balanced. */
++	if (decon->esd_irq_on)
++		return;
++
+ 	if (esd) {
+ 		if (esd->pcd_irq) {
+ 			decon_info("%s: pcd(%d) is %s, %d\n", __func__, esd->pcd_gpio, gpio_get_value(esd->pcd_gpio) ? "high" : "low", decon->ignore_vsync);
+@@ -867,6 +872,7 @@
+ 			decon_info("%s: det(%d) is %s\n", __func__, esd->disp_det_gpio, gpio_get_value(esd->disp_det_gpio) ? "high" : "low");
+ 			enable_irq(esd->disp_det_irq);
+ 		}
++		decon->esd_irq_on = true;
+ 	}
+ 	return;
+ }
+@@ -875,6 +881,9 @@
+ {
+ 	struct esd_protect *esd = &decon->esd;
+ 
++	if (!decon->esd_irq_on)
++		return;
++
+ 	if (esd) {
+ 		if (esd->pcd_irq) {
+ 			decon_info("%s: pcd(%d) is %s, %d\n", __func__, esd->pcd_gpio, gpio_get_value(esd->pcd_gpio) ? "high" : "low", decon->ignore_vsync);
+@@ -888,6 +897,7 @@
+ 			decon_info("%s: det(%d) is %s\n", __func__, esd->disp_det_gpio, gpio_get_value(esd->disp_det_gpio) ? "high" : "low");
+ 			disable_irq(esd->disp_det_irq);
+ 		}
++		decon->esd_irq_on = false;
+ 	}
+ 	return;
+ }
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -517,17 +517,66 @@
+ 	 * full sequence (decon-kms-dsi.md 2.3: "Do not copy the vendor's
+ 	 * DECON_STATE_INIT short-circuit"), so drop to OFF first.
+ 	 */
+-	if (decon->state == DECON_STATE_INIT)
++	if (decon->state == DECON_STATE_INIT) {
++		decon_info("decon_kms_enable: INIT -> OFF\n");
+ 		decon->state = DECON_STATE_OFF;
++	}
++
++	decon_info("decon_kms_enable: enter state=%d psr_mode=%d trig=%d\n",
++		   decon->state, decon->pdata->psr_mode, decon->pdata->trig_mode);
+ 
+ 	ret = decon_enable(decon);
+ 
++	decon_info("decon_kms_enable: decon_enable ret=%d state=%d\n", ret, decon->state);
++	if (!ret) {
++		decon_info("decon_kms_enable: VIDCON0=%08x VIDOUTCON0=%08x VIDINTCON0=%08x VIDINTCON1=%08x TRIGCON=%08x\n",
++			   decon_read(DECON_INT, VIDCON0),
++			   decon_read(DECON_INT, VIDOUTCON0),
++			   decon_read(DECON_INT, VIDINTCON0),
++			   decon_read(DECON_INT, VIDINTCON1),
++			   decon_read(DECON_INT, TRIGCON));
++		/*
++		 * int70: in VIDEO mode the FRAME interrupt is armed by
++		 * decon_activate_vsync(); decon_enable()'s decon_reg_init()
++		 * runs after our vblank registration and can clear
++		 * VIDINTCON0.  Re-arm it here and balance it in disable().
++		 */
++		if (decon->pdata->psr_mode == DECON_VIDEO_MODE && d->vblank_cb) {
++			decon_activate_vsync(decon);
++			decon_info("decon_kms_enable: FRAME irq re-armed, VIDINTCON0=%08x\n",
++				   decon_read(DECON_INT, VIDINTCON0));
++		}
++	}
++
+ 	mutex_unlock(&kms_lock);
+ 
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(decon_kms_enable);
+ 
++/*
++ * int70: dump the state and the four video registers the KMS path cares about.
++ * Exported for the fbdev slice, which has no decon pointer of its own.
++ */
++void decon_kms_log_state(struct decon_kms_dev *d, const char *tag)
++{
++	struct decon_device *decon;
++
++	if (!d)
++		return;
++	decon = d->decon;
++
++	decon_info("%s: state=%d psr_mode=%d trig=%d VIDCON0=%08x VIDOUTCON0=%08x VIDINTCON0=%08x VIDINTCON1=%08x TRIGCON=%08x\n",
++		   tag ? tag : "decon state",
++		   decon->state, decon->pdata->psr_mode, decon->pdata->trig_mode,
++		   decon_read(DECON_INT, VIDCON0),
++		   decon_read(DECON_INT, VIDOUTCON0),
++		   decon_read(DECON_INT, VIDINTCON0),
++		   decon_read(DECON_INT, VIDINTCON1),
++		   decon_read(DECON_INT, TRIGCON));
++}
++EXPORT_SYMBOL_GPL(decon_kms_log_state);
++
+ int decon_kms_disable(struct decon_kms_dev *d)
+ {
+ 	struct decon_device *decon;
+@@ -545,6 +594,10 @@
+ 	}
+ 
+ 	ret = decon_disable(decon);
++	if (!ret && decon->pdata->psr_mode == DECON_VIDEO_MODE && d->vblank_cb) {
++		decon_deactivate_vsync(decon);
++		decon_info("decon_kms_disable: FRAME irq deactivated (refcount balance)\n");
++	}
+ 	mutex_unlock(&kms_lock);
+ 
+ 	return ret;
+--- a/drivers/video/exynos/decon_7580/decon.h
++++ b/drivers/video/exynos/decon_7580/decon.h
+@@ -740,6 +740,8 @@
+ 	struct dpu			dpu_save;
+ #endif
+ 
++	/* int70: ESD IRQ enable state, so enable/disable are idempotent */
++	bool			esd_irq_on;
+ };
+ 
+ static inline struct decon_device *get_decon_drvdata(u32 id)
+--- a/drivers/video/exynos/decon_7580/decon-int_drv.c
++++ b/drivers/video/exynos/decon_7580/decon-int_drv.c
+@@ -73,6 +73,8 @@
+ 			set_bit(i * 4, &decon->underrun_stat.used_windows);
+ }
+ 
++static unsigned int decon_int_irq_log_count;
++
+ irqreturn_t decon_int_irq_handler(int irq, void *dev_data)
+ {
+ 	struct decon_device *decon = dev_data;
+@@ -90,6 +92,13 @@
+ 	}
+ 
+ 	irq_sts_reg = decon_read(DECON_INT, VIDINTCON1);
++	if (decon->kms_vblank_cb && decon_int_irq_log_count < 5) {
++		decon_int_irq_log_count++;
++		decon_info("decon irq: VIDINTCON1=%08x VIDCON0=%08x VIDINTCON0=%08x frame=%d\n",
++			   irq_sts_reg, decon_read(DECON_INT, VIDCON0),
++			   decon_read(DECON_INT, VIDINTCON0),
++			   !!(irq_sts_reg & VIDINTCON1_INT_FRAME));
++	}
+ 	if (irq_sts_reg & VIDINTCON1_INT_FRAME) {
+ 		/* VSYNC interrupt, accept it */
+ 		DISP_SS_EVENT_LOG(DISP_EVT_DECON_FRAMEDONE, &decon->sd, ktime_set(0, 0));
+@@ -784,6 +793,7 @@
+ 	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
+ 	ret = devm_request_irq(dev, res->start, decon_int_irq_handler, 0,
+ 			pdev->name, decon);
++	decon_info("decon IRQ0 (fifo) = %lu, requested ret=%d\n", (unsigned long)res->start, ret);
+ 	if (ret) {
+ 		decon_err("failed to install irq\n");
+ 		return ret;
+--- a/include/linux/exynos_decon_kms.h
++++ b/include/linux/exynos_decon_kms.h
+@@ -184,6 +184,10 @@
+  * have blanked the display first.  Process context. */
+ void decon_kms_put(struct decon_kms_dev *d);
+ 
++/* int70: log the DECON state and the video registers (VIDCON0/VIDOUTCON0/
++ * VIDINTCON0/VIDINTCON1/TRIGCON); diagnostics only. */
++void decon_kms_log_state(struct decon_kms_dev *d, const char *tag);
++
+ /* Read-only capabilities of the handle; the pointer is owned by @d and stays
+  * valid until decon_kms_put().  Safe to call at any time, from any context. */
+ const struct decon_kms_caps *decon_kms_caps(struct decon_kms_dev *d);
