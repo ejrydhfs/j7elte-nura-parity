@@ -127,3 +127,23 @@ read-only; every slice that needs to compile works in its own copy under
 | 15 | `KmsFence` | vblank → dma_fence commit completion | 1,3 |
 | 16 | `KmsAssemble` | series assembly, gates, build script | all |
 | 17 | `KmsBoot` | int50 build/flash harness + rollback image | 16 |
+
+## 7. M1 status snapshot (2026-11-24)
+
+Reached: our atomic DRM driver **registers `card0` + a KMS `fb0`** on hardware
+(`/dev/dri/card0`, `controlD64`, `fb0 -> 14830000.decon_fb`), with vendor DECON
+refusing to bind and KMS standing the controller up through the shim.
+
+Fixed on the way (all hardware-verified in sequence):
+`late_initcall_sync` boot loop; devm double-free in the vendor remove; drvdata published before
+`decon_kms_get`; `R_AARCH64_PREL32` unwind relocations in modules (`-fno-unwind-tables`);
+`RPM_ACTIVE` making `pm_runtime_get_sync` a no-op so DECON clocks stayed off; NULL encoder
+`.mode_set`; unguarded `funcs->commit/.dpms/.atomic_update` in the atomic-helper backport;
+NULL `load_lut` and encoder/connector `destroy`.
+
+Open (M1 blocker): **DECON FRAME interrupt never fires** in KMS video mode
+(`/proc/interrupts`: decon 0, dsim 64). `decon_enable()`'s `reg_init/reg_start` clears the
+`decon_activate_vsync()` arming done at `->load`, and the vendor re-arms only in
+`pan_display`. int70 forces `decon_activate_vsync()` after `decon_enable()` but hard-hangs
+(no auto-reboot), so the next image enables lockup-panic + panic-reboot to make failures
+recoverable, and re-tests that path with register readbacks.
