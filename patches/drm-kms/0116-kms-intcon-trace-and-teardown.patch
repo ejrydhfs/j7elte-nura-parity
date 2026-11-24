@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsIntcon <kmsic@local>
+Date: Tue, 24 Nov 2026 01:00:00 
+Subject: [PATCH 0116] gpu31-kms: trace the VIDINTCON0 write and make teardown non-blocking (int73)
+
+1. VIDINTCON0 stays 0 after the forced arm.  Add instrumentation at the
+   write itself and at the arm site, in the order Main asked:
+     - decon_reg_set_int(): log id / dsi_mode / psr_mode / trig_mode / en, the
+       value written, the register address (decon_int_drvdata->regs +
+       VIDINTCON0) and the immediate VIDINTCON0/VIDINTCON1 readback;
+     - decon_kms_arm_frame(): log state, pdata dsi_mode/psr_mode/trig_mode,
+       drvdata_ok and output_sd, then a scratch write/read of VIDOUTCON0
+       (proves writel() lands through the same decon_write_mask path), then
+       the set_int call, the DSIM_IOC_VSYNC return and the final readbacks.
+   No behavioural change yet: this names whether the write is lost, the mask
+   selection is wrong, or the id/base resolves elsewhere.
+
+2. Teardown wedge in kthread_stop(update_regs_thread):
+     - decon->kms_teardown (new flag) is set first;
+     - the producer is turned off with decon_reg_set_int(..., 0) and both
+       wait queues (vsync_info.wait, wait_frmdone) are woken;
+     - after a 20 ms grace, kthread_stop() runs only if the worker is not in
+       an uninterruptible sleep (TASK_UNINTERRUPTIBLE); otherwise it is logged
+       and skipped (a leaked thread beats a wedged kernel);
+     - decon_update_regs_handler()/decon_update_regs()/decon_wait_for_vsync()
+       bail out immediately while kms_teardown is set, so the worker can
+       finish and the stop (when attempted) is short.
+
+--- a/drivers/video/exynos/decon_7580/decon_reg_7580.c
++++ b/drivers/video/exynos/decon_7580/decon_reg_7580.c
+@@ -571,6 +571,10 @@
+ {
+ 	u32 val;
+ 
++	/* int73: name the write so a lost VIDINTCON0 update is traceable. */
++	pr_info("decon_reg_set_int: id=%u dsi_mode=%d psr_mode=%d trig_mode=%d en=%u\n",
++		id, dsi_mode, psr->psr_mode, psr->trig_mode, en);
++
+ 	if (en) {
+ 		val = VIDINTCON0_INT_ENABLE | VIDINTCON0_FIFOLEVEL_EMPTY;
+ 		if (psr->psr_mode == DECON_MIPI_COMMAND_MODE) {
+@@ -581,9 +585,15 @@
+ 			val |= VIDINTCON0_INT_FIFO | VIDINTCON0_INT_FRAME
+ 				| VIDINTCON0_FRAMESEL0_VSYNC;
+ 		}
++		pr_info("decon_reg_set_int: writing VIDINTCON0 val=%08x (addr=%px)\n",
++			val, decon_int_drvdata ? decon_int_drvdata->regs + VIDINTCON0 : NULL);
+ 		decon_write_mask(id, VIDINTCON0, val, ~0);
++		pr_info("decon_reg_set_int: VIDINTCON0 readback=%08x VIDINTCON1=%08x\n",
++			decon_read(id, VIDINTCON0), decon_read(id, VIDINTCON1));
+ 	} else {
+ 		decon_write_mask(id, VIDINTCON0, 0, VIDINTCON0_INT_ENABLE);
++		pr_info("decon_reg_set_int: disable, VIDINTCON0 readback=%08x\n",
++			decon_read(id, VIDINTCON0));
+ 	}
+ }
+ 
+--- a/drivers/video/exynos/decon_7580/decon.h
++++ b/drivers/video/exynos/decon_7580/decon.h
+@@ -742,6 +742,8 @@
+ 
+ 	/* int70: ESD IRQ enable state, so enable/disable are idempotent */
+ 	bool			esd_irq_on;
++	/* int73: teardown in progress; blocking paths must bail out */
++	bool			kms_teardown;
+ };
+ 
+ static inline struct decon_device *get_decon_drvdata(u32 id)
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -1240,6 +1240,10 @@
+ 	ktime_t timestamp;
+ 	int ret;
+ 
++	/* int73: never sleep for a frame during teardown. */
++	if (decon->kms_teardown)
++		return -ENODEV;
++
+ 	if (decon->pdata->psr_mode == DECON_MIPI_COMMAND_MODE) {
+ 		if (decon->ignore_vsync)
+ 			goto wait_exit;
+@@ -2077,6 +2081,8 @@
+ 
+ void decon_update_regs(struct decon_device *decon, struct decon_reg_data *regs)
+ {
++	if (decon->kms_teardown)
++		return;
+ 	struct decon_dma_buf_data old_dma_bufs[decon->pdata->max_win][MAX_BUF_PLANE_CNT];
+ 	int i, j;
+ 
+@@ -2191,6 +2197,11 @@
+ 	struct decon_reg_data *data, *next;
+ 	struct list_head saved_list;
+ 
++	if (decon->kms_teardown) {
++		decon_info("update handler: teardown, dropping queued work\n");
++		return;
++	}
++
+ 	if (decon->state == DECON_STATE_LPD)
+ 		decon_warn("%s: LPD state: %d\n", __func__, decon_get_lpd_block_cnt(decon));
+ 
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -39,6 +39,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/errno.h>
++#include <linux/sched.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+@@ -408,12 +409,31 @@
+ 	}
+ 	mutex_unlock(&kms_lock);
+ 
++	decon->kms_teardown = true;
++	{
++		struct decon_psr_info psr;
++
++		decon_to_psr_info(decon, &psr);
++		decon_reg_set_int(DECON_INT, &psr, DSI_MODE_SINGLE, 0);
++	}
++	wake_up_interruptible_all(&decon->vsync_info.wait);
++	wake_up_interruptible_all(&decon->wait_frmdone);
++	msleep(20);
++
+ 	if (decon->state != DECON_STATE_OFF)
+ 		decon_disable(decon);
+ 
+-	if (decon->update_regs_thread)
+-		kthread_stop(decon->update_regs_thread);
++	if (decon->update_regs_thread) {
++		unsigned long st = ACCESS_ONCE(decon->update_regs_thread->state);
+ 
++		if (st & TASK_UNINTERRUPTIBLE) {
++			decon_err("teardown: update worker in D state (0x%lx), skipping kthread_stop\n", st);
++		} else {
++			kthread_stop(decon->update_regs_thread);
++			decon_info("teardown: update worker stopped\n");
++		}
++	}
++
+ 	decon_unregister_entity(decon);
+ 
+ 	if (decon->ion_client)
+@@ -579,6 +599,17 @@
+ 		   where, decon_read(DECON_INT, VIDINTCON0),
+ 		   (int)decon->vsync_info.irq_refcount);
+ 
++	decon_info("decon_kms_arm_frame(%s): state=%d pdata dsi_mode=%d psr_mode=%d trig=%d drvdata_ok=%d output_sd=%p\n",
++		   where, decon->state, decon->pdata->dsi_mode,
++		   decon->pdata->psr_mode, decon->pdata->trig_mode,
++		   decon_int_drvdata == decon, decon->output_sd);
++	{
++		u32 scratch = decon_read(DECON_INT, VIDOUTCON0);
++
++		decon_write_mask(DECON_INT, VIDOUTCON0, scratch, ~0);
++		decon_info("decon_kms_arm_frame(%s): scratch VIDOUTCON0 %08x -> %08x\n",
++			   where, scratch, decon_read(DECON_INT, VIDOUTCON0));
++	}
+ 	decon_to_psr_info(decon, &psr);
+ 	decon_reg_set_int(DECON_INT, &psr, DSI_MODE_SINGLE, 1);
+ 	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 after set_int=%08x\n",
