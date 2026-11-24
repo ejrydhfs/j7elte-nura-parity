@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsDestroy <kmsdestroy@local>
+Date: Mon, 23 Nov 2026 20:20:00 
+Subject: [PATCH 0111] gpu31-kms: fbdev LUT no-ops and destroy hooks (int69, module-only)
+
+int68 gets further (fb0 registered, screen changes), then two NULL calls:
+
+  LR drm_fb_helper_setcmap+0x1ac [drm_kms_helper]   PC 0
+  LR drm_mode_config_cleanup+0x4c                   PC 0
+
+1. `drm_fb_helper_setcmap()` ends with `crtc_funcs->load_lut(crtc);`
+   (crtc->helper_private = drm_crtc_helper_funcs); our table had no
+   `.load_lut`.  `drm_fb_helper_restore_lut_atomic()` and
+   `drm_mode_gamma_set_ioctl()` use `crtc->funcs->gamma_set`; the latter
+   rejects NULL, the former checks, but a no-op makes both harmless.  The
+   fbdev fb is truecolor (pseudo-palette), so there is no hardware LUT:
+   `.load_lut` and `.gamma_set` are DRM_DEBUG_KMS no-ops.  `.gamma_get` does
+   not exist in this tree's `drm_crtc_funcs` (the get-gamma ioctl uses
+   crtc->gamma_store).
+
+2. `drm_mode_config_cleanup()` calls `encoder->funcs->destroy()`,
+   `connector->funcs->destroy()`, `plane->funcs->destroy()` and
+   `crtc->funcs->destroy()` unguarded, in that order.  Our encoder and
+   connector tables had no `.destroy` (plane and CRTC already had one), so the
+   first iteration jumped to NULL.  Set `.destroy = drm_encoder_cleanup` and
+   `.destroy = drm_connector_cleanup`; both are exported by drm.ko.
+
+Audit of the 3.10 fbdev/cleanup funcs-> surface:
+  - setcmap: crtc helper `.load_lut` (added, was unguarded);
+  - setcolreg: fb_helper funcs gamma_set/gamma_get, only reached for
+    non-truecolor; the CMA helper does not set them, and our fb is XRGB8888
+    truecolor (early return) - documented, not guarded;
+  - restore_lut / mode_gamma_set ioctl: crtc `.gamma_set` (guarded/NULL-checked,
+    now provided as a no-op);
+  - mode_config_cleanup: encoder/connector/plane/CRTC `.destroy` (all set now);
+  - atomic state: `.atomic_destroy_state` set for CRTC, plane and connector;
+  - `.set_config`, `.page_flip`, `.update_plane`, `.disable_plane`,
+    `.fill_modes`, `.detect` already present.
+
+Module-only: both files are `drivers/gpu/drm/exynos7580/` (obj-m), so the
+built-in image is unchanged.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -376,8 +376,30 @@
+ 	DRM_DEBUG_KMS("[CRTC:%d] frame flush\n", crtc->base.id);
+ }
+ 
++/*
++ * int69: the 3.10 fbdev path calls these unconditionally:
++ *   - drm_fb_helper_setcmap() ends with crtc_funcs->load_lut(crtc);
++ *   - drm_fb_helper_restore_lut_atomic()/drm_mode_gamma_set_ioctl() use
++ *     crtc->funcs->gamma_set (the ioctl rejects a NULL one, the restore path
++ *     checks it, but a no-op makes both harmless).
++ * The fbdev palette is a pseudo-palette in truecolor mode, so there is no
++ * hardware LUT to program: both are logging no-ops.
++ */
++static void exynos7580_crtc_load_lut(struct drm_crtc *crtc)
++{
++	DRM_DEBUG_KMS("load_lut (no HW LUT, pseudo-palette only)\n");
++}
++
++static void exynos7580_crtc_gamma_set(struct drm_crtc *crtc, u16 *r,
++				      u16 *g, u16 *b, uint32_t start,
++				      uint32_t size)
++{
++	DRM_DEBUG_KMS("gamma_set start=%u size=%u (no HW LUT)\n", start, size);
++}
++
+ static const struct drm_crtc_helper_funcs exynos7580_crtc_helper_funcs = {
+ 	.dpms		= exynos7580_crtc_dpms,
++	.load_lut	= exynos7580_crtc_load_lut,
+ 	.mode_fixup	= exynos7580_crtc_mode_fixup,
+ 	.mode_set	= exynos7580_crtc_mode_set,
+ 	.disable	= exynos7580_crtc_disable,
+@@ -410,6 +432,7 @@
+ 	.reset			= drm_atomic_helper_crtc_reset,
+ 	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
+ 	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
++	.gamma_set		= exynos7580_crtc_gamma_set,
+ 	.destroy		= exynos7580_crtc_destroy,
+ };
+ 
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c
+@@ -205,7 +205,11 @@
+ };
+ 
+ static const struct drm_encoder_funcs exynos7580_dsi_encoder_funcs = {
+-	/* drm_encoder_cleanup() is driven by drm_mode_config_cleanup(). */
++	/*
++	 * int69: drm_mode_config_cleanup() calls encoder->funcs->destroy()
++	 * unguarded, and it runs before the connectors/planes/CRTCs.
++	 */
++	.destroy	= drm_encoder_cleanup,
+ };
+ 
+ /* ------------------------------------------------------------------------
+@@ -283,6 +287,8 @@
+ 	.fill_modes		= drm_helper_probe_single_connector_modes,
+ 	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
+ 	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
++	/* int69: mode_config_cleanup() calls destroy() unguarded. */
++	.destroy		= drm_connector_cleanup,
+ 	/*
+ 	 * no ->atomic_set_property: CRTC_ID is handled by the core
+ 	 * (drm_atomic.c:630) and the connector has no driver properties.  The
