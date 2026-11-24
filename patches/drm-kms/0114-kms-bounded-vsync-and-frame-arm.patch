@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsBound <kmsbound@local>
+Date: Mon, 23 Nov 2026 22:30:00 
+Subject: [PATCH 0114] gpu31-kms: bounded KMS vsync wait and per-frame FRAME arming (int71)
+
+Two changes for a self-recovering, non-wedging bring-up:
+
+  - decon_update_regs(): on the KMS path the vsync wait is capped at 100 ms
+    (vendor VSYNC_TIMEOUT_MSEC is 300 ms) and a timeout logs
+    VIDCON0/VIDINTCON0/TRIGCON plus VIDINTCON0/VIDINTCON1 before the wait, so
+    a missing FRAME interrupt names the register state instead of sleeping for
+    600 ms and continuing silently.
+  - decon_kms_commit()/decon_kms_enable(): the FRAME interrupt is (re-)armed
+    after decon_enable() and after any decon_reg_start() the commit performs,
+    mirroring the vendor sequence: decon_pan_display() (decon-int_drv.c:
+    542-615) arms through decon_wait_for_vsync(), which brackets the sleep
+    with decon_activate_vsync()/decon_deactivate_vsync(); decon_reg_start()
+    (decon_reg_7580.c:480-490) only starts the pipe.  The new
+    decon_kms_arm_frame() does the same activate/deactivate pair (refcount
+    neutral) and logs VIDINTCON0 before/after each arming.
+  - decon_kms_commit() adds a second bounded 100 ms vsync wait after the
+    update and returns -ETIMEDOUT (with decon_kms_log_state()) instead of
+    leaving the caller to continue on an unarmed pipe.
+
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -2132,7 +2132,20 @@
+ 	else
+ 		DISP_SS_EVENT_LOG_WINCON(&decon->sd, regs);
+ 
+-	decon_wait_for_vsync(decon, VSYNC_TIMEOUT_MSEC);
++	/* int71: the KMS commit must never block indefinitely waiting for a
++	 * FRAME interrupt; cap it at 100 ms and name the register state. */
++	if (decon->kms_owned) {
++		decon_info("decon_update_regs: vsync wait <=100ms, VIDINTCON0=%08x VIDINTCON1=%08x\n",
++			   decon_read(DECON_INT, VIDINTCON0),
++			   decon_read(DECON_INT, VIDINTCON1));
++		if (decon_wait_for_vsync(decon, 100) < 0)
++			decon_err("decon_update_regs: vsync timeout (kms), VIDCON0=%08x VIDINTCON0=%08x TRIGCON=%08x\n",
++				  decon_read(DECON_INT, VIDCON0),
++				  decon_read(DECON_INT, VIDINTCON0),
++				  decon_read(DECON_INT, TRIGCON));
++	} else {
++		decon_wait_for_vsync(decon, VSYNC_TIMEOUT_MSEC);
++	}
+ 	if (decon_reg_wait_for_update_timeout(DECON_INT, 300 * 1000) < 0) {
+ 		DISP_SS_EVENT_LOG(DISP_EVT_UPDATE_TIMEOUT, &decon->sd,
+ 				ktime_set(0, 0));
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -38,6 +38,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/errno.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+@@ -71,6 +72,8 @@
+ static struct decon_kms_dev *kms_instance;
+ static DEFINE_MUTEX(kms_lock);
+ 
++static void decon_kms_arm_frame(struct decon_device *decon, const char *where);
++
+ /* ------------------------------------------------------------------------ */
+ /* helpers                                                                  */
+ /* ------------------------------------------------------------------------ */
+@@ -543,7 +546,8 @@
+ 		 */
+ 		if (decon->pdata->psr_mode == DECON_VIDEO_MODE && d->vblank_cb) {
+ 			decon_activate_vsync(decon);
+-			decon_info("decon_kms_enable: FRAME irq re-armed, VIDINTCON0=%08x\n",
++			decon_kms_arm_frame(decon, "after decon_enable/reg_start");
++			decon_info("decon_kms_enable: FRAME irq armed, VIDINTCON0=%08x\n",
+ 				   decon_read(DECON_INT, VIDINTCON0));
+ 		}
+ 	}
+@@ -555,6 +559,30 @@
+ EXPORT_SYMBOL_GPL(decon_kms_enable);
+ 
+ /*
++ * int71: re-arm the FRAME interrupt for the current frame without changing the
++ * vsync refcount.  Vendor reference: decon_pan_display() (decon-int_drv.c:
++ * 542-615) arms through decon_wait_for_vsync(), which calls
++ * decon_activate_vsync() before sleeping and decon_deactivate_vsync() after;
++ * decon_reg_start() (decon_reg_7580.c:480-490) only starts the pipe.  In KMS
++ * mode we do the same after decon_enable() and after any decon_reg_start() in
++ * the commit path; activate+deactivate re-writes VIDINTCON0 and leaves the
++ * registration refcount untouched.
++ */
++static void decon_kms_arm_frame(struct decon_device *decon, const char *where)
++{
++	if (decon->pdata->psr_mode != DECON_VIDEO_MODE)
++		return;
++
++	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 before=%08x\n",
++		   where, decon_read(DECON_INT, VIDINTCON0));
++	decon_activate_vsync(decon);
++	decon_deactivate_vsync(decon);
++	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 after=%08x VIDINTCON1=%08x\n",
++		   where, decon_read(DECON_INT, VIDINTCON0),
++		   decon_read(DECON_INT, VIDINTCON1));
++}
++
++/*
+  * int70: dump the state and the four video registers the KMS path cares about.
+  * Exported for the fbdev slice, which has no decon pointer of its own.
+  */
+@@ -631,8 +659,16 @@
+ 	mutex_lock(&decon->output_lock);
+ 
+ 	ret = decon_kms_program(decon, regs, wins, nr_wins);
+-	if (!ret)
++	if (!ret) {
++		/* arm after any decon_reg_start() the program performed */
++		decon_kms_arm_frame(decon, "commit after program");
+ 		decon_export_update_regs(decon, regs);
++		if (decon_wait_for_vsync(decon, 100) < 0) {
++			decon_err("decon_kms_commit: bounded vsync wait failed\n");
++			decon_kms_log_state(d, "commit vsync timeout");
++			ret = -ETIMEDOUT;
++		}
++	}
+ 
+ 	mutex_unlock(&decon->output_lock);
+ 
