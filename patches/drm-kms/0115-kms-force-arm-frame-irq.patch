@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsForceArm <kmsarm@local>
+Date: Mon, 23 Nov 2026 23:30:00 
+Subject: [PATCH 0115] gpu31-kms: force-arm the FRAME interrupt past the vsync refcount (int72)
+
+int71 reads back VIDINTCON0=0 after decon_enable() and after the arming call:
+decon_activate_vsync() only programs decon_reg_set_int() when
+vsync_info.irq_refcount transitions 0->1, and decon_kms_register_vblank_cb()
+took that reference in ->load() before the first
+decon_reg_init()/reg_start() cleared VIDINTCON0.  Every later refcounted arm
+was a no-op.
+
+  - decon_kms_register_vblank_cb() now only stores callback/data; no reference
+    is taken (arming is per decon_reg_start()).
+  - decon_kms_arm_frame() is now an unconditional force: log VIDINTCON0 and the
+    refcount, decon_to_psr_info() + decon_reg_set_int(..., 1), then
+    v4l2_subdev_call(DSIM_IOC_VSYNC, 1) with its return logged, then
+    VIDINTCON0/VIDINTCON1 again; if VIDINTCON0 still reads 0 it logs
+    "VIDINTCON0 still zero after arm" so a lost write (shadow/reg protect) is
+    distinguishable from a wrong mask.
+  - called after decon_enable() (which does reg_start), after
+    decon_kms_commit()'s program (another reg_start on full modeset), and once
+    more after the bounded wait succeeds (the wait's deactivate clears
+    VIDINTCON0 again, so this keeps the IRQ on between commits).
+  - decon_kms_disable() no longer deactivates vsync (we hold no reference).
+    decon_wait_for_vsync()'s own 0->1/1->0 bracket still works because the
+    refcount is now 0 at rest.
+
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -59,6 +59,7 @@
+ #include "../../../staging/android/sw_sync.h"
+ 
+ #include "decon.h"
++#include "decon_helper.h"
+ 
+ struct decon_kms_dev {
+ 	struct decon_device	*decon;
+@@ -545,7 +546,6 @@
+ 		 * VIDINTCON0.  Re-arm it here and balance it in disable().
+ 		 */
+ 		if (decon->pdata->psr_mode == DECON_VIDEO_MODE && d->vblank_cb) {
+-			decon_activate_vsync(decon);
+ 			decon_kms_arm_frame(decon, "after decon_enable/reg_start");
+ 			decon_info("decon_kms_enable: FRAME irq armed, VIDINTCON0=%08x\n",
+ 				   decon_read(DECON_INT, VIDINTCON0));
+@@ -559,27 +559,42 @@
+ EXPORT_SYMBOL_GPL(decon_kms_enable);
+ 
+ /*
+- * int71: re-arm the FRAME interrupt for the current frame without changing the
+- * vsync refcount.  Vendor reference: decon_pan_display() (decon-int_drv.c:
+- * 542-615) arms through decon_wait_for_vsync(), which calls
+- * decon_activate_vsync() before sleeping and decon_deactivate_vsync() after;
+- * decon_reg_start() (decon_reg_7580.c:480-490) only starts the pipe.  In KMS
+- * mode we do the same after decon_enable() and after any decon_reg_start() in
+- * the commit path; activate+deactivate re-writes VIDINTCON0 and leaves the
+- * registration refcount untouched.
++ * int72: force the FRAME interrupt on, bypassing the vsync refcount.
++ * decon_activate_vsync() only programs VIDINTCON0 when the refcount goes
++ * 0->1; ->load() used to take that reference before the first
++ * decon_reg_init()/reg_start() cleared VIDINTCON0, so later arming saw a
++ * non-zero refcount and did nothing.  Program the mask and the DSIM vsync
++ * source unconditionally here, exactly like the vendor pan_display path does
++ * through decon_wait_for_vsync() (decon_core.c:1228-1265).
+  */
+ static void decon_kms_arm_frame(struct decon_device *decon, const char *where)
+ {
+-	if (decon->pdata->psr_mode != DECON_VIDEO_MODE)
++	struct decon_psr_info psr;
++	int ret = 0;
++
++	if (!decon || decon->pdata->psr_mode != DECON_VIDEO_MODE)
+ 		return;
+ 
+-	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 before=%08x\n",
++	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 before=%08x refcount=%d\n",
++		   where, decon_read(DECON_INT, VIDINTCON0),
++		   (int)decon->vsync_info.irq_refcount);
++
++	decon_to_psr_info(decon, &psr);
++	decon_reg_set_int(DECON_INT, &psr, DSI_MODE_SINGLE, 1);
++	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 after set_int=%08x\n",
+ 		   where, decon_read(DECON_INT, VIDINTCON0));
+-	decon_activate_vsync(decon);
+-	decon_deactivate_vsync(decon);
+-	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 after=%08x VIDINTCON1=%08x\n",
++
++	if (decon->output_sd) {
++		ret = v4l2_subdev_call(decon->output_sd, core, ioctl,
++				       DSIM_IOC_VSYNC, (unsigned long *)1);
++		decon_info("decon_kms_arm_frame(%s): DSIM_IOC_VSYNC ret=%d\n", where, ret);
++	}
++
++	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 final=%08x VIDINTCON1=%08x\n",
+ 		   where, decon_read(DECON_INT, VIDINTCON0),
+ 		   decon_read(DECON_INT, VIDINTCON1));
++	if (!decon_read(DECON_INT, VIDINTCON0))
++		decon_err("decon_kms_arm_frame(%s): VIDINTCON0 still zero after arm\n", where);
+ }
+ 
+ /*
+@@ -622,10 +637,6 @@
+ 	}
+ 
+ 	ret = decon_disable(decon);
+-	if (!ret && decon->pdata->psr_mode == DECON_VIDEO_MODE && d->vblank_cb) {
+-		decon_deactivate_vsync(decon);
+-		decon_info("decon_kms_disable: FRAME irq deactivated (refcount balance)\n");
+-	}
+ 	mutex_unlock(&kms_lock);
+ 
+ 	return ret;
+@@ -667,6 +678,9 @@
+ 			decon_err("decon_kms_commit: bounded vsync wait failed\n");
+ 			decon_kms_log_state(d, "commit vsync timeout");
+ 			ret = -ETIMEDOUT;
++		} else {
++			/* the wait's deactivate cleared VIDINTCON0 again */
++			decon_kms_arm_frame(decon, "commit after wait");
+ 		}
+ 	}
+ 
+@@ -774,14 +788,11 @@
+ 	decon->kms_vblank_data = data;
+ 
+ 	/*
+-	 * decon_activate_vsync()/decon_deactivate_vsync() refcount the FRAME
+-	 * interrupt and the DSIM vsync source, so they stay the only owners of
+-	 * VIDINTCON1 - DRM code must never touch it (decon-kms-dsi.md 1.6).
++	 * int72: registration only stores the callback.  Arming is done per
++	 * decon_reg_start() by decon_kms_arm_frame(), because taking the
++	 * refcounted reference here made every later refcounted arm a no-op
++	 * after decon_reg_init()/reg_start() cleared VIDINTCON0.
+ 	 */
+-	if (cb)
+-		decon_activate_vsync(decon);
+-	else
+-		decon_deactivate_vsync(decon);
+ 
+ 	mutex_unlock(&kms_lock);
+ 
