@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsModeSet <kmsmodeset@local>
+Date: Mon, 23 Nov 2026 19:00:00 
+Subject: [PATCH 0109] gpu31-kms: give the DSI encoder a mode_set hook (int67, module-only)
+
+int66 reaches the first modeset and then jumps to NULL:
+
+    PC is at 0x0
+    LR is at crtc_set_mode.isra.0+0x144 [drm_kms_helper]
+
+drm_atomic_helper's crtc_set_mode() in this tree calls
+`encoder->funcs->mode_set(encoder, mode, adjusted_mode)` unconditionally
+(drivers/gpu/drm/drm_atomic_helper.c:753); this encoder only had .disable and
+.mode_fixup.  The DSI link and DECON programming live in the CRTC
+(enable_link()), so the encoder hook is a logging no-op.
+
+Audit of the other hooks the helper calls around a modeset (same file), so the
+next one is not hit blind:
+
+  - encoder .prepare/.disable/.dpms: guarded, and .disable exists here, so the
+    else-chain never reaches .dpms;
+  - encoder .enable/.commit: `if (funcs->enable) ... else if (funcs->commit)`,
+    both optional (neither is set);
+  - encoder .mode_fixup: called when .atomic_check is absent (it is), and it
+    exists;
+  - CRTC .mode_set/.mode_fixup/.disable/.enable: guarded / implemented;
+  - only the encoder .mode_set call is unguarded.
+
+Module-only change: only drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c is
+touched, which is not part of the built-in image.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_dsi.c
+@@ -161,6 +161,23 @@
+ }
+ 
+ /*
++ * int67: drm_atomic_helper's crtc_set_mode() calls encoder->funcs->mode_set()
++ * unconditionally (drivers/gpu/drm/drm_atomic_helper.c:753 in this tree), and
++ * this encoder had no such callback, so the first modeset jumped to NULL.
++ * The DSI link and DECON programming live in the CRTC (enable_link()), so the
++ * encoder hook is a logging no-op, as in the upstream drivers.
++ */
++static void
++exynos7580_dsi_encoder_mode_set(struct drm_encoder *encoder,
++				struct drm_display_mode *mode,
++				struct drm_display_mode *adjusted_mode)
++{
++	DRM_DEBUG_KMS("DSI encoder: mode_set %ux%u@%u (link handled by CRTC)\n",
++		      adjusted_mode->hdisplay, adjusted_mode->vdisplay,
++		      drm_mode_vrefresh(adjusted_mode));
++}
++
++/*
+  * The CRTC hands us the requested mode; reject anything but the panel timing
+  * and give the CRTC the exact values it must program into DECON and DSIM, so
+  * a userspace-supplied variant of the same mode cannot slip through.
+@@ -184,6 +201,7 @@
+ static const struct drm_encoder_helper_funcs exynos7580_dsi_encoder_helper_funcs = {
+ 	.disable	= exynos7580_dsi_encoder_disable,
+ 	.mode_fixup	= exynos7580_dsi_encoder_mode_fixup,
++	.mode_set	= exynos7580_dsi_encoder_mode_set,
+ };
+ 
+ static const struct drm_encoder_funcs exynos7580_dsi_encoder_funcs = {
