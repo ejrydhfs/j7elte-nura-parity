@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GpuMmapDebug <gpu-mmap@local>
+Date: Tue, 25 Nov 2026 09:10:00
+Subject: [PATCH 0137] gpu31-gem: instrument panfrost mmap path (int85)
+
+Mesa20-kmsro pairs with card0+renderD128 on int84 and reports Mali T720, but
+panfrost_bo_mmap's mmap() returns MAP_FAILED with ENOMEM after a successful
+DRM_IOCTL_PANFROST_MMAP_BO.  No return path in p7580_gem_mmap produces
+-ENOMEM, so first pin down which branch executes and what the kernel sees:
+
+ - p7580_gem_mmap: fops identity (f_op, ->mmap, ->unlocked_ioctl), minor
+   type/index, driver name, pgoff, vm size/flags; offset_hash hit/miss and
+   the drm_mmap() fallback rc; on a hit, obj size, offset_valid,
+   offset_node.start, backing, sgt/pages/nr_pages; then the rc of every
+   arm (CMA dma_mmap_attrs, sgt remap_pfn_range per chunk, SHMEM
+   VM_MIXEDMAP with vm_get) and the final FAIL rc;
+ - panfrost_ioctl_mmap_bo: handle, offset_valid, offset_node.start,
+   fake_offset, iova, lookup/no-offset failures;
+ - panfrost_ioctl_create_bo: requested size/flags, handle, iova,
+   offset_valid, offset_node.start;
+ - p7580_offset_alloc: npages and rc of the hole search, drm_mm insert and
+   hash insert, and the assigned start;
+ - p7580_gem_fault (ratelimited): page index, vaddr, vm_flags, backing,
+   pages/sgt, rc.
+
+Diagnostic only: no behavioural change.  Removal is one hunk per block.
+
+--- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-25 08:54:49.600356561 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-25 09:01:17.164775049 -0500
+@@ -642,11 +642,15 @@
+ 	hole = drm_mm_search_free(&gd->offset_mm, npages, 0, false);
+ 	if (!hole) {
+ 		ret = -ENOSPC;
++		pr_info("p7580_offset_alloc: no hole npages=%lu rc=%d\n",
++			npages, ret);
+ 		goto out;
+ 	}
+ 	memset(&bo->offset_node, 0, sizeof(bo->offset_node));
+ 	if (drm_mm_insert_node(&gd->offset_mm, &bo->offset_node, npages, 0)) {
+ 		ret = -ENOMEM;
++		pr_info("p7580_offset_alloc: insert failed npages=%lu rc=%d\n",
++			npages, ret);
+ 		goto out;
+ 	}
+ 	memset(&bo->offset_hash, 0, sizeof(bo->offset_hash));
+@@ -654,9 +658,13 @@
+ 	if (drm_ht_insert_item(&gd->offset_hash, &bo->offset_hash)) {
+ 		drm_mm_remove_node(&bo->offset_node);
+ 		ret = -ENOMEM;
++		pr_info("p7580_offset_alloc: hash insert failed npages=%lu rc=%d\n",
++			npages, ret);
+ 		goto out;
+ 	}
+ 	bo->offset_valid = 1;
++	pr_info("p7580_offset_alloc: npages=%lu start=0x%lx rc=0\n",
++		npages, bo->offset_node.start);
+ out:
+ 	mutex_unlock(&gd->mmap_offset_lock);
+ 	return ret;
+@@ -1290,6 +1298,9 @@
+ 	 * shape as the udl fault handler; avoids taking struct_mutex in
+ 	 * fault context at all. */
+ 	ret = p7580_map_page(bo, vma, f_vaddr, page_offset);
++	pr_info_ratelimited("p7580_gem_fault: page=0x%lx vaddr=0x%lx vflags=0x%lx backing=%u pages=%p sgt=%p rc=%d\n",
++		(unsigned long)page_offset, f_vaddr, vma->vm_flags,
++		bo->backing, bo->pages, bo->sgt, ret);
+ 	return p7580_fault_err(ret);
+ }
+ 
+@@ -1361,13 +1372,31 @@
+ 	 * already dying (kref_get_unless_zero), in which case the offset
+ 	 * is stale. An offset we never handed out is not ours: keep the
+ 	 * core legacy-map fallback exactly as drm_gem_mmap() did. */
++	vm_size = vma->vm_end - vma->vm_start;
++	pr_info("p7580_gem_mmap: enter fop=%pS fop_mmap=%pS fop_ioctl=%pS pgoff=0x%lx vm=0x%lx vflags=0x%lx minor_type=%d minor_idx=%d drv=%s gem_vm_ops=%p\n",
++		filp->f_op, filp->f_op ? filp->f_op->mmap : NULL,
++		filp->f_op ? filp->f_op->unlocked_ioctl : NULL,
++		vma->vm_pgoff, vm_size, vma->vm_flags,
++		priv->minor->type, priv->minor->index,
++		dev->driver->name ? dev->driver->name : "?",
++		dev->driver->gem_vm_ops);
++
+ 	obj = p7580_offset_lookup(gd, vma->vm_pgoff);
+-	if (!obj)
+-		return drm_mmap(filp, vma);
++	if (!obj) {
++		int drc;
+ 
+-	vm_size = vma->vm_end - vma->vm_start;
++		pr_info("p7580_gem_mmap: offset_lookup MISS pgoff=0x%lx\n",
++			vma->vm_pgoff);
++		drc = drm_mmap(filp, vma);
++		pr_info("p7580_gem_mmap: drm_mmap fallback rc=%d pgoff=0x%lx\n",
++			drc, vma->vm_pgoff);
++		return drc;
++	}
++
+ 	if (vm_size > obj->size ||
+ 	    !dev->driver->gem_vm_ops) {
++		pr_info("p7580_gem_mmap: bad request vm=0x%lx obj_size=0x%zx gem_vm_ops=%p rc=-EINVAL\n",
++			vm_size, obj->size, dev->driver->gem_vm_ops);
+ 		drm_gem_object_unreference_unlocked(obj);
+ 		return -EINVAL;
+ 	}
+@@ -1389,6 +1418,10 @@
+ 	vma->vm_pgoff = 0;
+ 
+ 	bo = to_p7580_bo(obj);
++	pr_info("p7580_gem_mmap: hit obj_size=0x%zx offset_valid=%u node_start=0x%llx backing=%u sgt=%p pages=%p nr_pages=%u cache_attr=0x%x\n",
++		obj->size, bo->offset_valid,
++		(unsigned long long)bo->offset_node.start, bo->backing,
++		bo->sgt, bo->pages, bo->nr_pages, bo->cache_attr);
+ 
+ 	/* WC default (covers both SHMEM CREATE_BO and CMA scanout), cached
+ 	 * opt-in (exynos update_vm_cache_attr shape). COHERENCY_NONE: WC is
+@@ -1407,6 +1440,8 @@
+ 		dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
+ 		ret = dma_mmap_attrs(obj->dev->dev, vma, bo->cma_vaddr,
+ 				     bo->cma_paddr, obj->size, &attrs);
++		pr_info("p7580_gem_mmap: cma dma_mmap_attrs rc=%d size=0x%zx paddr=%pa\n",
++			ret, obj->size, &bo->cma_paddr);
+ 		if (ret)
+ 			goto err_close;
+ 		return 0;
+@@ -1421,6 +1456,8 @@
+ 			pfn = __phys_to_pfn(sg_phys(sgl));
+ 			ret = remap_pfn_range(vma, vma->vm_start + off, pfn,
+ 					chunk, vma->vm_page_prot);
++			pr_info("p7580_gem_mmap: sgt chunk=%u off=0x%lx pfn=0x%lx rc=%d\n",
++				i, off, pfn, ret);
+ 			if (ret)
+ 				goto err_close;
+ 			off += sgl->length;
+@@ -1432,6 +1469,8 @@
+ 
+ 	if (!bo->pages) {
+ 		ret = -ENODEV;
++		pr_info("p7580_gem_mmap: no pages/sgt backing=%u rc=-ENODEV\n",
++			bo->backing);
+ 		goto err_close;
+ 	}
+ 
+@@ -1442,6 +1481,8 @@
+ 	 * last close of another mapping of the same BO. */
+ 	vma->vm_flags &= ~VM_PFNMAP;
+ 	vma->vm_flags |= VM_MIXEDMAP | VM_DONTCOPY;
++	pr_info("p7580_gem_mmap: mixedmap vflags=0x%lx vma_refs(before)=%u npages=%u rc=0\n",
++		vma->vm_flags, bo->vma_refs, bo->nr_pages);
+ 	mutex_lock(&obj->dev->struct_mutex);
+ 	p7580_gem_vm_get(bo);
+ 	mutex_unlock(&obj->dev->struct_mutex);
+@@ -1451,6 +1492,8 @@
+ 	/* The VMA reference taken by the lookup (and registered with
+ 	 * drm_vm_open_locked above) is dropped by the core close helper,
+ 	 * exactly as the old drm_gem_mmap() error path did. */
++	pr_info("p7580_gem_mmap: FAIL branch rc=%d pgoff=0x%lx vm=0x%lx\n",
++		ret, vma->vm_pgoff, vm_size);
+ 	drm_gem_vm_close(vma);
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-25 08:54:49.600715541 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-25 09:00:36.485085350 -0500
+@@ -210,6 +210,10 @@
+ 	bo = to_p7580_bo(obj);
+ 	args->handle = handle;
+ 	args->offset = (uint64_t)bo->iova;
++	pr_info("p7580_create_bo: size=0x%x flags=0x%x handle=%u iova=0x%llx offset_valid=%u node_start=0x%llx rc=0\n",
++		args->size, args->flags, handle,
++		(unsigned long long)bo->iova, bo->offset_valid,
++		(unsigned long long)bo->offset_node.start);
+ 	return 0;
+ }
+ 
+@@ -230,8 +234,11 @@
+ 	/* drm_gem_object_lookup takes the reference internally (no
+ 	 * outer struct_mutex needed; lookup is idr + kref_get). */
+ 	obj = drm_gem_object_lookup(dev, file_priv, args->handle);
+-	if (!obj)
++	if (!obj) {
++		pr_info("p7580_mmap_bo: handle=%u lookup MISS rc=-ENOENT\n",
++			args->handle);
+ 		return -ENOENT;
++	}
+ 	bo = to_p7580_bo(obj);
+ 	/* gpu31-mmlock: same fake-offset encoding as before (page index
+ 	 * << PAGE_SHIFT), now read from the driver-owned manager. The
+@@ -242,9 +249,16 @@
+ 	if (bo->offset_valid)
+ 		fake_offset = (uint64_t)bo->offset_node.start << PAGE_SHIFT;
+ 	mutex_unlock(&gd->mmap_offset_lock);
++	pr_info("p7580_mmap_bo: handle=%u offset_valid=%u node_start=0x%llx fake_offset=0x%llx iova=0x%llx\n",
++		args->handle, bo->offset_valid,
++		(unsigned long long)bo->offset_node.start,
++		(unsigned long long)fake_offset,
++		(unsigned long long)bo->iova);
+ 	drm_gem_object_unreference_unlocked(obj);
+-	if (!fake_offset)
++	if (!fake_offset) {
++		pr_info("p7580_mmap_bo: no fake offset rc=-ENOENT\n");
+ 		return -ENOENT;
++	}
+ 
+ 	args->offset = fake_offset;
+ 	return 0;
