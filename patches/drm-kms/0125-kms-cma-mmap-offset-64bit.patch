@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsMmapOff <kmsmmapoff@local>
+Date: Tue, 24 Nov 2026 12:00:00 
+Subject: [PATCH 0125] gpu31-kms: 64-bit CMA mmap offset (int79)
+
+int78's trace:
+
+    get_gem_mmap_offset obj=0 key=1049476 offset=3686400
+    drm_gem_cma_mmap: enter pgoff=900
+    drm_gem_cma_mmap: drm_gem_mmap ret=-22
+
+The core stores the fake offset in pages (drm_gem.c:370,
+`hash.key = drm_mm node start`) and drm_gem_mmap() looks it up with
+`vma->vm_pgoff`, also in pages.  get_gem_mmap_offset() computed
+`(unsigned int)key << PAGE_SHIFT`: with key 1049476 the shift overflows 32
+bits (1049476 << 12 = 3686400 mod 2^32), so userspace mmap()ed pgoff 900
+instead of 1049476, the offset_hash lookup missed and mmap returned -EINVAL.
+
+Fix: use unsigned long for the key and the returned byte offset (and log both
+with %lu).  Userspace gets a 64-bit offset, vm_pgoff is the page key, and the
+hash lookup hits.
+
+--- a/drivers/gpu/drm/drm_gem_cma_helper.c
++++ b/drivers/gpu/drm/drm_gem_cma_helper.c
+@@ -27,14 +27,22 @@
+ #include <drm/drm.h>
+ #include <drm/drm_gem_cma_helper.h>
+ 
+-static unsigned int get_gem_mmap_offset(struct drm_gem_object *obj)
++/*
++ * int79: the core stores the fake offset in *pages* (drm_gem.c:370,
++ * hash.key = drm_mm node start) and drm_gem_mmap() looks it up with
++ * vma->vm_pgoff, also in pages.  The byte offset handed to userspace must
++ * therefore be key << PAGE_SHIFT in a 64-bit type: the old 32-bit
++ * "unsigned int" truncated it (key 1049476 -> 3686400), userspace then mapped
++ * pgoff 900, the hash lookup missed and mmap returned -EINVAL.
++ */
++static unsigned long get_gem_mmap_offset(struct drm_gem_object *obj)
+ {
+-	unsigned int key = (unsigned int)obj->map_list.hash.key;
++	unsigned long key = obj->map_list.hash.key;
++	unsigned long offset = key << PAGE_SHIFT;
+ 
+-	/* int78: name the offset the dumb-map ioctl hands to userspace. */
+-	pr_info("drm_gem_cma: get_gem_mmap_offset obj=%p key=%u offset=%u\n",
+-		obj, key, key << PAGE_SHIFT);
+-	return key << PAGE_SHIFT;
++	pr_info("drm_gem_cma: get_gem_mmap_offset obj=%p key=%lu offset=%lu\n",
++		obj, key, offset);
++	return offset;
+ }
+ 
+ static void drm_gem_cma_buf_destroy(struct drm_device *drm,
