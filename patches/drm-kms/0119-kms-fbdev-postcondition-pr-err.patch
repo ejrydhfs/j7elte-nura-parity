@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsFbErr <kmsfberr@local>
+Date: Tue, 24 Nov 2026 04:35:00 
+Subject: [PATCH 0119] gpu31-kms: fbdev postcondition failure at KERN_ERR (int75, module-only)
+
+The int74 run's dmesg was flooded with userspace faults, so the fb0 failure
+reason was lost.  In addition to the full dev_err line and the register dump,
+the failure now emits an explicit pr_err with crtc id/enabled/active/
+primary->state->fb/wanted fb, which lands in the persisted 256 KB trace even
+when the rest is drowned out.  Module-only (fbdev slice).
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
+@@ -164,6 +164,12 @@
+ 			ex->crtc.primary && ex->crtc.primary->state ?
+ 				ex->crtc.primary->state->fb : NULL,
+ 			ex->crtc.primary ? ex->crtc.primary->fb : NULL, fb);
++		/* int75: keep the reason at KERN_ERR in the persisted trace. */
++		pr_err("exynos7580: fbdev scanout failed: crtc id=%u enabled=%d active=%d primary->state->fb=%p want=%p\n",
++		       ex->crtc.base.id, ex->crtc.enabled,
++		       ex->crtc.state ? ex->crtc.state->active : -1,
++		       ex->crtc.primary && ex->crtc.primary->state ?
++				ex->crtc.primary->state->fb : NULL, fb);
+ 		/* int70: name the register state that made the check fail. */
+ 		decon_kms_log_state(ex->decon, "fbdev scanout failed");
+ 		return -EIO;

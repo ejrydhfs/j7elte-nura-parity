@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsVsyncStop <kmsvs@local>
+Date: Tue, 24 Nov 2026 04:30:00 
+Subject: [PATCH 0118] gpu31-kms: bound decon_wait_for_vsync_thread so kthread_stop returns (int75)
+
+The int74 load wedge is the vendor vsync thread:
+
+    kthread_stop+0x70 <- decon_kms_put+0x1dc <- exynos7580_probe+0x154
+    stuck: [s3c-fb-vsync] decon_wait_for_vsync_thread+0x58
+
+decon_wait_for_vsync_thread() waits on `wait_event_interruptible` with a
+condition that can never become true during teardown (pipe off) and never
+checks kthread_should_stop(), so kthread_stop() blocks forever; the watchdog
+does not fire because userspace is alive.
+
+The loop now waits with a 100 ms timeout
+(`wait_event_interruptible_timeout(..., HZ/10)`) and exits on
+`kthread_should_stop() || decon->kms_teardown`.  decon_kms_teardown() already
+sets the flag, turns the producer off (`decon_reg_set_int(..., 0)`) and wakes
+`vsync_info.wait`/`wait_frmdone` before stopping, so the stop completes within
+one poll interval.  The D-state skip remains only as a last resort.
+
+--- a/drivers/video/exynos/decon_7580/decon-int_drv.c
++++ b/drivers/video/exynos/decon_7580/decon-int_drv.c
+@@ -856,15 +856,24 @@
+ {
+ 	struct decon_device *decon = data;
+ 
++	/*
++	 * int75: the vendor loop waits without a timeout, so kthread_stop()
++	 * blocked forever once the condition could no longer become true
++	 * (teardown with the pipe off).  Poll with a 100 ms timeout and exit
++	 * on kthread_should_stop()/kms_teardown, which bounds the stop.
++	 */
+ 	while (!kthread_should_stop()) {
+ 		ktime_t timestamp = decon->vsync_info.timestamp;
+-		int ret = wait_event_interruptible(decon->vsync_info.wait,
++		int ret = wait_event_interruptible_timeout(decon->vsync_info.wait,
+ 			!ktime_equal(timestamp, decon->vsync_info.timestamp) &&
+-			decon->vsync_info.active);
++			decon->vsync_info.active,
++			HZ / 10);
++
++		if (kthread_should_stop() || decon->kms_teardown)
++			break;
+ 
+-		if (!ret) {
++		if (ret > 0)
+ 			sysfs_notify(&decon->dev->kobj, NULL, "vsync");
+-		}
+ 	}
+ 
+ 	return 0;
