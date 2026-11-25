@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DeconWinDiag <decon-win@local>
+Date: Tue, 25 Nov 2026 13:00:00
+Subject: [PATCH 0143] gpu31-kms: dump DECON windows/registers, guard the ion free path
+
+KWin's commits are accepted (int92 re-enables a non-ON pipe) but the panel is
+black, so the remaining question is what the commit actually programs.  Add
+the evidence and stop the vendor free path from running on KMS-owned entries.
+
+Shim (decon_kms_api.c):
+- decon_kms_program(): one block per commit - nwin, max_win,
+  num_of_window(pre) and one line per window with the KMS state, the vendor
+  state/format enum, fourcc, idma, blending, plane alpha, the three dma
+  addresses and src/dst rects; after decon_export_set_win_config() the rc,
+  num_of_window and the wincon[] values it produced.
+- decon_kms_commit(): decon_kms_dump_regs() after decon_export_update_regs()
+  and again after the bound vsync wait - VIDCON0/VIDOUTCON0/VIDINTCON0/
+  VIDINTCON1/TRIGCON plus, per window, WINCON, VIDW_ADD0/ADD2/ADD3, VIDOSD_A/
+  B/C/D, VIDW_WHOLE_X/Y and VIDW_OFFSET_X/Y.  A working kmscube commit and a
+  black KWin commit can be compared line by line.
+
+Vendor free path (decon_core.c):
+- decon_free_dma_buf(): KMS-programmed entries carry only the IOVMM address
+  the shim mapped itself (decon_export_regs_param_addr() sets dma_addr and
+  nothing else), so dma->attachment is NULL.  Skip ion_iovmm_unmap() for them
+  (it BUG_ON()s on a non-ion dma_buf / dereferences the NULL attachment),
+  drop the fence if any, log the skip and clear the entry.  Real ion/vendor
+  entries keep the unchanged path.
+
+int92's non-ON commit re-enable is kept.
+
+Runtime: kmscube first (working reference), then KWin; diff the
+`decon_kms_program: win[...]` and `decon_kms_regs[...]` blocks.  For KWin's
+commit WINCON must carry WINCON_ENWIN and VIDW_ADD0 must equal the logged
+addr; if they do, the register path is right and the difference is in the
+buffer/format/blend or the pipe never latches (vsync arm/trigger).  No
+`ion_iovmm_unmap` trace may appear from a commit any more.
+
+---
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -173,8 +173,31 @@
+ 		}
+ 	}
+ 
+-	return decon_export_set_win_config(decon, regs, cfg,
+-					   decon->pdata->max_win);
++	/* int93: one block per commit describing exactly what will be
++	 * programmed; compare a working kmscube commit with KWin's. */
++	decon_info("decon_kms_program: nwin=%u max_win=%u num_of_window(pre)=%u\n",
++		   nr_wins, decon->pdata->max_win, regs->num_of_window);
++	for (i = 0; i < nr_wins; i++) {
++		decon_info("decon_kms_program: win[%u] kms_state=%u vendor_state=%u fourcc=0x%08x format=%u idma=%u blend=%u alpha=%d addr=0x%llx,0x%llx,0x%llx src=%d,%d %ux%u f=%ux%u dst=%d,%d %ux%u\n",
++			   i, wins[i].state, cfg[i].state, wins[i].fourcc,
++			   cfg[i].format, cfg[i].idma_type, cfg[i].blending,
++			   cfg[i].plane_alpha,
++			   (unsigned long long)wins[i].addr[0],
++			   (unsigned long long)wins[i].addr[1],
++			   (unsigned long long)wins[i].addr[2],
++			   wins[i].src.x, wins[i].src.y, wins[i].src.w,
++			   wins[i].src.h, wins[i].src.f_w, wins[i].src.f_h,
++			   wins[i].dst.x, wins[i].dst.y, wins[i].dst.w,
++			   wins[i].dst.h);
++	}
++
++	ret = decon_export_set_win_config(decon, regs, cfg,
++					  decon->pdata->max_win);
++	decon_info("decon_kms_program: set_win_config rc=%d num_of_window=%u wincon0=0x%08x wincon1=0x%08x wincon2=0x%08x\n",
++		   ret, regs->num_of_window, regs->wincon[0],
++		   regs->wincon[1] ? regs->wincon[1] : 0,
++		   regs->wincon[2] ? regs->wincon[2] : 0);
++	return ret;
+ }
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -677,6 +700,36 @@
+ }
+ EXPORT_SYMBOL_GPL(decon_kms_disable);
+ 
++/* int93: read back the window and video registers the commit just wrote. */
++static void decon_kms_dump_regs(struct decon_device *decon, const char *where)
++{
++	unsigned int i;
++
++	if (!decon || !decon->pdata)
++		return;
++	decon_info("decon_kms_regs[%s]: VIDCON0=%08x VIDOUTCON0=%08x VIDINTCON0=%08x VIDINTCON1=%08x TRIGCON=%08x\n",
++		   where, decon_read(DECON_INT, VIDCON0),
++		   decon_read(DECON_INT, VIDOUTCON0),
++		   decon_read(DECON_INT, VIDINTCON0),
++		   decon_read(DECON_INT, VIDINTCON1),
++		   decon_read(DECON_INT, TRIGCON));
++	for (i = 0; i < decon->pdata->max_win; i++)
++		decon_info("decon_kms_regs[%s]: win[%u] WINCON=%08x ADD0=0x%08x ADD2=0x%08x ADD3=0x%08x VIDOSD_A=%08x B=%08x C=%08x D=%08x WHOLE_X=%u WHOLE_Y=%u OFF_X=%u OFF_Y=%u\n",
++			   where, i,
++			   decon_read(DECON_INT, WINCON(i)),
++			   decon_read(DECON_INT, VIDW_ADD0(i)),
++			   decon_read(DECON_INT, VIDW_ADD2(i)),
++			   decon_read(DECON_INT, VIDW_ADD3(i)),
++			   decon_read(DECON_INT, VIDOSD_A(i)),
++			   decon_read(DECON_INT, VIDOSD_B(i)),
++			   decon_read(DECON_INT, VIDOSD_C(i)),
++			   decon_read(DECON_INT, VIDOSD_D(i)),
++			   decon_read(DECON_INT, VIDW_WHOLE_X(i)),
++			   decon_read(DECON_INT, VIDW_WHOLE_Y(i)),
++			   decon_read(DECON_INT, VIDW_OFFSET_X(i)),
++			   decon_read(DECON_INT, VIDW_OFFSET_Y(i)));
++}
++
+ int decon_kms_commit(struct decon_kms_dev *d,
+ 		     const struct decon_kms_win *wins, unsigned int nr_wins)
+ {
+@@ -727,6 +780,7 @@
+ 		/* arm after any decon_reg_start() the program performed */
+ 		decon_kms_arm_frame(decon, "commit after program");
+ 		decon_export_update_regs(decon, regs);
++		decon_kms_dump_regs(decon, "after update_regs");
+ 		if (decon_wait_for_vsync(decon, 100) < 0) {
+ 			decon_err("decon_kms_commit: bounded vsync wait failed\n");
+ 			decon_kms_log_state(d, "commit vsync timeout");
+@@ -734,6 +788,7 @@
+ 		} else {
+ 			/* the wait's deactivate cleared VIDINTCON0 again */
+ 			decon_kms_arm_frame(decon, "commit after wait");
++			decon_kms_dump_regs(decon, "after vsync");
+ 		}
+ 	}
+ 
+--- a/drivers/video/exynos/decon_7580/decon_core.c
++++ b/drivers/video/exynos/decon_7580/decon_core.c
+@@ -1368,6 +1368,24 @@
+ 	if (!dma->dma_addr)
+ 		return;
+ 
++	/*
++	 * int93: KMS-programmed entries carry only the IOVMM address the shim
++	 * mapped itself (decon_export_regs_param_addr() sets dma_addr and
++	 * nothing else).  There is no ion_handle/attachment behind them, so the
++	 * vendor ion unmap path must not run: ion_iovmm_unmap() would reject a
++	 * non-ion dma_buf (BUG_ON(dmabuf->ops != &dma_buf_ops)) or dereference
++	 * a NULL attachment.  The KMS side unmaps through iovmm_unmap() when
++	 * the BO is released; here the bookkeeping is simply cleared.
++	 */
++	if (!dma->attachment) {
++		decon_info("decon_free_dma_buf: kms-owned addr 0x%llx skipped (no attachment)\n",
++			   (unsigned long long)dma->dma_addr);
++		if (dma->fence)
++			sync_fence_put(dma->fence);
++		memset(dma, 0, sizeof(struct decon_dma_buf_data));
++		return;
++	}
++
+ 	if (dma->fence)
+ 		sync_fence_put(dma->fence);
+ 
