@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DmaBufSeek <dmabuf@local>
+Date: Tue, 25 Nov 2026 09:40:00
+Subject: [PATCH 0007] dma-buf: set FMODE_LSEEK so vfs_llseek reaches llseek
+
+0006 wired .llseek = dma_buf_llseek in dma_buf_fops and the function is in
+kallsyms, but on the device every lseek() on an exported dma-buf fd still
+returned ESPIPE, including SEEK_SET:
+
+    SEEK_SET: -1 errno=29 (ESPIPE)
+    SEEK_END: -1 errno=29 (ESPIPE)
+
+Cause: dma_buf fds are created with anon_inode_getfile(), which allocates the
+file through alloc_file(&path, OPEN_FMODE(flags), fops) and therefore does not
+set FMODE_LSEEK (only do_dentry_open() does).  fs/read_write.c vfs_llseek():
+"fn = no_llseek; if (file->f_mode & FMODE_LSEEK) { if (file->f_op->llseek)
+fn = file->f_op->llseek; }" -- so the fops slot was never consulted and
+no_llseek() returned ESPIPE for every whence.
+
+Set FMODE_LSEEK on the dma-buf file in dma_buf_export_named() (after the
+anon_inode_getfile() error check, which the 3.10 code also lacked).  SEEK_END
+then returns dmabuf->size through dma_buf_llseek().
+
+---
+--- a/drivers/base/dma-buf.c	2026-11-25 09:24:22.056744115 -0500
++++ b/drivers/base/dma-buf.c	2026-11-25 09:24:22.149500497 -0500
+@@ -182,6 +182,16 @@
+ 	dmabuf->exp_name = exp_name;
+ 
+ 	file = anon_inode_getfile("dmabuf", &dma_buf_fops, dmabuf, flags);
++	if (IS_ERR(file)) {
++		kfree(dmabuf);
++		return ERR_CAST(file);
++	}
++	/* anon_inode_getfile() allocates the file through alloc_file() and so
++	 * does not set FMODE_LSEEK (only do_dentry_open() does).  vfs_llseek()
++	 * gates on that bit before calling f_op->llseek, so without this every
++	 * lseek() on a dma-buf fd returns ESPIPE even though
++	 * dma_buf_fops.llseek is wired. */
++	file->f_mode |= FMODE_LSEEK;
+ 
+ 	dmabuf->file = file;
+ 

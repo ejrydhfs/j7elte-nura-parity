@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsPrimeRdwr <kmsrdwr@local>
+Date: Tue, 25 Nov 2026 09:42:00
+Subject: [PATCH 0137] gpu31-kms: accept DRM_RDWR on PRIME_HANDLE_TO_FD
+
+Measured on int86: drmPrimeHandleToFD(card0, dumb_handle,
+DRM_CLOEXEC | DRM_RDWR) returns EINVAL.  3.10 drm_prime.c only allows
+DRM_CLOEXEC in args->flags:
+
+    if (args->flags & ~DRM_CLOEXEC)
+        return -EINVAL;
+
+and DRM_RDWR does not exist in this tree's include/uapi/drm/drm.h.  Mesa's
+kmsro asks for a writable dma-buf (DRM_RDWR) when exporting the display BO,
+so the export fails before the importer ever sees a fd.
+
+Backport the upstream flags: define DRM_RDWR as O_RDWR, allow CLOEXEC|RDWR,
+and pass both through to drm_gem_prime_export() -> dma_buf_export() so the
+dma-buf file is opened writable (its mmap may then be MAP_SHARED PROT_WRITE).
+The fd remains O_CLOEXEC when asked.  Import (FD_TO_HANDLE) is unchanged.
+
+---
+--- a/include/uapi/drm/drm.h	2026-11-25 09:24:22.058152313 -0500
++++ b/include/uapi/drm/drm.h	2026-11-25 09:24:22.149732857 -0500
+@@ -618,6 +618,9 @@
+ };
+ 
+ #define DRM_CLOEXEC O_CLOEXEC
++/* Upstream DRM_RDWR: request a writable dma-buf fd on PRIME_HANDLE_TO_FD
++ * (value O_RDWR, passed through to dma_buf_export's file flags). */
++#define DRM_RDWR O_RDWR
+ struct drm_prime_handle {
+ 	__u32 handle;
+ 
+--- a/drivers/gpu/drm/drm_prime.c	2026-11-25 09:24:22.057451671 -0500
++++ b/drivers/gpu/drm/drm_prime.c	2026-11-25 09:24:22.149615315 -0500
+@@ -373,12 +373,14 @@
+ 	if (!dev->driver->prime_handle_to_fd)
+ 		return -ENOSYS;
+ 
+-	/* check flags are valid */
+-	if (args->flags & ~DRM_CLOEXEC)
++	/* check flags are valid (DRM_RDWR == O_RDWR requests a writable
++	 * dma-buf fd; Mesa/kmsro passes it for scanout exports) */
++	if (args->flags & ~(DRM_CLOEXEC | DRM_RDWR))
+ 		return -EINVAL;
+ 
+-	/* we only want to pass DRM_CLOEXEC which is == O_CLOEXEC */
+-	flags = args->flags & DRM_CLOEXEC;
++	/* pass the fd creation flags through: O_CLOEXEC and, when asked,
++	 * O_RDWR (the file mode then allows writable mmap of the export) */
++	flags = args->flags & (DRM_CLOEXEC | DRM_RDWR);
+ 
+ 	return dev->driver->prime_handle_to_fd(dev, file_priv,
+ 			args->handle, flags, &args->fd);
