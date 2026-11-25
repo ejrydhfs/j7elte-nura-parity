@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsFlip2 <kmsflip2@local>
+Date: Tue, 24 Nov 2026 20:05:00 
+Subject: [PATCH 0132] gpu31-kms: build the page-flip atomic state explicitly (int83, module-only)
+
+int82's trace showed `async=1 crtc->fb=0 primary->state->fb=0`: the 3.10
+helper path left the committed plane without the new framebuffer.
+exynos7580_crtc_page_flip() now builds the state itself: crtc event,
+drm_atomic_get_plane_state(primary) + drm_atomic_set_crtc_for_plane(crtc) +
+drm_atomic_set_fb_for_plane(fb), full-mode src/dst rectangle, logs state/total_planes/plane/planes[0]/plane_state/plane_state->fb/event/fb, sets the legacy
+crtc->fb for drm_mode_page_flip_ioctl's pre-check and calls
+drm_atomic_async_commit(); on success syncs plane->fb/crtc->fb from the new
+plane state.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -417,9 +417,72 @@
+ 				     struct drm_framebuffer *fb,
+ 				     struct drm_pending_vblank_event *event)
+ {
+-	/* 3.10's vtable has no flags argument; async flips are not supported. */
+-	crtc->fb = fb;	/* int82: core page_flip still checks this legacy field */
+-	return drm_atomic_helper_page_flip(crtc, fb, event, 0);
++	struct drm_plane *plane = crtc->primary;
++	struct drm_atomic_state *state;
++	struct drm_crtc_state *crtc_state;
++	struct drm_plane_state *plane_state;
++	int ret;
++
++	/*
++	 * int83: build the flip state explicitly instead of relying on
++	 * drm_atomic_helper_page_flip(); the 3.10 helper path left the plane
++	 * without a framebuffer in the committed state (trace:
++	 * primary->state->fb=0).  Mirror the helper: crtc event, plane bound to
++	 * this crtc with the new fb and full-mode src/dst rectangle.
++	 */
++	state = drm_atomic_state_alloc(crtc->dev);
++	if (!state)
++		return -ENOMEM;
++	state->acquire_ctx = drm_modeset_legacy_acquire_ctx(crtc);
++
++	crtc_state = drm_atomic_get_crtc_state(state, crtc);
++	if (IS_ERR(crtc_state)) {
++		ret = PTR_ERR(crtc_state);
++		goto fail;
++	}
++	crtc_state->event = event;
++
++	plane_state = drm_atomic_get_plane_state(state, plane);
++	if (IS_ERR(plane_state)) {
++		ret = PTR_ERR(plane_state);
++		goto fail;
++	}
++	ret = drm_atomic_set_crtc_for_plane(plane_state, crtc);
++	if (ret)
++		goto fail;
++	drm_atomic_set_fb_for_plane(plane_state, fb);
++
++	/* Full-frame source/destination from the current mode. */
++	{
++		struct drm_display_mode *mode = &crtc->state->mode;
++
++		plane_state->src_x = 0;
++		plane_state->src_y = 0;
++		plane_state->src_w = mode->hdisplay << 16;
++		plane_state->src_h = mode->vdisplay << 16;
++		plane_state->crtc_x = 0;
++		plane_state->crtc_y = 0;
++		plane_state->crtc_w = mode->hdisplay;
++		plane_state->crtc_h = mode->vdisplay;
++	}
++
++	pr_info("exynos7580_page_flip: state=%p total_planes=%u plane=%p planes[0]=%p pstate=%p pstate->fb=%p crtc event=%p fb=%p\n",
++		state, crtc->dev->mode_config.num_total_plane, plane,
++		state->planes[0], plane_state, plane_state->fb,
++		crtc_state->event, fb);
++
++	crtc->fb = fb;	/* legacy pre-check in drm_mode_page_flip_ioctl */
++
++	ret = drm_atomic_async_commit(state);
++	if (ret)
++		goto fail;
++
++	plane->fb = plane->state->fb;
++	crtc->fb = plane->state->fb;
++	return 0;
++fail:
++	drm_atomic_state_free(state);
++	return ret;
+ }
+ 
+ static void exynos7580_crtc_destroy(struct drm_crtc *crtc)
