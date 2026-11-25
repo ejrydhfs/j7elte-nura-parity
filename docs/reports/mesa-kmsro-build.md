@@ -110,8 +110,9 @@ Every option matches `mesa20-b`'s `meson-info/intro-buildoptions.json`
 Build cost and one caveat: the first `ninja -j3` run was killed by the int83
 flash reboot at 182/1047 targets; it was restarted in the same tree
 (`setsid nohup ninja -j3`, log `/data/mesabuild/mesa20-kmsro-build.log`) and
-finished 869/869 with **no `FAILED:` line**. Total compile ≈ 40 min of the 4
-cores. Peak memory stayed under ~1 GB of the 1.3 GB (no OOM, no swap).
+finished 869/869 with **no `FAILED:` line**. Wall time 13:16:14 (`build.ninja`)
+→ 13:44:05 (`libgallium_dri.so`), i.e. ≈28 min on 4 cores including the ~4 min
+reboot gap. Peak memory stayed under ~1 GB of the 1.3 GB (no OOM, no swap).
 
 `ninja install` then ran Mesa's own megadriver script
 (`mesa20/bin/install_megadrivers.py`), so the kmsro names are produced by Mesa,
