@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsFirstFrame <kmsff@local>
+Date: Tue, 24 Nov 2026 06:00:00 
+Subject: [PATCH 0120] gpu31-kms: make the initial modeset atomic-state based and explicit (int76, module-only)
+
+int75 registers fb0 (real scanout IOVA, DECON IRQ 234 firing) but
+exynos7580_initial_modeset() fails:
+
+    *ERROR* primary plane has no fb0 after the initial modeset
+
+The check used the legacy `crtc->state->enable` and `crtc->primary->fb`
+fields, which the atomic commit path does not maintain (int74 fixed the same
+mistake in the fbdev postcondition).  Changes:
+
+  - log the full atomic view before the check: crtc id/enabled/state/
+    state->active/state->enable, mode_config.num_plane, the primary plane,
+    plane->state, plane->state->fb and the legacy plane->fb;
+  - the postcondition is `crtc->state->active && crtc->enabled &&
+    plane->state && plane->state->fb`;
+  - if that is not satisfied, take the first fb in mode_config.fb_list,
+    allocate an atomic state, `drm_atomic_get_plane_state()` +
+    `drm_atomic_set_fb_for_plane()` and commit it through our
+    `drm_atomic_commit()` with the modeset locks released (log the fb and the
+    return value), then re-check under the locks and fail with the full state
+    only if it is still inconsistent.
+
+This guarantees a defined first frame instead of relying on the fb_helper
+internals, and never fails on a legacy field again.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+@@ -237,20 +237,79 @@
+ static int exynos7580_initial_modeset(struct exynos7580_device *ex,
+ 				      struct drm_device *drm)
+ {
++	struct drm_plane *plane = ex->crtc.primary;
++	struct drm_plane_state *pstate;
++	struct drm_framebuffer *fb = NULL;
++	bool ok;
+ 	int ret = 0;
+ 
+ 	drm_modeset_lock_all(drm);
+ 
+-	if (!ex->crtc.state || !ex->crtc.state->enable) {
+-		DRM_ERROR("CRTC is not active after the initial modeset\n");
+-		ret = -EIO;
+-	} else if (!ex->crtc.primary || !ex->crtc.primary->fb) {
+-		DRM_ERROR("primary plane has no fb0 after the initial modeset\n");
+-		ret = -EIO;
+-	}
++	/*
++	 * int76: the postcondition must use the atomic state, not the legacy
++	 * crtc->state->enable / plane->fb fields (the atomic commit path does
++	 * not maintain them; int74 fixed the same mistake in the fbdev slice).
++	 * Log every field so a real mismatch is unambiguous.
++	 */
++	pstate = plane ? plane->state : NULL;
++	DRM_INFO("initial modeset state: crtc id=%u enabled=%d state=%p active=%d enable=%d planes_empty=%d primary=%p pstate=%p pstate->fb=%p legacy->fb=%p\n",
++		 ex->crtc.base.id, ex->crtc.enabled, ex->crtc.state,
++		 ex->crtc.state ? ex->crtc.state->active : -1,
++		 ex->crtc.state ? ex->crtc.state->enable : -1,
++		 list_empty(&drm->mode_config.plane_list), plane, pstate,
++		 pstate ? pstate->fb : NULL, plane ? plane->fb : NULL);
+ 
++	ok = ex->crtc.state && ex->crtc.state->active && ex->crtc.enabled &&
++	     pstate && pstate->fb;
++	if (!ok) {
++		if (list_empty(&drm->mode_config.fb_list)) {
++			DRM_ERROR("initial modeset: no framebuffer to attach\n");
++			ret = -EIO;
++		} else {
++			fb = list_first_entry(&drm->mode_config.fb_list,
++					      struct drm_framebuffer, head);
++		}
++	}
+ 	drm_modeset_unlock_all(drm);
++	if (ret || ok)
++		return ret;
+ 
++	/*
++	 * int76: if the fb_helper path did not leave the primary plane
++	 * attached to fb0, make the first frame explicit instead of failing:
++	 * allocate a state, attach the fb to the primary plane and commit it
++	 * through our atomic_commit (without the modeset locks held).
++	 */
++	{
++		struct drm_atomic_state *state = drm_atomic_state_alloc(drm);
++		struct drm_plane_state *sp;
++
++		if (!state)
++			return -ENOMEM;
++		sp = drm_atomic_get_plane_state(state, plane);
++		if (IS_ERR(sp)) {
++			ret = PTR_ERR(sp);
++			drm_atomic_state_free(state);
++			return ret;
++		}
++		drm_atomic_set_fb_for_plane(sp, fb);
++		DRM_INFO("initial modeset: explicit commit of fb %p on plane %p\n", fb, plane);
++		ret = drm_atomic_commit(state);
++		DRM_INFO("initial modeset: explicit commit ret=%d\n", ret);
++		if (ret)
++			return ret;
++	}
++
++	drm_modeset_lock_all(drm);
++	pstate = plane ? plane->state : NULL;
++	if (!ex->crtc.state || !ex->crtc.state->active || !ex->crtc.enabled ||
++	    !pstate || pstate->fb != fb) {
++		DRM_ERROR("initial modeset still inconsistent after the explicit commit: active=%d enabled=%d pstate->fb=%p want=%p\n",
++			  ex->crtc.state ? ex->crtc.state->active : -1,
++			  ex->crtc.enabled, pstate ? pstate->fb : NULL, fb);
++		ret = -EIO;
++	}
++	drm_modeset_unlock_all(drm);
+ 	return ret;
+ }
+ 
