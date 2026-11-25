@@ -69,3 +69,21 @@ Remaining, with the latest evidence:
 Test harness and rollback image are unchanged (`wdpet.sh`, `logd.sh`, `kmstest.sh <rev>`,
 `kernel-boot-int49.img`). Note this image is OpenRC: stop the UI with
 `rc-service xsession stop` (not `systemctl`).
+
+## 2026-11-25 — Plasma Mobile is running
+
+With int93 (blob MODE_ID, panfrost DRM 1.1 + modern CREATE_BO flags, dma-buf SEEK_END,
+platform driver renamed `panfrost`, commit re-enable, ion unmap guard) plus the system Mesa 26:
+
+- `kwin_wayland --drm` runs as an atomic compositor (markers: atomic-ams, planes-enumerated,
+  gpu-added, gl-compositing, output-added; no commit failures; DECON frame IRQs rising).
+- `startplasmamobile`-equivalent session (kwin + kactivitymanagerd + plasmashell with
+  `PLASMA_PLATFORM=phone:handset`, `PLASMA_DEFAULT_SHELL=org.kde.plasma.mobileshell`) shows the
+  **“Welcome to Plasma Mobile”** initialization screen on the panel.
+- Session recipe: `/home/user/plasma-boot.sh` (detached under `dbus-run-session`), env
+  `XDG_RUNTIME_DIR=/data/plasma-run`, `KWIN_DRM_DEVICES=/dev/dri/card0`,
+  `KWIN_RENDER_NODES=/dev/dri/renderD128`, `KWIN_COMPOSE=O2ES`.
+
+Remaining for a usable phone: touch/input in the session, boot integration (load KMS modules and
+start Plasma instead of X11/nura-shell), brightness/rotation, PipeWire (media), and the known
+non-blocking issues (rmmod cleanup oops, occasional ion unmap trace, legacy page-flip adapter).
