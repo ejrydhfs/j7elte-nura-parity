@@ -48,11 +48,14 @@ m20env() {
 # cell_run <name> <cmd...>  -- run, log raw, print the renderer summary
 cell_run() {
 	name=$1; shift
+	out=/tmp/mesa-cell.log
 	printf '\n========== CELL %s : %s\n' "$name" "$*" | tee -a "$log"
-	"$@" 2>&1 | tee -a "$log" | grep -E "$KEEP" | sed 's/^/  /'
+	"$@" >"$out" 2>&1
 	rc=$?
-	r=$(grep -a "PROBE renderer:" "$log" | tail -1 | sed 's/PROBE renderer: //')
-	printf 'CELL %s renderer=%s\n' "$name" "${r:-<none>}"
+	grep -E "$KEEP" "$out" | sed 's/^/  /'
+	cat "$out" >>"$log"
+	r=$(grep -a "PROBE renderer:" "$out" | tail -1 | sed 's/PROBE renderer: //')
+	printf 'CELL %s rc=%d renderer=%s\n' "$name" "$rc" "${r:-<none>}"
 }
 
 probe() { "$P" "$@"; }
