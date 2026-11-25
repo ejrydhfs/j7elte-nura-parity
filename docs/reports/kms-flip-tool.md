@@ -4,16 +4,39 @@
 DECON bring-up. It drives the interface a compositor (KWin, Weston) uses:
 `DRM_CLIENT_CAP_ATOMIC`, `drmModeAtomicCommit()` with plane `FB_ID` and a
 `DRM_MODE_PAGE_FLIP_EVENT` completion, non-blocking page flips, and
-dma-bufs imported with PRIME. It no longer uses the legacy
-`drmModePageFlip()`/`drmModeSetCrtc()` path for the test itself (legacy
-`SetCrtc` is only a restore fallback).
+dma-bufs imported with PRIME. It does not use `drmModePageFlip()` for the
+test itself: every flip is an atomic plane commit. Legacy `drmModeSetCrtc`
+is used only to establish the mode on a kernel without `MODE_ID`/property
+blobs (see below) and as the restore fallback.
 
 Two phases run per invocation:
 
 | Phase | Buffers | What it proves |
 |---|---|---|
-| `dumb` | two `CREATE_DUMB` + `ADDFB2` XRGB8888 buffers, solid colours | atomic modeset (connector `CRTC_ID`, CRTC `ACTIVE`/`MODE_ID`, plane `FB_ID`/`CRTC_ID`/`SRC_*`/`CRTC_*`) and N async page flips retire with one DRM event each |
+| `dumb` | two `CREATE_DUMB` + `ADDFB2` XRGB8888 buffers, solid colours | mode establishment (atomic when `MODE_ID` + blob ioctls exist, else legacy `SetCrtc`) and N atomic page flips, each retiring with one DRM event |
 | `dmabuf` | two dma-bufs imported into card0, `ADDFB2`, same flips | the PRIME import + scanout path KWin uses for GPU-rendered buffers |
+
+### Atomic modeset capability
+
+Atomic *modeset* needs the CRTC `MODE_ID` blob property and
+`CREATE_PROPBLOB`/`DESTROYPROPBLOB`; both arrived in DRM v4.2. Our 3.10
+atomic core is the v4.0 backport, so the current KMS kernel has neither
+(`kwin-bringup-plan.md` §0/§2.1). The tool therefore treats an atomic
+modeset as optional:
+
+* `atomic_modeset=1` — `MODE_ID` and blob ioctl present; the first commit
+  is a full atomic modeset (connector `CRTC_ID`, CRTC `ACTIVE` + `MODE_ID`,
+  plane `FB_ID`/`CRTC_ID`/`SRC_*`/`CRTC_*`).
+* `atomic_modeset=0` — the mode is established once with legacy
+  `drmModeSetCrtc` and every *flip* is still an atomic plane commit
+  (`legacy_modeset=1` in the phase line). This isolates the flip path from
+  the known `MODE_ID` gap; a KWin run still fails the earlier CRTC
+  requirement until the v4.2 backport lands.
+
+Page-flip commits deliberately carry only the primary-plane properties.
+Adding `ACTIVE`/connector `CRTC_ID` on every flip would look like a modeset
+to the v4.0 core when the legacy mode-set did not sync those fields, and
+would be rejected without `ALLOW_MODESET`.
 
 The dma-buf source is selected in this order and reported as `source=`:
 
@@ -103,6 +126,12 @@ master (`rc-service xsession stop` on the OpenRC image), then:
     --frames 10 --timeout-ms 250 --pattern solid
 ```
 
+On the 2026-11-25 KMS boot there is no `/dev/dri/renderD128` (panfrost is
+not loaded), so `dmabuf` reports `source=card-prime`; that is the expected
+fallback. That core is the v4.0 atomic backport, which has no `MODE_ID`, so
+`atomic_modeset=0` and the first phase reports `legacy_modeset=1`. See the
+counters below.
+
 Useful variants:
 
 ```sh
@@ -118,33 +147,49 @@ kmsflip --device /dev/dri/card0 --list               # connectors/modes
 
 ## Expected counters
 
-A healthy run prints one line per phase and one summary line. The exact
-numbers below are **expected** from the atomic property set the driver
-registers; they have not been observed in this ticket because the device is
-running the int49-class render-only image (no card0). Capture them on the
-next KMS image.
+A healthy run prints one line per phase and one summary line. The numbers
+below are **expected**; they were not observed in this ticket because the
+device is running the int49-class render-only image (no card0). Capture them
+on the next KMS image.
 
 `commits` counts every `drmModeAtomicCommit()` call, including EBUSY
 retries; `commit_ok` counts accepted commits; `events` counts completion
-events belonging to that phase; `flips` counts page flips that retired
-(the modeset's own completion is an event but not a flip).
+events belonging to that phase; `flips` counts page flips that retired (the
+atomic modeset's own completion is an event but not a flip). `modeset=1`
+marks an atomic modeset; `legacy_modeset=1` marks the one-time
+`drmModeSetCrtc` on a kernel without `MODE_ID`.
+
+Full atomic modeset (`atomic_modeset=1`, v4.2 `MODE_ID` backport):
 
 ```
-KMSFLIP: dev=/dev/dri/card0 connector=<n> crtc=<m> plane=<p> mode=720x1280 (720x1280@60) atomic=1 saved_fb=<f>
-KMSFLIP: phase=dumb source=dumb modeset=1 flips=10/10 commits=11 commit_ok=11 events=11 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 addfb_fallback=0 elapsed_ms=~180 PASS
+KMSFLIP: dev=/dev/dri/card0 connector=<n> crtc=<m> plane=<p> mode=720x1280 (720x1280@60) atomic=1 atomic_modeset=1 mode_id=1 saved_fb=<f>
+KMSFLIP: phase=dumb source=dumb modeset=1 legacy_modeset=0 flips=10/10 commits=11 commit_ok=11 events=11 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 addfb_fallback=0 elapsed_ms=~180 PASS
 KMSFLIP: dmabuf source=panfrost-gbm path=gbm:/dev/dri/renderD128
-KMSFLIP: phase=dmabuf source=panfrost-gbm modeset=0 flips=10/10 commits=11 commit_ok=11 events=11 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 addfb_fallback=0 elapsed_ms=~180 PASS
+KMSFLIP: phase=dmabuf source=panfrost-gbm modeset=0 legacy_modeset=0 flips=10/10 commits=11 commit_ok=11 events=11 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 addfb_fallback=0 elapsed_ms=~180 PASS
 KMSFLIP: restore=atomic saved_fb=<f>
-KMSFLIP: RESULT PASS device=/dev/dri/card0 connector=<n> crtc=<m> plane=<p> mode=720x1280 frames=10 phases=2 commits=22 commit_ok=22 events=22 flips=20/20 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 restore=ok elapsed_ms=~400
+KMSFLIP: RESULT PASS device=/dev/dri/card0 … frames=10 phases=2 commits=22 commit_ok=22 events=22 flips=20/20 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 atomic_modeset=1 legacy_modeset=0 restore=ok elapsed_ms=~400
+```
+
+v4.0 atomic core (`MODE_ID`/blob absent — the current int82-class kernel):
+the same flips, with the mode established once by legacy `SetCrtc`. The
+phase that establishes the mode has one fewer commit/event because it does
+not do an atomic modeset.
+
+```
+KMSFLIP: dev=/dev/dri/card0 connector=<n> crtc=<m> plane=<p> mode=720x1280 (720x1280@60) atomic=1 atomic_modeset=0 mode_id=0 saved_fb=<f>
+KMSFLIP: phase=dumb source=dumb modeset=0 legacy_modeset=1 flips=10/10 commits=10 commit_ok=10 events=10 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 addfb_fallback=0 elapsed_ms=~180 PASS
+KMSFLIP: phase=dmabuf source=panfrost-gbm modeset=0 legacy_modeset=0 flips=10/10 commits=11 commit_ok=11 events=11 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 addfb_fallback=0 elapsed_ms=~180 PASS
+KMSFLIP: restore=legacy saved_fb=<f>
+KMSFLIP: RESULT PASS device=/dev/dri/card0 … frames=10 phases=2 commits=21 commit_ok=21 events=21 flips=20/20 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 atomic_modeset=0 legacy_modeset=1 restore=ok elapsed_ms=~400
 ```
 
 Expected relationships:
 
 | Counter | Healthy value | Meaning of a deviation |
 |---|---|---|
-| `commits` | `flips + phases` (+ EBUSY retries) | fewer than `frames+1` means the tool aborted early |
-| `commit_ok` | `flips + phases` | a mismatch is a lost/retried commit |
-| `events` | `frames + 1` per phase | fewer: no flip completion event (dead vblank/flip path); more: events leaked across commits |
+| `commits` | `frames + phases` with atomic establishment; `frames` for the legacy-establishment phase and `frames + 1` for later phases | fewer than the phase's `frames` means the tool aborted early |
+| `commit_ok` | equals `commits` minus EBUSY retries | a mismatch is a lost/retried commit |
+| `events` | `frames + 1` per phase with atomic establishment; `frames` for the legacy-establishment phase | fewer: no flip completion event (dead vblank/flip path); more: events leaked across commits |
 | `flips` | `frames/frames` | first failure stops that phase |
 | `timeouts` | `0` | an event did not arrive inside `--timeout-ms` |
 | `ebusy` | `0` | previous flip still pending; retried inside the timeout. A handful is tolerable, sustained EBUSY is a flip that never retires |
@@ -152,7 +197,9 @@ Expected relationships:
 | `other` | `0` | any other errno (EACCES/ENOMEM/…); logged |
 | `checksum_bad` | `0` | CPU mapping changed while the buffer was on screen |
 | `addfb_fallback` | `0` | `ADDFB2` rejected and legacy `ADDFB` used; the atomic path still works but the driver’s format handling should be checked |
-| `restore` | `ok` | `fail` is a warning: flips may still PASS, but the panel is left on the last test frame |
+| `atomic_modeset` | `1` on a v4.2+ backport, `0` on the v4.0 core | `0` is the known KWin CRTC blocker, not a flip failure; `mode_id=0` identifies it |
+| `legacy_modeset` | `1` for the establishing phase when `atomic_modeset=0` | never on a kernel with `MODE_ID` |
+| `restore` | `ok` (method `atomic` or `legacy`) | `fail` is a warning: flips may still PASS, but the panel is left on the last test frame |
 
 Exit status: `0` PASS, `1` FAIL, `2` usage, `3` SKIP (no card0, or no
 render node for `--probe`).
@@ -162,7 +209,9 @@ render node for `--probe`).
 Every blocking operation has a deadline:
 
 * `drmModeAtomicCommit()` runs `NONBLOCK` for page flips; the initial
-  modeset is blocking but is followed by the same event deadline.
+  atomic modeset (or the legacy `drmModeSetCrtc` fallback) is blocking but
+  is covered by the same watchdog and, for the atomic case, by the event
+  deadline.
 * EBUSY commit retries stop at `--timeout-ms` (the attempt that exhausts
   the budget is counted in `commit_fail`, not `timeouts`).
 * Every completion wait is `poll()` in <=20 ms slices with a monotonic
@@ -176,10 +225,24 @@ Every blocking operation has a deadline:
   `RmFB` is retried for at most 500 ms on EBUSY.
 * `SIGINT`/`SIGTERM` set the same abort flag, so the run still restores the
   saved CRTC (or disables it if the CRTC was off before).
+* All DRM work (KMS run, `--list`, `--probe`) executes in a supervised child.
+  The parent enforces `--hard-timeout-ms` + 5 s, then `SIGKILL`s the child
+  and returns a `RESULT FAIL reason=watchdog` line, so the caller never
+  blocks indefinitely. `--list` gets a 10 s budget and `--probe` 30 s.
+  A task stuck in kernel `D` state cannot be killed by any signal; in that
+  case the parent still returns, and the stuck task can only be cleared by
+  the hardware watchdog/reboot. That is a kernel/driver defect, not a
+  userspace wait the tool can break.
 
 The tool saves the CRTC (`drmModeGetCrtc`) before the first commit and
-restores its fb/mode with an atomic commit, falling back to `drmModeSetCrtc`
-only if the atomic restore fails.
+restores its fb/mode with an atomic commit when `MODE_ID` exists, otherwise
+with `drmModeSetCrtc`; if the CRTC was off before, it is disabled again.
+
+On the KMS test image of 2026-11-25, Main reported `kmscube` wedging in
+`exynos7580_crtc_page_flip` → `drm_mode_page_flip_ioctl` (D state); the
+leaked modeset lock also made a root `kmsflip --list` hang in this seat's
+run. That is why `--list` is now supervised; the hang is a driver lock
+defect, not a userspace wait the tool can break.
 
 ## Checking the flip path without a display
 

@@ -313,18 +313,19 @@ Mode/connector discovery for debugging:
 ## 7. Notes and risks
 
 - **Atomic path.** `kmsflip` now builds the compositor path itself:
-  `DRM_CLIENT_CAP_ATOMIC`, `ATOMIC` commits setting connector `CRTC_ID`,
-  CRTC `ACTIVE`/`MODE_ID` and plane `FB_ID`/`CRTC_ID`/`SRC_*`/`CRTC_*`, with
-  `PAGE_FLIP_EVENT` completions. It does not use `drmModePageFlip()`/
-  `drmModeSetCrtc()` for the test (legacy `SetCrtc` is only the restore
-  fallback), so it fails where KWin would fail even if `modetest`
-  (`modetest -v`, legacy) still passes. `kms-flip-tool.md` documents the
-  counters.
+  `DRM_CLIENT_CAP_ATOMIC`, plane `FB_ID`/`CRTC_ID`/`SRC_*`/`CRTC_*` commits
+  with `PAGE_FLIP_EVENT` completions, and (when the kernel has `MODE_ID` +
+  property blobs) a full atomic modeset with connector `CRTC_ID` and CRTC
+  `ACTIVE`/`MODE_ID`. It does not use `drmModePageFlip()` for the test, so it
+  fails where KWin would fail even if `modetest -v` (legacy) still passes.
+  On the v4.0 atomic core (no `MODE_ID`) the tool reports
+  `atomic_modeset=0`, establishes the mode with legacy `SetCrtc` and still
+  flips atomically; `kms-flip-tool.md` documents both counter sets.
 - **libdrm 2.4.134 vs 3.10 UAPI.** Uses
   `GETRESOURCES/GETCONNECTOR/GETENCODER/GETCRTC/GETPROPERTY/GETPROPBLOB/
-  ATOMIC/CREATE_DUMB/MAP_DUMB/ADDFB2/RMFB/DESTROY_DUMB/PRIME_*`; all are in
-  the backported 3.10 UAPI (see `decon-kms-m0.md`). Property/blob support is
-  required for the atomic modeset, hence the explicit `MODE_ID` blob.
+  ATOMIC/CREATE_DUMB/MAP_DUMB/ADDFB2/RMFB/DESTROY_DUMB/PRIME_*`. Property
+  blobs are used only when the CRTC `MODE_ID` property exists; the v4.0
+  backport has neither, which is why the atomic modeset is capability-gated.
 - **Master conflicts.** If X/Weston (or another process) holds DRM master,
   `drmSetMaster` prints a warning and flips fail with `EACCES`; run the KMS
   tests from a console session with no compositor (M1/M2), or stop the

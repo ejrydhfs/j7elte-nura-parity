@@ -60,6 +60,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -299,7 +300,8 @@ struct flip_stats {
 	unsigned commit_fail;
 	unsigned events;	/* completion events for this phase */
 	unsigned flips;		/* page flips that retired */
-	unsigned modeset;	/* 1 if this phase carried the modeset */
+	unsigned modeset;	/* 1 if this phase carried an atomic modeset */
+	unsigned legacy_modeset;/* 1 if the mode was set with SetCrtc */
 	unsigned timeouts;
 	unsigned ebusy;
 	unsigned einval;
@@ -365,6 +367,8 @@ struct kms_ctx {
 	uint32_t plane_src_x, plane_src_y, plane_src_w, plane_src_h;
 	uint32_t plane_crtc_x, plane_crtc_y, plane_crtc_w, plane_crtc_h;
 	uint32_t mode_blob;
+	int have_mode_id;		/* CRTC MODE_ID property exists */
+	int can_atomic_modeset;		/* MODE_ID + CREATE_PROPBLOB */
 	int did_modeset;
 };
 
@@ -655,10 +659,36 @@ static int kms_setup(struct kms_ctx *k, const char *dev, int conn_id,
 	if (need_prop(k->fd, k->conn_props, "connector", "CRTC_ID",
 		      &k->conn_crtc_id) < 0 ||
 	    need_prop(k->fd, k->crtc_props, "crtc", "ACTIVE",
-		      &k->crtc_active) < 0 ||
-	    need_prop(k->fd, k->crtc_props, "crtc", "MODE_ID",
-		      &k->crtc_mode_id) < 0)
+		      &k->crtc_active) < 0)
 		return 1;
+	/*
+	 * MODE_ID and the property-blob ioctls arrived in DRM v4.2; our 3.10
+	 * tree has the v4.0 atomic core, which has neither.  Atomic *flips*
+	 * (plane FB_ID + PAGE_FLIP_EVENT) still work when the mode was
+	 * established by legacy SetCrtc, so treat an atomic modeset as an
+	 * optional capability instead of failing the whole run.
+	 */
+	k->have_mode_id = prop_lookup(k->fd, k->crtc_props, "MODE_ID",
+				      &k->crtc_mode_id, NULL) == 0;
+	if (k->have_mode_id) {
+		errno = 0;
+		if (drmModeCreatePropertyBlob(k->fd, &k->mode,
+					      sizeof(k->mode),
+					      &k->mode_blob) == 0) {
+			k->can_atomic_modeset = 1;
+		} else {
+			fprintf(stderr, "kmsflip: MODE_ID present but "
+				"CREATE_PROPBLOB failed: %s; using legacy "
+				"modeset\n", strerror(errno));
+			k->mode_blob = 0;
+		}
+	}
+	if (!k->can_atomic_modeset)
+		fprintf(stderr, "kmsflip: atomic modeset unavailable (%s); "
+			"mode will be established with drmModeSetCrtc, "
+			"then flipped atomically\n",
+			k->have_mode_id ? "no property blob support" :
+					  "CRTC has no MODE_ID");
 	if (need_prop(k->fd, k->plane_props, "primary plane", "FB_ID",
 		      &k->plane_fb_id) < 0 ||
 	    need_prop(k->fd, k->plane_props, "primary plane", "CRTC_ID",
@@ -681,18 +711,12 @@ static int kms_setup(struct kms_ctx *k, const char *dev, int conn_id,
 		      &k->plane_crtc_h) < 0)
 		return 1;
 
-	if (drmModeCreatePropertyBlob(k->fd, &k->mode, sizeof(k->mode),
-				      &k->mode_blob) < 0) {
-		fprintf(stderr, "kmsflip: create MODE_ID blob: %s\n",
-			strerror(errno));
-		return 1;
-	}
-
 	printf("KMSFLIP: dev=%s connector=%u crtc=%u plane=%u mode=%s "
-	       "(%dx%d@%d) atomic=1 saved_fb=%u\n", dev, k->conn_id,
-	       k->crtc_id, k->plane->plane_id, k->mode.name,
-	       k->mode.hdisplay, k->mode.vdisplay, k->mode.vrefresh,
-	       k->saved ? k->saved->buffer_id : 0);
+	       "(%dx%d@%d) atomic=1 atomic_modeset=%d mode_id=%d "
+	       "saved_fb=%u\n", dev, k->conn_id, k->crtc_id,
+	       k->plane->plane_id, k->mode.name, k->mode.hdisplay,
+	       k->mode.vdisplay, k->mode.vrefresh, k->can_atomic_modeset,
+	       k->have_mode_id, k->saved ? k->saved->buffer_id : 0);
 	return 0;
 }
 
@@ -739,10 +763,21 @@ static int atomic_commit(struct kms_ctx *k, uint32_t fb, int modeset,
 		return -1;
 	}
 
-	if (req_add(req, k->conn_id, k->conn_crtc_id, k->crtc_id,
-		    "connector CRTC_ID", st) ||
-	    req_add(req, k->crtc_id, k->crtc_active, 1, "CRTC ACTIVE", st) ||
-	    req_add(req, k->plane->plane_id, k->plane_crtc_id, k->crtc_id,
+	/*
+	 * A page flip only touches the primary plane.  Adding connector
+	 * CRTC_ID / CRTC ACTIVE on every flip would turn the commit into a
+	 * modeset on cores that did not sync those legacy fields, and the
+	 * atomic check would then reject it without ALLOW_MODESET.  Keep the
+	 * modeset properties for the initial commit only.
+	 */
+	if (modeset &&
+	    (req_add(req, k->conn_id, k->conn_crtc_id, k->crtc_id,
+		     "connector CRTC_ID", st) ||
+	     req_add(req, k->crtc_id, k->crtc_active, 1, "CRTC ACTIVE", st))) {
+		drmModeAtomicFree(req);
+		return -1;
+	}
+	if (req_add(req, k->plane->plane_id, k->plane_crtc_id, k->crtc_id,
 		    "plane CRTC_ID", st) ||
 	    req_add(req, k->plane->plane_id, k->plane_fb_id, fb,
 		    "plane FB_ID", st) ||
@@ -1150,6 +1185,31 @@ static int buf_gbm_fb(struct kms_ctx *k, struct flip_buf *b, int w, int h,
 
 /* ------------------------------------------------------------- phases */
 
+/*
+ * Mode establishment for kernels that predate DRM v4.2 (no MODE_ID / no
+ * property-blob ioctls).  Legacy SetCrtc is used only to switch the mode on;
+ * every subsequent flip is an atomic plane commit.
+ */
+static int legacy_set_mode(struct kms_ctx *k, uint32_t fb,
+			   struct flip_stats *st)
+{
+	int e;
+
+	errno = 0;
+	if (drmModeSetCrtc(k->fd, k->crtc_id, fb, 0, 0, &k->conn_id, 1,
+			   &k->mode) == 0)
+		return 0;
+	e = err_from(-1);
+	if (e == EINVAL)
+		st->einval++;
+	else
+		st->other++;
+	st->commit_fail++;
+	fprintf(stderr, "kmsflip: %s: drmModeSetCrtc (legacy mode set): "
+		"%s\n", st->phase, strerror(e));
+	return -1;
+}
+
 static int run_flip_phase(struct kms_ctx *k, const char *name,
 			  const char *source, struct flip_buf *b, int nbuf,
 			  int frames, int timeout_ms, int kind,
@@ -1157,7 +1217,8 @@ static int run_flip_phase(struct kms_ctx *k, const char *name,
 {
 	int w = k->mode.hdisplay, h = k->mode.vdisplay;
 	unsigned long token;
-	int need_modeset = !k->did_modeset;
+	int need_modeset = !k->did_modeset && k->can_atomic_modeset;
+	int expected_events = frames;
 	int i, cur = 0, rc = 0;
 	double t0;
 
@@ -1171,24 +1232,38 @@ static int run_flip_phase(struct kms_ctx *k, const char *name,
 	fill_buffer(b[0].map, b[0].pitch, w, h, kind, 0);
 	b[0].csum = fnv1a_rows(b[0].map, b[0].pitch, (size_t)w * 4, h);
 
-	token = g_next_token++;
-	if (atomic_commit(k, b[0].fb, need_modeset, token, timeout_ms, st)) {
-		rc = -1;
-		goto out;
+	if (!k->did_modeset && !k->can_atomic_modeset) {
+		/* v4.0 atomic core: no MODE_ID/blob, establish with legacy. */
+		if (legacy_set_mode(k, b[0].fb, st)) {
+			rc = -1;
+			goto out;
+		}
+		k->did_modeset = 1;
+		st->legacy_modeset = 1;
+	} else {
+		/* Atomic modeset (first phase) or an atomic page flip into
+		 * this phase's first buffer (later phases). */
+		expected_events = frames + 1;
+		token = g_next_token++;
+		if (atomic_commit(k, b[0].fb, need_modeset, token,
+				  timeout_ms, st)) {
+			rc = -1;
+			goto out;
+		}
+		if (wait_flip(k, token, timeout_ms, st)) {
+			st->timeouts++;
+			fprintf(stderr, "kmsflip: %s: initial commit "
+				"timed out\n", name);
+			drain_events(k);
+			rc = -1;
+			goto out;
+		}
+		k->did_modeset = 1;
+		st->modeset = need_modeset ? 1 : 0;
 	}
-	if (wait_flip(k, token, timeout_ms, st)) {
-		st->timeouts++;
-		fprintf(stderr, "kmsflip: %s: initial commit timed out\n",
-			name);
-		drain_events(k);
-		rc = -1;
-		goto out;
-	}
-	k->did_modeset = 1;
-	st->modeset = need_modeset ? 1 : 0;
 	if (fnv1a_rows(b[0].map, b[0].pitch, (size_t)w * 4, h) != b[0].csum) {
 		st->checksum_bad++;
-		fprintf(stderr, "kmsflip: %s: modeset buffer checksum "
+		fprintf(stderr, "kmsflip: %s: initial buffer checksum "
 			"changed\n", name);
 	}
 
@@ -1230,9 +1305,9 @@ out:
 	}
 	if (rc == 0 && st->flips != (unsigned)frames)
 		rc = -1;
-	if (rc == 0 && st->events != (unsigned)frames + 1) {
+	if (rc == 0 && st->events != (unsigned)expected_events) {
 		fprintf(stderr, "kmsflip: %s: %u completion events, "
-			"expected %d\n", name, st->events, frames + 1);
+			"expected %d\n", name, st->events, expected_events);
 		rc = -1;
 	}
 	if (rc == 0 && (st->timeouts || st->einval || st->other ||
@@ -1244,11 +1319,12 @@ out:
 			printf("KMSFLIP: phase=%s dumped=%s\n", name, dump);
 	}
 
-	printf("KMSFLIP: phase=%s source=%s modeset=%u flips=%u/%d "
-	       "commits=%u commit_ok=%u events=%u timeouts=%u ebusy=%u "
-	       "einval=%u other=%u checksum_bad=%u addfb_fallback=%u "
-	       "elapsed_ms=%.0f %s\n", name, source, st->modeset, st->flips,
-	       frames, st->commits, st->commit_ok, st->events, st->timeouts,
+	printf("KMSFLIP: phase=%s source=%s modeset=%u legacy_modeset=%u "
+	       "flips=%u/%d commits=%u commit_ok=%u events=%u timeouts=%u "
+	       "ebusy=%u einval=%u other=%u checksum_bad=%u "
+	       "addfb_fallback=%u elapsed_ms=%.0f %s\n", name, source,
+	       st->modeset, st->legacy_modeset, st->flips, frames,
+	       st->commits, st->commit_ok, st->events, st->timeouts,
 	       st->ebusy, st->einval, st->other, st->checksum_bad,
 	       st->addfb_fallback, st->elapsed_ms, rc ? "FAIL" : "PASS");
 	g_cur_stats = NULL;
@@ -1445,7 +1521,7 @@ static int kms_restore(struct kms_ctx *k)
 	if (!k->did_modeset)
 		return 0;
 
-	req = drmModeAtomicAlloc();
+	req = k->can_atomic_modeset ? drmModeAtomicAlloc() : NULL;
 	if (req) {
 		int good = 1;
 
@@ -1736,8 +1812,11 @@ static int run_probe(const char *node, int hard_ms)
 	watchdog_arm(hard_ms > 0 ? hard_ms : 30000);
 	fd = open(node, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
-		printf("KMSFLIP: RESULT SKIP reason=no-render-node node=%s\n",
-		       node);
+		int e = errno;
+
+		printf("KMSFLIP: RESULT SKIP reason=%s node=%s errno=%s\n",
+		       e == ENOENT ? "no-render-node" : "render-node-open",
+		       node, strerror(e));
 		watchdog_disarm();
 		return 3;
 	}
@@ -1893,6 +1972,8 @@ static int run_kms(const char *dev, const char *render_node, int conn_id,
 	total.einval = sd.einval + sdm.einval;
 	total.other = sd.other + sdm.other;
 	total.checksum_bad = sd.checksum_bad + sdm.checksum_bad;
+	total.modeset = sd.modeset + sdm.modeset;
+	total.legacy_modeset = sd.legacy_modeset + sdm.legacy_modeset;
 
 	rc = (!f_dumb && !f_dma && !g_stop) ? 0 : 1;
 	if (g_stop)
@@ -1900,17 +1981,19 @@ static int run_kms(const char *dev, const char *render_node, int conn_id,
 	printf("KMSFLIP: RESULT %s device=%s connector=%u crtc=%u plane=%u "
 	       "mode=%s frames=%d phases=%d commits=%u commit_ok=%u "
 	       "events=%u flips=%u/%d timeouts=%u ebusy=%u einval=%u "
-	       "other=%u checksum_bad=%u restore=%s elapsed_ms=%.0f\n",
+	       "other=%u checksum_bad=%u atomic_modeset=%d "
+	       "legacy_modeset=%u restore=%s elapsed_ms=%.0f\n",
 	       rc ? "FAIL" : "PASS", dev, k.conn_id ? k.conn_id : 0,
 	       k.crtc_id, plane_id, k.mode.name,
 	       frames, phases, total.commits, total.commit_ok, total.events,
 	       total.flips, phases * frames, total.timeouts, total.ebusy,
 	       total.einval, total.other, total.checksum_bad,
+	       k.can_atomic_modeset, total.legacy_modeset,
 	       restore_rc == 0 ? "ok" : "fail", now_ms() - t0);
 	return rc;
 }
 
-static void kms_list(const char *dev)
+static int kms_list(const char *dev)
 {
 	drmModeRes *res;
 	drmModeConnector *conn;
@@ -1919,14 +2002,14 @@ static void kms_list(const char *dev)
 	fd = open(dev, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		fprintf(stderr, "kmsflip: open %s: %s\n", dev, strerror(errno));
-		exit(3);
+		return 3;
 	}
 	res = drmModeGetResources(fd);
 	if (!res) {
 		fprintf(stderr, "kmsflip: drmModeGetResources: %s\n",
 			strerror(errno));
 		close(fd);
-		exit(1);
+		return 1;
 	}
 	printf("KMSFLIP-LIST: dev=%s crtcs=%d connectors=%d encoders=%d\n", dev,
 	       res->count_crtcs, res->count_connectors, res->count_encoders);
@@ -1948,6 +2031,117 @@ static void kms_list(const char *dev)
 	}
 	drmModeFreeResources(res);
 	close(fd);
+	return 0;
+}
+
+/*
+ * Supervisor: run the DRM work in a child and enforce a wall-clock deadline
+ * from the parent.  A leaked modeset lock can leave an ioctl in
+ * uninterruptible D state where even SIGKILL cannot be delivered; in that
+ * case the parent stops waiting after a short grace period and returns to the
+ * shell instead of wedging the caller.  The child's own setitimer watchdog
+ * (armed by run_kms/run_probe) still handles interruptible hangs and restores
+ * the CRTC.
+ */
+static int supervise(const char *what, int hard_ms,
+		     int (*fn)(void *), void *arg)
+{
+	pid_t pid;
+	double end;
+	int status = 0, reaped = 0, i;
+
+	fflush(NULL);
+	pid = fork();
+	if (pid < 0) {
+		perror("kmsflip: fork");
+		return fn(arg);
+	}
+	if (pid == 0) {
+		int rc = fn(arg);
+
+		fflush(NULL);
+		_exit(rc == 0 ? 0 : rc == 3 ? 3 : 1);
+	}
+
+	/* Give the in-process watchdog its 2 s grace before the hard kill. */
+	end = now_ms() + hard_ms + 5000.0;
+	for (;;) {
+		pid_t w = waitpid(pid, &status, WNOHANG);
+
+		if (w == pid) {
+			reaped = 1;
+			break;
+		}
+		if (w < 0 && errno != EINTR)
+			break;
+		if (now_ms() >= end) {
+			fprintf(stderr, "kmsflip: %s: hard timeout %d ms; "
+				"killing pid %ld\n", what, hard_ms, (long)pid);
+			kill(pid, SIGKILL);
+			for (i = 0; i < 20; i++) {
+				if (waitpid(pid, &status, WNOHANG) == pid) {
+					reaped = 1;
+					break;
+				}
+				usleep(50000);
+			}
+			printf("KMSFLIP: RESULT FAIL reason=watchdog phase=%s "
+			       "hard_timeout_ms=%d\n", what, hard_ms);
+			return 1;
+		}
+		usleep(50000);
+	}
+	if (!reaped)
+		return 1;
+	if (WIFEXITED(status)) {
+		int rc = WEXITSTATUS(status);
+
+		return rc == 0 ? 0 : rc == 3 ? 3 : 1;
+	}
+	printf("KMSFLIP: RESULT FAIL reason=signal phase=%s signal=%d\n",
+	       what, WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+	return 1;
+}
+
+struct kms_run_args {
+	const char *dev;
+	const char *render_node;
+	const char *mode_str;
+	const char *dump;
+	int conn_id, crtc_id, frames, timeout_ms, hard_ms;
+	int kind, hold_ms, no_dmabuf, force_self;
+};
+
+static int kms_run_trampoline(void *p)
+{
+	struct kms_run_args *a = p;
+
+	return run_kms(a->dev, a->render_node, a->conn_id, a->crtc_id,
+		       a->mode_str, a->frames, a->timeout_ms, a->hard_ms,
+		       a->kind, a->dump, a->hold_ms, a->no_dmabuf,
+		       a->force_self);
+}
+
+static int kms_list_trampoline(void *p)
+{
+	int rc;
+
+	watchdog_arm(10000);
+	rc = kms_list(p);
+	watchdog_disarm();
+	return rc;
+}
+
+struct probe_args {
+	const char *node;
+	int hard_ms;
+};
+
+static int probe_trampoline(void *p)
+{
+	struct probe_args *a = p;
+
+	return run_probe(a->node, a->hard_ms);
 }
 
 /* ------------------------------------------------------------- headless */
@@ -2436,9 +2630,13 @@ int main(int argc, char **argv)
 	}
 	event_ctx_init();
 
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	if (list) {
-		kms_list(dev);
-		return 0;
+		int hard = hard_ms > 0 ? hard_ms : 10000;
+
+		return supervise("list", hard, kms_list_trampoline,
+				 (void *)dev);
 	}
 	if (headless) {
 		int hard = hard_ms > 0 ? hard_ms : 5000 + frames * 2000;
@@ -2448,8 +2646,14 @@ int main(int argc, char **argv)
 		watchdog_disarm();
 		return rc;
 	}
-	if (probe)
-		return run_probe(render_node, hard_ms);
+	if (probe) {
+		struct probe_args pa;
+
+		pa.node = render_node;
+		pa.hard_ms = hard_ms > 0 ? hard_ms : 30000;
+		return supervise("probe", pa.hard_ms, probe_trampoline,
+				 &pa);
+	}
 
 	/*
 	 * Render-only bring-up kernels (int49-class) have no card0.  Do not
@@ -2464,7 +2668,26 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
-	return run_kms(dev, render_node, conn_id, crtc_id, mode, frames,
-		       timeout_ms, hard_ms, kind, dump, hold_ms, no_dmabuf,
-		       prime_self);
+	{
+		struct kms_run_args a;
+		int nphases = no_dmabuf ? 1 : 2;
+		int hard = hard_ms > 0 ? hard_ms :
+			   auto_hard_ms(frames, timeout_ms, nphases);
+
+		memset(&a, 0, sizeof(a));
+		a.dev = dev;
+		a.render_node = render_node;
+		a.mode_str = mode;
+		a.dump = dump;
+		a.conn_id = conn_id;
+		a.crtc_id = crtc_id;
+		a.frames = frames;
+		a.timeout_ms = timeout_ms;
+		a.hard_ms = hard;
+		a.kind = kind;
+		a.hold_ms = hold_ms;
+		a.no_dmabuf = no_dmabuf;
+		a.force_self = prime_self;
+		return supervise("kms", hard, kms_run_trampoline, &a);
+	}
 }
