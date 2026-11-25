@@ -1,0 +1,149 @@
+#!/bin/sh
+# kms-test-install - install the self-arming KMS test-boot hook.
+#
+#   ./kms-test-install install     copy the scripts and add the inittab hook
+#   ./kms-test-install uninstall   remove the hook (scripts stay unless -p)
+#   ./kms-test-install check       show marker/hook/daemon state
+#
+# The hook is a single ::sysinit line in /etc/inittab, placed between
+# "/sbin/openrc boot" and "/sbin/openrc default".  That is the earliest point
+# where /dev (devfs), /proc, /sys and /run are mounted and the root filesystem
+# is read-write -- CONFIG_DEVTMPFS_MOUNT is NOT set on this kernel, so nothing
+# earlier can open /dev/watchdog -- and it is still before every default
+# runlevel service, in particular xsession.
+#
+# Deliberately NOT an OpenRC service: no /etc/init.d file, no rc-update, no
+# runlevel default is changed.  The inittab command is a no-op unless
+# /etc/kms-test-mode exists.
+#
+# Enable:  touch /etc/kms-test-mode      Disable: rm /etc/kms-test-mode
+
+set -eu
+
+DEST=${KMS_DEST:-/usr/local/sbin}
+HOOK_LINE="::sysinit:$DEST/kms-test-arm boot"
+HOOK_MARK='# kms-test-mode: self-arming watchdog before the default runlevel'
+INITTAB=${KMS_INITTAB:-/etc/inittab}
+BACKUP=$INITTAB.pre-kms-test
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+[ "$(id -u)" -eq 0 ] || {
+	echo "kms-test-install: must run as root" >&2
+	exit 1
+}
+
+usage() {
+	echo "usage: $0 install|uninstall [-p]|check" >&2
+}
+
+hook_count() {
+	grep -cF "$HOOK_LINE" "$INITTAB" 2>/dev/null || true
+}
+
+have_hook() {
+	[ "$(hook_count)" = "1" ]
+}
+
+install_pieces() {
+	install -d "$DEST"
+	install -m 755 "$here/kms-test-arm" "$DEST/kms-test-arm"
+	install -m 755 "$here/kms-load.sh" "$DEST/kms-load.sh"
+	echo "installed $DEST/kms-test-arm and $DEST/kms-load.sh"
+}
+
+add_hook() {
+	if have_hook; then
+		echo "inittab hook already present (one line); nothing to add"
+		return 0
+	fi
+	if [ "$(hook_count)" -gt 1 ] 2>/dev/null; then
+		echo "kms-test-install: $INITTAB has $HOOK_LINE more than once; fix it by hand" >&2
+		return 1
+	fi
+	if ! grep -qE '^::wait:[[:space:]]*/sbin/openrc default[[:space:]]*$' "$INITTAB"; then
+		echo "kms-test-install: no '::wait:/sbin/openrc default' line in $INITTAB" >&2
+		return 1
+	fi
+	[ -e "$BACKUP" ] || cp -p "$INITTAB" "$BACKUP"
+	tmp=$INITTAB.kms-test.new
+	awk -v cmt="$HOOK_MARK" -v hook="$HOOK_LINE" '
+		{ }
+		/^::wait:[[:space:]]*\/sbin\/openrc default[[:space:]]*$/ && !done {
+			print cmt
+			print hook
+			done = 1
+		}
+		{ print }
+		END { if (!done) exit 3 }
+	' "$INITTAB" >"$tmp" || {
+		rc=$?
+		rm -f "$tmp"
+		echo "kms-test-install: awk failed (rc=$rc); $INITTAB untouched" >&2
+		return 1
+	}
+	if [ "$(grep -cF "$HOOK_LINE" "$tmp")" != "1" ] ||
+	   ! grep -qE '^::wait:[[:space:]]*/sbin/openrc default[[:space:]]*$' "$tmp"; then
+		rm -f "$tmp"
+		echo "kms-test-install: generated inittab failed validation; untouched" >&2
+		return 1
+	fi
+	# inittab is read by init at boot only; replacing it is safe at runtime.
+	chmod 644 "$tmp"
+	mv -f "$tmp" "$INITTAB"
+	echo "added to $INITTAB:"
+	grep -nF -e "$HOOK_MARK" -e "$HOOK_LINE" "$INITTAB" | sed 's/^/  /'
+	echo "  (previous file kept as $BACKUP)"
+}
+
+remove_hook() {
+	if ! grep -qF "$HOOK_LINE" "$INITTAB" 2>/dev/null; then
+		echo "inittab hook not present; nothing to remove"
+		return 0
+	fi
+	tmp=$INITTAB.kms-test.new
+	grep -vF -e "$HOOK_LINE" -e "$HOOK_MARK" "$INITTAB" >"$tmp"
+	if [ "$(grep -cF "$HOOK_LINE" "$tmp" || true)" != "0" ]; then
+		rm -f "$tmp"
+		echo "kms-test-install: failed to remove the hook; $INITTAB untouched" >&2
+		return 1
+	fi
+	chmod 644 "$tmp"
+	mv -f "$tmp" "$INITTAB"
+	echo "removed the kms-test-mode hook from $INITTAB"
+}
+
+case "${1:-check}" in
+install)
+	install_pieces
+	add_hook
+	cat <<EOF
+
+Test mode is OFF until you create the marker:
+  touch /etc/kms-test-mode     # arm watchdog + dmesg logger at next boot
+  rm /etc/kms-test-mode        # back to the daily behaviour (next boot)
+
+Nothing runs right now; to arm the current boot without rebooting:
+  $DEST/kms-test-arm start
+  $DEST/kms-load.sh <rev>
+EOF
+	;;
+uninstall)
+	remove_hook
+	if [ "${2:-}" = "-p" ]; then
+		rm -f "$DEST/kms-test-arm" "$DEST/kms-load.sh"
+		echo "removed the scripts from $DEST"
+	fi
+	echo "the marker $([ -e /etc/kms-test-mode ] && echo 'is still present (delete it)' || echo 'is not present')"
+	;;
+check)
+	if [ -x "$DEST/kms-test-arm" ]; then
+		exec "$DEST/kms-test-arm" status
+	fi
+	echo "$DEST/kms-test-arm not installed"
+	;;
+*)
+	usage
+	exit 2
+	;;
+esac

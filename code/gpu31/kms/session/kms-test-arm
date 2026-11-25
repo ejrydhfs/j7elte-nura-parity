@@ -1,0 +1,315 @@
+#!/bin/sh
+# kms-test-arm - self-arming hardware watchdog + filtered dmesg logger.
+#
+#   kms-test-arm boot     hook for /etc/inittab (::sysinit, after "openrc boot");
+#                         always exits 0 and acts only when the marker exists
+#   kms-test-arm start    arm both daemons now, idempotent; non-zero if a piece
+#                         is not running afterwards
+#   kms-test-arm stop     stop both daemons (watchdog is disarmed by close)
+#   kms-test-arm status   print marker/hook/daemon/trace state
+#
+# The J7 hardware watchdog (S3C2410 WDT, 30 s DT timeout) resets the SoC when
+# userspace stops petting it.  Arming it *before* the default runlevel means a
+# test kernel that wedges during module load or during xsession start still
+# reboots instead of needing a battery pull.
+#
+# Enable:  touch /etc/kms-test-mode      Disable: rm /etc/kms-test-mode
+# The marker is the only switch; no OpenRC runlevel or service default is
+# touched.  See docs/reports/kms-session-auto.md for the failure-mode table.
+#
+# This file deliberately has no OpenRC dependency (no rc-service/rc-update):
+# it needs only /bin/sh, /proc, /dev/watchdog and a writable trace file.  The
+# "boot" mode is invoked from /etc/inittab by kms-test-install, i.e. outside
+# the OpenRC service graph entirely.
+
+set -u
+
+MARKER=${KMS_TEST_MARKER:-/etc/kms-test-mode}
+WD=${KMS_TEST_WD:-/dev/watchdog}
+TRACE=${KMS_TEST_TRACE:-/home/user/kms.trace}
+BOOTLOG=${KMS_TEST_LOG:-/var/log/kms-test-arm.log}
+RUNDIR=${KMS_TEST_RUNDIR:-/run/kms-test-arm}
+DMESG_FILTER=${KMS_TEST_DMESG_FILTER:-'decon|exynos|drm|watchdog|teardown|vsync|irq|Unable to handle|Internal error|Kernel BUG|Oops|Call trace|lockup|panic'}
+PING=${KMS_TEST_PING:-5}          # seconds between watchdog pings (timeout is 30 s)
+SNAP=${KMS_TEST_SNAP:-2}          # seconds between dmesg snapshots
+
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+INITTAB=${KMS_INITTAB:-/etc/inittab}
+
+say() {
+	# Best effort: never fail because the boot log is missing/read-only.
+	printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo '?')" "$*" \
+		>>"$BOOTLOG" 2>/dev/null || true
+}
+
+marker_present() {
+	[ -e "$MARKER" ]
+}
+
+# A lock dir is live only while its recorded pid is alive.  A stale dir (boot
+# hook ran before /run was remounted as tmpfs, or a SIGKILLed daemon) is taken
+# over instead of blocking a restart.
+lock_live() {
+	[ -d "$1" ] || return 1
+	pid=$(cat "$1/pid" 2>/dev/null || echo '')
+	[ -n "$pid" ] || return 1
+	kill -0 "$pid" 2>/dev/null
+}
+
+lock_take() {
+	dir=$1
+	if mkdir "$dir" 2>/dev/null; then
+		printf '%s\n' "$$" >"$dir/pid"
+		return 0
+	fi
+	lock_live "$dir" && return 1
+	rm -rf "$dir" 2>/dev/null
+	mkdir "$dir" 2>/dev/null || return 1
+	printf '%s\n' "$$" >"$dir/pid"
+	return 0
+}
+
+lock_release() {
+	dir=$1
+	[ "$(cat "$dir/pid" 2>/dev/null || echo '')" = "$$" ] || return 0
+	rm -rf "$dir" 2>/dev/null
+	return 0
+}
+
+lock_pid() {
+	cat "$1/pid" 2>/dev/null || echo ''
+}
+
+# --- watchdog pet --------------------------------------------------------
+# One process holds the device open for the whole boot; the pid recorded in
+# wd.lock is that process, so stop(1) can signal it directly.  A kernel hang
+# stops the pings and the SoC resets after the 30 s DT timeout.  With
+# CONFIG_WATCHDOG_NOWAYOUT=n, the magic-close byte plus the close that follows
+# the EXIT trap disarms it, so "stop" does not leave a reset pending.
+wd_disarm() {
+	# 'V' is magic close where the driver supports it; the process exit that
+	# follows stops the timer with nowayout=0.
+	printf 'V' >&3 2>/dev/null
+	exit 0
+}
+
+__wd() {
+	# This function is the whole pet process (spawned as "kms-test-arm __wd"),
+	# so $$ is the pid that holds the device and stop(1) can signal it.  Lock
+	# first, open second: a duplicate invocation must not touch the device (a
+	# second open is EBUSY on the real watchdog and would truncate a mock).
+	[ -e "$WD" ] || {
+		say "wd: $WD missing; watchdog not armed"
+		return 1
+	}
+	lock_take "$RUNDIR/wd.lock" || {
+		say "wd: another pet is alive, not starting"
+		return 0
+	}
+	trap 'lock_release "$RUNDIR/wd.lock"' EXIT
+	trap wd_disarm INT TERM
+	# A failed open exits this daemon only (not the boot hook / caller).
+	exec 3>"$WD" || return 1
+	say "wd: armed on $WD, ping every ${PING}s"
+	printf 'w' >&3 || return 1
+	tick=0
+	while :; do
+		# 1 s ticks so a TERM is acted on quickly; ping every PING ticks.
+		sleep 1
+		tick=$((tick + 1))
+		[ "$tick" -ge "$PING" ] || continue
+		tick=0
+		printf 'w' >&3 || return 1
+	done
+}
+
+# --- filtered dmesg logger ----------------------------------------------
+# Snapshots the interesting lines to $TRACE every $SNAP seconds.  Writes go to
+# a temp file and are renamed, so a hang in the middle of a snapshot never
+# truncates the last good trace.  dmesg is never cleared: the ring stays
+# available to other readers and pstore keeps the panic console.
+__logd() {
+	lock_take "$RUNDIR/logd.lock" || {
+		say "logd: already running"
+		return 0
+	}
+	trap 'lock_release "$RUNDIR/logd.lock"' EXIT
+	trap 'exit 0' INT TERM
+	tmp=$TRACE.tmp
+	if ! ( : >"$tmp" ) 2>/dev/null; then
+		say "logd: cannot write $tmp; trace disabled"
+		trap - EXIT
+		lock_release "$RUNDIR/logd.lock"
+		return 1
+	fi
+	rm -f "$tmp"
+	say "logd: snapshotting to $TRACE every ${SNAP}s"
+	first=1
+	while :; do
+		if out=$(timeout 3 dmesg 2>/dev/null); then
+			{
+				if [ "$first" -eq 1 ]; then
+					printf '# kms-test-arm: logger started, uptime %s\n' \
+						"$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
+					first=0
+				fi
+				printf '%s\n' "$out" | grep -iE "$DMESG_FILTER"
+			} >"$tmp" 2>/dev/null
+			if [ -s "$tmp" ]; then
+				mv -f "$tmp" "$TRACE" 2>/dev/null || say "logd: rename to $TRACE failed"
+			fi
+		fi
+		timeout 2 sync 2>/dev/null || true
+		sleep "$SNAP"
+	done
+}
+
+# --- control -------------------------------------------------------------
+spawn() {
+	# Detach fully: the boot hook must return immediately and the daemons must
+	# outlive the login session / the default-runlevel start.
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$SELF" "$1" </dev/null >>"$BOOTLOG" 2>&1 &
+	else
+		nohup "$SELF" "$1" </dev/null >>"$BOOTLOG" 2>&1 &
+	fi
+}
+
+start() {
+	mkdir -p "$RUNDIR" 2>/dev/null || true
+	[ -d "$RUNDIR" ] || {
+		echo "kms-test-arm: cannot create $RUNDIR" >&2
+		return 1
+	}
+	spawn __wd
+	spawn __logd
+	# Give the children time to take their locks / open the device.
+	i=0
+	while [ "$i" -lt 20 ]; do
+		if lock_live "$RUNDIR/wd.lock" && lock_live "$RUNDIR/logd.lock"; then
+			break
+		fi
+		sleep 0.1 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+	rc=0
+	if lock_live "$RUNDIR/wd.lock"; then
+		echo "watchdog: armed (pid $(lock_pid "$RUNDIR/wd.lock"), $WD, ping ${PING}s)"
+	else
+		echo "watchdog: NOT armed (see $BOOTLOG)" >&2
+		rc=1
+	fi
+	if lock_live "$RUNDIR/logd.lock"; then
+		echo "logger:   running (pid $(lock_pid "$RUNDIR/logd.lock"), $TRACE)"
+	else
+		echo "logger:   NOT running (see $BOOTLOG)" >&2
+		rc=1
+	fi
+	return $rc
+}
+
+stop() {
+	rc=0
+	for name in logd wd; do
+		dir="$RUNDIR/$name.lock"
+		pid=$(lock_pid "$dir")
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			kill -TERM "$pid" 2>/dev/null || true
+			i=0
+			while [ "$i" -lt 60 ] && kill -0 "$pid" 2>/dev/null; do
+				sleep 0.1 2>/dev/null || sleep 1
+				i=$((i + 1))
+			done
+			if kill -0 "$pid" 2>/dev/null; then
+				kill -KILL "$pid" 2>/dev/null || true
+				echo "$name: killed (SIGKILL; fd closed by the kernel)" >&2
+				rc=1
+			else
+				echo "$name: stopped"
+			fi
+			rm -rf "$dir" 2>/dev/null || true
+		else
+			rm -rf "$dir" 2>/dev/null || true
+			echo "$name: not running"
+		fi
+	done
+	return $rc
+}
+
+status() {
+	rc=0
+	enabled=0
+	marker_present && enabled=1
+	if marker_present; then
+		echo "marker:   $MARKER present (test mode enabled)"
+	else
+		echo "marker:   absent (test mode disabled; boot hook is a no-op)"
+	fi
+	if grep -qF 'kms-test-arm boot' "$INITTAB" 2>/dev/null; then
+		echo "hook:     $INITTAB contains 'kms-test-arm boot'"
+	else
+		echo "hook:     $INITTAB has NO 'kms-test-arm boot' line (boot arming off)"
+		[ "$enabled" -eq 1 ] && rc=1
+	fi
+	if [ -e "$WD" ]; then
+		echo "device:   $WD present ($(ls -l "$WD" 2>/dev/null | awk '{print $1, $5}'))"
+	else
+		echo "device:   $WD MISSING"
+		[ "$enabled" -eq 1 ] && rc=1
+	fi
+	for name in wd logd; do
+		dir="$RUNDIR/$name.lock"
+		pid=$(lock_pid "$dir")
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			printf '%-9s running (pid %s)\n' "$name:" "$pid"
+		else
+			printf '%-9s NOT running\n' "$name:"
+			[ "$enabled" -eq 1 ] && rc=1
+		fi
+	done
+	if [ -e "$TRACE" ]; then
+		echo "trace:    $TRACE ($(wc -l <"$TRACE" 2>/dev/null | tr -d ' ') lines, updated $(date -r "$TRACE" '+%H:%M:%S' 2>/dev/null || echo '?'))"
+	else
+		echo "trace:    $TRACE MISSING"
+		[ "$enabled" -eq 1 ] && rc=1
+	fi
+	[ -e "$BOOTLOG" ] && echo "boot log: $BOOTLOG"
+	return $rc
+}
+
+boot() {
+	# Reached from inittab: must never fail the boot sequence.
+	marker_present || return 0
+	{
+		say "boot: marker present, arming before the default runlevel"
+		start
+	} >>"$BOOTLOG" 2>&1
+	return 0
+}
+
+case "${1:-status}" in
+boot)
+	boot
+	;;
+start)
+	marker_present || echo "kms-test-arm: $MARKER absent; arming anyway (manual start)" >&2
+	start
+	;;
+stop)
+	stop
+	;;
+status)
+	status
+	;;
+__wd)
+	__wd
+	;;
+__logd)
+	__logd
+	;;
+*)
+	echo "usage: $0 [boot|start|stop|status]" >&2
+	exit 2
+	;;
+esac
+exit $?
