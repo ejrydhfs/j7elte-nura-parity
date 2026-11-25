@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsFlip <kmsflip@local>
+Date: Tue, 24 Nov 2026 18:00:00 
+Subject: [PATCH 0129] gpu31-kms: trace the legacy page-flip EBUSY and the PRIME ioctl (int82)
+
+kmscube's "failed to queue page flip: Resource busy" comes from
+drm_mode_page_flip_ioctl(): it checks the legacy `crtc->fb` field and returns
+-EBUSY when it is NULL, which the atomic commit path never maintained.  The
+check now logs the crtc id and `primary->state->fb`, so the diagnosis is in the
+trace.
+
+The Mesa/kmsro question needs evidence from the PRIME side:
+drm_gem_prime_fd_to_handle() logs device/fd/dma_buf/caller and the imported
+object/handle/return, so a kmscube run shows whether FD_TO_HANDLE (and thus our
+import) is exercised at all.
+
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -3500,6 +3500,10 @@
+ 		 * due to a hotplug event, that userspace has not
+ 		 * yet discovered.
+ 		 */
++		pr_info("drm_mode_page_flip_ioctl: crtc %u legacy fb NULL -> -EBUSY (primary->state->fb=%p)\n",
++			crtc->base.id,
++			crtc->primary && crtc->primary->state ?
++				crtc->primary->state->fb : NULL);
+ 		ret = -EBUSY;
+ 		goto out;
+ 	}
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -317,6 +317,9 @@
+ 	if (IS_ERR(dma_buf))
+ 		return PTR_ERR(dma_buf);
+ 
++	pr_info("drm_gem_prime_fd_to_handle: dev=%s fd=%d dma_buf=%p by %s\n",
++		dev->driver->name, prime_fd, dma_buf, current->comm);
++
+ 	mutex_lock(&file_priv->prime.lock);
+ 
+ 	ret = drm_prime_lookup_buf_handle(&file_priv->prime,
+@@ -334,6 +337,8 @@
+ 	}
+ 
+ 	ret = drm_gem_handle_create(file_priv, obj, handle);
++	pr_info("drm_gem_prime_fd_to_handle: imported obj=%p handle=%u ret=%d\n",
++		obj, ret ? 0 : *handle, ret);
+ 	drm_gem_object_unreference_unlocked(obj);
+ 	if (ret)
+ 		goto out_put;

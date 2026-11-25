@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsFbSync <kmsfbs@local>
+Date: Tue, 24 Nov 2026 18:05:00 
+Subject: [PATCH 0130] gpu31-kms: keep the legacy crtc->fb/plane->fb in sync (int82, module-only)
+
+After every atomic commit, and in the page-flip wrapper, sync the 3.10 legacy
+fields from the atomic state (crtc->fb = primary->state->fb, plane->fb =
+state->fb).  drm_mode_page_flip_ioctl() returns -EBUSY while crtc->fb is NULL
+and legacy helper paths read it; the atomic commit path does not update them.
+The commit entry also logs async, crtc->fb and primary->state->fb so the flip
+path is visible.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -418,6 +418,7 @@
+ 				     struct drm_pending_vblank_event *event)
+ {
+ 	/* 3.10's vtable has no flags argument; async flips are not supported. */
++	crtc->fb = fb;	/* int82: core page_flip still checks this legacy field */
+ 	return drm_atomic_helper_page_flip(crtc, fb, event, 0);
+ }
+ 
+@@ -567,8 +568,38 @@
+ 	 * M1 is synchronous: a NONBLOCK/PAGE_FLIP_EVENT request gets exactly the
+ 	 * same tail and is completed by the event, which is what KWin requires.
+ 	 */
++	pr_info("exynos7580_atomic_commit: async=%d crtc->fb=%p primary->state->fb=%p by %s\n",
++		async, drm->mode_config.crtc_list.next ?
++			container_of(drm->mode_config.crtc_list.next,
++				     struct drm_crtc, head)->fb : NULL,
++		drm->mode_config.crtc_list.next ?
++			container_of(drm->mode_config.crtc_list.next,
++				     struct drm_crtc, head)->primary->state ?
++			container_of(drm->mode_config.crtc_list.next,
++				     struct drm_crtc, head)->primary->state->fb : NULL : NULL,
++		current->comm);
+ 	exynos7580_commit_tail(state);
+ 
++	/*
++	 * int82: the 3.10 legacy fields are still consulted by the core:
++	 * drm_mode_page_flip_ioctl() returns -EBUSY when crtc->fb is NULL, and
++	 * drm_crtc_helper paths read crtc->fb.  The atomic commit path does not
++	 * maintain them, so sync them here (plane->fb is handled by the
++	 * helper's page_flip TODO; do it for all cases).
++	 */
++	{
++		struct drm_crtc *c;
++
++		list_for_each_entry(c, &drm->mode_config.crtc_list, head) {
++			struct drm_plane *p = c->primary;
++
++			if (p && p->state) {
++				p->fb = p->state->fb;
++				c->fb = p->state->fb;
++			}
++		}
++	}
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(exynos7580_atomic_commit);
