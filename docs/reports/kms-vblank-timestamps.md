@@ -170,8 +170,8 @@ For the record, the shape of the patch if it is ever revisited:
 2. **`get_scanout_position()`** in `exynos_drm7580_main.c`:
    read line counter and vstatus, map to the core convention (`vpos >= 0`
    active, negative in vblank), set `hpos = 0` (no pixel counter), and return
-   `DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_ACCURATE`, plus
-   `DRM_SCANOUTPOS_INVBL` for the vblank statuses. Only one pipe exists.
+   `DRM_SCANOUTPOS_VALID` plus `DRM_SCANOUTPOS_INVBL` for the vblank statuses
+   (`ACCURATE` only after the mapping is measured). Only one pipe exists.
 
 3. **`get_vblank_timestamp()`** in `exynos_drm7580_main.c`:
    validate `pipe == EXYNOS7580_PIPE` and `crtc->enabled`, then call
@@ -234,6 +234,12 @@ The code above is small, but its central input is unvalidated:
   `get_scanout_position`. Samsung's current downstream DECON
   (`google-modules/display`, android-15) likewise has no scanout-position
   callback. Upstream Exynos DRM has shipped with this path for years.
+* **Register-read context.** `get_scanout_position()` is called under
+  `dev->vblank_time_lock` (spinlock, IRQs off) and from the hard IRQ, so the
+  new shim entry point must be a plain `readl` of already-clocked DECON
+  registers: no `decon->slock`, no `pm_runtime`, no sleeping. The existing
+  shim entry points are documented as process context, so an IRQ-safe API
+  contract is part of the work.
 * **The benefit is small.** The fallback timestamp is taken in the same
   interrupt, a few microseconds later than the vendor's own
   `vsync_info.timestamp = ktime_get()` at IRQ entry
