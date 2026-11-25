@@ -31,7 +31,7 @@ lines are after the patch):
 | 53-63 | - | `drm_lock_all_owner_gone()`: `!pid_alive(owner) || owner->state == TASK_DEAD`.  `pid_alive()` alone is not enough — it stays true up to and including the zombie state (its own kerneldoc says "at most zombie state"); `do_exit()` sets `TASK_DEAD` before its final `schedule()`, after which the task never runs again |
 | 65-105 | - | `drm_lock_all_force_release(dev, owner, why)`: `pr_err` owner/pid/state, then depth/ctx/why/caller, `dump_stack()`, clear `lock_all_owner`/`lock_all_depth`/`acquire_ctx`, `drm_modeset_drop_locks()` + `drm_modeset_acquire_fini()` + `kfree(ctx)`, unlock the legacy crtc mutexes, unlock `mode_config.mutex`, `put_task_struct(owner)` |
 | 107-139 | - | exported `drm_modeset_lock_all_force_unlock(dev, why)`: under the abandon mutex, no-op when no owner, no-op (pr_debug) when the owner is alive and not current, else force release |
-| 182-190 | before old 83 | `drm_modeset_lock_all()`: if the recorded owner is not current and is gone, force-release **before** `mutex_lock(&config->mutex)`, i.e. before another task can block on a dead owner |
+| 182-192 | before old 83 | `drm_modeset_lock_all()`: when an owner other than us is recorded, call the rescue path **before** `mutex_lock(&config->mutex)`; the pointer test does not dereference, the liveness test and the release happen under the abandon mutex |
 | 207-213 | after old 96 | `get_task_struct(current)` when installing the owner, so the recorded pointer stays valid to inspect after the task dies |
 | 250-280 | before old 135 | `drm_modeset_unlock_all()` repeated `config->lock_all_owner != current` check and the whole depth-0 clear+release under the abandon mutex; `put_task_struct()` added.  Nesting (`--depth`) semantics unchanged |
 
@@ -122,6 +122,15 @@ alternatives, not a stack.
   may still return and release.
 * `owner->state` is read without barriers; a stale `TASK_RUNNING` only delays
   the rescue to the next `lock_all()`/`drm_release()` caller.
+* The pre-existing entry logs of `lock_all()`/`unlock_all()` still print
+  `config->lock_all_owner->comm` outside the abandon mutex, so a pointer loaded
+  there can in principle outlive a concurrent force release that drops the last
+  reference.  That race predates this patch (before it the raw pointer was
+  never refcounted at all, so it could be freed while recorded for as long as
+  the lock stayed held); the patch narrows it to the few instructions between
+  the pointer load and the `comm` load.  Closing it completely means guarding
+  those two log statements too, which would put a mutex in the normal path for
+  a log-only string — deliberately not done here.
 * Cost on the healthy path: 2 refcount atomics in `lock_all`/`unlock_all` and
   one extra mutex round-trip at depth 0.  Nested calls are unchanged.
 * This is recovery, not prevention: a client can still hold the global

@@ -34,7 +34,7 @@ dead client is enough to wedge the whole KMS device.
 
 ---
 diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
-index c28e7c4..cfcf2a0 100644
+index c28e7c4..6523611 100644
 --- a/drivers/gpu/drm/drm_crtc.c
 +++ b/drivers/gpu/drm/drm_crtc.c
 @@ -39,6 +39,105 @@
@@ -143,7 +143,7 @@ index c28e7c4..cfcf2a0 100644
  /**
   * drm_modeset_lock_all - take all modeset locks
   * @dev: drm device
-@@ -80,6 +179,16 @@ void drm_modeset_lock_all(struct drm_device *dev)
+@@ -80,6 +179,18 @@ void drm_modeset_lock_all(struct drm_device *dev)
  	if (WARN_ON(!ctx))
  		return;
  
@@ -151,16 +151,18 @@ index c28e7c4..cfcf2a0 100644
 +	 * int83: only the owner releases these locks, in
 +	 * drm_modeset_unlock_all().  A task that died while owning them never
 +	 * gets there, so the mutex_lock() below would block every later ioctl
-+	 * forever.  Check the recorded (refcounted) owner before waiting.
++	 * forever.  A recorded owner that is not us is worth checking before
++	 * waiting; the liveness test itself lives under the abandon mutex in
++	 * drm_modeset_lock_all_force_unlock(), because the last reference to a
++	 * dead owner is dropped there.
 +	 */
-+	if (config->lock_all_owner && config->lock_all_owner != current &&
-+	    drm_lock_all_owner_gone(config->lock_all_owner))
++	if (config->lock_all_owner && config->lock_all_owner != current)
 +		drm_modeset_lock_all_force_unlock(dev, "owner task died");
 +
  	mutex_lock(&config->mutex);
  
  	/* Another task may have become the owner while we waited. */
-@@ -95,6 +204,12 @@ void drm_modeset_lock_all(struct drm_device *dev)
+@@ -95,6 +206,12 @@ void drm_modeset_lock_all(struct drm_device *dev)
  	list_for_each_entry(crtc, &config->crtc_list, head)
  		mutex_lock_nest_lock(&crtc->mutex, &config->mutex);
  
@@ -173,7 +175,7 @@ index c28e7c4..cfcf2a0 100644
  	config->lock_all_owner = current;
  	config->lock_all_depth = 1;
  	config->acquire_ctx = ctx;
-@@ -132,6 +247,22 @@ void drm_modeset_unlock_all(struct drm_device *dev)
+@@ -132,6 +249,22 @@ void drm_modeset_unlock_all(struct drm_device *dev)
  		return;
  	}
  
@@ -196,7 +198,7 @@ index c28e7c4..cfcf2a0 100644
  	config->lock_all_owner = NULL;
  	config->acquire_ctx = NULL;
  	if (ctx) {
-@@ -146,6 +277,7 @@ void drm_modeset_unlock_all(struct drm_device *dev)
+@@ -146,6 +279,7 @@ void drm_modeset_unlock_all(struct drm_device *dev)
  		mutex_unlock(&crtc->mutex);
  
  	mutex_unlock(&config->mutex);
