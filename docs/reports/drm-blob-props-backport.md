@@ -127,6 +127,24 @@ Log: `/run/media/asdf/db69437b-ed35-414a-8bd1-bade16b06830/j7k/blobwork-build.lo
 `drm_fops.o`, `drm_kms_helper.o`, `exynos7580/*` and links `drm.o`,
 `drm_kms_helper.o`, `exynos-drm7580.o`; zero errors, zero warnings.
 
+The int84-shaped module config was also built (`CONFIG_MODULES=y`,
+`CONFIG_DRM_KMS_HELPER=m`, `CONFIG_DRM_EXYNOS7580=m`), same command, `rc=0`,
+log `blobwork-build-mod.log`. The only diagnostics are two pre-existing
+`-Wmissing-attributes` warnings on the KMS module's `init_module`/`cleanup_module`
+(3.10 `linux/init.h` vs gcc 16), nothing from this patch. `make ... .ko` in that
+scratch tree fails modpost because the builtin `drm.o` was never relinked into a
+`vmlinux` there (the same error list contains pre-existing exports such as
+`drm_atomic_state_alloc`, `drm_universal_plane_init`, `sys_copyarea`), so it is a
+scratch-tree artefact, not a missing export. The symbols this patch shares across
+module boundaries are in `__ksymtab` of `drivers/gpu/drm/built-in.o`
+(`__ksymtab_drm_atomic_set_mode_for_crtc`, `__ksymtab_drm_atomic_set_mode_prop_for_crtc`,
+`__ksymtab_drm_property_{create,lookup,reference,unreference}_blob`,
+`__ksymtab_drm_mode_convert_to_umode`, `__ksymtab_drm_mode_convert_umode`,
+`__ksymtab_drm_mode_validate_basic`) and `drm_kms_helper.o` names exactly the three
+it needs (`drm_atomic_set_mode_for_crtc`, `drm_property_reference_blob`,
+`drm_property_unreference_blob`). `drm_property_destroy_user_blobs()` is
+deliberately unexported, as in v4.2 (only `drm_release()` calls it).
+
 `CONFIG_DRM_EXYNOS` (the vendor 3.10 exynos driver, a legacy `drm_crtc_init()` user)
 cannot be enabled on arm64 at all: its Kconfig `depends on DRM && (PLAT_SAMSUNG ||
 ARCH_MULTIPLATFORM)`. It was therefore not compiled. Risk is bounded by grep: the
