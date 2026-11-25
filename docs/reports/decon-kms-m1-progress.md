@@ -47,3 +47,25 @@ fbdev postcondition fields, 32-bit mmap offset overflow, and `lock_all` nesting.
    opened via `KWIN_RENDER_NODES`/`GBM_BACKEND`. Test with `kmscube -D /dev/dri/card0` and
    `EGL_PLATFORM=gbm`.
 3. Run `kwin_wayland` against `card0` (no compositor yet), then the Plasma Mobile session.
+
+## Update after int80–int82
+
+Also working now:
+- `modetest -s 20@18:720x1280` sets the mode cleanly (no gamma error, no hang) — DECON IRQ climbs.
+- `dd /dev/fb0` returns (~66 MB/s).
+- `kmscube` reaches our commit path (`exynos7580_atomic_commit: async=1`) and no longer oopses.
+
+Remaining, with the latest evidence:
+- **Page flip carries no buffer**: `atomic_commit: async=1 crtc->fb=0 primary->state->fb=0 by kmscube`
+  → the 3.10 `drm_atomic_helper_page_flip` path does not install the flip fb into the plane state
+  before our commit; `drm_mode_page_flip_ioctl`'s legacy `crtc->fb` guard and the atomic state must
+  be reconciled in the adapter (next: set the plane state fb from the flip ioctl args in
+  `exynos7580_atomic_commit`/page_flip wrapper, and verify `state->planes[i]` + `plane_states[i]`).
+- **Mesa still picks llvmpipe** for GBM on card0 (no `fd_to_handle` trace → kmsro never imports into
+  our device). Needs a Mesa-side pairing investigation (exynos kmsro ↔ panfrost) once flips work.
+- A dead DRM client can leak `lock_all` (owner task exits while holding it) — release on file close
+  or check owner liveness before blocking.
+
+Test harness and rollback image are unchanged (`wdpet.sh`, `logd.sh`, `kmstest.sh <rev>`,
+`kernel-boot-int49.img`). Note this image is OpenRC: stop the UI with
+`rc-service xsession stop` (not `systemctl`).
