@@ -1,0 +1,485 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PanfrostMesa26 <mesa26@local>
+Date: Tue, 25 Nov 2026 10:30:00
+Subject: [PATCH 0138] gpu31-panfrost: DRM 1.1 + Mesa 26 GET_PARAM/flags uapi
+
+Mesa 26's panfrost/kmod backend (same code as the local 27.0-devel tree)
+refuses this driver before any ioctl: panfrost_kmod_dev_create() requires
+drmGetVersion() >= 1.1.  It then queries a feature set through GET_PARAM
+(required=true: a failed query is an assert in debug builds and zeros in
+release builds, which breaks the compiler) and passes modern CREATE_BO flags.
+
+- drm_driver major/minor 1.0 -> 1.1.  Deliberately 1.1 and not higher: 1.3
+  adds SYSTEM_TIMESTAMP, 1.4 SET_LABEL_BO and 1.6 QUERY_BO_INFO (Mesa would
+  switch the import path to an ioctl this table does not implement).  1.1
+  gives BO_HEAP/NOEXEC flags + GET_BO_OFFSET imports, which this driver has.
+- Feature snapshot at probe (block is powered there), read with the mainline
+  panfrost_gpu_init_features() offsets: GPU_ID, L2/CORE/TILER/MEM/MMU
+  features, AS/JS present, THREAD_FEATURES, MAX_THREADS, max workgroup /
+  barrier, COHERENCY, AFBC (0x4C), 4 texture features, JS features per
+  present slot, shader/tiler/l2/stack present (LO|HI<<32), TLS alloc,
+  nr_core_groups = hweight64(l2_present).  GET_PARAM answers all of them
+  from this snapshot; the 1.3/1.5/1.6-only ids stay -EINVAL (Mesa tolerates
+  because it gates them on the version).  Every query is logged with id,
+  value and rc, so the device run shows exactly which ids Mesa 26 asks for.
+- CREATE_BO: keep size==0 (and now pad!=0) rejected; accept
+  PANFROST_BO_NOEXEC (1) and PANFROST_BO_HEAP (2), accept PANFROST_BO_WB_MMAP
+  (4) as a no-op (backing is pre-faulted SHMEM either way), and warn-ignore
+  any unknown bit instead of -EINVAL.  One enter log with args->flags plus
+  sizeof/flags/pad/offset offsets proves the uapi layout on the device.
+  MMAP_BO flags are warn-ignored too (currently no meaning).
+- uapi: enum drm_panfrost_param gains the modern ids in upstream order
+  (through SELECTED_COHERENCY; GPU_PROD_ID stays 0) and the PANFROST_BO_*
+  defines; struct layouts are unchanged (verified by the enter log).
+
+Diagnostic prints are one line per ioctl/probe and can be dropped later.
+
+---
+--- a/drivers/gpu/drm/panfrost/panfrost_drm.h
++++ b/drivers/gpu/drm/panfrost/panfrost_drm.h
+@@ -90,6 +90,15 @@
+  * There are currently no values for the flags argument, but it may be
+  * used in a future extension.
+  */
++/* Valid flags for drm_panfrost_create_bo (modern uapi; 1.1 and later).
++ * PANFROST_BO_NOEXEC/HEAP are hints to the kernel: this driver always backs
++ * CREATE_BO with pre-faulted SHMEM, so they are accepted and recorded only.
++ * PANFROST_BO_WB_MMAP is accepted for ABI completeness (WC is the default
++ * mapping; the flag is a no-op here). */
++#define PANFROST_BO_NOEXEC	1
++#define PANFROST_BO_HEAP	2
++#define PANFROST_BO_WB_MMAP	4
++
+ struct drm_panfrost_create_bo {
+ 	__u32 size;
+ 	__u32 flags;
+@@ -127,8 +136,55 @@
+ 	__u64 offset;
+ };
+ 
++/* Queryable parameters.  The order and values are the modern uapi
++ * (Mesa 26+); the first entry is the v5.2 GPU_PROD_ID so old and new
++ * userspace read the same handshake. */
+ enum drm_panfrost_param {
+ 	DRM_PANFROST_PARAM_GPU_PROD_ID,
++	DRM_PANFROST_PARAM_GPU_REVISION,
++	DRM_PANFROST_PARAM_SHADER_PRESENT,
++	DRM_PANFROST_PARAM_TILER_PRESENT,
++	DRM_PANFROST_PARAM_L2_PRESENT,
++	DRM_PANFROST_PARAM_STACK_PRESENT,
++	DRM_PANFROST_PARAM_AS_PRESENT,
++	DRM_PANFROST_PARAM_JS_PRESENT,
++	DRM_PANFROST_PARAM_L2_FEATURES,
++	DRM_PANFROST_PARAM_CORE_FEATURES,
++	DRM_PANFROST_PARAM_TILER_FEATURES,
++	DRM_PANFROST_PARAM_MEM_FEATURES,
++	DRM_PANFROST_PARAM_MMU_FEATURES,
++	DRM_PANFROST_PARAM_THREAD_FEATURES,
++	DRM_PANFROST_PARAM_MAX_THREADS,
++	DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ,
++	DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ,
++	DRM_PANFROST_PARAM_COHERENCY_FEATURES,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES0,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES1,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES2,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES3,
++	DRM_PANFROST_PARAM_JS_FEATURES0,
++	DRM_PANFROST_PARAM_JS_FEATURES1,
++	DRM_PANFROST_PARAM_JS_FEATURES2,
++	DRM_PANFROST_PARAM_JS_FEATURES3,
++	DRM_PANFROST_PARAM_JS_FEATURES4,
++	DRM_PANFROST_PARAM_JS_FEATURES5,
++	DRM_PANFROST_PARAM_JS_FEATURES6,
++	DRM_PANFROST_PARAM_JS_FEATURES7,
++	DRM_PANFROST_PARAM_JS_FEATURES8,
++	DRM_PANFROST_PARAM_JS_FEATURES9,
++	DRM_PANFROST_PARAM_JS_FEATURES10,
++	DRM_PANFROST_PARAM_JS_FEATURES11,
++	DRM_PANFROST_PARAM_JS_FEATURES12,
++	DRM_PANFROST_PARAM_JS_FEATURES13,
++	DRM_PANFROST_PARAM_JS_FEATURES14,
++	DRM_PANFROST_PARAM_JS_FEATURES15,
++	DRM_PANFROST_PARAM_NR_CORE_GROUPS,
++	DRM_PANFROST_PARAM_THREAD_TLS_ALLOC,
++	DRM_PANFROST_PARAM_AFBC_FEATURES,
++	DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP,
++	DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY,
++	DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES,
++	DRM_PANFROST_PARAM_SELECTED_COHERENCY,
+ };
+ 
+ struct drm_panfrost_get_param {
+--- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h
++++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
+@@ -76,8 +76,39 @@
+ 	struct mutex bo_lock;		/* serialises bo_list */
+ 	struct list_head bo_list;
+ 	atomic_t pm_ref;		/* live-job runtime-PM refs (see submit.c) */
++	/* Mesa 26 GET_PARAM snapshot: read once at probe while the block is
++	 * powered (values are constant for the part). */
++	struct {
++		uint64_t gpu_id;		/* GPU_ID register */
++		uint64_t shader_present;
++		uint64_t tiler_present;
++		uint64_t l2_present;
++		uint64_t stack_present;
++		uint32_t as_present;
++		uint32_t js_present;
++		uint32_t l2_features;
++		uint32_t core_features;
++		uint32_t tiler_features;
++		uint32_t mem_features;
++		uint32_t mmu_features;
++		uint32_t thread_features;
++		uint32_t max_threads;
++		uint32_t thread_max_workgroup_sz;
++		uint32_t thread_max_barrier_sz;
++		uint32_t coherency_features;
++		uint32_t afbc_features;
++		uint32_t texture_features[4];
++		uint32_t js_features[16];
++		uint32_t nr_core_groups;
++		uint32_t thread_tls_alloc;
++	} feat;
+ };
+ 
++struct drm_device;
++/* Fill *value for one DRM_PANFROST_PARAM_* from the probe snapshot.
++ * Returns -EINVAL for parameters this driver does not expose. */
++int p7580_drv_get_param(struct drm_device *ddev, uint32_t param, uint64_t *value);
++
+ /* gpu31-storm58: bounded BO-age ledger size (see p7580_drv_file). */
+ #define P7580_BO_AGE_SLOTS	64u
+ 
+--- a/drivers/gpu/drm/panfrost/panfrost7580_main.c
++++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c
+@@ -303,8 +303,12 @@
+ 	.name = "panfrost",
+ 	.desc = "Mali-T720 render-only (Exynos 7580)",
+ 	.date = "20261119",
++	/* 1.1: the first version Mesa 26/27 accepts (its panfrost/kmod backend
++	 * refuses < 1.1).  1.3 adds SYSTEM_TIMESTAMP, 1.4 SET_LABEL_BO and 1.6
++	 * QUERY_BO_INFO, none of which this ioctl table implements, so stop at
++	 * 1.1: BO_HEAP/NOEXEC flags and the GET_BO_OFFSET import path only. */
+ 	.major = 1,
+-	.minor = 0,
++	.minor = 1,
+ 	.patchlevel = 0,
+ };
+ 
+@@ -445,12 +449,92 @@
+ };
+ MODULE_DEVICE_TABLE(of, p7580_of_match);
+ 
+-/* GPU feature registers (MIDGARD, kbase mali_midg_regmap.h). */
++/* GPU feature registers (MIDGARD, mainline panfrost_regs.h / kbase
++ * mali_midg_regmap.h).  These are the GPU block offsets, not the JOB/MMU
++ * interrupt offsets used further down this file. */
+ #define P7580_GPU_ID			0x000u
+-#define P7580_GPU_L2_FEATURES		0x02Cu
+-#define P7580_GPU_CORE_FEATURES		0x030u
++#define P7580_GPU_L2_FEATURES		0x004u
++#define P7580_GPU_CORE_FEATURES		0x008u
++#define P7580_GPU_TILER_FEATURES	0x00Cu
++#define P7580_GPU_MEM_FEATURES		0x010u
++#define P7580_GPU_MMU_FEATURES		0x014u
++#define P7580_GPU_AS_PRESENT		0x018u
+ #define P7580_GPU_JS_PRESENT		0x01Cu
++#define P7580_GPU_AFBC_FEATURES		0x04Cu
++#define P7580_GPU_THREAD_MAX_THREADS	0x0A0u
++#define P7580_GPU_THREAD_MAX_WORKGROUP	0x0A4u
++#define P7580_GPU_THREAD_MAX_BARRIER	0x0A8u
++#define P7580_GPU_THREAD_FEATURES	0x0ACu
++#define P7580_GPU_TEXTURE_FEATURES(n)	(0x0B0u + ((n) * 4u))
++#define P7580_GPU_JS_FEATURES(n)	(0x0C0u + ((n) * 4u))
+ #define P7580_GPU_SHADER_PRESENT_LO	0x100u
++#define P7580_GPU_SHADER_PRESENT_HI	0x104u
++#define P7580_GPU_TILER_PRESENT_LO	0x110u
++#define P7580_GPU_TILER_PRESENT_HI	0x114u
++#define P7580_GPU_L2_PRESENT_LO		0x120u
++#define P7580_GPU_L2_PRESENT_HI		0x124u
++#define P7580_GPU_COHERENCY_FEATURES	0x300u
++#define P7580_GPU_THREAD_TLS_ALLOC	0x310u
++#define P7580_GPU_STACK_PRESENT_LO	0xE00u
++#define P7580_GPU_STACK_PRESENT_HI	0xE04u
++
++/* Experimental (Mesa 26) convergence: snapshot the feature registers once,
++ * while probe holds the block powered, and answer GET_PARAM from it.  Reads
++ * follow the mainline panfrost_gpu_init_features() order/offsets. */
++static void p7580_capture_features(struct p7580_drv *drv)
++{
++	void __iomem *regs = drv->regs;
++	unsigned int i, njs;
++
++	drv->feat.gpu_id = readl(regs + P7580_GPU_ID);
++	drv->feat.l2_features = readl(regs + P7580_GPU_L2_FEATURES);
++	drv->feat.core_features = readl(regs + P7580_GPU_CORE_FEATURES);
++	drv->feat.tiler_features = readl(regs + P7580_GPU_TILER_FEATURES);
++	drv->feat.mem_features = readl(regs + P7580_GPU_MEM_FEATURES);
++	drv->feat.mmu_features = readl(regs + P7580_GPU_MMU_FEATURES);
++	drv->feat.as_present = readl(regs + P7580_GPU_AS_PRESENT);
++	drv->feat.js_present = readl(regs + P7580_GPU_JS_PRESENT) & 0x7u;
++	drv->feat.thread_features = readl(regs + P7580_GPU_THREAD_FEATURES);
++	drv->feat.max_threads = readl(regs + P7580_GPU_THREAD_MAX_THREADS);
++	drv->feat.thread_max_workgroup_sz =
++		readl(regs + P7580_GPU_THREAD_MAX_WORKGROUP);
++	drv->feat.thread_max_barrier_sz =
++		readl(regs + P7580_GPU_THREAD_MAX_BARRIER);
++	drv->feat.coherency_features = readl(regs + P7580_GPU_COHERENCY_FEATURES);
++	drv->feat.afbc_features = readl(regs + P7580_GPU_AFBC_FEATURES);
++	for (i = 0; i < 4; i++)
++		drv->feat.texture_features[i] =
++			readl(regs + P7580_GPU_TEXTURE_FEATURES(i));
++	drv->feat.shader_present = readl(regs + P7580_GPU_SHADER_PRESENT_LO);
++	drv->feat.shader_present |=
++		(uint64_t)readl(regs + P7580_GPU_SHADER_PRESENT_HI) << 32;
++	drv->feat.tiler_present = readl(regs + P7580_GPU_TILER_PRESENT_LO);
++	drv->feat.tiler_present |=
++		(uint64_t)readl(regs + P7580_GPU_TILER_PRESENT_HI) << 32;
++	drv->feat.l2_present = readl(regs + P7580_GPU_L2_PRESENT_LO);
++	drv->feat.l2_present |=
++		(uint64_t)readl(regs + P7580_GPU_L2_PRESENT_HI) << 32;
++	drv->feat.stack_present = readl(regs + P7580_GPU_STACK_PRESENT_LO);
++	drv->feat.stack_present |=
++		(uint64_t)readl(regs + P7580_GPU_STACK_PRESENT_HI) << 32;
++	drv->feat.thread_tls_alloc = readl(regs + P7580_GPU_THREAD_TLS_ALLOC);
++	drv->feat.nr_core_groups = hweight64(drv->feat.l2_present);
++	njs = hweight32(drv->feat.js_present);
++	for (i = 0; i < 16; i++)
++		drv->feat.js_features[i] = (i < njs) ?
++			readl(regs + P7580_GPU_JS_FEATURES(i)) : 0;
++	pr_info("p7580_features: gpu_id=0x%llx rev=0x%llx l2=0x%08x core=0x%08x tiler=0x%08x mem=0x%08x mmu=0x%08x as=0x%x js=0x%x shader=0x%llx l2_present=0x%llx max_threads=%u thread_feat=0x%08x tls=%u afbc=0x%08x\n",
++		(unsigned long long)drv->feat.gpu_id,
++		(unsigned long long)(drv->feat.gpu_id & 0xffff),
++		drv->feat.l2_features, drv->feat.core_features,
++		drv->feat.tiler_features, drv->feat.mem_features,
++		drv->feat.mmu_features, drv->feat.as_present,
++		drv->feat.js_present,
++		(unsigned long long)drv->feat.shader_present,
++		(unsigned long long)drv->feat.l2_present,
++		drv->feat.max_threads, drv->feat.thread_features,
++		drv->feat.thread_tls_alloc, drv->feat.afbc_features);
++}
+ 
+ /* PM wrappers for the jobs-slice dump path (void-arg, device-direct):
+  * the jobs slice never includes pm_runtime.h; these live in the driver
+@@ -500,6 +584,113 @@
+ 	return pf7580_power_cycle(drv->power);
+ }
+ 
++int p7580_drv_get_param(struct drm_device *ddev, uint32_t param,
++		       uint64_t *value)
++{
++	struct p7580_drv *drv = ddev ? ddev->dev_private : NULL;
++
++	if (!drv || !value)
++		return -ENODEV;
++
++	switch (param) {
++	case DRM_PANFROST_PARAM_GPU_PROD_ID:
++		*value = drv->feat.gpu_id >> 16;
++		break;
++	case DRM_PANFROST_PARAM_GPU_REVISION:
++		*value = drv->feat.gpu_id & 0xffff;
++		break;
++	case DRM_PANFROST_PARAM_SHADER_PRESENT:
++		*value = drv->feat.shader_present;
++		break;
++	case DRM_PANFROST_PARAM_TILER_PRESENT:
++		*value = drv->feat.tiler_present;
++		break;
++	case DRM_PANFROST_PARAM_L2_PRESENT:
++		*value = drv->feat.l2_present;
++		break;
++	case DRM_PANFROST_PARAM_STACK_PRESENT:
++		*value = drv->feat.stack_present;
++		break;
++	case DRM_PANFROST_PARAM_AS_PRESENT:
++		*value = drv->feat.as_present;
++		break;
++	case DRM_PANFROST_PARAM_JS_PRESENT:
++		*value = drv->feat.js_present;
++		break;
++	case DRM_PANFROST_PARAM_L2_FEATURES:
++		*value = drv->feat.l2_features;
++		break;
++	case DRM_PANFROST_PARAM_CORE_FEATURES:
++		*value = drv->feat.core_features;
++		break;
++	case DRM_PANFROST_PARAM_TILER_FEATURES:
++		*value = drv->feat.tiler_features;
++		break;
++	case DRM_PANFROST_PARAM_MEM_FEATURES:
++		*value = drv->feat.mem_features;
++		break;
++	case DRM_PANFROST_PARAM_MMU_FEATURES:
++		*value = drv->feat.mmu_features;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_FEATURES:
++		*value = drv->feat.thread_features;
++		break;
++	case DRM_PANFROST_PARAM_MAX_THREADS:
++		*value = drv->feat.max_threads;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ:
++		*value = drv->feat.thread_max_workgroup_sz;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
++		*value = drv->feat.thread_max_barrier_sz;
++		break;
++	case DRM_PANFROST_PARAM_COHERENCY_FEATURES:
++		*value = drv->feat.coherency_features;
++		break;
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES0:
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES1:
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES2:
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES3:
++		*value = drv->feat.texture_features[param -
++			DRM_PANFROST_PARAM_TEXTURE_FEATURES0];
++		break;
++	case DRM_PANFROST_PARAM_JS_FEATURES0:
++	case DRM_PANFROST_PARAM_JS_FEATURES1:
++	case DRM_PANFROST_PARAM_JS_FEATURES2:
++	case DRM_PANFROST_PARAM_JS_FEATURES3:
++	case DRM_PANFROST_PARAM_JS_FEATURES4:
++	case DRM_PANFROST_PARAM_JS_FEATURES5:
++	case DRM_PANFROST_PARAM_JS_FEATURES6:
++	case DRM_PANFROST_PARAM_JS_FEATURES7:
++	case DRM_PANFROST_PARAM_JS_FEATURES8:
++	case DRM_PANFROST_PARAM_JS_FEATURES9:
++	case DRM_PANFROST_PARAM_JS_FEATURES10:
++	case DRM_PANFROST_PARAM_JS_FEATURES11:
++	case DRM_PANFROST_PARAM_JS_FEATURES12:
++	case DRM_PANFROST_PARAM_JS_FEATURES13:
++	case DRM_PANFROST_PARAM_JS_FEATURES14:
++	case DRM_PANFROST_PARAM_JS_FEATURES15:
++		*value = drv->feat.js_features[param -
++			DRM_PANFROST_PARAM_JS_FEATURES0];
++		break;
++	case DRM_PANFROST_PARAM_NR_CORE_GROUPS:
++		*value = drv->feat.nr_core_groups;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_TLS_ALLOC:
++		*value = drv->feat.thread_tls_alloc;
++		break;
++	case DRM_PANFROST_PARAM_AFBC_FEATURES:
++		*value = drv->feat.afbc_features;
++		break;
++	default:
++		/* SYSTEM_TIMESTAMP*, ALLOWED_JM_CTX_PRIORITIES and
++		 * SELECTED_COHERENCY belong to 1.3/1.5/1.6; Mesa tolerates
++		 * -EINVAL there because it gates them on the version. */
++		return -EINVAL;
++	}
++	return 0;
++}
++
+ static int p7580_drv_probe(struct platform_device *pdev)
+ {
+ 	struct resource *mem;
+@@ -562,6 +753,7 @@
+ 		ret = -ENODEV;
+ 		goto err_pm;
+ 	}
++	p7580_capture_features(drv);
+ 
+ 	/* GEM allocator (IOVA window; no MMIO). */
+ 	ret = p7580_dev_init(&drv->gd, &pdev->dev);
+--- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c
+@@ -42,6 +42,12 @@
+ 
+ #include "drm_syncobj.h"		/* 0003 (staged by Makefile) */
+ #include "panfrost7580_gem.h"
++/* Probe-snapshot GET_PARAM backend (main.c).  Declared here instead of
++ * including panfrost7580_drv.h, whose jobs slice mirrors struct
++ * p7580_submit locally in this TU. */
++struct drm_device;
++int p7580_drv_get_param(struct drm_device *ddev, uint32_t param,
++			uint64_t *value);
+ #include "panfrost7580_ioctl.h"
+ #include "panfrost_drm.h"
+ /* ABI gate (gpu31-abialign): v5.2/Mesa-20.3 wire sizes + offsets. The
+@@ -155,24 +161,31 @@
+ 			     struct drm_file *file_priv)
+ {
+ 	struct drm_panfrost_get_param *args = data;
++	int ret;
+ 
+-	(void)dev;
+ 	(void)file_priv;
+ 	/* ABI gate: run the build-time checks on every call path so a
+ 	 * header drift cannot slip past an unbuilt TU. Cheap (constant). */
+ 	p7580_abi_check_get_param();
+-	/* Mesa 20.3 panfrost_query_raw zeroes the struct, sets param, and
+-	 * issues the IOWR(0x44/16 B) ioctl; non-PROD_ID probes arrive with
+-	 * pad == 0 and must fail -EINVAL (NOT success-with-garbage): the
+-	 * caller asserts !required and falls back to compiled-in defaults.
+-	 * Upstream v5.2 panfrost_ioctl_get_param has the identical gate. */
+-	if (args->param != DRM_PANFROST_PARAM_GPU_PROD_ID)
+-		return -EINVAL;
+-	if (args->pad)
++	/* Mesa 20.3 and 26+ both zero the struct, set param and issue the
++	 * IOWR(0x44/16 B) ioctl.  Mesa 26 requires a whole feature set (its
++	 * panfrost/kmod backend asserts on a failed required query in debug
++	 * builds, and compiles zeros otherwise), so answer every
++	 * DRM_PANFROST_PARAM_* this part has a register for from the probe
++	 * snapshot.  Unknown/unsupported ids stay -EINVAL: Mesa gates the
++	 * 1.3/1.5/1.6-only params on the DRM version and tolerates the
++	 * failure.  The log is the evidence for which ids Mesa actually
++	 * asks for. */
++	if (args->pad) {
++		pr_info("p7580_get_param: pad=0x%x param=%u rc=-EINVAL\n",
++			args->pad, args->param);
+ 		return -EINVAL;
+-	args->value = P7580_GPU_PROD_ID;
+-	args->pad = 0;
+-	return 0;
++	}
++	ret = p7580_drv_get_param(dev, args->param, &args->value);
++	pr_info("p7580_get_param: param=%u value=0x%llx rc=%d%s\n",
++		args->param, (unsigned long long)args->value, ret,
++		ret ? " (unknown/unsupported)" : "");
++	return ret;
+ }
+ 
+ int panfrost_ioctl_create_bo(struct drm_device *dev, void *data,
+@@ -185,10 +198,25 @@
+ 	uint32_t handle;
+ 	int ret;
+ 
+-	if (args->flags)
+-		return -EINVAL;
+-	if (!args->size)
++	if (!args->size || args->pad) {
++		pr_info("p7580_create_bo: bad args size=0x%x pad=0x%x rc=-EINVAL\n",
++			args->size, args->pad);
+ 		return -EINVAL;
++	}
++	/* Modern Mesa (kernel 1.1+) passes PANFROST_BO_NOEXEC (non-executable
++	 * BO) and PANFROST_BO_HEAP (alloc-on-fault tiler heap).  Backing here
++	 * is always pre-faulted SHMEM, so both are hints: accept and record
++	 * them; ignore, with a warning, any bit this driver does not know
++	 * instead of failing the allocation. */
++	if (args->flags & ~(PANFROST_BO_NOEXEC | PANFROST_BO_HEAP |
++			    PANFROST_BO_WB_MMAP))
++		pr_warn("p7580_create_bo: unknown flags 0x%x ignored (size=0x%x)\n",
++			args->flags, args->size);
++	pr_info("p7580_create_bo: enter size=0x%x flags=0x%x abi sizeof=%zu flags_off=%zu pad_off=%zu offset_off=%zu\n",
++		args->size, args->flags, sizeof(*args),
++		offsetof(struct drm_panfrost_create_bo, flags),
++		offsetof(struct drm_panfrost_create_bo, pad),
++		offsetof(struct drm_panfrost_create_bo, offset));
+ 
+ 	/* SHMEM for general BOs (upstream panfrost uses drm_gem_shmem;
+ 	 * CMA carries no size beyond the display window and fails 8 MiB+
+@@ -227,7 +255,8 @@
+ 	uint64_t fake_offset = 0;
+ 
+ 	if (args->flags)
+-		return -EINVAL;
++		pr_warn("p7580_mmap_bo: flags=0x%x ignored (currently no meaning)\n",
++			args->flags);
+ 	if (!gd)
+ 		return -ENODEV;
+ 
