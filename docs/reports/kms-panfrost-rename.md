@@ -129,12 +129,13 @@ script's `CONFIG_EXPECT` closure list so a silent loss fails the gate.
 built-in render node avoids adding a third `.ko` to the KMS module pair, whose
 vermagic pairing is already the fragile part of int82/int83.
 
-### Integrator addition (patches) and the three merge points
+### Integrator addition (patches) and the four merge points
 
 The combined image needs, on top of the int83 KMS series:
 `patches/drm-backport/0001-0004`, `code/gpu31/kms/0001-drm-3.10-render-node-mode-b.patch`,
 `code/gpu31/driver/0001` + `0002`. Applied in that order on top of the KMS
-series, everything applies **except** three known overlaps (verified, §5):
+series, everything applies **except** three known overlaps plus one KMS-side
+gap (verified, §5):
 
 1. `patches/drm-backport/0005-build-wiring-for-shims.patch` — its
    `drivers/gpu/drm/Makefile` hunk no longer matches because maxwell-atomic
@@ -150,6 +151,31 @@ series, everything applies **except** three known overlaps (verified, §5):
    already carries the identical `DMA_ATTR_WRITE_COMBINE` conversion (plus the
    arm64 format-specifier fixes). The two overlap at
    `drm_gem_cma_helper.c:35` and cannot both apply.
+4. **PRIME ioctls are not wired on card0** (measured by `MesaPair` on the
+   int83 boot: `DRM_CAP_PRIME=0x0`). `patches/drm-kms/0200` sets
+   `DRIVER_PRIME` in `driver_features` and `.gem_prime_export/get_sg_table/
+   vmap/vunmap/import`, but never `.prime_handle_to_fd`/`.prime_fd_to_handle`,
+   and 3.10 derives `DRM_CAP_PRIME` from exactly those two pointers
+   (`drm_ioctl.c:287-288`: `0x1` = import, `0x2` = export). renderonly's first
+   allocation step is `drmPrimeHandleToFD(card0)`, so kmsro fails before it
+   renders. Add to the `drm_driver` initializer in 0200
+   (`exynos_drm7580_main.c`, next to `.gem_prime_export`):
+
+   ```c
+   	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
+   	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
+   ```
+
+   With those two, `DRM_CAP_PRIME` reads `0x3`, and
+   `drm_gem_prime_handle_to_fd()` reaches the generic
+   `drm_gem_prime_export()` (3.10 has no dispatcher: `.gem_prime_export` *is*
+   the exporter, `drm_prime.c:185-195`). The two existing candidates
+   `code/gpu31/dmabuf/0002-drm-exynos7580-gem-prime-export.patch` and
+   `patches/iommu-dma/0001-drm-exynos7580-wire-gem-prime-export-for-kbase-umm.patch`
+   carry this wiring (plus their own `drm_driver` rewrite) but target the
+   pre-0200 filename `drivers/gpu/drm/exynos7580/exynos7580_drm.c`, so neither
+   applies to the int83 tree — port the two lines into 0200 instead of
+   resurrecting those patches.
 
 `code/gpu31/driver/0003-…-fault-head-vertexjob-decode.patch` is not part of any
 build script and does not apply to the current driver 0001 (pre-existing, see
