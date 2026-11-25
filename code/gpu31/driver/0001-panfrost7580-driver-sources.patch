@@ -6298,7 +6298,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	.probe = p7580_drv_probe,
 +	.remove = p7580_drv_remove,
 +	.driver = {
-+		.name = "panfrost7580",
++		.name = "panfrost",
 +		.owner = THIS_MODULE,
 +		.of_match_table = of_match_ptr(p7580_of_match),
 +		.pm = &p7580_drv_pm_ops,
@@ -6310,7 +6310,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +MODULE_AUTHOR("gpu31");
 +MODULE_DESCRIPTION("panfrost7580 render-only DRM driver (Mali-T720, Exynos 7580)");
 +MODULE_LICENSE("GPL v2");
-+MODULE_ALIAS("platform:panfrost7580");
++MODULE_ALIAS("platform:panfrost");
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	1969-12-31 19:00:00.000000000 -0500
 +++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-21 00:00:00.000000000 -0500
