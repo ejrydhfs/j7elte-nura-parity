@@ -1,0 +1,38 @@
+# Recovered symbols (kallsyms-finder) for the stock SM-J700M J700MUBU2BRC2 kernel.
+# Image: raw arm64 Image, Linux 3.10.61-13213628, Mali kbase t72x/r7p0 built-in.
+# Image base 0xffffffc000205000; file offset = VA - base.
+#
+ffffffc0004d7b48 T kbase_mmu_update
+ffffffc0004d7b94 T kbase_mmu_disable_as
+ffffffc0004d947c t kbase_mmu_report_fault_and_kill
+ffffffc0004daa74 T kbase_exception_name
+ffffffc0004dacf4 T kbase_mmu_interrupt_process
+ffffffc0004ed838 T kbase_reg_write
+ffffffc0004ed880 T kbase_reg_read
+ffffffc0004ed8d4 T kbase_gpu_interrupt
+ffffffc0004ee050 t kbase_mmu_irq_handler
+ffffffc0004ee120 t kbase_job_irq_handler
+ffffffc0004eff5c T kbase_job_hw_submit
+ffffffc0004f010c T kbase_job_done
+ffffffc0004f0ac4 T kbase_job_slot_init
+ffffffc0004f0f18 T kbase_job_slot_hardstop
+ffffffc0004f1020 T kbase_backend_jm_kill_jobs_from_kctx
+ffffffc0004f14bc T kbase_gpu_slot_update
+ffffffc0004f2624 T kbase_gpu_cacheclean
+ffffffc0004f2840 T kbase_gpu_dump_slots
+ffffffc0004f2960 T kbase_js_choose_affinity
+ffffffc0004f2ad8 T kbase_js_affinity_retain_slot_cores
+ffffffc0004f2f80 t wait_ready
+ffffffc0004f3030 t write_cmd
+ffffffc0004f3090 T kbase_mmu_interrupt
+ffffffc0004f32a0 T kbase_mmu_hw_configure
+ffffffc0004f34ac T kbase_mmu_hw_clear_fault
+ffffffc0004f34f4 T kbase_mmu_hw_enable_fault
+ffffffc0004f4774 T kbase_pm_enable_interrupts
+ffffffc0004f4834 T kbase_pm_enable_interrupts_mmu_mask
+ffffffc0004f48f8 T kbase_pm_disable_interrupts
+ffffffc0004f49b4 T kbase_pm_clock_off
+ffffffc0004f4b60 T kbase_pm_init_hw
+ffffffc0004f4fdc T kbase_pm_clock_on
+ffffffc0004f6028 T kbase_pm_request_cores
+ffffffc0004f621c T kbase_pm_register_inuse_cores
