@@ -1,0 +1,230 @@
+From a0ae5af88bf21ca5c83e5af01d8637084de0e4dd Mon Sep 17 00:00:00 2001
+From: BlobProps <blobprops@local>
+Date: Wed, 25 Nov 2026 09:51:57 -0500
+Subject: [PATCH 0138] gpu31-kms: fix blob lifetime so module unload cannot
+ double-free a blob
+
+`rmmod exynos_drm7580` after a MODE_ID commit (or even after the fbdev
+modeset alone) oopses in drm_property_free_blob():
+
+  Unable to handle kernel paging request at virtual address dead000000000108
+  PC is at drm_property_free_blob+0x28/0x9c
+  LR is at drm_property_unreference_blob.part.0+0xbc/0xd4
+
+0xdead000000000108 is LIST_POISON1 + 8, i.e. the store `next->prev = prev`
+in __list_del() with next == LIST_POISON1: drm_property_free_blob() runs a
+second time on a blob it already freed.
+
+Root cause (0135 ported v4.2's single shared reference): v4.2 lets the
+device's property_blob_list, the creating client and the CRTC states share
+*one* reference for a blob.  drm_mode_config_cleanup() therefore unrefs a
+reference that may already belong to a live CRTC state:
+
+  - a user blob's creation reference is gone once the client exits
+    (drm_property_destroy_user_blobs), so cleanup's unref frees the blob
+    while crtc->state->mode_blob still points to it;
+  - cleanup drains blobs before fbs, and drm_framebuffer_remove() then runs
+    drm_mode_set_config_internal(NULL) -> drm_atomic_helper_set_config() ->
+    drm_atomic_get_crtc_state() -> duplicate_state, which does
+    kref_get(crtc->state->mode_blob) on the just-freed blob, and
+    drm_atomic_set_mode_for_crtc(NULL) unrefs it again: refcount 0 -> 1 -> 0
+    and free_blob runs on the poisoned list head.
+
+Fix the reference model instead of the order: the device list owns its own
+reference.
+
+  - drm_property_create_blob() returns a blob with two references: one for
+    dev->mode_config.property_blob_list and one for the caller.
+  - Unlisting (DESTROYPROPBLOB, client close, EDID replacement,
+    mode_config_cleanup) removes head_global and drops *only* the list
+    reference, via drm_property_unlist_blob_locked().  A blob that a CRTC
+    state still references stays alive, so a dangling mode_blob can no
+    longer exist and kref_get() can no longer resurrect a freed blob.
+  - The caller/state reference is dropped by the owner: clients at destroy,
+    CRTC states in atomic_destroy_state()/reset() (unchanged).
+  - drm_property_free_blob() re-initialises both list heads
+    (list_del_init) before kfree, because by the time the last reference
+    goes the blob may already be unlisted; it still runs exactly once,
+    under blob_lock, when the refcount reaches 0.
+  - drm_mode_createblob_ioctl()'s copy-from-user failure path now undoes
+    both references (the blob never reached userspace).
+  - drm_mode_config_cleanup() drains the list with
+    drm_property_unlist_blob_locked() under blob_lock, keeping v4.2's
+    position in the teardown order; correctness no longer depends on that
+    order.
+
+Audited (no change needed): every mode_blob reference is taken by
+drm_atomic_helper_crtc_duplicate_state()/drm_atomic_set_mode_{,prop_}for_crtc()
+and dropped exactly once by drm_atomic_helper_crtc_destroy_state()/reset()
+(or when the mode is replaced).
+
+Runtime gate: with a client that sets MODE_ID (or just the fbdev mode),
+`rmmod exynos_drm7580` must complete without an oops, and a repeat
+rmmod/insmod cycle stays clean.
+---
+ drivers/gpu/drm/drm_crtc.c | 76 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 67 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index f5ae171..9410eae 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -3193,12 +3193,20 @@ done:
+  * Creates a new blob property for a specified DRM device, optionally
+  * copying data.
+  *
++ * Reference model: on success the blob carries two references, one owned by
++ * @dev's mode_config.property_blob_list and one owned by the caller.  The list
++ * reference is dropped when the blob is unlisted (destroyblob ioctl, file
++ * close, EDID replacement, drm_mode_config_cleanup()), which is also when the
++ * blob leaves the idr.  A blob that a CRTC state still points at therefore
++ * stays alive until that state is destroyed, no matter in which order the
++ * teardown paths run.
++ *
+  * @dev: DRM device to create property for
+  * @length: Length to allocate for blob data
+  * @data: If specified, copies data into blob
+  *
+  * Returns:
+- * New blob property with a single reference on success, or an ERR_PTR
++ * New blob property with a reference for the caller on success, or an ERR_PTR
+  * value on failure.
+  */
+ struct drm_property_blob *
+@@ -3215,8 +3223,9 @@ drm_property_create_blob(struct drm_device *dev, size_t length,
+ 	if (!blob)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	/* This must be explicitly initialised, so we can safely call list_del
+-	 * on it in the removal handler, even if it isn't in a file list. */
++	/* head_file is explicitly initialised, so a blob that is never added to
++	 * a client's blob list (kernel-created modes, EDID) can be freed
++	 * without touching an uninitialised list head. */
+ 	INIT_LIST_HEAD(&blob->head_file);
+ 	blob->length = length;
+ 	blob->dev = dev;
+@@ -3238,6 +3247,9 @@ drm_property_create_blob(struct drm_device *dev, size_t length,
+ 	list_add_tail(&blob->head_global,
+ 		      &dev->mode_config.property_blob_list);
+ 
++	/* The second reference is the caller's; the list keeps the first. */
++	kref_get(&blob->refcount);
++
+ 	mutex_unlock(&dev->mode_config.blob_lock);
+ 
+ 	return blob;
+@@ -3258,8 +3270,10 @@ static void drm_property_free_blob(struct kref *kref)
+ 
+ 	WARN_ON(!mutex_is_locked(&blob->dev->mode_config.blob_lock));
+ 
+-	list_del(&blob->head_global);
+-	list_del(&blob->head_file);
++	/* Either head may have been unlinked already while other references
++	 * kept the blob alive; re-initialising keeps the double unlink safe. */
++	list_del_init(&blob->head_global);
++	list_del_init(&blob->head_file);
+ 	drm_mode_object_put(blob->dev, &blob->base);
+ 
+ 	kfree(blob);
+@@ -3311,6 +3325,25 @@ static void drm_property_unreference_blob_locked(struct drm_property_blob *blob)
+ 	kref_put(&blob->refcount, drm_property_free_blob);
+ }
+ 
++/**
++ * drm_property_unlist_blob_locked - unlink a blob and drop the device reference
++ * @blob: blob property
++ *
++ * Removes @blob from the device's property_blob_list and drops the reference
++ * the list owns.  Other references (a CRTC state's mode_blob, a client's
++ * creation reference) keep the blob alive; its id is released only when the
++ * last reference goes away.  Must be called with mode_config.blob_lock held.
++ * Safe to call on a blob that was already unlisted.
++ */
++static void drm_property_unlist_blob_locked(struct drm_property_blob *blob)
++{
++	if (list_empty(&blob->head_global))
++		return;
++
++	list_del_init(&blob->head_global);
++	drm_property_unreference_blob_locked(blob);
++}
++
+ /**
+  * drm_property_destroy_user_blobs - destroy all blobs created by this client
+  * @dev:	DRM device
+@@ -3325,6 +3358,7 @@ void drm_property_destroy_user_blobs(struct drm_device *dev,
+ 
+ 	list_for_each_entry_safe(blob, bt, &file_priv->blobs, head_file) {
+ 		list_del_init(&blob->head_file);
++		drm_property_unlist_blob_locked(blob);
+ 		drm_property_unreference_blob_locked(blob);
+ 	}
+ 
+@@ -3441,7 +3475,12 @@ int drm_mode_createblob_ioctl(struct drm_device *dev,
+ 	return 0;
+ 
+ out_blob:
+-	drm_property_unreference_blob(blob);
++	/* The blob never reached userspace: drop both the caller reference and
++	 * the device-list reference. */
++	mutex_lock(&dev->mode_config.blob_lock);
++	drm_property_unlist_blob_locked(blob);
++	drm_property_unreference_blob_locked(blob);
++	mutex_unlock(&dev->mode_config.blob_lock);
+ 	return ret;
+ }
+ 
+@@ -3490,8 +3529,11 @@ int drm_mode_destroyblob_ioctl(struct drm_device *dev,
+ 	}
+ 
+ 	/* We must drop head_file here, because we may not be the last
+-	 * reference on the blob. */
++	 * reference on the blob.  Dropping the list reference as well keeps
++	 * the destroyed blob out of the device's blob list; a CRTC state that
++	 * still uses it keeps it alive by its own reference. */
+ 	list_del_init(&blob->head_file);
++	drm_property_unlist_blob_locked(blob);
+ 	drm_property_unreference_blob_locked(blob);
+ 	mutex_unlock(&dev->mode_config.blob_lock);
+ 
+@@ -3543,8 +3585,13 @@ int drm_mode_connector_update_edid_property(struct drm_connector *connector,
+ 	int ret, size;
+ 
+ 	if (connector->edid_blob_ptr) {
+-		drm_property_unreference_blob(connector->edid_blob_ptr);
++		struct drm_property_blob *old = connector->edid_blob_ptr;
++
+ 		connector->edid_blob_ptr = NULL;
++		mutex_lock(&dev->mode_config.blob_lock);
++		drm_property_unlist_blob_locked(old);
++		drm_property_unreference_blob_locked(old);
++		mutex_unlock(&dev->mode_config.blob_lock);
+ 	}
+ 
+ 	/* Delete edid, when there is none. */
+@@ -4407,10 +4454,21 @@ void drm_mode_config_cleanup(struct drm_device *dev)
+ 		drm_property_destroy(dev, property);
+ 	}
+ 
++	/*
++	 * Drop the device's own reference on every blob still in the list.
++	 * This only unlinks them: a blob that a CRTC state still points at
++	 * stays alive on that reference and is freed by
++	 * drm_crtc_cleanup()/drm_atomic_helper_crtc_destroy_state() below,
++	 * which is what keeps the teardown order (blobs before fbs/crtcs)
++	 * safe even though drm_framebuffer_remove() can still run a
++	 * set_config(NULL) commit on those states.
++	 */
++	mutex_lock(&dev->mode_config.blob_lock);
+ 	list_for_each_entry_safe(blob, bt, &dev->mode_config.property_blob_list,
+ 				 head_global) {
+-		drm_property_unreference_blob(blob);
++		drm_property_unlist_blob_locked(blob);
+ 	}
++	mutex_unlock(&dev->mode_config.blob_lock);
+ 
+ 	/*
+ 	 * Single-threaded teardown context, so it's not required to grab the
+-- 
+2.56.0
+

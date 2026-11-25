@@ -1,12 +1,13 @@
 # v4.2 blob properties + CRTC `MODE_ID` — backport for the M0 atomic core (int84)
 
-Status: **patch complete, compile-checked, and integrated into Image-int84; not
-booted.** Patch:
-`patches/drm-kms/0135-kms-blob-props-and-crtc-mode-id.patch`. Applies on top of
-`drm-atomic/0001..0005` → `drm-kms/0104..0130/0133` → `0134`. No existing patch is
-modified. The previous boot evidence is int83; this report adds the kernel pieces
-KWin needs and the compile/apply proof, not a hardware run. Integration state is
-in §9.
+Status: **0135 integrated into Image-int84 and booted; its blob lifetime bug found
+on hardware at `rmmod` and fixed by 0138 (compile/apply-checked, runtime verification
+pending).** Patches:
+`patches/drm-kms/0135-kms-blob-props-and-crtc-mode-id.patch` and
+`patches/drm-kms/0138-kms-blob-lifetime-fix.patch` (applied after 0135). Applies on
+top of `drm-atomic/0001..0005` → `drm-kms/0104..0130/0133` → `0134` → `0135` →
+`0138`. No existing patch is modified. The crash analysis and the corrected
+reference model are in §10; the int84 integration state is in §9.
 
 Why: `kwin_wayland` 6.8's `DrmCrtc::updateProperties()` (kwin
 `src/backends/drm/drm_crtc.cpp:93-97`) treats a CRTC without `MODE_ID` and `ACTIVE`
@@ -265,3 +266,123 @@ Not yet on hardware: the expected device observations (MODE_ID in `modetest -c`,
 KWin `DrmCrtc` init) are still pending flash/boot; the int84 report is
 `docs/reports/decon-kms-int84.md`.
 
+
+## 10. 0138 — blob lifetime fix (rmmod double free)
+
+### 10.1 The crash
+
+int84, after a client set `MODE_ID` and exited, `rmmod exynos_drm7580`:
+
+```
+Unable to handle kernel paging request at virtual address dead000000000108
+PC is at drm_property_free_blob+0x28/0x9c
+LR is at drm_property_unreference_blob.part.0+0xbc/0xd4
+```
+
+`dead000000000108` is `LIST_POISON1 + 8` (`LIST_POISON1 = 0xdead000000000100`).
+Disassembling the built `drm_crtc.o` shows `+0x28` is the store `next->prev = prev`
+of `__list_del()`; the faulting pointer is `entry->next == LIST_POISON1`, which is
+exactly the state `list_del()` leaves behind. So `drm_property_free_blob()` ran a
+**second time on an already freed blob**.
+
+### 10.2 Why it happens (deterministic on every rmmod)
+
+0135 ported v4.2's *shared* creation reference: the device's
+`property_blob_list`, the creating client and the CRTC states share one reference.
+That breaks when the state outlives the reference that the drain drops:
+
+1. Boot: the fbdev path calls `crtc->funcs->set_config` =
+   `drm_atomic_helper_set_config()` (`exynos_drm7580_fbdev.c:118`), which creates
+   the mode blob (`drm_atomic_set_mode_for_crtc()`) and stores the creation
+   reference in `crtc->state->mode_blob`. The list holds the *same* reference.
+2. `rmmod` → `exynos7580_unload()` (`exynos_drm7580_main.c:426`) →
+   `drm_mode_config_cleanup()` (`main.c:437`). The blob drain
+   (`drm_crtc.c:4410` in 0135; v4.2 order) unrefs that shared reference →
+   refcount 0 → `drm_property_free_blob()` frees the blob, `list_del()` poisons
+   `head_global`. But `crtc->state->mode_blob` still points at it.
+3. Still inside cleanup, the fb loop (`drm_crtc.c:4482` in 0138, `:4424` in 0135)
+   runs `drm_framebuffer_remove()` (`drm_framebuffer.c:238`). The fbdev
+   framebuffer is still referenced by `drm_fbdev_cma` (its fini runs from a devm
+   action, `exynos_drm7580_fbdev.c:100/268`, i.e. *after* `->unload()`), so
+   `refcount > 1` and the path at `drm_framebuffer.c:272` runs
+   `drm_mode_set_config_internal(NULL)`.
+4. `drm_atomic_helper_set_config()` → `drm_atomic_get_crtc_state()` →
+   `drm_atomic_helper_crtc_duplicate_state()` → `kref_get()` on the freed
+   `mode_blob` (refcount 0 → 1), then `drm_atomic_set_mode_for_crtc(NULL)`
+   unrefs it again (1 → 0) → **`drm_property_free_blob()` a second time** →
+   `list_del()` on the poisoned `head_global` → the oops above.
+
+The same applies to a user `MODE_ID` blob once the client exits: the file
+reference is gone, so the drain's unref is really the CRTC state's reference.
+v4.2 survives only because in v4.2 that `set_config(NULL)` path is usually skipped
+(fb refcount 1) and `drm_crtc_cleanup()`'s unref then merely underflows an
+already-dead refcount instead of freeing; our images keep the fbdev framebuffer
+referenced past cleanup, so the latent bug became deterministic.
+
+### 10.3 The fix: the device list owns its own reference
+
+| event | 0135 refs (list+caller+states) | 0138 refs |
+|---|---|---|
+| `create_blob()` | 1 | 2 (list + caller) |
+| `MODE_ID` commit takes a state ref | 2 (creation + state) | 3 (list + caller + state) |
+| client exits (`destroy_user_blobs`) | 1 (state only) | 1 (list only) |
+| cleanup drains the list | frees → dangling state | list ref dropped, blob stays alive on the state ref |
+| fb removal `set_config(NULL)` | `kref_get` on freed → `free_blob` #2 → oops | get 2 → unref 1, no free |
+| state destroy | (already crashed) | 0 → `free_blob` once, `list_del_init` of the already drained head |
+
+Implementation (`drivers/gpu/drm/drm_crtc.c`, +67/−9):
+
+- `drm_property_create_blob()` (`:3213`) returns **two** references: one for
+  `dev->mode_config.property_blob_list`, one for the caller
+  (`kref_init` + `kref_get` after `list_add_tail`).
+- `drm_property_unlist_blob_locked()` (`:3338`, new) removes `head_global` and
+  drops **only** the device reference; idempotent (`list_empty` guard). Every
+  site that destroys a blob uses it: `drm_mode_destroyblob_ioctl()` (`:3500`),
+  `drm_property_destroy_user_blobs()` (`:3352`), EDID replacement
+  (`drm_mode_connector_update_edid_property()`), `drm_mode_config_cleanup()`
+  (`:4458`, now under `blob_lock`), and the `CREATE_PROPBLOB` copy-fault path.
+- `drm_property_free_blob()` (`:3266`) re-initialises both heads
+  (`list_del_init`) instead of `list_del`: by the time the last reference goes the
+  blob is normally already unlisted, and this keeps that legitimate case from
+  touching a poisoned head. It still runs exactly once, under `blob_lock`, when
+  the kref reaches 0; a blob can no longer be resurrected from `LOOKUP_PROPBLOB`
+  because unlinking and `drm_mode_object_put()` happen under the same lock.
+- State references are unchanged and audited: taken in
+  `drm_atomic_helper_crtc_duplicate_state()` (2145),
+  `drm_atomic_set_mode_for_crtc()`/`drm_atomic_set_mode_prop_for_crtc()`
+  (`drm_atomic.c:249/296/306`), dropped exactly once in
+  `drm_atomic_helper_crtc_destroy_state()` (2168) and `..._reset()` (2117), and
+  by the replace paths inside the setters.
+- v4.2 teardown order is kept (properties → blobs → fbs → planes → crtcs →
+  `idr_destroy`). Correctness no longer depends on it: draining the list can
+  only drop the device reference.
+
+### 10.4 Gates for int88
+
+- compile: `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+  -j8 drivers/gpu/drm/` → rc=0, no new warnings; built both with
+  `CONFIG_DRM_KMS_HELPER=y/DRM_EXYNOS7580=y` (`blobwork-build-0138-builtin.log`,
+  0 errors/0 warnings) and with `=m/=m`
+  (`blobwork-build-0138-mod.log`, only the pre-existing init.h
+  `-Wmissing-attributes` pair).
+- apply: `git apply --check` rc=0 on the series+0135 baseline; 0136/0137 do not
+  touch `drm_crtc.c`, so it also applies unchanged on int87.
+- runtime (Main): `modetest`/kwin client sets `MODE_ID`, exits,
+  `rmmod exynos_drm7580` must not oops; repeat `insmod`/`rmmod` + a
+  client-kill-without-close variant. Expected: no `drm_property_free_blob` in
+  the log; blob count at teardown only frees, never unlinks twice.
+
+### 10.5 Companion finding (not in 0138)
+
+The trigger is not blob-specific: the driver's fbdev teardown is a **devm action**
+(`exynos7580_fbdev_devm_release()`, `fbdev.c:100`, registered at `:268`), which the
+driver core runs *after* `exynos7580_unload()` → after
+`drm_mode_config_cleanup()`. `drm_fbdev_cma_fini()` then works on mode objects that
+cleanup already tore down (`drm_framebuffer_cleanup()`'s `list_del(&fb->head)`,
+`drm_fb_helper_fini()`), which is a separate UAF risk on the same rmmod path. The
+blob fix removes the double free analysed here; a fully clean unload still wants
+fbdev teardown moved before `drm_mode_config_cleanup()` (a driver/contract change —
+`exynos_drm7580_unload()` cannot call the static fbdev release as-is). If int88's
+rmmod oopses again, expect a different signature
+(`drm_framebuffer_cleanup`/`drm_fb_helper_fini`/`kfree`), not
+`drm_property_free_blob`.
