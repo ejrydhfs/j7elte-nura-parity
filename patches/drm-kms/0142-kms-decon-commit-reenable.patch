@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DeconCommitFix <decon-commit@local>
+Date: Tue, 25 Nov 2026 12:30:00
+Subject: [PATCH 0142] gpu31-kms: re-enable the DECON in commit instead of -EAGAIN
+
+Live KWin frames fail with:
+
+  exynos7580_plane_atomic_update_cb: [PLANE:16] atomic update failed: -11
+
+-11 is decon_kms_commit()'s `if (decon->state != DECON_STATE_ON) return
+-EAGAIN;`.  The initial fbdev restore / KWin's early commit sequence can leave
+the pipe in a non-ON state while the KMS CRTC stays active; every later frame
+is then dropped (the panel stays black although vblank IRQs keep counting).
+
+- decon_kms_commit(): if the state is not ON, log the transition with the
+  caller, run decon_kms_enable() (the same path crtc_enable_link() uses) and
+  retry the commit exactly once.  If enabling fails or the state is still not
+  ON, return that errno (or -EAGAIN) after decon_kms_log_state().  No loop, no
+  unbounded retry.
+- decon_kms_disable(): log state and caller (comm) on every disable.
+- exynos7580_crtc_disable_link()/exynos7580_crtc_disable()/
+  exynos7580_crtc_dpms(): log comm plus (for dpms) the mode, so the
+  disable -> re-enable sequence KWin triggers is visible next to the shim
+  lines.
+
+The vendor fbdev async path (decon_kms_commit_async) keeps its documented
+pre-signalled-fence behaviour; only the synchronous KMS commit changes.
+
+---
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -661,6 +661,9 @@
+ 
+ 	decon = d->decon;
+ 
++	decon_info("decon_kms_disable: state=%d by %s\n",
++		   decon->state, current->comm);
++
+ 	mutex_lock(&kms_lock);
+ 	if (decon->state == DECON_STATE_OFF) {
+ 		mutex_unlock(&kms_lock);
+@@ -686,8 +689,27 @@
+ 
+ 	decon = d->decon;
+ 
+-	if (decon->state != DECON_STATE_ON)
+-		return -EAGAIN;
++	/*
++	 * int92: the KMS pipe can be left off by a disable that raced (or by
++	 * the fbdev restore sequence) while a client keeps committing frames;
++	 * the old code then returned -EAGAIN for every frame and the panel
++	 * stayed black.  Bring the pipe back exactly like crtc_enable_link()
++	 * does and retry this commit once.  Bounded: no loop, one enable.
++	 */
++	if (decon->state != DECON_STATE_ON) {
++		int oldstate = decon->state;
++		int eret;
++
++		decon_info("decon_kms_commit: state=%d -> enable -> retry by %s\n",
++			   oldstate, current->comm);
++		eret = decon_kms_enable(d);
++		decon_info("decon_kms_commit: enable rc=%d state=%d\n",
++			   eret, decon->state);
++		if (eret || decon->state != DECON_STATE_ON) {
++			decon_kms_log_state(d, "commit not ON after enable");
++			return eret ? eret : -EAGAIN;
++		}
++	}
+ 
+ 	regs = decon_export_regs_alloc();
+ 	if (!regs)
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -172,6 +172,8 @@
+ 		return;
+ 	}
+ 
++	pr_info("exynos7580_crtc_disable_link: disabling link state (by %s)\n",
++		current->comm);
+ 	decon_kms_disable(ex->decon);	/* s_stream(0) then reg_stop, vendor order */
+ 	decon_kms_power_put(ex->decon);
+ 
+@@ -295,6 +297,7 @@
+ 	 * core drop those references so a disable cannot leave the vblank
+ 	 * machinery on.
+ 	 */
++	pr_info("[CRTC:%d] crtc_disable by %s\n", crtc->base.id, current->comm);
+ 	drm_vblank_off(crtc->dev, drm_crtc_index(crtc));
+ 
+ 	/* Encoder ->disable already ran (s_stream(0)); this is idempotent. */
+@@ -304,6 +307,8 @@
+ static void exynos7580_crtc_dpms(struct drm_crtc *crtc, int mode)
+ {
+ 	/* Legacy/helper fallback only; the atomic path uses enable/disable. */
++	pr_info("[CRTC:%d] dpms mode=%d by %s\n", crtc->base.id, mode,
++		current->comm);
+ 	if (mode == DRM_MODE_DPMS_ON)
+ 		exynos7580_crtc_enable(crtc);
+ 	else
