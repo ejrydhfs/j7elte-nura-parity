@@ -432,7 +432,7 @@ The phone cannot be recovered from this host. Do this exactly:
      The phone must appear as a physical device (usb:..., not emulator-*).
   5. Re-run this script with --yes:
 
-         $PROG --yes
+         $0 --yes
 
      It will push $INT49_IMG_NAME, verify its sha256 on the phone, dd it to
      mmcblk0p10, read the partition back, verify sha256 again, reboot, and
@@ -664,7 +664,7 @@ DEGRADED)
 		say "  ssh $DEV \"rootshell sh -c 'rc-service xsession start'\""
 		say ""
 		say "or reboot the phone. Only if the session cannot start at all:"
-		say "  $PROG --force"
+		say "  $0 --force"
 		exit 1
 	fi
 	;;
