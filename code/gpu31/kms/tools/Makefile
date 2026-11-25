@@ -1,13 +1,15 @@
-# kmsflip - KMS page-flip + deterministic pattern checker (j7elte)
+# kmsflip - atomic KMS flip / dma-buf import checker (j7elte)
 #
 # Native on-device build (musl userland, no cross sysroot with DRM/EGL):
-#   make                 build kmsflip with the EGL/GBM headless path
-#   make NO_EGL=1        KMS-only build (libdrm headers alone)
-#   make check           headless smoke (needs /dev/dri/renderD128)
+#   make                 build kmsflip with the GBM dma-buf source + headless
+#   make NO_EGL=1        libdrm-only build (dumb/PRIME source, no GBM)
+#   make check           headless GBM/EGL smoke (/dev/dri/renderD128)
+#   make probe           render-node dma-buf source probe (no card0)
 #   make clean
 #
 # Links the *system* libdrm; Mesa/EGL/GBM can be redirected at run time to
-# /data/mesabuild/mesa20-b via env.sh (see run-headless.sh).
+# /data/mesabuild/mesa20-b via env.sh (see run-headless.sh and
+# docs/reports/kms-flip-tool.md).
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -g
@@ -42,7 +44,10 @@ kmsflip: kmsflip.c
 check: kmsflip
 	./kmsflip --headless --frames 3
 
+probe: kmsflip
+	@if [ -r ./env.sh ]; then . ./env.sh kms; fi; ./kmsflip --probe
+
 clean:
 	rm -f kmsflip
 
-.PHONY: all check clean
+.PHONY: all check probe clean

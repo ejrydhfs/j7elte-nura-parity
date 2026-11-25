@@ -1,16 +1,18 @@
 #!/bin/sh
-# run-kms.sh - card0 acceptance test (M1: modetest + dumb-buffer flips;
-#              M2: kmscube on panfrost buffers).
+# run-kms.sh - card0 acceptance test (atomic dumb-buffer flips + dma-buf
+#              import flips; modetest; optional kmscube).
 #
-# Preflight: card0 must exist, else exits 3 ("SKIP") - today only
-# /dev/dri/renderD128 exists, so this script is the gate that flips from SKIP
-# to PASS when the DECON KMS subdriver lands.
+# Preflight: card0 must exist, else exits 3 ("SKIP").  On int49-class
+# render-only images only /dev/dri/renderD128 exists; use
+# "kmsflip --probe" there (kms-flip-tool.md).
 #
 #   sh run-kms.sh
 #   SKIP_KMSCUBE=1 sh run-kms.sh        # M1 gate only (no GPU scanout yet)
 #   FRAMES=50 PATTERN=gradient sh run-kms.sh
+#   DMABUF=0 sh run-kms.sh               # dumb phase only
 #
-# PASS = kmsflip N/N flips with matching checksums + modetest -s animation
+# PASS = kmsflip atomic dumb+dma-buf phases N/N flips with matching
+#        checksums + modetest -s animation
 #        + (unless skipped) kmscube runs 10 s + zero underrun/timeout/DSIM
 #        deltas in dmesg. DRM/panfrost deltas are printed diagnostics.
 #
@@ -27,7 +29,8 @@ KMSFLIP=${KMSFLIP:-$DIR/kmsflip}
 DEV=${KMS_DEV:-/dev/dri/card0}
 MODULE=${KMS_MODULE:-exynos}
 FRAMES=${FRAMES:-10}
-PATTERN=${PATTERN:-bars}
+PATTERN=${PATTERN:-solid}
+DMABUF=${DMABUF:-1}
 TIMEOUT_MS=${TIMEOUT_MS:-250}
 
 say() { printf '%s\n' "$*"; }
@@ -102,6 +105,7 @@ say "KMS: modetest ${MODETEST_BASE:-?} -s ${CONN:-?}: pattern=$mok vflip=$vok$mn
 set -- --device "$DEV" --frames "$FRAMES" --pattern "$PATTERN" \
 	--timeout-ms "$TIMEOUT_MS" --dump "$OUT/kms-$STAMP.ppm"
 [ -n "$CONN" ] && set -- "$@" --connector "$CONN"
+[ "$DMABUF" = 0 ] && set -- "$@" --no-dmabuf
 "$KMSFLIP" "$@" > "$LOG" 2>&1
 krc=$?
 cat "$LOG"

@@ -63,8 +63,8 @@ No cross-compilation is needed for anything in this slice.
 
 | File | Role |
 |---|---|
-| `kmsflip.c` | The test tool. KMS mode: two CPU-filled dumb buffers, `drmModeSetCrtc`, N `DRM_MODE_PAGE_FLIP_EVENT` flips with per-flip timeout and FNV-1a checksum verification; `--list` resource dump; `--dump x.ppm` pattern artifact; max-RSS reporting. Headless mode: GBM BO alloc+map on a render node, then EGL surfaceless + GLES2 render of a deterministic pattern, `glReadPixels` checksum across N frames. |
-| `Makefile` | Native build. `make` = KMS+EGL/GBM; `make NO_EGL=1` = libdrm only; `make check` = 3-frame headless smoke. |
+| `kmsflip.c` | The atomic test tool (see `kms-flip-tool.md`). KMS mode: dumb `ADDFB2` buffers plus dma-bufs imported from the panfrost render node (or card PRIME round-trip), atomic modeset + N `DRM_MODE_ATOMIC_NONBLOCK|PAGE_FLIP_EVENT` flips, per-commit/event timeouts, per-phase EVENTS/EBUSY/EINVAL counters, FNV-1a checksum verification, `--list`, `--dump`; `--probe` checks the dma-buf source on render-only images. Headless mode: GBM BO alloc+map on a render node, then EGL surfaceless + GLES2 render, `glReadPixels` checksum across N frames. |
+| `Makefile` | Native build. `make` = KMS+EGL/GBM; `make NO_EGL=1` = libdrm only; `make check` = 3-frame headless smoke; `make probe` = render-node dma-buf source probe. |
 | `build.sh` | On-device build wrapper (header checks, `file`/`ldd`). |
 | `env.sh` | Selects the Mesa stack: `egl` (mesa20-b + `EGL_PLATFORM=surfaceless`), `kms` (mesa20-b libs + `MESA_LOADER_DRIVER_OVERRIDE=panfrost`, no platform override), `system` (stock Mesa 26). |
 | `kms-dmesg.sh` | `snapshot` / `delta` of DECON underrun, vsync/update-timeout, DSIM, DRM-core and panfrost counters. Gate: underrun/timeout/DSIM deltas must be 0; DRM/panfrost deltas are diagnostics (`STRICT_DRM=1`, `STRICT_PF=1` to escalate). |
@@ -155,13 +155,14 @@ flock /tmp/gpsdev.lock sh /data/kms/tools/run-kms.sh
 
 ## 4. Pass/fail criteria
 
-`kmsflip` KMS summary line (`ok/timeout/checksum_bad/flip_err`):
+`kmsflip` atomic summary line (`flips/timeouts/events/ebusy/einval`);
+full per-counter table in `kms-flip-tool.md`:
 
 | Gate | PASS condition | What it catches |
 |---|---|---|
-| Flips retire | `ok == frames`, `timeout == 0`, `flip_err == 0` | missing/never-signalled vblank, dead page-flip path, CRTC not scanning |
+| Flips retire | `flips == frames` per phase, `timeouts == 0`, `einval == 0`, `events == frames+1` | missing/never-signalled vblank, dead atomic flip path, rejected properties, lost events |
 | Pattern integrity | `checksum_bad == 0`; FNV-1a-64 over the active pixels is identical before the flip and after the flip event | dma-buf/GEM corruption, cache/alias bugs, buffer reused under scanout |
-| Content actually changes | `csum_first != csum_last` (per-frame constant mixed into every pixel) | “flip succeeded” but the same buffer/memory is scanned out |
+| Content actually changes | successive `--pattern solid` frames use different colours; each buffer is refilled before its flip and checksummed after the event | “flip succeeded” but the same buffer/memory is scanned out |
 | Display pipeline counters (`kms-dmesg.sh delta`) | `underrun_delta == 0`, `timeout_delta == 0`, `dsim_delta == 0` | DECON FIFO underrun (`underrun (level …`), `decon wait for vsync timeout`, `linecnt_is_zero timeout`, DSIM errors |
 | Diagnostics | `drm_delta`, `p7580_delta` printed; fatal only with `STRICT_DRM=1` / `STRICT_PF=1` | DRM-core `*ERROR*`, panfrost job errors |
 
@@ -283,10 +284,11 @@ After the DECON KMS subdriver binds (`card0` present), `run-kms.sh`:
 3. `kmsflip --frames 10` prints, on success:
 
 ```
-KMSFLIP: dev=/dev/dri/card0 connector=<n> crtc=<m> mode=720x1280 (720x1280@60)
-KMSFLIP: crtc set, starting 10 flips (timeout 250 ms)
-KMSFLIP: flip 10/10 t=<…> ms
-KMSFLIP: frames=10 ok=10 timeout=0 checksum_bad=0 flip_err=0 stale=0 elapsed=<…>ms fps=60.0 csum_first=0x… csum_last=0x… maxrss=<…>kB PASS
+KMSFLIP: dev=/dev/dri/card0 connector=<n> crtc=<m> plane=<p> mode=720x1280 (720x1280@60) atomic=1 saved_fb=<f>
+KMSFLIP: phase=dumb source=dumb modeset=1 flips=10/10 commits=11 commit_ok=11 events=11 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 elapsed_ms=<…> PASS
+KMSFLIP: phase=dmabuf source=panfrost-gbm modeset=0 flips=10/10 commits=11 commit_ok=11 events=11 timeouts=0 ebusy=0 einval=0 other=0 checksum_bad=0 elapsed_ms=<…> PASS
+KMSFLIP: restore=atomic saved_fb=<f>
+KMSFLIP: RESULT PASS device=/dev/dri/card0 … frames=10 phases=2 commits=22 events=22 flips=20/20 timeouts=0 ebusy=0 einval=0 other=0 restore=ok elapsed_ms=<…>
 KMSDMESG: underrun_delta=0 timeout_delta=0 dsim_delta=0 drm_delta=0 p7580_delta=0 PASS
 RESULT: PASS
 ```
@@ -310,25 +312,28 @@ Mode/connector discovery for debugging:
 
 ## 7. Notes and risks
 
-- **Legacy vs atomic.** `kmsflip` deliberately uses `drmModeSetCrtc` +
-  `DRM_MODE_PAGE_FLIP_EVENT`, which exist in the 3.10 DRM core. `modetest`
-  and `kmscube` probe `DRM_CLIENT_CAP_ATOMIC` and fall back to legacy while
-  M0 is not merged; after M0/M1 the same tools can be re-run with atomic
-  (`kmscube -A`). The KMS driver must implement legacy `page_flip` even if
-  the atomic commit path is the long-term interface, otherwise `modetest -v`
-  and `kmsflip` fail.
-- **libdrm 2.4.134 vs 3.10 UAPI.** Only ioctls present since 3.10 are used
-  (`GETRESOURCES/GETCONNECTOR/GETENCODER/SETCRTC/PAGEFLIP/CREATE_DUMB/MAP_DUMB/
-  ADDFB/RMFB/DESTROY_DUMB`). Newer libdrm’s atomic/modifier probes are
-  capability-gated and harmless on this kernel.
+- **Atomic path.** `kmsflip` now builds the compositor path itself:
+  `DRM_CLIENT_CAP_ATOMIC`, `ATOMIC` commits setting connector `CRTC_ID`,
+  CRTC `ACTIVE`/`MODE_ID` and plane `FB_ID`/`CRTC_ID`/`SRC_*`/`CRTC_*`, with
+  `PAGE_FLIP_EVENT` completions. It does not use `drmModePageFlip()`/
+  `drmModeSetCrtc()` for the test (legacy `SetCrtc` is only the restore
+  fallback), so it fails where KWin would fail even if `modetest`
+  (`modetest -v`, legacy) still passes. `kms-flip-tool.md` documents the
+  counters.
+- **libdrm 2.4.134 vs 3.10 UAPI.** Uses
+  `GETRESOURCES/GETCONNECTOR/GETENCODER/GETCRTC/GETPROPERTY/GETPROPBLOB/
+  ATOMIC/CREATE_DUMB/MAP_DUMB/ADDFB2/RMFB/DESTROY_DUMB/PRIME_*`; all are in
+  the backported 3.10 UAPI (see `decon-kms-m0.md`). Property/blob support is
+  required for the atomic modeset, hence the explicit `MODE_ID` blob.
 - **Master conflicts.** If X/Weston (or another process) holds DRM master,
   `drmSetMaster` prints a warning and flips fail with `EACCES`; run the KMS
   tests from a console session with no compositor (M1/M2), or stop the
   session first (M4).
-- **Screen restore.** `kmsflip` saves the CRTC state before `SetCrtc` and
-  restores it (including the original fb/mode) on exit; on a KMS-only boot
-  with `drm_fb_helper`, the console returns. With `--hold-ms` the pattern can
-  be left visible before restoring.
+- **Screen restore.** `kmsflip` saves the CRTC state before the first atomic
+  commit and restores it (including the original fb/mode) on exit; on a
+  KMS-only boot with `drm_fb_helper`, the console returns. With `--hold-ms`
+  the pattern can be left visible before restoring. Restore uses atomic with
+  a legacy `SetCrtc` fallback and is bounded by a 5 s watchdog.
 - **dmesg ring.** Whole-log counters (`kms-dmesg.sh`) avoid needing root for
   a live `dmesg -w`; a ring wrap during a very long soak makes the delta
   negative — re-run after `dmesg -c` (root) rather than accepting it.

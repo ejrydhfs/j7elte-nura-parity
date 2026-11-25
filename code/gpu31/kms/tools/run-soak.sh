@@ -1,9 +1,10 @@
 #!/bin/sh
-# run-soak.sh - 300-flip KMS soak (M1/M2 acceptance).
+# run-soak.sh - 300-flip-per-phase KMS soak (M1/M2 acceptance).
 #
-# Flips a deterministic pattern 300 times at the panel's vblank, verifies the
-# mapped buffer checksum after every flip, and fails on any flip timeout,
-# checksum change, or dmesg underrun/timeout/DSIM counter movement. Also
+# Flips a deterministic pattern 300 times per phase (dumb + dma-buf) at the
+# panel's vblank, verifies the mapped buffer checksum after every flip, and
+# fails on any flip timeout, checksum change, or dmesg underrun/timeout/DSIM
+# counter movement. Also
 # records max RSS, wall time, FPS and the thermal ceiling so leak/underflow
 # regressions show up.
 #
@@ -22,7 +23,8 @@ LOG=$OUT/soak-$STAMP.log
 KMSFLIP=${KMSFLIP:-$DIR/kmsflip}
 DEV=${KMS_DEV:-/dev/dri/card0}
 FRAMES=${FRAMES:-300}
-PATTERN=${PATTERN:-bars}
+PATTERN=${PATTERN:-solid}
+DMABUF=${DMABUF:-1}
 TIMEOUT_MS=${TIMEOUT_MS:-200}
 
 say() { printf '%s\n' "$*"; }
@@ -45,8 +47,11 @@ MEM_BEFORE=$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)
 T_BEFORE=$(max_temp)
 "$DIR/kms-dmesg.sh" snapshot > "$OUT/before-$STAMP.txt"
 
+DBUFARG=""
+[ "$DMABUF" = 0 ] && DBUFARG="--no-dmabuf"
+# shellcheck disable=SC2086
 "$KMSFLIP" --device "$DEV" --frames "$FRAMES" --pattern "$PATTERN" \
-	--timeout-ms "$TIMEOUT_MS" --dump "$OUT/soak-$STAMP.ppm" > "$LOG" 2>&1
+	--timeout-ms "$TIMEOUT_MS" $DBUFARG --dump "$OUT/soak-$STAMP.ppm" > "$LOG" 2>&1
 rc=$?
 cat "$LOG"
 
