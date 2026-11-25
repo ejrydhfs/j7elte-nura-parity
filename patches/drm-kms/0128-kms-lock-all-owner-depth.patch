@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsLockOwner <kmslo@local>
+Date: Tue, 24 Nov 2026 16:00:00 
+Subject: [PATCH 0128] gpu31-kms: owner/depth legacy lock_all (int81)
+
+int80's depth-only nesting was wrong: the log shows the *outer* call taking a
+depth and the nested release dropping to depth 0 without the owner releasing:
+
+    drm_modeset_lock_all: enter by modetest (ctx=0 depth=0)
+    drm_modeset_lock_all: nested by modetest depth=1 (outer ctx=0)
+    drm_modeset_unlock_all: enter by modetest (ctx=0 depth=1)
+    drm_modeset_unlock_all: nested release by modetest depth=0
+
+and the next ioctl blocked.  mode_config.mutex is not recursive, so the
+nesting must be tracked by owner task:
+
+  - drm_mode_config gains `struct task_struct *lock_all_owner`;
+  - lock_all: same task as owner -> depth++ and return; otherwise take
+    mode_config.mutex + the legacy crtc mutexes, set owner/depth=1 and the
+    install acquire_ctx (with a re-check after the mutex);
+  - unlock_all: only the owner may release; depth-- and only at 0 clear the
+    owner, drop the ctx, unlock the crtc mutexes and mode_config.mutex; a
+    non-owner call logs loudly and does not unlock;
+  - both log owner/depth/ctx; the first same-task nest dumps a backtrace so
+    the redundant acquisition path is identified in the next trace.
+
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -51,57 +51,54 @@
+ 	struct drm_mode_config *config = &dev->mode_config;
+ 	struct drm_modeset_acquire_ctx *ctx;
+ 	struct drm_crtc *crtc;
+-	int ret;
+ 
+-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+-	if (WARN_ON(!ctx))
+-		return;
++	pr_info("drm_modeset_lock_all: enter by %s (owner=%s depth=%u ctx=%p)\n",
++		current->comm,
++		config->lock_all_owner ? config->lock_all_owner->comm : "none",
++		config->lock_all_depth, config->acquire_ctx);
+ 
+-	pr_info("drm_modeset_lock_all: enter by %s (ctx=%p depth=%u)\n",
+-		current->comm, config->acquire_ctx, config->lock_all_depth);
+ 	/*
+-	 * int80: lock_all is recursive through the legacy call chains
+-	 * (ioctl -> set_config -> our commit -> helper paths).  A nested call
+-	 * used to take config->mutex/crtc->mutex again and overwrite
+-	 * config->acquire_ctx, so the inner unlock_all released the outer
+-	 * locks and the outer unlock_all no longer unlocked crtc->mutex: the
+-	 * legacy CRTC mutex stayed held and the next drm_mode_setcrtc blocked.
+-	 * Count the nesting and only the outermost call takes/releases locks.
++	 * int81: mode_config.mutex is not recursive.  Track the owning task
++	 * and a depth; a nested call by the *same* task is a no-op, anything
++	 * else must wait for the owner like a plain mutex would.
+ 	 */
+-	if (config->acquire_ctx) {
++	if (config->lock_all_owner == current) {
++		static bool nest_dumped;
++
+ 		config->lock_all_depth++;
+-		pr_info("drm_modeset_lock_all: nested by %s depth=%u (outer ctx=%p)\n",
+-			current->comm, config->lock_all_depth, config->acquire_ctx);
++		pr_info("drm_modeset_lock_all: same-task nest by %s depth=%u\n",
++			current->comm, config->lock_all_depth);
++		if (!nest_dumped) {
++			nest_dumped = true;
++			pr_info("drm_modeset_lock_all: first nest backtrace follows\n");
++			dump_stack();
++		}
+ 		return;
+ 	}
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (WARN_ON(!ctx))
++		return;
++
+ 	mutex_lock(&config->mutex);
+ 
++	/* Another task may have become the owner while we waited. */
++	if (config->lock_all_owner == current) {
++		mutex_unlock(&config->mutex);
++		kfree(ctx);
++		config->lock_all_depth++;
++		return;
++	}
++
+ 	drm_modeset_acquire_init(ctx, 0);
+ 
+ 	list_for_each_entry(crtc, &config->crtc_list, head)
+ 		mutex_lock_nest_lock(&crtc->mutex, &config->mutex);
+ 
+-	/*
+-	 * int77 (bring-up simplification): do NOT take connection_mutex or the
+-	 * per-object w/w modeset locks here.  The 4.0 expansion is what
+-	 * drm_mode_getresources blocked on after the initial modeset, and with
+-	 * a single driver and the legacy crtc->mutex already held the extra
+-	 * locks buy nothing.  Revisit before multiple drivers/clients.
+-	 * The acquire ctx is still installed because
+-	 * drm_atomic_helper_set_config() uses it as state->acquire_ctx and the
+-	 * commit path adds crtc/plane w/w locks to it; unlock_all drops those.
+-	 */
+-	ret = 0;
+-
+-	config->lock_all_depth = 0;
+-	pr_info("drm_modeset_lock_all: acquired by %s (config->acquire_ctx=%p)\n", current->comm, ctx);
+-
+-	/*
+-	 * now we hold the locks, so now that it is safe, stash the ctx for
+-	 * drm_modeset_unlock_all() and for the legacy atomic helper entry
+-	 * points (drm_modeset_legacy_acquire_ctx()).
+-	 */
++	config->lock_all_owner = current;
++	config->lock_all_depth = 1;
+ 	config->acquire_ctx = ctx;
++	pr_info("drm_modeset_lock_all: acquired by %s (ctx=%p)\n", current->comm, ctx);
+ }
+ EXPORT_SYMBOL(drm_modeset_lock_all);
+ 
+@@ -115,29 +112,41 @@
+ 	struct drm_modeset_acquire_ctx *ctx = config->acquire_ctx;
+ 	struct drm_crtc *crtc;
+ 
+-	pr_info("drm_modeset_unlock_all: enter by %s (config->acquire_ctx=%p depth=%u)\n",
+-		current->comm, ctx, config->lock_all_depth);
+-	if (!ctx) {
+-		pr_err("drm_modeset_unlock_all: no ctx by %s\n", current->comm);
+-		mutex_unlock(&config->mutex);
++	pr_info("drm_modeset_unlock_all: enter by %s (owner=%s depth=%u ctx=%p)\n",
++		current->comm,
++		config->lock_all_owner ? config->lock_all_owner->comm : "none",
++		config->lock_all_depth, ctx);
++
++	if (config->lock_all_owner != current) {
++		pr_err("drm_modeset_unlock_all: %s is not the owner (%s), not unlocking\n",
++		       current->comm,
++		       config->lock_all_owner ? config->lock_all_owner->comm : "none");
+ 		return;
+ 	}
+-	if (config->lock_all_depth) {
+-		config->lock_all_depth--;
++	if (WARN_ON(!config->lock_all_depth))
++		return;
++
++	if (--config->lock_all_depth) {
+ 		pr_info("drm_modeset_unlock_all: nested release by %s depth=%u\n",
+ 			current->comm, config->lock_all_depth);
+ 		return;
+ 	}
+ 
++	config->lock_all_owner = NULL;
+ 	config->acquire_ctx = NULL;
+-	drm_modeset_drop_locks(ctx);
+-	drm_modeset_acquire_fini(ctx);
+-	kfree(ctx);
++	if (ctx) {
++		drm_modeset_drop_locks(ctx);
++		drm_modeset_acquire_fini(ctx);
++		kfree(ctx);
++	} else {
++		pr_err("drm_modeset_unlock_all: no ctx by %s\n", current->comm);
++	}
+ 
+ 	list_for_each_entry(crtc, &config->crtc_list, head)
+ 		mutex_unlock(&crtc->mutex);
+ 
+ 	mutex_unlock(&config->mutex);
++	pr_info("drm_modeset_unlock_all: released by %s\n", current->comm);
+ }
+ EXPORT_SYMBOL(drm_modeset_unlock_all);
+ 
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -994,7 +994,8 @@
+ 	struct mutex mutex; /* protects configuration (mode lists etc.) */
+ 	struct drm_modeset_lock connection_mutex; /* protects connector->encoder and encoder->crtc links */
+ 	struct drm_modeset_acquire_ctx *acquire_ctx; /* for legacy _lock_all() / _unlock_all() */
+-	unsigned int lock_all_depth; /* int80: legacy lock_all nesting depth */
++	unsigned int lock_all_depth; /* int81: legacy lock_all nesting depth */
++	struct task_struct *lock_all_owner; /* int81: task owning the legacy locks */
+ 	struct mutex idr_mutex; /* for IDR management */
+ 	struct idr crtc_idr; /* use this idr for all IDs, fb, crtc, connector, modes - just makes life easier */
+ 	/* this is limited to one for now */
