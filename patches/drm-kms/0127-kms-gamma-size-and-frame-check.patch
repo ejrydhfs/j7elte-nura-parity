@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsGammaDup <kmsgd@local>
+Date: Tue, 24 Nov 2026 14:05:00 
+Subject: [PATCH 0127] gpu31-kms: gamma_size for the legacy ioctls, one-frame-per-state check (int80, module-only)
+
+  - drm_crtc_init gives the CRTC a 256-entry software gamma store so
+    drm_mode_gamma_set_ioctl() stops returning -EINVAL ("failed to set gamma:
+    Invalid argument"); .gamma_set/.load_lut stay no-ops (no hardware LUT).
+  - exynos7580_plane_commit_frame() logs an error if the same atomic state
+    commits a frame twice, confirming the highest-index-plane rule.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -475,6 +475,19 @@
+ 	drm_crtc_helper_add(crtc, &exynos7580_crtc_helper_funcs);
+ 
+ 	/*
++	 * int80: the legacy gamma ioctls require a non-zero gamma_size;
++	 * without it drm_mode_gamma_set_ioctl returns -EINVAL ("failed to set
++	 * gamma: Invalid argument").  The CRTC has no hardware LUT (truecolor),
++	 * so a 256-entry software store is enough for the ioctl to succeed and
++	 * .gamma_set/.load_lut stay no-ops.
++	 */
++	if (!crtc->gamma_size) {
++		crtc->gamma_size = 256;
++		crtc->gamma_store = kzalloc(crtc->gamma_size * 3 * sizeof(u16),
++					    GFP_KERNEL);
++	}
++
++	/*
+ 	 * drm_mode_config_reset() normally allocates the initial CRTC state; do
+ 	 * it here as well so a driver that never calls it cannot crash the
+ 	 * atomic helpers on a NULL crtc->state.
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_plane.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_plane.c
+@@ -302,6 +302,9 @@
+  * highest index in the changeset therefore commits the complete frame, which
+  * keeps the "exactly one decon_kms_commit() per atomic commit" rule.
+  */
++static struct drm_atomic_state *exynos7580_last_commit_state;
++static unsigned int exynos7580_last_commit_count;
++
+ static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
+ 					 struct drm_plane *plane,
+ 					 struct drm_plane_state *old_state)
+@@ -331,6 +334,16 @@
+ 		     i < plane->dev->mode_config.num_total_plane; i++)
+ 			if (astate->planes[i])
+ 				return 0;
++
++		/* int80: a state must commit exactly one frame. */
++		if (astate == exynos7580_last_commit_state) {
++			exynos7580_last_commit_count++;
++			pr_err("exynos7580_plane_commit_frame: state %p commits again (%u)\n",
++			       astate, exynos7580_last_commit_count);
++		} else {
++			exynos7580_last_commit_state = astate;
++			exynos7580_last_commit_count = 1;
++		}
+ 	}
+ 
+ 	if (nplanes == 0 || nplanes > EXYNOS7580_MAX_PLANES)
