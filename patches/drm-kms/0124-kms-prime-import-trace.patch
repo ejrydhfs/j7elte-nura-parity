@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsPrime <kmsprime@local>
+Date: Tue, 24 Nov 2026 10:05:00 
+Subject: [PATCH 0124] gpu31-kms: trace PRIME import and ADDFB2 (int78, module-only)
+
+kmscube falls back to llvmpipe, so the kmsro/PRIME path needs evidence:
+exynos7580_gem_prime_import() now logs the dma_buf pointer/size and the caller,
+then the resulting object/attachment/sg table; exynos7580_fb_create() logs the
+ADDFB2 width/height/format/modifiers/handles.  With modetest -P (same import
+without Mesa) the failing side is named: no import call at all (kmsro did not
+pick us), an import error, or an ADDFB2/format/modifier mismatch.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
+@@ -507,6 +507,9 @@
+ 	size_t size;
+ 	int ret;
+ 
++	pr_info("exynos7580_gem_prime_import: enter dma_buf=%p size=%zu by %s\n",
++		dma_buf, dma_buf ? dma_buf->size : 0, current->comm);
++
+ 	if (!drm || !drm->dev || !dma_buf || !dma_buf->size)
+ 		return ERR_PTR(-EINVAL);
+ 
+@@ -549,6 +552,8 @@
+ 
+ 	DRM_DEBUG_PRIME("imported %zu bytes, %d sg entries\n",
+ 			dma_buf->size, sgt->nents);
++	pr_info("exynos7580_gem_prime_import: ok obj=%p import_attach=%p sgt=%p\n",
++		&cma->base, attach, sgt);
+ 
+ 	return &cma->base;
+ 
+@@ -590,6 +595,13 @@
+ 	if (!drm || !file || !mode_cmd)
+ 		return ERR_PTR(-EINVAL);
+ 
++	pr_info("exynos7580_fb_create: %ux%u fmt=%08x handles=%u,%u,%u,%u pitches=%u,%u offsets=%u,%u\n",
++		mode_cmd->width, mode_cmd->height, mode_cmd->pixel_format,
++		mode_cmd->handles[0], mode_cmd->handles[1],
++		mode_cmd->handles[2], mode_cmd->handles[3],
++		mode_cmd->pitches[0], mode_cmd->pitches[1],
++		mode_cmd->offsets[0], mode_cmd->offsets[1]);
++
+ 	obj = drm_gem_object_lookup(drm, file, mode_cmd->handles[0]);
+ 	if (!obj)
+ 		return ERR_PTR(-ENOENT);

@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsMmap <kmsmmap@local>
+Date: Tue, 24 Nov 2026 10:00:00 
+Subject: [PATCH 0123] gpu31-kms: trace the CMA dumb-map offset and mmap path (int78)
+
+modetest -s fails with "failed to map buffer: No error information".  Name the
+three sides of the path:
+
+  - drm_gem_cma_dumb_map_offset() -> get_gem_mmap_offset(): logs the object,
+    its offset_hash key and the byte offset handed to userspace;
+  - drm_gem_cma_mmap(): logs vma->vm_pgoff, the size and the caller, the
+    drm_gem_mmap() return and vm_private_data, then the CMA paddr and the
+    remap_pfn_range() return.
+
+A zero/short offset or a failed hash lookup is then directly visible, as is an
+offset_hash miss (drm_gem_mmap falling back to drm_mmap).
+
+--- a/drivers/gpu/drm/drm_gem_cma_helper.c
++++ b/drivers/gpu/drm/drm_gem_cma_helper.c
+@@ -29,7 +29,12 @@
+ 
+ static unsigned int get_gem_mmap_offset(struct drm_gem_object *obj)
+ {
+-	return (unsigned int)obj->map_list.hash.key << PAGE_SHIFT;
++	unsigned int key = (unsigned int)obj->map_list.hash.key;
++
++	/* int78: name the offset the dumb-map ioctl hands to userspace. */
++	pr_info("drm_gem_cma: get_gem_mmap_offset obj=%p key=%u offset=%u\n",
++		obj, key, key << PAGE_SHIFT);
++	return key << PAGE_SHIFT;
+ }
+ 
+ static void drm_gem_cma_buf_destroy(struct drm_device *drm,
+@@ -247,7 +252,12 @@
+ 	struct drm_gem_cma_object *cma_obj;
+ 	int ret;
+ 
++	pr_info("drm_gem_cma_mmap: enter pgoff=%lu size=%lu by %s\n",
++		(unsigned long)vma->vm_pgoff,
++		(unsigned long)(vma->vm_end - vma->vm_start), current->comm);
+ 	ret = drm_gem_mmap(filp, vma);
++	pr_info("drm_gem_cma_mmap: drm_gem_mmap ret=%d private=%p\n",
++		ret, ret ? NULL : vma->vm_private_data);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -256,6 +266,7 @@
+ 
+ 	ret = remap_pfn_range(vma, vma->vm_start, cma_obj->paddr >> PAGE_SHIFT,
+ 			vma->vm_end - vma->vm_start, vma->vm_page_prot);
++	pr_info("drm_gem_cma_mmap: paddr=%pa remap ret=%d\n", &cma_obj->paddr, ret);
+ 	if (ret)
+ 		drm_gem_vm_close(vma);
+ 
