@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DmaBufSeek <dmabuf@local>
+Date: Tue, 25 Nov 2026 09:20:00
+Subject: [PATCH 0006] dma-buf: add llseek (SEEK_END = buffer size)
+
+This 3.10 tree's dma_buf_fops has only .release/.mmap, so lseek() on an
+exported dma-buf fd fails with EINVAL.  Mesa's panfrost import sizes the BO
+with lseek(fd, 0, SEEK_END); on failure bo->size becomes SIZE_MAX and the
+following mmap is called with length -1, which the kernel rejects with
+ENOMEM before any driver mmap handler runs (measured on int85 as
+"FBDDBG mmap FAIL handle=5 size=18446744073709551615 (SIZE_MAX)
+off=0x10193000", i.e. no p7580_gem_mmap entry at all).
+
+Backport the upstream dma-buf llseek: SEEK_END is the buffer size, SEEK_SET
+is 0, SEEK_CUR is f_pos; any other whence is EINVAL.  With it,
+lseek(exported_fd, 0, SEEK_END) returns dmabuf->size and the importer maps
+the right length.
+
+---
+--- a/drivers/base/dma-buf.c	2026-11-25 09:13:01.772218864 -0500
++++ b/drivers/base/dma-buf.c	2026-11-25 09:13:01.861119285 -0500
+@@ -77,7 +77,34 @@
+ 	return dmabuf->ops->mmap(dmabuf, vma);
+ }
+ 
++/* 3.10 has no dma_buf llseek: lseek(exported_fd, 0, SEEK_END) failed, so
++ * importers that size the buffer that way (Mesa's panfrost
++ * panfrost_bo_create -> lseek -> bo->size) got SIZE_MAX and passed -1 as
++ * the mmap length (ENOMEM before any syscall).  Backport of the upstream
++ * dma-buf SEEK_END support: f_pos is only used for SEEK_CUR, and SEEK_END
++ * is the buffer size. */
++static loff_t dma_buf_llseek(struct file *file, loff_t offset, int whence)
++{
++	struct dma_buf *dmabuf = file->private_data;
++	loff_t base;
++
++	if (!dmabuf)
++		return -EINVAL;
++
++	if (whence == SEEK_SET)
++		base = 0;
++	else if (whence == SEEK_CUR)
++		base = file->f_pos;
++	else if (whence == SEEK_END)
++		base = dmabuf->size;
++	else
++		return -EINVAL;
++
++	return base + offset;
++}
++
+ static const struct file_operations dma_buf_fops = {
++	.llseek		= dma_buf_llseek,
+ 	.release	= dma_buf_release,
+ 	.mmap		= dma_buf_mmap_internal,
+ };
