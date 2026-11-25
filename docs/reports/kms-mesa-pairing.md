@@ -173,7 +173,7 @@ the gbm BO. Our driver already provides all four primitives:
 | Requirement | Our driver | Where |
 |---|---|---|
 | `CREATE_DUMB` / `DUMB_MAP` / `DESTROY_DUMB` | yes (`drm_gem_cma_dumb_create` …) | `exynos_drm7580_main.c:404-406` |
-| `PRIME` handle→fd export (renderonly needs it) | **only via `gem_prime_export`; the `prime_handle_to_fd` ioctl hook is missing → `DRM_CAP_PRIME=0` (measured §4.2)** | `exynos_drm7580_main.c:390,399`; hook lives in `code/gpu31/dmabuf/0002-…patch` |
+| `PRIME` handle→fd export (renderonly needs it) | **only via `gem_prime_export`; `prime_handle_to_fd` is unset → `DRM_CAP_PRIME=0` (measured §4.2)** | `exynos_drm7580_main.c:390,399`; hooks missing in `patches/drm-kms/0200-kms-main-bind.patch:588` |
 | `PRIME` fd→handle import (clients that pass fds) | import helper exists, same missing `prime_fd_to_handle` hook | `exynos_drm7580_dmabuf.c:495+` |
 | `ADDFB2` flags=0 with a GEM handle | yes, `drm_gem_object_lookup()` | `exynos_drm7580_dmabuf.c:580-607` |
 | `IN_FORMATS` + modifiers | **no** — non-zero `flags` rejected, no blob | `exynos_drm7580_dmabuf.c:43-45,143` |
@@ -294,12 +294,17 @@ Two consequences:
    `drmPrimeHandleToFD(ro->kms_fd, dumb_handle, …)`
    (`renderonly.c:108`), which the KMS node rejects while `DRM_CAP_PRIME` is 0.
    The KMS slice's `exynos_drm7580_main.c` registers
-   `.gem_prime_export`/`.gem_prime_import` only; the ioctl entry points
-   `.prime_handle_to_fd = drm_gem_prime_handle_to_fd` and
-   `.prime_fd_to_handle = drm_gem_prime_fd_to_handle` (which the 3.10 core
-   requires before it reports `DRM_PRIME_CAP_IMPORT/EXPORT`) exist only in
-   `code/gpu31/dmabuf/0002-drm-exynos7580-gem-prime-export.patch` /
-   `patches/iommu-dma/0001-…`, and the int83 image does not apply them.
+   `.gem_prime_export`/`.gem_prime_import` only. 3.10 derives
+   `DRM_CAP_PRIME` from the two drm_driver pointers
+   (`drm_ioctl.c:287-288`: `0x1` = `prime_fd_to_handle`, `0x2` =
+   `prime_handle_to_fd`), so the two lines
+   `.prime_handle_to_fd = drm_gem_prime_handle_to_fd,` and
+   `.prime_fd_to_handle = drm_gem_prime_fd_to_handle,` belong next to
+   `.gem_prime_export` in `patches/drm-kms/0200-kms-main-bind.patch:588`.
+   `code/gpu31/dmabuf/0002` and `patches/iommu-dma/0001` carry the identical
+   wiring but target the pre-0200 file name
+   (`drivers/gpu/drm/exynos7580/exynos7580_drm.c`), which the series never
+   creates - do not apply them (`kms-panfrost-rename.md` §3 item 4).
    Set-up phase needs handle→fd; scanout needs fd→handle; `ADDFB2` (already
    present) is the third leg.
 2. **The modeset lock was already wedged on that boot:** with the node named
@@ -339,12 +344,15 @@ no `card0`. kmsro needs both on one kernel. So the card0 rows must run on a
    either rebuild it with `-Dgallium-drivers=panfrost,kmsro` (produces
    `exynos_dri.so`; `meson.build:219`), or use the system Mesa 26 once gates 3/4
    are addressed. `-Dplatforms=x11 -Dllvm=disabled` can stay.
-4. **Driver capability:** wire `.prime_handle_to_fd` /
-   `.prime_fd_to_handle` on the KMS driver (apply
-   `code/gpu31/dmabuf/0002-drm-exynos7580-gem-prime-export.patch`, 2 lines, or
-   the equivalent `patches/iommu-dma/0001`). Without it `DRM_CAP_PRIME` is 0
-   (measured, §4.2) and kmsro's own dumb-buffer export fails before any
-   rendering starts.
+4. **Driver capability:** add `.prime_handle_to_fd =
+   drm_gem_prime_handle_to_fd` and `.prime_fd_to_handle =
+   drm_gem_prime_fd_to_handle` to the drm_driver in
+   `patches/drm-kms/0200-kms-main-bind.patch:588` (next to
+   `.gem_prime_export`). `code/gpu31/dmabuf/0002` and
+   `patches/iommu-dma/0001` contain the same two lines but target the pre-0200
+   path and must not be applied. Without this, `DRM_CAP_PRIME` is 0 (measured,
+   §4.2) and kmsro's own dumb-buffer export fails before any rendering
+   starts.
 5. **Image:** one kernel must expose `card0` *and* `renderD128`
    (`CONFIG_DRM_PANFROST7580=y` in the KMS series;
    `kms-panfrost-rename.md` §3). Without it kmsro has no render device to pair
