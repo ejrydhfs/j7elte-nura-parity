@@ -179,10 +179,16 @@ static void do_opens(void)
 	};
 	for (size_t i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
 		int fd = drmOpenWithType(tries[i].name, NULL, tries[i].type);
-		printf("PROBE openWithType: name=%s type=%s -> %d%s\n",
-		       tries[i].name,
-		       tries[i].type == DRM_NODE_RENDER ? "render" : "card",
-		       fd, fd < 0 ? strerror(errno) : "");
+		if (fd >= 0)
+			printf("PROBE openWithType: name=%s type=%s -> %d\n",
+			       tries[i].name,
+			       tries[i].type == DRM_NODE_RENDER ? "render" : "card",
+			       fd);
+		else
+			printf("PROBE openWithType: name=%s type=%s -> -1 (%s)\n",
+			       tries[i].name,
+			       tries[i].type == DRM_NODE_RENDER ? "render" : "card",
+			       strerror(errno));
 		if (fd >= 0)
 			close(fd);
 	}
