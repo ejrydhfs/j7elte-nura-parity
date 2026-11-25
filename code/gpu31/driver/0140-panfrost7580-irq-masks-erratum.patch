@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: IrqMaskFix <irq-mask@local>
+Date: Tue, 25 Nov 2026 15:00:00
+Subject: [PATCH 0140] gpu31-panfrost: unmask MMU/GPU interrupts, re-apply erratum 10797, print fault state on timeout
+
+The KWin 0x08 timeouts are silent because this driver never unmasks the
+MMU/GPU-level interrupt sources stock kbase enables: MMU faults and GPU-level
+errors (multiple fault, etc.) are dropped, and a stuck slot only shows the
+generic JS_TIMEOUT log.
+
+- jm_hw.h: add the kbase GPU_CONTROL GPU_IRQ_MASK (0x1058, ALL=0x10581), the
+  MMU block (RAWSTAT/CLEAR/MASK/STAT at 0x2000..0x200C) and the AS fault
+  registers (0x2400 + as*0x40: FAULTSTATUS +0x1C, FAULTADDRESS_LO/HI
+  +0x20/+0x24, FAULTEXTRA_LO +0x38); add the t72x SHADER_CONFIG register and
+  the erratum-10797 value (0x02000000).  Label the JS status states kbase
+  style (0x00 NOT_STARTED/OK, 0x01 DONE, 0x08 ACTIVE, plus the existing stop
+  codes) instead of "NO_EXCEPTION" for all of them.
+- job.c: p7580_job_irq_program() writes MMU_INT_CLEAR=0xFFFFFFFF,
+  MMU_INT_MASK=0xFFFFFFFF and GPU_IRQ_MASK=0x10581, logging the readback; it
+  runs right after the JOB interrupt pair in p7580_job_dev_init() and
+  p7580_job_dev_rearm().
+- job.c: p7580_job_post_reset() writes SHADER_CONFIG=0x02000000 and logs the
+  readback; it runs after the plain SOFT/HARD-reset fallback and after the
+  full recovery power cycle (which performs the reset), so the erratum bit is
+  present on every post-reset GPU.  (There was no SHADER_CONFIG write anywhere
+  in the driver or the power slice before this patch.)
+- job.c TIMEOUT: after the existing snapshot, print a TIMEOUT-DIAG line with
+  AS0 FAULTSTATUS, FAULTADDRESS HI/LO, FAULTEXTRA_LO, MMU_INT_RAWSTAT,
+  MMU_INT_STAT and GPU_INT_RAWSTAT, plus the JS state name.  A silent 0x08 now
+  either stays silent (nothing latched anywhere) or names a real MMU/GPU
+  fault.
+
+Diagnostic/infrastructure only: no scheduling or recovery change.
+---
+--- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
++++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
+@@ -89,6 +89,26 @@
+ #define P7580_GPU_CMD_SOFT_RESET	0x01u
+ #define P7580_GPU_CMD_HARD_RESET	0x02u
+ #define P7580_GPU_INT_RAWSTAT		0x0020u
++/* kbase GPU_CONTROL block (mali_midg_regmap.h): unlike the mainline
++ * 0x028 GPU_INT_MASK used by the power slice, this is the register stock
++ * kbase unmasks to ALL so a fault is never silent. */
++#define P7580_GPU_IRQ_MASK		0x1058u
++#define P7580_GPU_IRQ_MASK_ALL		0x10581u
++/* t72x r1p0 erratum 10797 (kbase GPUCORE-10797): SC_ENABLE_TEXGRD_FLAGS.
++ * No reset leaves it set, so it must be written after every reset. */
++#define P7580_GPU_SHADER_CONFIG		0x0F04u
++#define P7580_GPU_SHADER_CONFIG_T72X	0x02000000u
++/* MMU block (0x2000) and address-space registers (0x2400 + as*0x40). */
++#define P7580_MMU_INT_RAWSTAT		0x2000u
++#define P7580_MMU_INT_CLEAR		0x2004u
++#define P7580_MMU_INT_MASK		0x2008u
++#define P7580_MMU_INT_STAT		0x200Cu
++#define P7580_MMU_AS_BASE		0x2400u
++#define P7580_MMU_AS_STRIDE		0x40u
++#define P7580_MMU_AS_FAULTSTATUS	0x1Cu
++#define P7580_MMU_AS_FAULTADDRESS_LO	0x20u
++#define P7580_MMU_AS_FAULTADDRESS_HI	0x24u
++#define P7580_MMU_AS_FAULTEXTRA_LO	0x38u
+ #define P7580_GPU_INT_CLEAR		0x0024u
+ #define P7580_GPU_IRQ_RESET_COMPLETED	(1u << 8)
+ 
+@@ -195,6 +215,23 @@
+ {
+ 	unsigned int i;
+ 
++	/* kbase jm_hw.h slot states, so a TIMEOUT line says what the JM
++	 * actually did: 0x00 never started, 0x01 finished, 0x08 running. */
++	switch (status) {
++	case 0x00u:
++		return "NOT_STARTED/OK";
++	case 0x01u:
++		return "DONE";
++	case 0x02u:
++		return "INTERRUPTED";
++	case 0x03u:
++		return "STOPPED";
++	case 0x04u:
++		return "TERMINATED";
++	case 0x08u:
++		return "ACTIVE";
++	}
++
+ 	for (i = 0; i < sizeof(p7580_js_faults) /
+ 			sizeof(p7580_js_faults[0]); i++) {
+ 		if (p7580_js_faults[i].code == status)
+--- a/drivers/gpu/drm/panfrost/panfrost7580_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c
+@@ -352,6 +352,31 @@
+ {
+ 	return readl(jd->regs + reg);
+ }
++
++/* int95: unmask the interrupt sources stock kbase keeps enabled, so an
++ * MMU fault or a GPU-level error is delivered instead of leaving a slot
++ * silent.  MMU_INT_CLEAR first drains any latch, then MASK=ALL. */
++static void p7580_job_irq_program(struct p7580_job_dev *jd, const char *where)
++{
++	p7580_writel(jd, P7580_MMU_INT_CLEAR, 0xFFFFFFFFu);
++	p7580_writel(jd, P7580_MMU_INT_MASK, 0xFFFFFFFFu);
++	p7580_writel(jd, P7580_GPU_IRQ_MASK, P7580_GPU_IRQ_MASK_ALL);
++	pr_info("p7580_job: %s irq-mask gpu_irq_mask=0x%08x(rd 0x%08x) mmu_mask=0x%08x(rd 0x%08x) mmu_raw=0x%08x\n",
++		where, P7580_GPU_IRQ_MASK_ALL,
++		p7580_readl(jd, P7580_GPU_IRQ_MASK),
++		0xFFFFFFFFu, p7580_readl(jd, P7580_MMU_INT_MASK),
++		p7580_readl(jd, P7580_MMU_INT_RAWSTAT));
++}
++
++/* t72x r1p0 erratum 10797: re-assert SC_ENABLE_TEXGRD_FLAGS after every
++ * reset (kbase panfrost_gpu_init_quirks does it once at probe; the bit is
++ * cleared by a reset, so a post-recovery GPU ran without it). */
++static void p7580_job_post_reset(struct p7580_job_dev *jd)
++{
++	p7580_writel(jd, P7580_GPU_SHADER_CONFIG, P7580_GPU_SHADER_CONFIG_T72X);
++	pr_info("p7580_job: post-reset SHADER_CONFIG=0x%08x (t72x erratum 10797)\n",
++		p7580_readl(jd, P7580_GPU_SHADER_CONFIG));
++}
+ /* gpu31-iova: fault-time mapping resolver registration (process
+  * context, before faults). The driver registers a hook that renders
+  * the faulting job's {handle,iova,size} snapshot into the ERR pin;
+@@ -553,6 +578,7 @@
+ 	 * before the first START (bounded: two extra reads at probe). */
+ 	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
+ 	p7580_writel(jd, P7580_JOB_INT_MASK, mask & (js_present | (js_present << 16)));
++	p7580_job_irq_program(jd, "dev-init");
+ 	pr_info("p7580_job: irq-arm rawstat=0x%08x stat=0x%08x mask=0x%08x js_present=0x%x\n",
+ 		p7580_readl(jd, P7580_JOB_INT_RAWSTAT),
+ 		p7580_readl(jd, P7580_JOB_INT_STAT),
+@@ -590,6 +616,7 @@
+ 	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
+ 	p7580_writel(jd, P7580_JOB_INT_MASK,
+ 		     mask & (jd->js_present | (jd->js_present << 16)));
++	p7580_job_irq_program(jd, "rearm");
+ }
+ 
+ /* Idle when no slot has a queued command, no job is in flight and no
+@@ -1163,6 +1190,25 @@
+ 			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0,
+ 			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
+ 			job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
++		/* int95: a silent 0x08 timeout is indistinguishable from a
++		 * dropped MMU fault unless the AS/MMU/GPU interrupt state is
++		 * printed. AS0 is the only address space this driver uses
++		 * (P7580_DRV_AS_NR), so read AS0's fault trio. */
++		{
++			void __iomem *as = jd->regs + P7580_MMU_AS_BASE +
++				(0u * P7580_MMU_AS_STRIDE);
++
++			pr_err("p7580_job: TIMEOUT-DIAG slot=%d js=%s(0x%02x) AS%d FAULTSTATUS=0x%08x FAULTADDRESS=0x%08x%08x EXTRA_LO=0x%08x MMU_RAWSTAT=0x%08x MMU_STAT=0x%08x GPU_INT_RAWSTAT=0x%08x\n",
++				slot, p7580_js_status_name(status), status,
++				0u, /* AS0: the only address space this driver programs */
++				readl(as + P7580_MMU_AS_FAULTSTATUS),
++				readl(as + P7580_MMU_AS_FAULTADDRESS_HI),
++				readl(as + P7580_MMU_AS_FAULTADDRESS_LO),
++				readl(as + P7580_MMU_AS_FAULTEXTRA_LO),
++				p7580_readl(jd, P7580_MMU_INT_RAWSTAT),
++				p7580_readl(jd, P7580_MMU_INT_STAT),
++				p7580_readl(jd, P7580_GPU_INT_RAWSTAT));
++		}
+ 		/* gpu31-iova: same mapping line as the ERR pin (process
+ 		 * context here, but the hook is IRQ-safe anyway). */
+ 		if (jd->iova_resolve && job->iova_handles &&
+@@ -1485,6 +1531,7 @@
+ 		}
+ 		p7580_writel(jd, P7580_GPU_INT_CLEAR,
+ 			     P7580_GPU_IRQ_RESET_COMPLETED);
++		p7580_job_post_reset(jd);
+ 	}
+ 
+ 	/* 4. Complete core power cycle (gpu31-readback + gpu31-firstfault).
+@@ -1502,6 +1549,8 @@
+ 			pr_err("p7580_job: recover-cycle FAIL rc=%d\n", crc);
+ 		p7580_job_ev(jd, P7580_EV_CYCLE, fault_slot, 0, 0,
+ 			     (uint32_t)crc, 0, 0);
++		/* the cycle performed the reset: re-assert the erratum bit */
++		p7580_job_post_reset(jd);
+ 	}
+ 
+ 	/* 5. re-arm the slot IRQs the handler demuxes. Order mirrors
