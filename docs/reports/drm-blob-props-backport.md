@@ -1,10 +1,12 @@
 # v4.2 blob properties + CRTC `MODE_ID` — backport for the M0 atomic core (int84)
 
-Status: **patch complete and compile-checked; not booted.** Patch:
+Status: **patch complete, compile-checked, and integrated into Image-int84; not
+booted.** Patch:
 `patches/drm-kms/0135-kms-blob-props-and-crtc-mode-id.patch`. Applies on top of
 `drm-atomic/0001..0005` → `drm-kms/0104..0130/0133` → `0134`. No existing patch is
 modified. The previous boot evidence is int83; this report adds the kernel pieces
-KWin needs and the compile/apply proof, not a hardware run.
+KWin needs and the compile/apply proof, not a hardware run. Integration state is
+in §9.
 
 Why: `kwin_wayland` 6.8's `DrmCrtc::updateProperties()` (kwin
 `src/backends/drm/drm_crtc.cpp:93-97`) treats a CRTC without `MODE_ID` and `ACTIVE`
@@ -238,3 +240,28 @@ int83's new-file hunk-count gate and `git apply --check` gate accept the patch
 6.8 with `KWIN_DRM_DEBUG=1` must log `DrmCrtc` initialising instead of
 `More outputs are enabled than there are CRTCs`; a MODE_ID-bearing atomic commit
 must reach `exynos7580_crtc_mode_set()` with the panel timing.
+
+## 9. int84 integration (G31, commit 4c5cce7)
+
+`0135` is in Image-int84, applied after `0134` and before the drm-backport/driver
+patches:
+
+- patch order: `0104..0130` → `0133` → `0134` → **`0135`** → drm-backport
+  `0001-0004` → `0005` wiring → mode-b → driver `0001/0002` → `0136`
+- build: 5369 log lines, **0 errors**; `Image-int84`
+  `2fee6bef69a48af930660656bd5b1d14c5d59f25753ed364c6f562bda8328ae9`,
+  `exynos-drm7580-int84.ko`
+  `8317703a256dcf3f8f89d51ea0c7356e44e67ad1230157b931909af2eb93cede`,
+  `drm_kms_helper-int84.ko`
+  `0781cf9d849fca0f00310b8a323a459f73a89cc8a3655992ff2a7521bed1cb31`
+- blob gates all pass on the built tree: `drm_property_create_blob`/
+  `lookup_blob`, `drm_atomic_set_mode_for_crtc`/`set_mode_prop_for_crtc`,
+  `drm_mode_convert_umode`, `MODE_ID` created/attached,
+  `CREATEPROPBLOB`/`DESTROYPROPBLOB`, `destroy_user_blobs` in `drm_release`
+- int83 gates unchanged (two KMS `.ko`, imports, relocations, stock dt,
+  pstore/lockup)
+
+Not yet on hardware: the expected device observations (MODE_ID in `modetest -c`,
+KWin `DrmCrtc` init) are still pending flash/boot; the int84 report is
+`docs/reports/decon-kms-int84.md`.
+
