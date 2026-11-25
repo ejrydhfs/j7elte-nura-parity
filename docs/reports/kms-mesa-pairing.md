@@ -163,9 +163,13 @@ Consequences:
 * `kmscube` (20220902) tries `AddFB2WithModifiers` and, on failure, retries
   `drmModeAddFB2` with `flags = 0` (`kmscube drm-common.c:112`), so the missing
   `IN_FORMATS` does **not** block kmscube.
-* `kmscube` builds the fb from `gbm_bo_get_handle()`; with renderonly that is
-  the **KMS dumb handle**, so the stock kmscube path does not call
-  `PRIME_FD_TO_HANDLE` on `card0` at all. `dmesg | grep fd_to_handle` is
+* `kmscube` builds the fb from `gbm_bo_get_handle()`, i.e.
+  `__DRI_IMAGE_ATTRIB_HANDLE` → `WINSYS_HANDLE_TYPE_KMS`
+  (Mesa 20.3.5 `src/gallium/frontends/dri/dri2.c:1149-1151`), and panfrost
+  answers that from the renderonly scanout
+  (`src/gallium/drivers/panfrost/pan_resource.c:125-129`), so kmscube gets the
+  **KMS dumb handle** on the gbm device's own fd and the stock kmscube path
+  does not call `PRIME_FD_TO_HANDLE` on `card0` at all. `dmesg | grep fd_to_handle` is
   therefore *not* a reliable "kmsro paired" signal for kmscube — the reliable
   signals are `CREATE_DUMB` + `prime_handle_to_fd` on `card0` and the renderer
   string. (Weston/KWin do pass dma-buf fds and will need the import path.)
