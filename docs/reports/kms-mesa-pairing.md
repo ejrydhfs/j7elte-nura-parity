@@ -13,31 +13,49 @@ the matrix after the next paired image are in §7.
 Tools: `code/gpu31/kms/tools/mesa/` (`mesaprobe.c`, `drmshim.c`, `Makefile`,
 `run-matrix.sh`).
 
+> **Update (same day):** the render driver was renamed to `panfrost`
+> (`2d19f91`, see `kms-panfrost-rename.md`). Every number below is the
+> pre-rename measurement; §1.1 states what changes, what stays blocked, and
+> which cells become historical. The rename removes the name gate only — the
+> card0 rows still need a combined image (§4.1).
+
 ---
 
 ## 1. Verdict
 
 `llvmpipe` is not a Mesa bug and not a gbm-backend problem: **kmsro pairs the
 KMS device with a render device purely by the kernel driver name, and our
-render node is called `panfrost7580`, not `panfrost`.**
+render node was called `panfrost7580`, not `panfrost`.** (Since `2d19f91` it is
+`panfrost`; see §1.1 for what that fixes and what it does not.)
 
 | Gate | What Mesa compares | Our value | Needed | Fixable by env? |
 |---|---|---|---|---|
 | 1. DRI module for the KMS fd | `drmGetVersion(card0)->name` → `<name>_dri.so` | `exynos` | `exynos` | n/a — **already correct** |
-| 2. kmsro render-device search (Mesa 20) | `drmOpenWithType("panfrost", DRM_NODE_RENDER)` exact name match on every render node | `panfrost7580` | `panfrost` | **no** |
-| 2'. kmsro render-device search (Mesa 26) | platform render nodes whose `drmGetVersion()->name` ∈ {`panfrost`, `panthor`, `lima`, `msm`, `etnaviv`, `v3d`, `vc4`, `asahi`, `rocket`, `ethosu`, `zink`} | `panfrost7580` | `panfrost` | **no** |
-| 3. panfrost screen on the render node (Mesa 26 only) | `pan_kmod_drm_drv_match(fd,"panfrost")` **and** DRM version ≥ 1.1 | `panfrost7580`, 1.0 | `panfrost`, ≥1.1 | name via gate 2'; version no |
+| 2. kmsro render-device search (Mesa 20) | `drmOpenWithType("panfrost", DRM_NODE_RENDER)` exact name match on every render node | `panfrost7580` → now `panfrost` (2d19f91) | `panfrost` | **no** |
+| 2'. kmsro render-device search (Mesa 26) | platform render nodes whose `drmGetVersion()->name` ∈ {`panfrost`, `panthor`, `lima`, `msm`, `etnaviv`, `v3d`, `vc4`, `asahi`, `rocket`, `ethosu`, `zink`} | `panfrost7580` → now `panfrost` (2d19f91) | `panfrost` | **no** |
+| 3. panfrost screen on the render node (Mesa 26 only) | `pan_kmod_drm_drv_match(fd,"panfrost")` **and** DRM version ≥ 1.1 | name fixed by 2d19f91; still `1.0` | `panfrost`, ≥1.1 | name via gate 2'; version no |
 | 4. panfrost ioctl ABI (Mesa 26 only) | `PANFROST_CREATE_BO` with the 6.x argument set | 3.10-era ABI → `EINVAL` | newer ABI | no |
 
 Mesa 20.3.5 (`/data/mesabuild/mesa20-b`) stops at gate 2 and has **no** kmsro
 driver compiled in at all, so it cannot be the pairing side either.
 
-**Minimal fix:** change the render driver's `drm_driver.name` from
-`"panfrost7580"` to `"panfrost"` (`code/gpu31/driver/0001-panfrost7580-driver-sources.patch:5856`;
-the platform driver name at `:6301` may stay). The KMS side already answers to
+**Minimal fix (landed in `2d19f91`):** the render driver's `drm_driver.name`
+is now `"panfrost"` instead of `"panfrost7580"`
+(`code/gpu31/driver/0001-panfrost7580-driver-sources.patch:5856`; the platform
+driver name at `:6301` is deliberately kept). The KMS side already answers to
 `exynos` (`code/gpu31/kms/exynos_drm7580_main.c:56`, verified as the literal
 `exynos` in the built `exynos-drm7580-int82.ko`). No environment variable and no
-Mesa build flag can substitute for that name.
+Mesa build flag could have substituted for that name.
+
+### 1.1 Status after the rename (`2d19f91`)
+
+| Cell / gate | Pre-rename (measured, §4) | After the rename |
+|---|---|---|
+| `render-opens` | `panfrost` → -1, `panfrost7580` → 4 | `panfrost` → 4, `panfrost7580` → -1 (probe still covers both) |
+| Mesa 20 loader on the render node | `MESA_LOADER: failed to open panfrost7580` → llvmpipe | loads `panfrost_dri.so` → `Mali T720 (Panfrost)`; `MESA_LOADER_DRIVER_OVERRIDE=panfrost` and the `drmshim` name map become redundant (both harmless) |
+| Mesa 26 loader/panfrost screen | rejected on name (gate 2'/3) | passes the name gate, still rejected: `kernel driver is too old (requires at least 1.1, found 1.0)`, then `DRM_IOCTL_PANFROST_CREATE_BO err=22` — needs `.minor = 1` + the 6.x ioctl ABI |
+| kmsro pairing on card0 | gate 2/2' unsatisfied | gate 2/2' satisfied; the remaining blockers are the render stack (§5 items 2/3) and the combined image (§4.1) |
+| `kmscube -D /dev/dri/card0` | llvmpipe | unchanged until a KMS image also ships the render node and PRIME is wired (§5 items 4/5); then Mesa 20 + rebuilt kmsro gives Panfrost |
 
 ---
 
@@ -72,6 +90,7 @@ Device names actually reported by the kernel:
 
 ```
 /dev/dri/renderD128: drmGetVersion -> panfrost7580 "Mali-T720 render-only (Exynos 7580)"
+                     (pre-rename; 2d19f91 changes this line to "panfrost", version stays 1.0.0)
                      drmDevice bustype = DRM_BUS_PLATFORM (2)
                      DUMB_BUFFER=0  PRIME=import|export
 /dev/dri/card0 (int82): .name = "exynos" (source + string in the .ko)
@@ -138,8 +157,9 @@ if (!pan_kmod_driver_version_at_least(&drv_info, 1, 1)) {                  /* ve
    mesa_loge("kernel driver is too old (requires at least 1.1, found %d.%d)", ...);
 ```
 
-Our render driver is `.name = "panfrost7580", .major = 1, .minor = 0`
-(`code/gpu31/driver/0001-panfrost7580-driver-sources.patch:5856-5861`).
+Our render driver was `.name = "panfrost7580", .major = 1, .minor = 0`
+(`code/gpu31/driver/0001-panfrost7580-driver-sources.patch:5856-5861`); since
+`2d19f91` the name is `"panfrost"` and only the version still trips this check.
 
 ### 3.3 What kmsro needs from the scanout driver
 
@@ -153,8 +173,8 @@ the gbm BO. Our driver already provides all four primitives:
 | Requirement | Our driver | Where |
 |---|---|---|
 | `CREATE_DUMB` / `DUMB_MAP` / `DESTROY_DUMB` | yes (`drm_gem_cma_dumb_create` …) | `exynos_drm7580_main.c:404-406` |
-| `PRIME` handle→fd export (renderonly needs it) | yes, `DRIVER_PRIME` + `.gem_prime_export = drm_gem_prime_export` | `exynos_drm7580_main.c:390,399` |
-| `PRIME` fd→handle import (clients that pass fds) | yes, `exynos7580_gem_prime_import` | `exynos_drm7580_dmabuf.c:495+` |
+| `PRIME` handle→fd export (renderonly needs it) | **only via `gem_prime_export`; the `prime_handle_to_fd` ioctl hook is missing → `DRM_CAP_PRIME=0` (measured §4.2)** | `exynos_drm7580_main.c:390,399`; hook lives in `code/gpu31/dmabuf/0002-…patch` |
+| `PRIME` fd→handle import (clients that pass fds) | import helper exists, same missing `prime_fd_to_handle` hook | `exynos_drm7580_dmabuf.c:495+` |
 | `ADDFB2` flags=0 with a GEM handle | yes, `drm_gem_object_lookup()` | `exynos_drm7580_dmabuf.c:580-607` |
 | `IN_FORMATS` + modifiers | **no** — non-zero `flags` rejected, no blob | `exynos_drm7580_dmabuf.c:43-45,143` |
 | vblank / page-flip event | present but the flip carries no fb | open int83 item |
@@ -180,6 +200,12 @@ Consequences:
 
 Cell names are `run-matrix.sh` cells; the renderer line is the raw
 `glGetString(GL_RENDERER)` from `mesaprobe --gbm|--default`.
+
+**All rows are pre-rename** (kernel `#37`, render node answering
+`panfrost7580`). After `2d19f91` rows 15/16 flip (`panfrost` → 4,
+`panfrost7580` → -1), row 10 becomes Panfrost without any override/shim, and
+rows 11/12/14 keep working with or without the override. Rows 3–6 and 9 stay
+llvmpipe for the version/ABI reasons in §1.1.
 
 | # | Cell | Mesa | Node | Env | Renderer |
 |---|---|---|---|---|---|
@@ -218,7 +244,7 @@ Interpretation, one line each:
   card0: row 13 is the exact error the gbm path would hit on card0, because
   `exynos_dri.so` is absent.
 
-### 4.1 The card0 rows (skipped on this boot)
+### 4.1 The card0 rows (skipped on this boot, and they need a *combined* image)
 
 `sys-card-baseline`, `sys-card-verbose`, `sys-card-gbmbackend`,
 `sys-card-ovr-exynos`, `sys-card-ovr-panfrost`, `sys-card-shim`,
@@ -245,16 +271,66 @@ by the render-node rows: the same `loader_get_driver_for_fd` picks
 `exynos_dri.so` for card0 (the name is already `exynos`), and the same kmsro
 render-node search is what fails.
 
+### 4.2 card0 measured on the int83-only image (same day, later boot)
+
+The phone was reflashed with the int83 KMS image (kernel `#37` rebuilt
+2026-11-23) while this ticket was open. That image has **`card0` but no
+`renderD128`**, which lets the KMS half be measured (read-only, as root —
+`card0` is `root:video 0660`):
+
+```
+PROBE node: kernel_driver=exynos  desc="Samsung Exynos 7580 DECON DRM/KMS" date=20261123
+PROBE cap: DUMB_BUFFER=1
+PROBE cap: PRIME=0x0 (import=0 export=0)      <-- no PRIME at all on card0
+PROBE openWithType: name=exynos type=card -> 3
+PROBE openWithType: name=exynos7580 -> -1 (No such file or directory)
+PROBE openWithType: name=panfrost|panfrost7580 type=render -> -1 (no render node)
+```
+
+Two consequences:
+
+1. **kmsro's allocation path cannot work on card0 as built.**
+   `renderonly_create_kms_dumb_buffer_for_resource()` does
+   `drmPrimeHandleToFD(ro->kms_fd, dumb_handle, …)`
+   (`renderonly.c:108`), which the KMS node rejects while `DRM_CAP_PRIME` is 0.
+   The KMS slice's `exynos_drm7580_main.c` registers
+   `.gem_prime_export`/`.gem_prime_import` only; the ioctl entry points
+   `.prime_handle_to_fd = drm_gem_prime_handle_to_fd` and
+   `.prime_fd_to_handle = drm_gem_prime_fd_to_handle` (which the 3.10 core
+   requires before it reports `DRM_PRIME_CAP_IMPORT/EXPORT`) exist only in
+   `code/gpu31/dmabuf/0002-drm-exynos7580-gem-prime-export.patch` /
+   `patches/iommu-dma/0001-…`, and the int83 image does not apply them.
+   Set-up phase needs handle→fd; scanout needs fd→handle; `ADDFB2` (already
+   present) is the third leg.
+2. **The modeset lock was already wedged on that boot:** with the node named
+   `exynos` (condition 1 satisfied) `mesaprobe --info` printed version+caps and
+   then blocked *uninterruptibly* inside `drmModeGetResources()` (SIGTERM from
+   `timeout 8` did not take it down). So no CRTC/plane/`IN_FORMATS`
+   enumeration, and none of the card0 cells could run on that boot — the same
+   client-death/lock-all symptom `kms-mesa-m1-progress.md` tracks (int83's
+   0133 force-release did not prevent it here). `mesaprobe --ver` exists for
+   exactly this case: it never issues a modeset ioctl.
+3. No `renderD128` on this image, so kmsro still has nothing to pair with —
+   the combined image (§5 item 4) remains a hard precondition.
+
+A further precondition surfaced with the rename audit
+(`kms-panfrost-rename.md` §3): the current KMS image series
+(`build-int83.sh`) configures **no** `CONFIG_DRM_PANFROST7580` — a KMS image has
+`card0` but no `renderD128`, and the GPU images (…int49) have `renderD128` but
+no `card0`. kmsro needs both on one kernel. So the card0 rows must run on a
+**combined image** (KMS series + `patches/drm-backport/0001-0004` + `mode-b` +
+`driver/0001,0002` + `CONFIG_DRM_PANFROST7580=y`), not on int83 as built.
+
 ---
 
 ## 5. Minimal fix
 
-1. **Kernel (1 string):** `p7580_drm_driver.name = "panfrost"` (instead of
-   `"panfrost7580"`) in
-   `code/gpu31/driver/0001-panfrost7580-driver-sources.patch:5856`. Keep the
-   platform driver name, module name and DT match as they are. Nothing else in
-   the driver changes; `drmGetVersion()` starts answering `panfrost`, which
-   satisfies gate 2 for Mesa 20 and gates 2/2' for Mesa 26.
+1. **Kernel (1 string) — done in `2d19f91`:** `p7580_drm_driver.name =
+   "panfrost"` (instead of `"panfrost7580"`) in
+   `code/gpu31/driver/0001-panfrost7580-driver-sources.patch:5856`. Platform
+   driver name, module name and DT match are unchanged. `drmGetVersion()` now
+   answers `panfrost`, satisfying gate 2 for Mesa 20 and gates 2/2' for
+   Mesa 26.
 2. **Render stack:** keep `/data/mesabuild/mesa20-b` for rendering (rows 11/12);
    the stock Mesa 26 additionally needs `.minor = 1` and the newer
    `PANFROST_CREATE_BO` argument set (rows 3/6) — track that separately, it is
@@ -263,7 +339,18 @@ render-node search is what fails.
    either rebuild it with `-Dgallium-drivers=panfrost,kmsro` (produces
    `exynos_dri.so`; `meson.build:219`), or use the system Mesa 26 once gates 3/4
    are addressed. `-Dplatforms=x11 -Dllvm=disabled` can stay.
-4. **Not a fix:** `EGL_PLATFORM=gbm|surfaceless`, `GBM_BACKEND=dri`,
+4. **Driver capability:** wire `.prime_handle_to_fd` /
+   `.prime_fd_to_handle` on the KMS driver (apply
+   `code/gpu31/dmabuf/0002-drm-exynos7580-gem-prime-export.patch`, 2 lines, or
+   the equivalent `patches/iommu-dma/0001`). Without it `DRM_CAP_PRIME` is 0
+   (measured, §4.2) and kmsro's own dumb-buffer export fails before any
+   rendering starts.
+5. **Image:** one kernel must expose `card0` *and* `renderD128`
+   (`CONFIG_DRM_PANFROST7580=y` in the KMS series;
+   `kms-panfrost-rename.md` §3). Without it kmsro has no render device to pair
+   with and Mesa 26 falls back exactly as rows 4/5 show; the int83-only boot
+   (§4.2) is that state.
+6. **Not a fix:** `EGL_PLATFORM=gbm|surfaceless`, `GBM_BACKEND=dri`,
    `MESA_LOADER_DRIVER_OVERRIDE=exynos|panfrost`, `LIBGL_DEBUG`/`EGL_LOG_LEVEL`/
    `PAN_MESA_DEBUG` only change *logging* or the primary driver name; none of
    them can rename the render device (rows 2–9).
@@ -286,11 +373,12 @@ Longer term, for Weston/KWin on the same path: add `IN_FORMATS` +
 
 ---
 
-## 6. Why "the kernel names it `panfrost7580`" was not visible before
+## 6. Why the render-node name never showed up in the int49-era tests
 
 `egltest`/`kmsflip` on `renderD128` always set
 `MESA_LOADER_DRIVER_OVERRIDE=panfrost` (`tools/env.sh` `kms|egl`), which bypasses
-gate 1 for a *render-only* use and hides the name mismatch: panfrost's screen is
+gate 1 for a *render-only* use and hid the name mismatch (the override is now
+redundant but harmless, `2d19f91`): panfrost's screen is
 created directly on the render node, no kmsro, no card0. The mismatch only
 matters at the kmsro join, which needs a KMS node — i.e. it stayed invisible
 until card0 existed.
@@ -299,12 +387,26 @@ until card0 existed.
 
 ## 7. Finishing the card0 matrix (one boot, after the paired image)
 
-`int83` (or any image whose `.ko` pair matches the running kernel) must be
-flashed by Main first — the int82 `.ko` pair must **not** be loaded on it.
+Preconditions, in order:
+
+1. a **combined** image (§4.1): the kernel must expose **both** `/dev/dri/card0`
+   and `/dev/dri/renderD128`, with the `.ko` pair matching that kernel build
+   (`load-kms.sh <rev>` uses `/home/user/*-<rev>.ko`; the int82 pair must not be
+   loaded on an int83 kernel);
+2. the render driver name is already `panfrost` (`2d19f91`) in any image built
+   from the current driver patch;
+3. a pairing-capable Mesa: mesa20-b **rebuilt** with
+   `-Dgallium-drivers=panfrost,kmsro`, or system Mesa 26 once §5 item 2/3 land;
+4. `DRM_CAP_PRIME` non-zero on card0 (§5 item 4) — check first with
+   `./mesaprobe --ver /dev/dri/card0`; if it prints `PRIME=0x0`, stop: kmsro
+   cannot allocate scanout buffers;
+5. a live modeset lock: on the int83-only boot `drmModeGetResources()` blocked
+   uninterruptibly (§4.2), so re-flash/reboot before the card0 cells if
+   `--info` hangs.
 
 ```sh
 # 1. on the phone, as root, from the image's own module pair
-echo nura | /usr/local/bin/rootshell sh /home/user/mesa/load-kms.sh int83
+echo nura | /usr/local/bin/rootshell sh /home/user/mesa/load-kms.sh <rev>
 #    -> /dev/dri/card0 + renderD128, wdpet + logd armed
 
 # 2. as user, serialized behind the shared lock (logd holds the lock: stop it
@@ -312,20 +414,25 @@ echo nura | /usr/local/bin/rootshell sh /home/user/mesa/load-kms.sh int83
 flock /tmp/gpsdev.lock sh /home/user/mesa/run-matrix.sh all
 ```
 
-Cells and expected renderer (with today's kernel, i.e. *before* the rename):
+Cells and expected renderer on a combined image, post-rename:
 
-| Cell | Expected now | Expected after rename (+ mesa20 kmsro) |
-|---|---|---|
-| `sys-card-baseline` | llvmpipe | Mali T720 (Panfrost) |
-| `sys-card-verbose` | llvmpipe | Mali T720 (Panfrost) |
-| `sys-card-gbmbackend` | llvmpipe | same as baseline |
-| `sys-card-ovr-exynos` | llvmpipe (kmsro loaded, no render node found) | Mali T720 (Panfrost) |
-| `sys-card-ovr-panfrost` | llvmpipe (panfrost on an exynos fd: `CREATE_BO`/screen fails) | n/a |
-| `sys-card-shim` | Mali T720 (Panfrost) *if* the version/ABI gate is shimmed; with Mesa 20 + name shim: Panfrost | — (shim is only proof machinery) |
-| `m20-card-ovr-panfrost` | gbm device fails (panfrost on card0) | n/a |
-| `m20-card-shim-kmsro` | `<none>`: `failed to open exynos` (no kmsro in mesa20-b) | Panfrost (after rebuilding mesa20 with `kmsro`) |
-| `kmscube-baseline` | `renderer: llvmpipe` | `renderer: Mali T720 (Panfrost)` |
-| `kmscube-shim` | `renderer: Mali T720 (Panfrost)` with mesa20-b + name shim | — |
+| Cell | mesa20-b **as installed** (no kmsro) | mesa20-b rebuilt with `kmsro` | system Mesa 26 |
+|---|---|---|---|
+| `sys-card-baseline` | llvmpipe (name `exynos` → exynos_dri.so exists, but its render search finds nothing usable without kmsro rebuild; see note) | Mali T720 (Panfrost) | llvmpipe (version 1.0 / ABI) |
+| `sys-card-verbose`, `sys-card-gbmbackend` | same as baseline | same | same |
+| `sys-card-ovr-exynos` | llvmpipe | Mali T720 (Panfrost) | llvmpipe (`kernel driver is too old`) |
+| `sys-card-ovr-panfrost` | gbm fails / llvmpipe (panfrost screen on an exynos fd) | n/a | n/a |
+| `sys-card-shim` | Panfrost with the old name shim on a pre-rename kernel; otherwise identical to baseline | — | — |
+| `m20-card-ovr-panfrost` | gbm device fails | n/a | n/a |
+| `m20-card-shim-kmsro` | `<none>`: `failed to open exynos` | Panfrost | n/a |
+| `kmscube-baseline` | `failed to create gbm device` / no renderer | `renderer: Mali T720 (Panfrost)` | `renderer: llvmpipe` |
+| `kmscube-shim` | same as baseline (shim is identity post-rename) | — | — |
+
+Note: mesa20-b is the *render* side only; on card0 `gbm_create_device(card0)`
+asks the loader for `exynos_dri.so`, which mesa20-b does not ship
+(`m20-render-kmsro`, row 13), so the card0 rows only reach Panfrost after the
+mesa20 rebuild. `drmshim`'s `panfrost7580=panfrost` map is a no-op since
+`2d19f91`; `DRM_VER_SHIM` remains useful for the Mesa 26 version gate only.
 
 Note: `/home/user/logd.sh` opens `/tmp/gpsdev.lock` and holds it for its whole
 life; kill it (root) before taking the lock for the matrix, then restart it if
@@ -339,6 +446,10 @@ before running kmscube into the known page-flip bug.
 ---
 
 ## 8. Appendix — raw evidence
+
+All captures are **pre-rename** (kernel `#37`). Post-`2d19f91` the two
+`render-opens` blocks flip (`panfrost` → 4, `panfrost7580` → -1); everything
+else is unchanged for that kernel, which cannot load the KMS modules.
 
 ```
 ### render-opens (real names)

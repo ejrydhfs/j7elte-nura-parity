@@ -1,6 +1,7 @@
 /* mesaprobe.c - which Gallium driver does Mesa/Gbm/EGL pick for a DRM node?
  *
  * Answers, for one node:
+ *   --ver <node>       version + caps only (never touches modeset ioctls)
  *   --info <node>      kernel driver name (drmGetVersion), libdrm bus type,
  *                      DRM_CAP_DUMB_BUFFER/PRIME, every DRM device libdrm
  *                      knows, and whether the node is a KMS node (has a CRTC),
@@ -53,13 +54,14 @@
 #define MAX_DEVS 32
 
 static const char *node = NULL;
-static bool opt_info, opt_opens, opt_gbm, opt_default, opt_render, opt_addfb;
+static bool opt_info, opt_ver, opt_opens, opt_gbm, opt_default, opt_render,
+	opt_addfb;
 static int opt_w = 720, opt_h = 1280;
 
 static void usage(void)
 {
 	fprintf(stderr,
-		"usage: mesaprobe --info|--opens|--gbm <node>|--default "
+		"usage: mesaprobe --info|--ver|--opens|--gbm <node>|--default "
 		"[--render] [--addfb] [--size WxH]\n");
 	exit(2);
 }
@@ -164,6 +166,9 @@ static void print_devices(void)
 	drmFreeDevices(devs, n);
 }
 
+/* The exact lookups Mesa 20's kmsro performs (drmOpenWithType("panfrost",
+ * DRM_NODE_RENDER)), plus the pre-2d19f91 literal so a stale module/kernel
+ * shows up instead of silently "not found". */
 static void do_opens(void)
 {
 	struct { const char *name; int type; } tries[] = {
@@ -177,7 +182,7 @@ static void do_opens(void)
 		printf("PROBE openWithType: name=%s type=%s -> %d%s\n",
 		       tries[i].name,
 		       tries[i].type == DRM_NODE_RENDER ? "render" : "card",
-		       fd, fd < 0 ? " (not found)" : "");
+		       fd, fd < 0 ? strerror(errno) : "");
 		if (fd >= 0)
 			close(fd);
 	}
@@ -362,9 +367,15 @@ int main(int argc, char **argv)
 {
 	int kms_fd = -1;
 
+	/* Line-buffered: on a KMS node whose modeset lock is wedged the probe
+	 * blocks inside an ioctl, and the last printed line must say which. */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--info"))
 			opt_info = true;
+		else if (!strcmp(argv[i], "--ver"))
+			opt_ver = true;
 		else if (!strcmp(argv[i], "--opens"))
 			opt_opens = true;
 		else if (!strcmp(argv[i], "--gbm"))
@@ -383,11 +394,25 @@ int main(int argc, char **argv)
 			usage();
 	}
 
-	if (!opt_info && !opt_opens && !opt_gbm && !opt_default)
+	if (!opt_info && !opt_ver && !opt_opens && !opt_gbm && !opt_default)
 		opt_info = true;
-	if ((opt_info || opt_opens || opt_gbm) && !node)
+	if ((opt_info || opt_ver || opt_opens || opt_gbm) && !node)
 		node = "/dev/dri/card0";
 
+	if (opt_ver && !opt_info && node) {
+		/* version + caps only: safe on a wedged modeset lock */
+		kms_fd = open(node, O_RDWR | O_CLOEXEC);
+		if (kms_fd < 0) {
+			printf("PROBE open: %s: %s\n", node, strerror(errno));
+			return 1;
+		}
+		printf("PROBE node: %s\n", node);
+		print_ver("node", kms_fd);
+		print_caps(kms_fd);
+		close(kms_fd);
+		if (!opt_opens)
+			return 0;
+	}
 	if (opt_info && node) {
 		kms_fd = open(node, O_RDWR | O_CLOEXEC);
 		if (kms_fd < 0) {
@@ -399,7 +424,7 @@ int main(int argc, char **argv)
 		print_caps(kms_fd);
 		print_modeset(kms_fd);
 		print_devices();
-		if (!opt_opens && !opt_gbm) {
+		if (!opt_opens && !opt_gbm && !opt_ver) {
 			close(kms_fd);
 			return 0;
 		}

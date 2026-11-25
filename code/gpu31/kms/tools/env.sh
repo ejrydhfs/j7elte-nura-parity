@@ -10,10 +10,13 @@
 #           kmscube/modetest can drive a future /dev/dri/card0 via GBM.
 #   system  Stock Mesa 26.3.0 (/usr/lib, /usr/lib/dri) - reference only.
 #
-# Why the override: the kernel calls the device "panfrost7580", but the
-# DRI loader maps DRIVER_OVERRIDE=panfrost to panfrost_dri.so; without it
-# the loader looks for panfrost7580_dri.so and falls back to llvmpipe
-# (docs/reports/gpu31-mesa20.md section 3).
+# Why the override: MESA_LOADER_DRIVER_OVERRIDE=panfrost pins the DRI module
+# to panfrost_dri.so regardless of the render node's DRM driver name.  It is
+# redundant since the driver was renamed to "panfrost" (2d19f91), but kept so
+# these tools still work against kernels/modules built before that rename,
+# where the loader would look for panfrost7580_dri.so and fall back to
+# llvmpipe (docs/reports/gpu31-mesa20.md section 3,
+# docs/reports/kms-panfrost-rename.md).
 set -u
 
 _kms_mode=${1:-egl}

@@ -31,8 +31,9 @@ mesaprobe: mesaprobe.c
 drmshim.so: drmshim.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -fPIC -shared -o $@ $< -ldl
 
+# --ver/--opens only: no modeset ioctl, safe on a node whose lock_all is wedged
 check: mesaprobe
-	./mesaprobe --info /dev/dri/card0 --opens
+	./mesaprobe --ver /dev/dri/card0 --opens
 
 clean:
 	rm -f mesaprobe drmshim.so
