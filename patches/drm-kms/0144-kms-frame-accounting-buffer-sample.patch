@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PresentDiag <present@local>
+Date: Tue, 25 Nov 2026 13:30:00
+Subject: [PATCH 0144] gpu31-kms: per-commit frame accounting, fb/addr logs, buffer sample
+
+int93 showed a single KWin commit programs the right window (WINCON=0x1e01f,
+ADD0=0x10400000, 720x1280 AR24, blend NONE), yet the panel alternates
+blue/black.  That points at which buffer is presented per frame, or at more
+than one frame being programmed per atomic commit.
+
+- exynos7580_atomic_commit(): increments a commit sequence, zeroes the
+  per-commit frame counter, logs `seq=N start by <comm>`, and after
+  commit_tail logs `seq=N commit_tail done, frames=M`.
+- exynos7580_plane_commit_frame(): counts and logs every DECON commit:
+  `seq=N frame=M astate=… plane=… fb=… fb_id=… addr0/1/2=… dst=… nplanes=N`,
+  then the decon_kms_commit() rc.  Two lines with the same seq and
+  frame=1,2 prove the commit path runs twice per atomic commit; alternating
+  addresses across seq values name the presented BOs.
+  The fb is read from plane->state (the new state), not the legacy field.
+- exynos7580_own_scanout(): samples the first 16 bytes of the buffer that is
+  about to be presented, on every call (before the cached-address early
+  return): `sample import|cma fb=… id=… px=…`.  A painted AR24 frame prints
+  its colour; an unpainted BO prints 00000000 00000000 00000000 00000000.
+  Imported fbs are read through the attachment's sg page, dumb/CMA fbs
+  through cma->vaddr + fb->offsets[0].
+- decon_kms_commit() (shim): logs a monotonically increasing `call=N` with
+  nwin/state/comm on entry, correlating the shim call count with the module's
+  per-commit frame counter.
+
+Fence audit (no code change): this 3.10/M0 core has no atomic IN_FENCE_FD
+property and no fence array in struct drm_atomic_state (only panfrost SUBMIT
+in_fences exist), and the KMS dma-buf import path has no reservation wait
+(3.10 dma-buf has no dma_resv).  So a compositor's render fences cannot reach
+the KMS commit; the sample log shows whether the black frames are buffers
+presented before their GPU work finished.
+
+Diagnostic only; int93 dumps and the int92 re-enable path stay.
+---
+--- a/drivers/video/exynos/decon_7580/decon_kms_api.c
++++ b/drivers/video/exynos/decon_7580/decon_kms_api.c
+@@ -730,11 +730,14 @@
+ 			   decon_read(DECON_INT, VIDW_OFFSET_Y(i)));
+ }
+ 
++static unsigned int decon_kms_commit_calls;
++
+ int decon_kms_commit(struct decon_kms_dev *d,
+ 		     const struct decon_kms_win *wins, unsigned int nr_wins)
+ {
+ 	struct decon_device *decon;
+ 	struct decon_reg_data *regs;
++	unsigned int call = ++decon_kms_commit_calls;
+ 	int ret;
+ 
+ 	if (!d || !wins || !nr_wins)
+@@ -742,6 +745,9 @@
+ 
+ 	decon = d->decon;
+ 
++	pr_info("decon_kms_commit: call=%u nwin=%u state=%d by %s\n",
++		call, nr_wins, decon->state, current->comm);
++
+ 	/*
+ 	 * int92: the KMS pipe can be left off by a disable that raced (or by
+ 	 * the fbdev restore sequence) while a client keeps committing frames;
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -89,6 +89,10 @@
+ static struct exynos7580_crtc_link crtc_link;
+ static DEFINE_MUTEX(crtc_lock);
+ 
++/* int94: per-atomic-commit frame accounting (read by plane.c). */
++unsigned int exynos7580_commit_seq;
++unsigned int exynos7580_frames_in_commit;
++
+ static struct exynos7580_device *crtc_to_ex(struct drm_crtc *crtc)
+ {
+ 	return to_exynos7580(crtc->dev);
+@@ -686,6 +690,10 @@
+ 	if (WARN_ON(!ex || !ex->decon))
+ 		return -ENODEV;
+ 
++	exynos7580_commit_seq++;
++	exynos7580_frames_in_commit = 0;
++	pr_info("exynos7580_atomic_commit: seq=%u start by %s (frames reset to 0)\n",
++		exynos7580_commit_seq, current->comm);
+ 	exynos7580_dump_atomic_state("commit-enter", drm, state);
+ 
+ 	/*
+@@ -740,7 +748,8 @@
+ 				     struct drm_crtc, head)->primary->state->fb : NULL : NULL,
+ 		current->comm);
+ 	exynos7580_commit_tail(state);
+-	pr_info("exynos7580_atomic_commit: commit_tail done\n");
++	pr_info("exynos7580_atomic_commit: seq=%u commit_tail done, frames=%u\n",
++		exynos7580_commit_seq, exynos7580_frames_in_commit);
+ 
+ 	/*
+ 	 * int82: the 3.10 legacy fields are still consulted by the core:
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_plane.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_plane.c
+@@ -329,6 +329,9 @@
+ static struct drm_atomic_state *exynos7580_last_commit_state;
+ static unsigned int exynos7580_last_commit_count;
+ 
++extern unsigned int exynos7580_commit_seq;
++extern unsigned int exynos7580_frames_in_commit;
++
+ static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
+ 					 struct drm_plane *plane,
+ 					 struct drm_plane_state *old_state)
+@@ -389,7 +392,24 @@
+ 		}
+ 	}
+ 
++	/* int94: one line per DECON commit: which fb/address this frame
++	 * programs and how many times the commit path ran for this atomic
++	 * commit (reset in exynos7580_atomic_commit). */
++	exynos7580_frames_in_commit++;
++	pr_info("exynos7580_plane_commit_frame: seq=%u frame=%u astate=%p plane=%d fb=%p fb_id=%u addr0=0x%llx addr1=0x%llx addr2=0x%llx dst=%dx%d%+d%+d nplanes=%u\n",
++		exynos7580_commit_seq, exynos7580_frames_in_commit, astate,
++		plane->base.id,
++		pstate ? pstate->fb : NULL,
++		(pstate && pstate->fb) ? pstate->fb->base.id : 0,
++		(unsigned long long)(nplanes ? wins[0].addr[0] : 0),
++		(unsigned long long)(nplanes ? wins[0].addr[1] : 0),
++		(unsigned long long)(nplanes ? wins[0].addr[2] : 0),
++		wins[0].dst.w, wins[0].dst.h, wins[0].dst.x, wins[0].dst.y,
++		nplanes);
++
+ 	ret = decon_kms_commit(ex->decon, wins, nplanes);
++	pr_info("exynos7580_plane_commit_frame: seq=%u frame=%u decon_kms_commit rc=%d\n",
++		exynos7580_commit_seq, exynos7580_frames_in_commit, ret);
+ 	if (ret)
+ 		DRM_ERROR("DECON commit failed: %d\n", ret);
+ 
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
+@@ -50,6 +50,7 @@
+ #include <linux/slab.h>
+ #include <linux/exynos_iovmm.h>
+ 
++#include <linux/highmem.h>
+ #include <drm/drmP.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_crtc_helper.h>
+@@ -343,6 +344,35 @@
+ 	if (plane != 0)		/* only single-plane formats are accepted */
+ 		return -EINVAL;
+ 
++	/* int94: sample the first 16 bytes of the buffer that is about to be
++	 * presented (before the cached-address early return, so every commit
++	 * samples).  A painted AR24 frame shows its colour; an unpainted BO
++	 * shows zero -- which is what tells "presenter alternates buffers"
++	 * from "we program the wrong address". */
++	if (plane == 0) {
++		u32 px[4] = { 0, 0, 0, 0 };
++
++		if (obj->import_attach && obj->driver_private) {
++			struct sg_table *sgt = obj->driver_private;
++			void *va;
++
++			if (sgt && sgt->sgl) {
++				va = kmap(sg_page(sgt->sgl));
++				if (va) {
++					memcpy(px, va, sizeof(px));
++					kunmap(sg_page(sgt->sgl));
++				}
++			}
++			pr_info("exynos7580_own_scanout: sample import fb=%p id=%u px=%08x %08x %08x %08x\n",
++				fb, fb->base.id, px[0], px[1], px[2], px[3]);
++		} else if (efb->cma->vaddr) {
++			memcpy(px, (u8 *)efb->cma->vaddr + fb->offsets[0],
++			       sizeof(px));
++			pr_info("exynos7580_own_scanout: sample cma fb=%p id=%u px=%08x %08x %08x %08x\n",
++				fb, fb->base.id, px[0], px[1], px[2], px[3]);
++		}
++	}
++
+ 	if (exynos7580_scanout_cached(efb, plane, addr))
+ 		return 0;
+ 

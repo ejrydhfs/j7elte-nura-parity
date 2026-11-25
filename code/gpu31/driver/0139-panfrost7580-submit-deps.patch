@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SubmitDeps <submit-deps@local>
+Date: Tue, 25 Nov 2026 14:00:00
+Subject: [PATCH 0139] gpu31-panfrost: log SUBMIT dependencies around the sched queue
+
+KWin's batches hit the media GPU's silent start timeout (js_status 0x08,
+head==tail) under the compositor and Mesa's submit fails; a sched dependency
+that never satisfies would leave exactly that signature (the JM never starts
+the job).  The submit path builds dependencies from three sources - the
+per-file serial predecessor, the ioctl in-fences and each BO's resv exclusive
+fence - but nothing logged which of them was pending when the node was queued.
+
+- p7580_drv_submit(): one summary line per SUBMIT (jc, slot, requirements,
+  BO/in-fence/out-sync counts, submit_no, comm), then per BO the iova, size
+  and resv exclusive fence (pointer, context, seqno, signaled) and per
+  in-fence the same fence state.
+- p7580_drv_split_queue(): for node 0, dump prev (serial/node fence), every
+  in-fence and every BO resv exclusive fence with signaled state before any
+  dependency is added; count the dependencies actually added
+  (`deps_queued`) and log them right before drm_sched_job_submit().
+- Resv publication: log each BO's iova and the exclusive fence being added
+  (context/seqno) under serial_lock, and the new per-file serial_prev.
+
+This names the pending dependency when a job is queued and shows whether the
+KMS-imported BO carries a resv fence (the cross-device cycle hypothesis): a
+BO whose excl fence is the GPU's own job and which is also scanned out cannot
+deadlock by itself, but a resv fence from another device would.
+
+Diagnostic only; no ordering change.
+---
+--- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c
++++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
+@@ -1580,7 +1580,7 @@
+ 	struct p7580_submit_job *job;
+ 	struct drm_sched_job *sched_job = NULL;
+ 	struct dma_fence *fence_ref = NULL;
+-	unsigned int i;
++	unsigned int i, deps_queued = 0;
+ 	int ret;
+ 
+ 	*fence_out = NULL;
+@@ -1677,6 +1677,36 @@
+ 		dma_fence_get(fence_ref);
+ 	}
+ 
++	/* int94: what this node will wait for, before anything is added:
++	 * the previous node/serial fence, the ioctl in-fences and every
++	 * submitted BO's resv exclusive fence with its signaled state. */
++	if (pos == 0) {
++		pr_info("p7580_deps: seq=%u slot=%d prev=%p prev_sig=%d nf=%u nr=%u nodes=%u\n",
++			job->seqno, s->slot, prev,
++			prev ? dma_fence_is_signaled(prev) : 1, s->nf, s->nr,
++			s->nodes);
++		for (i = 0; i < s->nf; i++)
++			pr_info("p7580_deps: seq=%u inf[%u]=%p ctx=%llu seqno=%llu sig=%d\n",
++				job->seqno, i, s->inf[i],
++				(unsigned long long)s->inf[i]->context,
++				(unsigned long long)s->inf[i]->seqno,
++				dma_fence_is_signaled(s->inf[i]));
++		for (i = 0; i < s->nr; i++) {
++			struct p7580_bo *dbo = to_p7580_bo(s->objs[i]);
++			struct dma_fence *dfe =
++				dma_resv_get_excl(&dbo->resv);
++
++			pr_info("p7580_deps: seq=%u bo[%u] iova=0x%llx excl=%p ctx=%llu seqno=%llu sig=%d\n",
++				job->seqno, i, (unsigned long long)dbo->iova,
++				dfe,
++				dfe ? (unsigned long long)dfe->context : 0ULL,
++				dfe ? (unsigned long long)dfe->seqno : 0ULL,
++				dfe ? dma_fence_is_signaled(dfe) : 1);
++			if (dfe)
++				dma_fence_put(dfe);
++		}
++	}
++
+ 	/* Ordering: this node waits for the previous fence. For pos 0
+ 	 * that is the per-file serial predecessor; for every later node
+ 	 * it is the node queued immediately before it, which is what
+@@ -1687,6 +1717,7 @@
+ 		ret = drm_sched_job_add_dependency(sched_job, prev);
+ 		if (ret)
+ 			goto err_sched;
++		deps_queued++;
+ 	}
+ 	if (pos == 0) {
+ 		for (i = 0; i < s->nf; i++) {
+@@ -1696,22 +1727,30 @@
+ 							   s->inf[i]);
+ 			if (ret)
+ 				goto err_sched;
++			deps_queued++;
+ 		}
+ 		for (i = 0; i < s->nr; i++) {
+ 			struct p7580_bo *bo = to_p7580_bo(s->objs[i]);
+ 			struct dma_fence *f = dma_resv_get_excl(&bo->resv);
+ 
+ 			if (f) {
+-				if (!dma_fence_is_signaled(f))
++				bool pending = !dma_fence_is_signaled(f);
++
++				if (pending)
+ 					ret = drm_sched_job_add_dependency(
+ 						sched_job, f);
+ 				dma_fence_put(f);
+ 				if (ret)
+ 					goto err_sched;
++				if (pending)
++					deps_queued++;
+ 			}
+ 		}
+ 	}
+ 
++	pr_info("p7580_deps: seq=%u pos=%u/%u sched_submit with deps_queued=%u\n",
++		job->seqno, pos, s->nodes ? s->nodes - 1 : 0, deps_queued);
++
+ 	/* Per-job runtime-PM lifetime: armed before the job becomes
+ 	 * visible to the async worker, released in free_job. */
+ 	p7580_drv_job_pm_arm(s->drv);
+@@ -1865,6 +1904,31 @@
+ 		}
+ 	}
+ 
++	/* int94: submit summary - BOs (iova + resv exclusive fence state)
++	 * and every in-fence (pointer, context, seqno, signaled). */
++	pr_info("p7580_submit: jc=0x%llx slot=%d req=0x%x bo=%u inf=%u out_sync=%u submit_no=%u by %s\n",
++		(unsigned long long)args->jc, slot, args->requirements, nr, nf,
++		args->out_sync, df->submit_no, current->comm);
++	for (i = 0; i < nr; i++) {
++		struct p7580_bo *sbo = to_p7580_bo(objs[i]);
++		struct dma_fence *fe = dma_resv_get_excl(&sbo->resv);
++
++		pr_info("p7580_submit: bo[%u] handle=%u iova=0x%llx size=0x%zx resv_excl=%p ctx=%llu seqno=%llu sig=%d\n",
++			i, hsave[i], (unsigned long long)sbo->iova,
++			(size_t)sbo->base.size, fe,
++			fe ? (unsigned long long)fe->context : 0ULL,
++			fe ? (unsigned long long)fe->seqno : 0ULL,
++			fe ? dma_fence_is_signaled(fe) : 1);
++		if (fe)
++			dma_fence_put(fe);
++	}
++	for (i = 0; i < nf; i++)
++		pr_info("p7580_submit: inf[%u]=%p ctx=%llu seqno=%llu sig=%d\n",
++			i, inf[i],
++			(unsigned long long)inf[i]->context,
++			(unsigned long long)inf[i]->seqno,
++			dma_fence_is_signaled(inf[i]));
++
+ 	/* 3. gpu31-chainsplit: walk the submitted chain (next pointers)
+ 	 * and queue one sched job per node on this slot's entity. Each
+ 	 * node gets its own START, so the standard p7580_js_config()
+@@ -2152,6 +2216,15 @@
+ 
+ 					if (!o)
+ 						continue;
++					pr_info("p7580_resv: submit_no=%u bo[%u] iova=0x%llx excl=%p ctx=%llu seqno=%llu\n",
++						df->submit_no, i,
++						(unsigned long long)
++							to_p7580_bo(o)->iova,
++						last_fence,
++						(unsigned long long)
++							last_fence->context,
++						(unsigned long long)
++							last_fence->seqno);
+ 					dma_resv_add_excl_fence(
+ 						&to_p7580_bo(o)->resv,
+ 						last_fence);
+@@ -2161,6 +2234,14 @@
+ 			df->serial_prev = last_fence;
+ 			if (df->serial_prev)
+ 				dma_fence_get(df->serial_prev);
++			pr_info("p7580_serial: submit_no=%u serial_prev=%p ctx=%llu seqno=%llu old=%p\n",
++				df->submit_no, df->serial_prev,
++				last_fence ?
++					(unsigned long long)last_fence->context :
++					0ULL,
++				last_fence ?
++					(unsigned long long)last_fence->seqno :
++					0ULL, old);
+ 			mutex_unlock(&df->serial_lock);
+ 			if (old)
+ 				dma_fence_put(old);
