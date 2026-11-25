@@ -1,13 +1,17 @@
 # v4.2 blob properties + CRTC `MODE_ID` — backport for the M0 atomic core (int84)
 
 Status: **0135 integrated into Image-int84 and booted; its blob lifetime bug found
-on hardware at `rmmod` and fixed by 0138 (compile/apply-checked, runtime verification
-pending).** Patches:
-`patches/drm-kms/0135-kms-blob-props-and-crtc-mode-id.patch` and
-`patches/drm-kms/0138-kms-blob-lifetime-fix.patch` (applied after 0135). Applies on
-top of `drm-atomic/0001..0005` → `drm-kms/0104..0130/0133` → `0134` → `0135` →
-`0138`. No existing patch is modified. The crash analysis and the corrected
-reference model are in §10; the int84 integration state is in §9.
+on hardware at `rmmod` and fixed by 0138; the fbdev teardown ordering on the same
+path fixed by 0139 (both compile/apply-checked, runtime verification pending).**
+Patches: `patches/drm-kms/0135-kms-blob-props-and-crtc-mode-id.patch`,
+`patches/drm-kms/0138-kms-blob-lifetime-fix.patch` and
+`patches/drm-kms/0139-kms-fbdev-teardown-order.patch` (0138/0139 applied after
+0135). Applies on top of `drm-atomic/0001..0005` → `drm-kms/0104..0130/0133` →
+`0134` → `0135` → `0138` → `0139`. No existing patch is modified; 0139 adds one
+line to the contract header and the same line to
+`code/gpu31/kms/exynos_drm7580.h` so the assembly `cmp` gate holds. The crash
+analysis and the corrected reference model are in §10, the fbdev fix in §11; the
+int84 integration state is in §9.
 
 Why: `kwin_wayland` 6.8's `DrmCrtc::updateProperties()` (kwin
 `src/backends/drm/drm_crtc.cpp:93-97`) treats a CRTC without `MODE_ID` and `ACTIVE`
@@ -372,17 +376,71 @@ Implementation (`drivers/gpu/drm/drm_crtc.c`, +67/−9):
   client-kill-without-close variant. Expected: no `drm_property_free_blob` in
   the log; blob count at teardown only frees, never unlinks twice.
 
-### 10.5 Companion finding (not in 0138)
+### 10.5 Companion finding (fixed separately in 0139)
 
 The trigger is not blob-specific: the driver's fbdev teardown is a **devm action**
 (`exynos7580_fbdev_devm_release()`, `fbdev.c:100`, registered at `:268`), which the
 driver core runs *after* `exynos7580_unload()` → after
 `drm_mode_config_cleanup()`. `drm_fbdev_cma_fini()` then works on mode objects that
 cleanup already tore down (`drm_framebuffer_cleanup()`'s `list_del(&fb->head)`,
-`drm_fb_helper_fini()`), which is a separate UAF risk on the same rmmod path. The
-blob fix removes the double free analysed here; a fully clean unload still wants
-fbdev teardown moved before `drm_mode_config_cleanup()` (a driver/contract change —
-`exynos_drm7580_unload()` cannot call the static fbdev release as-is). If int88's
-rmmod oopses again, expect a different signature
-(`drm_framebuffer_cleanup`/`drm_fb_helper_fini`/`kfree`), not
-`drm_property_free_blob`.
+`drm_fb_helper_fini()`), which is a separate UAF risk on the same rmmod path. 0138
+removes the blob double free analysed here; 0139 (below) moves the fbdev teardown
+before `drm_mode_config_cleanup()` so the same rmmod path has no fb-side UAF left.
+
+## 11. 0139 — fbdev teardown before `drm_mode_config_cleanup`
+
+Patch: `patches/drm-kms/0139-kms-fbdev-teardown-order.patch` (3 files, +36/−7,
+applied after 0136/0137; sha256 `38b460ad…`).
+
+### 11.1 Problem
+
+`exynos7580_fbdev_init()` registers `exynos7580_fbdev_devm_release()` as a devm
+action (`fbdev.c:268`), and the driver core runs devm actions **after**
+`drm_driver->unload()`. So `drm_fbdev_cma_fini()` — which does
+`unregister_framebuffer()`, `drm_framebuffer_unregister_private()` +
+`drm_fb_cma_destroy()` (→ `drm_framebuffer_cleanup()`, `list_del(&fb->head)`) and
+`drm_fb_helper_fini()` — ran after `drm_mode_config_cleanup()` had freed the
+fbdev framebuffer's list entry, the planes, the CRTCs and the mode-object idr.
+That is a UAF on the same rmmod path, and it is also what kept the fbdev
+framebuffer referenced *inside* cleanup, which is how
+`drm_framebuffer_remove()` reached the blob double free fixed by 0138 (§10.2 step
+3).
+
+### 11.2 Change
+
+- `exynos7580_fbdev_fini()` (new, `fbdev.c`): takes the file-private
+  `exynos7580_fbdev` handle, clears it, and calls `drm_fbdev_cma_fini()` once.
+  Idempotent — a second call is a no-op.
+- `exynos7580_fbdev_devm_release()` now only checks the handle and delegates to
+  `exynos7580_fbdev_fini()`, so the devm fallback cannot double-finish.
+- `exynos7580_unload()` (`exynos_drm7580_main.c`) calls
+  `exynos7580_fbdev_fini()` after unregistering the vblank callback and
+  **before** `drm_vblank_cleanup()`/`drm_mode_config_cleanup()`, matching the
+  vendor exynos order (`exynos_drm_drv.c:145-149`: fbdev fini → vblank cleanup →
+  mode_config cleanup).
+- The probe error path (`err_vblank`) calls it too, so a load that fails after
+  `exynos7580_fbdev_init()` (e.g. the initial modeset) does not leave a
+  registered fb0 / half-live helper behind.
+- Contract: one line, `void exynos7580_fbdev_fini(void);`, added to
+  `drivers/gpu/drm/exynos7580/exynos_drm7580.h` (KmsFbdev section). Because the
+  assembly gate compares the in-tree header byte-for-byte with
+  `code/gpu31/kms/exynos_drm7580.h`, the same line is added there in the same
+  commit; the existing `exynos7580_atomic_check/commit` prototype greps still
+  pass.
+
+`EXPORT_SYMBOL` is not needed: `main.c` and `fbdev.c` are the same module
+(`exynos-drm7580`), built-in or `=m`.
+
+### 11.3 Evidence and gates
+
+- compile: `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+  -j8 drivers/gpu/drm/` → rc=0 with `CONFIG_DRM_EXYNOS7580=y`
+  (`blobwork-build-0139-builtin.log`, 0 errors, 0 warnings) and with `=m`
+  (`blobwork-build-0139-mod.log`, only the pre-existing init.h
+  `-Wmissing-attributes` pair); both edited files rebuild.
+- apply: `git apply --check` rc=0 against the series+0135 baseline *and* after
+  0136 (int87 order); 0137 touches only `drm_prime.c`/`uapi drm.h`.
+- runtime (Main): `insmod exynos_drm7580` → fb0 up → `rmmod` clean, **twice in a
+  row**, with and without a client that set `MODE_ID`. Expected: no oops, no
+  `drm_fbdev_cma_fini`/`drm_framebuffer_cleanup`/`drm_property_free_blob` in the
+  log, `/dev/fb0` gone after rmmod and back after the second insmod.

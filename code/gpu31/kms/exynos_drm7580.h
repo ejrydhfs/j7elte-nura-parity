@@ -109,5 +109,7 @@ void exynos7580_vblank_irq(struct drm_device *drm, unsigned int pipe);
 /* ---- KmsFbdev ----------------------------------------------------------- */
 /* drm_fb_helper emulation on KMS; returns 0 or -errno. */
 int exynos7580_fbdev_init(struct exynos7580_device *ex);
+/* Tear fb0 down (idempotent); ->unload() calls it before mode_config_cleanup. */
+void exynos7580_fbdev_fini(void);
 
 #endif /* __EXYNOS_DRM7580_H__ */

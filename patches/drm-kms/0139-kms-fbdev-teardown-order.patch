@@ -1,0 +1,140 @@
+From bb020d7efed29c596df6820fa67809f7413ad005 Mon Sep 17 00:00:00 2001
+From: BlobProps <blobprops@local>
+Date: Wed, 25 Nov 2026 10:00:31 -0500
+Subject: [PATCH 0139] gpu31-kms: tear fb0 down before mode_config_cleanup on
+ unload (int88)
+
+The fbdev helper's teardown is a devres action
+(exynos7580_fbdev_devm_release, registered by exynos7580_fbdev_init) and the
+driver core runs it AFTER drm_driver->unload().  By then
+drm_mode_config_cleanup() has destroyed the planes/CRTCs/framebuffers, so
+drm_fbdev_cma_fini()'s drm_framebuffer_cleanup() (list_del on a dead fb) and
+drm_fb_helper_fini() work on freed mode objects.  It is also what drove
+drm_framebuffer_remove() into the blob double free 0138 fixes: the fbdev
+framebuffer was still referenced during cleanup, so the fb loop ran
+set_config(NULL) on a state whose mode blob had just been drained.
+
+Add exynos7580_fbdev_fini(): clear the file-private handle and call
+drm_fbdev_cma_fini() once.  The devres action delegates to it and is a no-op
+after the explicit call (idempotent).  Call it from exynos7580_unload() before
+drm_vblank_cleanup()/drm_mode_config_cleanup() (the vendor exynos order:
+fbdev_fini -> vblank_cleanup -> mode_config_cleanup), and from the load error
+path so a probe that fails after fbdev_init leaves no registered fb0 behind.
+
+Contract: one declaration added to exynos_drm7580.h (the cross-slice
+interface); code/gpu31/kms/exynos_drm7580.h carries the same line so the
+assembly cmp gate stays happy.
+
+Evidence: make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error
+-j8 drivers/gpu/drm/ rc=0 both with DRM_EXYNOS7580=y (0 warnings) and =m (only
+the pre-existing init.h attribute pair); git apply --check rc=0 on the int87
+baseline (series + 0135 + 0136).
+
+Gate: insmod -> fbdev up -> rmmod clean, twice in a row, with and without a
+client that set MODE_ID.
+---
+ drivers/gpu/drm/exynos7580/exynos_drm7580.h   |  2 ++
+ .../gpu/drm/exynos7580/exynos_drm7580_fbdev.c | 31 ++++++++++++++-----
+ .../gpu/drm/exynos7580/exynos_drm7580_main.c  | 10 ++++++
+ 3 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580.h b/drivers/gpu/drm/exynos7580/exynos_drm7580.h
+index f8deb8d..2a09386 100644
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580.h
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580.h
+@@ -109,5 +109,7 @@ void exynos7580_vblank_irq(struct drm_device *drm, unsigned int pipe);
+ /* ---- KmsFbdev ----------------------------------------------------------- */
+ /* drm_fb_helper emulation on KMS; returns 0 or -errno. */
+ int exynos7580_fbdev_init(struct exynos7580_device *ex);
++/* Tear fb0 down (idempotent); ->unload() calls it before mode_config_cleanup. */
++void exynos7580_fbdev_fini(void);
+ 
+ #endif /* __EXYNOS_DRM7580_H__ */
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
+index eba69bb..1af627f 100644
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_fbdev.c
+@@ -53,10 +53,11 @@ MODULE_PARM_DESC(fbdev_bpp,
+ 		 "Preferred fb0 bits per pixel: 32, 24, 16, 15 or 8 (default: 32)");
+ 
+ /*
+- * Handle of the single fbdev this driver owns. The contract header
+- * deliberately has no fbdev member and no new cross-slice global may be
+- * added, so it stays file-private and is released through a devres action
+- * when the DECON device goes away.
++ * Handle of the single fbdev this driver owns. The contract header has no
++ * fbdev member, so it stays file-private; exynos7580_fbdev_fini() releases it
++ * explicitly from ->unload() (before the core frees the mode objects it points
++ * at), and the devres action is the fallback for a detach that never reaches
++ * ->unload().
+  */
+ static struct drm_fbdev_cma *exynos7580_fbdev;
+ 
+@@ -97,17 +98,33 @@ static struct fb_info *exynos7580_fb0(struct exynos7580_device *ex)
+ 	return info;
+ }
+ 
+-static void exynos7580_fbdev_devm_release(void *data)
++/*
++ * Tear /dev/fb0 and the fb helper down. Must run from ->unload() before
++ * drm_mode_config_cleanup(): drm_fbdev_cma_fini() destroys the fbdev
++ * framebuffer (drm_framebuffer_cleanup() list_del, drm_fb_helper_fini()), so
++ * running it after the core freed the CRTCs/planes/framebuffers it points at
++ * dereferences dead mode objects. Idempotent: the devres action becomes a
++ * no-op once this has cleared the handle.
++ */
++void exynos7580_fbdev_fini(void)
+ {
+-	struct drm_fbdev_cma *fbdev = data;
++	struct drm_fbdev_cma *fbdev = exynos7580_fbdev;
+ 
+-	if (exynos7580_fbdev != fbdev)
++	if (!fbdev)
+ 		return;
+ 
+ 	exynos7580_fbdev = NULL;
+ 	drm_fbdev_cma_fini(fbdev);
+ }
+ 
++static void exynos7580_fbdev_devm_release(void *data)
++{
++	if (exynos7580_fbdev != data)
++		return;
++
++	exynos7580_fbdev_fini();
++}
++
+ /*
+  * Program the CRTC so it actually scans fb0 out. drm_fb_helper only registers
+  * the fb (drm_fb_helper_single_fb_probe() stops at register_framebuffer()), and
+diff --git a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+index 33ea70d..bf81055 100644
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+@@ -415,6 +415,7 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
+ 
+ err_vblank:
+ 	decon_kms_register_vblank_cb(ex->decon, NULL, NULL);
++	exynos7580_fbdev_fini();
+ 	drm_vblank_cleanup(drm);
+ err_config:
+ 	drm_mode_config_cleanup(drm);
+@@ -433,6 +434,15 @@ static int exynos7580_unload(struct drm_device *drm)
+ 	atomic_set(&exynos7580_vblank_users, 0);
+ 	decon_kms_register_vblank_cb(ex->decon, NULL, NULL);
+ 
++	/*
++	 * fb0 first: drm_fbdev_cma_fini() destroys the fb helper and its
++	 * private framebuffer, so it must not run after
++	 * drm_mode_config_cleanup() has freed the CRTCs/planes/framebuffers it
++	 * still points at (the devres action that used to do this runs after
++	 * ->unload()).
++	 */
++	exynos7580_fbdev_fini();
++
+ 	drm_vblank_cleanup(drm);
+ 	drm_mode_config_cleanup(drm);
+ 
+-- 
+2.56.0
+
