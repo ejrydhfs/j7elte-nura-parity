@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsLocks <kmslocks@local>
+Date: Tue, 24 Nov 2026 08:00:00 
+Subject: [PATCH 0121] gpu31-kms: simplify drm_modeset_lock_all for bring-up and log it (int77)
+
+After int76 the device loads and the DECON IRQs run, but every userspace entry
+blocks in drm_modeset_lock_all (modetest drm_mode_getresources) or in
+fb_open's info->lock, i.e. a modeset lock stayed held after the initial
+modeset.
+
+  - drm_modeset_lock_all() no longer takes connection_mutex or the per-object
+    w/w crtc/plane modeset locks; it keeps mode_config.mutex + the legacy
+    crtc->mutex loop and still installs config->acquire_ctx (used by
+    drm_atomic_helper_set_config() as state->acquire_ctx; any w/w locks the
+    commit path adds to it are dropped by unlock_all()).
+    This is a bring-up simplification to revisit before multiple
+    drivers/clients (documented in the code).
+  - lock_all/unlock_all log the caller (current->comm) and the ctx pointer, so
+    an enter without a matching exit names the leaking path.
+
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -57,6 +57,7 @@
+ 	if (WARN_ON(!ctx))
+ 		return;
+ 
++	pr_info("drm_modeset_lock_all: enter by %s (ctx=%p)\n", current->comm, config->acquire_ctx);
+ 	mutex_lock(&config->mutex);
+ 
+ 	drm_modeset_acquire_init(ctx, 0);
+@@ -64,20 +65,20 @@
+ 	list_for_each_entry(crtc, &config->crtc_list, head)
+ 		mutex_lock_nest_lock(&crtc->mutex, &config->mutex);
+ 
+-	ret = drm_modeset_lock(&config->connection_mutex, ctx);
+-	if (!ret)
+-		ret = drm_modeset_lock_all_crtcs(dev, ctx);
+-	if (WARN_ON(ret)) {
+-		drm_modeset_drop_locks(ctx);
+-		drm_modeset_acquire_fini(ctx);
+-		kfree(ctx);
+-		list_for_each_entry(crtc, &config->crtc_list, head)
+-			mutex_unlock(&crtc->mutex);
+-		mutex_unlock(&config->mutex);
+-		return;
+-	}
++	/*
++	 * int77 (bring-up simplification): do NOT take connection_mutex or the
++	 * per-object w/w modeset locks here.  The 4.0 expansion is what
++	 * drm_mode_getresources blocked on after the initial modeset, and with
++	 * a single driver and the legacy crtc->mutex already held the extra
++	 * locks buy nothing.  Revisit before multiple drivers/clients.
++	 * The acquire ctx is still installed because
++	 * drm_atomic_helper_set_config() uses it as state->acquire_ctx and the
++	 * commit path adds crtc/plane w/w locks to it; unlock_all drops those.
++	 */
++	ret = 0;
+ 
+ 	WARN_ON(config->acquire_ctx);
++	pr_info("drm_modeset_lock_all: acquired by %s (config->acquire_ctx=%p)\n", current->comm, ctx);
+ 
+ 	/*
+ 	 * now we hold the locks, so now that it is safe, stash the ctx for
+@@ -98,6 +99,7 @@
+ 	struct drm_modeset_acquire_ctx *ctx = config->acquire_ctx;
+ 	struct drm_crtc *crtc;
+ 
++	pr_info("drm_modeset_unlock_all: enter by %s (config->acquire_ctx=%p)\n", current->comm, ctx);
+ 	if (WARN_ON(!ctx)) {
+ 		mutex_unlock(&config->mutex);
+ 		return;
