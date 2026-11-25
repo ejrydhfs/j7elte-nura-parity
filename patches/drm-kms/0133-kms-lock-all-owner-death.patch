@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsLockRelease <kmslr@local>
+Date: Wed, 25 Nov 2026 08:10:00 
+Subject: [PATCH 0133] gpu31-kms: release the legacy lock_all when its owner dies (int83)
+
+int81/int82 gave drm_modeset_lock_all() an owner + depth in
+drm_mode_config, and only that owner may release it:
+
+    drm_modeset_unlock_all: enter by X (owner=modetest depth=1 ctx=...)
+    drm_modeset_unlock_all: modetest is not the owner (...), not unlocking
+
+If the owning task dies between taking and releasing the locks (killed,
+oops, or simply closing the DRM file while still inside a legacy path) the
+owner pointer stays set, mode_config.mutex and the legacy crtc mutexes stay
+locked, and every later DRM ioctl blocks in mutex_lock() forever - a
+dead client is enough to wedge the whole KMS device.
+
+  - the recorded owner becomes refcounted (get_task_struct in lock_all,
+    put_task_struct in unlock_all and in the new rescue path), so it stays
+    safe to inspect and to name in logs after it dies;
+  - new drm_modeset_lock_all_force_unlock(dev, why): under a private
+    abandon mutex, if the recorded owner is the current task or is gone
+    (!pid_alive() or state == TASK_DEAD, i.e. do_exit()'s final state), it
+    logs owner/pid/state/depth/ctx loudly + backtrace, clears
+    owner/depth/acquire_ctx, drops the ctx locks, unlocks the legacy crtc
+    mutexes and mode_config.mutex, and drops the task reference;
+  - drm_modeset_lock_all() calls it before waiting when the recorded owner
+    is dead, so a later ioctl does not block on a dead task;
+  - drm_release() calls it (DRIVER_MODESET only, and only when an owner is
+    recorded) so a closing/killed client cannot leave the lock behind;
+  - drm_modeset_unlock_all() takes the abandon mutex around its final
+    clear+release, so a rescue can never observe the live owner as dead and
+    double-release; the normal depth/owner algorithm is unchanged.
+
+---
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index c28e7c4..cfcf2a0 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -39,6 +39,105 @@
+ 
+ #include "drm_crtc_internal.h"
+ 
++/*
++ * int83: serialises force-releasing the legacy lock_all.  The locks being
++ * dropped are held by a task that can no longer drop them itself, so nothing
++ * else can serialise the rescue, and two rescuers racing would unlock the
++ * same mutex twice.  Lock order: drm_modeset_unlock_all() holds the modeset
++ * locks and then takes this mutex; the rescue path takes this mutex and only
++ * *releases* mode_config.mutex, so it never waits for it and cannot invert the
++ * order.
++ */
++static DEFINE_MUTEX(drm_lock_all_abandon_mutex);
++
++/*
++ * int83: a legacy lock_all owner that can no longer run will never reach
++ * drm_modeset_unlock_all().  pid_alive() stays true up to and including the
++ * zombie state, so the task state has to be checked as well: do_exit() sets
++ * TASK_DEAD before its final schedule(), after which the task never runs
++ * again.  The recorded owner is refcounted, so this dereference is safe.
++ */
++static bool drm_lock_all_owner_gone(struct task_struct *owner)
++{
++	return !pid_alive(owner) || owner->state == TASK_DEAD;
++}
++
++/*
++ * int83: drop the legacy lock_all on behalf of @owner, which is either the
++ * current task (closing the client that took the locks) or a task that is
++ * gone.  The caller holds drm_lock_all_abandon_mutex.  @owner holds
++ * mode_config.mutex, the legacy crtc mutexes and whatever w/w locks the
++ * commit path added to the ctx, so this releases exactly what
++ * drm_modeset_unlock_all() would have.
++ */
++static void drm_lock_all_force_release(struct drm_device *dev,
++				       struct task_struct *owner,
++				       const char *why)
++{
++	struct drm_mode_config *config = &dev->mode_config;
++	struct drm_modeset_acquire_ctx *ctx = config->acquire_ctx;
++	struct drm_crtc *crtc;
++
++	pr_err("drm_modeset_lock_all_force_release: owner %s/%d state=%ld\n",
++	       owner->comm, owner->pid, owner->state);
++	pr_err("drm_modeset_lock_all_force_release: depth=%u ctx=%p (%s) by %s/%d\n",
++	       config->lock_all_depth, ctx, why, current->comm, current->pid);
++	pr_err("drm_modeset_lock_all_force_release: forcing unlock of the legacy modeset locks\n");
++	dump_stack();
++
++	config->lock_all_owner = NULL;
++	config->lock_all_depth = 0;
++	config->acquire_ctx = NULL;
++	if (ctx) {
++		drm_modeset_drop_locks(ctx);
++		drm_modeset_acquire_fini(ctx);
++		kfree(ctx);
++	} else {
++		pr_err("drm_modeset_lock_all_force_release: no ctx to drop\n");
++	}
++
++	list_for_each_entry(crtc, &config->crtc_list, head)
++		mutex_unlock(&crtc->mutex);
++
++	mutex_unlock(&config->mutex);
++	put_task_struct(owner);
++	pr_err("drm_modeset_lock_all_force_release: released by %s\n", current->comm);
++}
++
++/**
++ * drm_modeset_lock_all_force_unlock - drop a stranded legacy lock_all
++ * @dev: drm device
++ * @why: caller-supplied reason, only used for the log
++ *
++ * int83: if the task owning the legacy drm_modeset_lock_all() locks dies, or
++ * closes its DRM file, before drm_modeset_unlock_all(), those locks are never
++ * released and every later DRM ioctl blocks forever.  This drops them on its
++ * behalf.  It is a no-op unless the recorded owner is the current task or can
++ * no longer run, so the normal release path is not affected.
++ */
++void drm_modeset_lock_all_force_unlock(struct drm_device *dev, const char *why)
++{
++	struct drm_mode_config *config = &dev->mode_config;
++	struct task_struct *owner;
++
++	mutex_lock(&drm_lock_all_abandon_mutex);
++	owner = config->lock_all_owner;
++	if (!owner) {
++		mutex_unlock(&drm_lock_all_abandon_mutex);
++		return;
++	}
++	if (owner != current && !drm_lock_all_owner_gone(owner)) {
++		/* Still alive and responsible for its own unlock_all. */
++		pr_debug("drm_modeset_lock_all_force_unlock: owner %s/%d alive, not forcing (%s)\n",
++			 owner->comm, owner->pid, why);
++		mutex_unlock(&drm_lock_all_abandon_mutex);
++		return;
++	}
++	drm_lock_all_force_release(dev, owner, why);
++	mutex_unlock(&drm_lock_all_abandon_mutex);
++}
++EXPORT_SYMBOL(drm_modeset_lock_all_force_unlock);
++
+ /**
+  * drm_modeset_lock_all - take all modeset locks
+  * @dev: drm device
+@@ -80,6 +179,16 @@ void drm_modeset_lock_all(struct drm_device *dev)
+ 	if (WARN_ON(!ctx))
+ 		return;
+ 
++	/*
++	 * int83: only the owner releases these locks, in
++	 * drm_modeset_unlock_all().  A task that died while owning them never
++	 * gets there, so the mutex_lock() below would block every later ioctl
++	 * forever.  Check the recorded (refcounted) owner before waiting.
++	 */
++	if (config->lock_all_owner && config->lock_all_owner != current &&
++	    drm_lock_all_owner_gone(config->lock_all_owner))
++		drm_modeset_lock_all_force_unlock(dev, "owner task died");
++
+ 	mutex_lock(&config->mutex);
+ 
+ 	/* Another task may have become the owner while we waited. */
+@@ -95,6 +204,12 @@ void drm_modeset_lock_all(struct drm_device *dev)
+ 	list_for_each_entry(crtc, &config->crtc_list, head)
+ 		mutex_lock_nest_lock(&crtc->mutex, &config->mutex);
+ 
++	/*
++	 * int83: hold a reference so a recorded owner stays safe to inspect
++	 * (and to name in logs) after it dies; dropped in unlock_all and in
++	 * drm_lock_all_force_release().
++	 */
++	get_task_struct(current);
+ 	config->lock_all_owner = current;
+ 	config->lock_all_depth = 1;
+ 	config->acquire_ctx = ctx;
+@@ -132,6 +247,22 @@ void drm_modeset_unlock_all(struct drm_device *dev)
+ 		return;
+ 	}
+ 
++	/*
++	 * int83: take the abandon mutex before clearing the owner, so a
++	 * concurrent drm_modeset_lock_all_force_unlock() either sees the owner
++	 * still alive (and backs off) or sees the field cleared (and does
++	 * nothing); it can never observe this task as dead while it is still
++	 * here and double-release.
++	 */
++	mutex_lock(&drm_lock_all_abandon_mutex);
++	if (config->lock_all_owner != current) {
++		/* The rescue path got here first. */
++		mutex_unlock(&drm_lock_all_abandon_mutex);
++		return;
++	}
++
++	/* int83: drop the reference taken by drm_modeset_lock_all(). */
++	put_task_struct(config->lock_all_owner);
+ 	config->lock_all_owner = NULL;
+ 	config->acquire_ctx = NULL;
+ 	if (ctx) {
+@@ -146,6 +277,7 @@ void drm_modeset_unlock_all(struct drm_device *dev)
+ 		mutex_unlock(&crtc->mutex);
+ 
+ 	mutex_unlock(&config->mutex);
++	mutex_unlock(&drm_lock_all_abandon_mutex);
+ 	pr_info("drm_modeset_unlock_all: released by %s\n", current->comm);
+ }
+ EXPORT_SYMBOL(drm_modeset_unlock_all);
+diff --git a/drivers/gpu/drm/drm_fops.c b/drivers/gpu/drm/drm_fops.c
+index 429e07d..b8fbe68 100644
+--- a/drivers/gpu/drm/drm_fops.c
++++ b/drivers/gpu/drm/drm_fops.c
+@@ -441,6 +441,16 @@ int drm_release(struct inode *inode, struct file *filp)
+ 
+ 	mutex_lock(&drm_global_mutex);
+ 
++	/*
++	 * int83: the legacy lock_all is released by the task that took it.  If
++	 * the client closing its file is that task (or the recorded owner is
++	 * already dead), release the locks here instead of leaving every later
++	 * ioctl blocked forever.  No-op in the normal case.
++	 */
++	if (drm_core_check_feature(dev, DRIVER_MODESET) &&
++	    dev->mode_config.lock_all_owner)
++		drm_modeset_lock_all_force_unlock(dev, "client file release");
++
+ 	DRM_DEBUG("open_count = %d\n", dev->open_count);
+ 
+ 	if (dev->driver->preclose)
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 9900468..20542b9 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -995,7 +995,7 @@ struct drm_mode_config {
+ 	struct drm_modeset_lock connection_mutex; /* protects connector->encoder and encoder->crtc links */
+ 	struct drm_modeset_acquire_ctx *acquire_ctx; /* for legacy _lock_all() / _unlock_all() */
+ 	unsigned int lock_all_depth; /* int81: legacy lock_all nesting depth */
+-	struct task_struct *lock_all_owner; /* int81: task owning the legacy locks */
++	struct task_struct *lock_all_owner; /* int81/int83: refcounted owner of the legacy locks */
+ 	struct mutex idr_mutex; /* for IDR management */
+ 	struct idr crtc_idr; /* use this idr for all IDs, fb, crtc, connector, modes - just makes life easier */
+ 	/* this is limited to one for now */
+@@ -1179,6 +1179,8 @@ struct drm_prop_enum_list {
+ 
+ extern void drm_modeset_lock_all(struct drm_device *dev);
+ extern void drm_modeset_unlock_all(struct drm_device *dev);
++extern void drm_modeset_lock_all_force_unlock(struct drm_device *dev,
++					      const char *why);
+ extern void drm_warn_on_modeset_not_all_locked(struct drm_device *dev);
+ 
+ extern int drm_crtc_init(struct drm_device *dev,
