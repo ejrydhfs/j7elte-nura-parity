@@ -1,0 +1,3 @@
+# int84: render node in the KMS image (panfrost7580, renamed to "panfrost").
+# Built in so the KMS image keeps exactly two loadable objects.
+CONFIG_DRM_PANFROST7580=y

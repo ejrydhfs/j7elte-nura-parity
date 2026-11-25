@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsPrimeHooks <kmsph@local>
+Date: Tue, 24 Nov 2026 22:00:00 
+Subject: [PATCH 0136] gpu31-kms: card0 PRIME ioctl hooks (int84, module-only)
+
+DRM_CAP_PRIME reported 0x0 on int83 although the driver sets DRIVER_PRIME and
+.gem_prime_import/.gem_prime_export: the core also requires
+.prime_handle_to_fd/.prime_fd_to_handle on the card0 drm_driver for the ioctls
+(DRM_IOCTL_PRIME_HANDLE_TO_FD / FD_TO_HANDLE) and for the capability mask.
+
+kmsro's first allocation step is drmPrimeHandleToFD(card0, dumb_handle), so
+without these it fails even when the render node exists.  Wire the two generic
+helpers next to the existing import/export; DRM_CAP_PRIME then reads 0x3.
+
+dmabuf/0002 and iommu-dma/0001 are NOT used: they target the pre-0200
+exynos7580_drm.c filename.
+
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_main.c
+@@ -466,6 +466,14 @@
+ 	.gem_prime_vmap		= exynos7580_gem_prime_vmap,
+ 	.gem_prime_vunmap	= exynos7580_gem_prime_vunmap,
+ 	.gem_prime_import	= exynos7580_gem_prime_import,
++	/*
++	 * int84: DRM_PRIME alone does not fill DRM_CAP_PRIME; kmsro's first
++	 * allocation step is drmPrimeHandleToFD(card0, dumb_handle), so the
++	 * card0 drm_driver needs the two prime ioctl hooks as well (they were
++	 * missing, hence DRM_CAP_PRIME=0x0 on int83).
++	 */
++	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
++	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
+ 	.dumb_create		= drm_gem_cma_dumb_create,
+ 	.dumb_map_offset	= drm_gem_cma_dumb_map_offset,
+ 	.dumb_destroy		= drm_gem_cma_dumb_destroy,
