@@ -355,7 +355,7 @@ no `card0`. kmsro needs both on one kernel. So the card0 rows must run on a
    `PAN_MESA_DEBUG` only change *logging* or the primary driver name; none of
    them can rename the render device (rows 2–9).
 
-Expected result after (1) + (3), with `EGL_PLATFORM=gbm`:
+Expected result after (1) + (3) + (4) + (5), with `EGL_PLATFORM=gbm`:
 
 ```
 kmscube -D /dev/dri/card0
@@ -365,7 +365,8 @@ kmscube -D /dev/dri/card0
 
 and on `card0` the traces to look for are `CREATE_DUMB` + `prime_handle_to_fd`
 (renderonly's allocation) — not `fd_to_handle` (see §3.3). The page flip still
-carries no fb until the int83 fix lands; that is a separate defect.
+carries no fb until the int83 page-flip fix (`0134`) is verified on hardware;
+that is a separate defect.
 
 Longer term, for Weston/KWin on the same path: add `IN_FORMATS` +
 `DRM_MODE_FB_MODIFIERS`/`DRM_FORMAT_MOD_LINEAR` acceptance to
