@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsLinkFix <kms-link@local>
+Date: Tue, 25 Nov 2026 12:00:00
+Subject: [PATCH 0141] gpu31-kms: stop a stale needs_full_modeset forcing every commit
+
+int90 proved KWin's -EINVAL:
+
+  drm_atomic_check_only: FAIL crtc=19 requires full modeset
+      (mode_changed=1 active_changed=0) but allow_modeset=0
+
+`exynos7580_crtc_atomic_check()` copied `crtc_link.needs_full_modeset` into
+`state->mode_changed` on every commit.  That flag is set by disable_link() and
+in crtc_init(), but only cleared in crtc->mode_set() -- which the atomic
+commit tail reaches only for commits that are already full modesets.  Once it
+was set, every plane-only commit was turned into a full modeset and
+drm_atomic_check_only() rejected it when the client did not pass
+DRM_MODE_ATOMIC_ALLOW_MODESET (KWin's flips).
+
+- enable_link() now clears needs_full_modeset whenever it leaves/returns with
+  the link on, so a successful enable (including the atomic_commit() path that
+  never calls mode_set()) cannot leave the flag stale; both the early
+  already-on return and the completion path log the clear.
+- atomic_check() derives the decision from the actual transition:
+  activating (inactive -> active; the commit calls enable_link anyway),
+  mode_changed/active_changed (real full modeset), or a genuinely off link
+  while staying active.  Only in the last case may it force mode_changed, and
+  only with ALLOW_MODESET; a plane-only commit with the link off is rejected
+  with a named `link_off` log instead of silently programming a dead pipe.
+  A link that is on can never be forced by a stale flag.
+- One log line per check: crtc, needs_full_modeset, link_on, activating,
+  mode_changed, active_changed, allow_modeset, resulting modeset and the
+  forced reason.
+
+The first enable after probe/resume still runs the full enable link sequence
+(activation path), which is what the earlier planes/power ordering expects.
+
+---
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -108,6 +108,13 @@
+ 	mutex_lock(&crtc_lock);
+ 
+ 	if (crtc_link.on) {
++		/* The link is up, so whatever asked for a full modeset has been
++		 * satisfied already; a stale flag must not leak into the next
++		 * atomic_check(). */
++		if (crtc_link.needs_full_modeset) {
++			pr_info("exynos7580_crtc_enable_link: link already on, clearing stale needs_full_modeset\n");
++			crtc_link.needs_full_modeset = false;
++		}
+ 		mutex_unlock(&crtc_lock);
+ 		return 0;
+ 	}
+@@ -135,10 +142,15 @@
+ 	}
+ 
+ 	crtc_link.on = true;
++	/* DispPower 5.1 is satisfied: DECON was re-initialised by
++	 * decon_kms_enable() above, so the next commit no longer needs a full
++	 * modeset.  Clearing here (and not only in crtc->mode_set) also covers
++	 * the atomic_commit() enable path, which never calls mode_set(). */
++	crtc_link.needs_full_modeset = false;
+ 
+ 	mutex_unlock(&crtc_lock);
+ 
+-	DRM_DEBUG_KMS("DECON link enabled\n");
++	pr_info("exynos7580_crtc_enable_link: link on, needs_full_modeset cleared\n");
+ 
+ 	return 0;
+ }
+@@ -315,23 +327,54 @@
+ 	if (!state->active)
+ 		return 0;
+ 
+-	modeset = state->mode_changed || state->active_changed;
+-
+ 	/*
+-	 * DispPower 5.1: nothing saves DECON register state across a
+-	 * pm_runtime cycle, so after a link-off every commit must be a full
+-	 * modeset.  Forcing mode_changed here makes the core reject a
+-	 * plane-only commit that does not carry DRM_MODE_ATOMIC_ALLOW_MODESET
+-	 * (drm_atomic_check_only()) and makes crtc_set_mode() re-run
+-	 * mode_set() when it does, which re-programs the whole pipe.
++	 * int91: the link flags are only a hint for THIS commit.  The old code
++	 * forced mode_changed whenever needs_full_modeset was set and never
++	 * cleared it outside crtc->mode_set(), so a stale flag turned every
++	 * later plane-only commit into a full modeset and drm_atomic_check_only()
++	 * rejected it with -EINVAL when the client (KWin) did not pass
++	 * DRM_MODE_ATOMIC_ALLOW_MODESET.
++	 *
++	 * Decide from the real transition:
++	 *  - activating (inactive -> active): the commit already calls
++	 *    enable_link() (exynos7580_crtc_enabling()), so no forcing;
++	 *  - mode/active change: already a full modeset;
++	 *  - link really off while staying active (disable/pm cycle): DECON
++	 *    registers are gone, so this commit must re-init the pipe.  Only
++	 *    legal with ALLOW_MODESET; without it the commit cannot be served
++	 *    safely and is rejected (the log names link_off);
++	 *  - link on: a stale needs_full_modeset cannot force anything; the
++	 *    next enable_link()/mode_set() clears it.
+ 	 */
+-	mutex_lock(&crtc_lock);
+-	if (crtc_link.needs_full_modeset && !state->mode_changed)
+-		state->mode_changed = true;
+-	mutex_unlock(&crtc_lock);
++	{
++		bool link_on, needs, activating, forced = false;
++
++		mutex_lock(&crtc_lock);
++		link_on = crtc_link.on;
++		needs = crtc_link.needs_full_modeset;
++		mutex_unlock(&crtc_lock);
++
++		activating = state->active && state->enable &&
++			     (!crtc->state || !crtc->state->active);
++		modeset = state->mode_changed || state->active_changed ||
++			  activating;
+ 
+-	if (state->mode_changed)
+-		modeset = true;
++		if (!modeset && needs && !link_on) {
++			if (!astate->allow_modeset) {
++				pr_info("[CRTC:%d] atomic_check: link_off plane-only commit without ALLOW_MODESET -> -EINVAL (needs_full_modeset=%d link_on=%d)\n",
++					crtc->base.id, needs, link_on);
++				return -EINVAL;
++			}
++			state->mode_changed = true;
++			modeset = true;
++			forced = true;
++		}
++		pr_info("[CRTC:%d] atomic_check: needs_full_modeset=%d link_on=%d activating=%d mode_changed=%d active_changed=%d allow_modeset=%d modeset=%d%s\n",
++			crtc->base.id, needs, link_on, activating,
++			state->mode_changed, state->active_changed,
++			astate->allow_modeset, modeset,
++			forced ? " (forced: link_off)" : "");
++	}
+ 
+ 	/*
+ 	 * DeconPlane commits the frame from its last plane hook, so a commit
