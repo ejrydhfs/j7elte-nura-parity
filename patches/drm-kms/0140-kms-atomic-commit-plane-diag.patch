@@ -1,0 +1,420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KmsCommitDiag <kms-diag@local>
+Date: Tue, 25 Nov 2026 11:30:00
+Subject: [PATCH 0140] gpu31-kms: instrument the atomic commit/check path (int90)
+
+KWin initialises (AMS, planes, GPU, GL, output) and then its first atomic
+commit fails with EINVAL; the only visible line is the pre-swap state dump.
+This patch is diagnostic only (no behaviour change) and closes every gap
+between the ATOMIC ioctl and the first DECON register write:
+
+- core `drm_atomic_plane_check()`: print the whole incoming plane state
+  (plane id, crtc, fb, format, src 16.16, dst) and every rejection reason with
+  values (both-set rule, possible_crtcs mask, format table, coordinate
+  overflow, source outside fb).  These were DRM_DEBUG_KMS, invisible at the
+  production log level.
+- core `drm_atomic_crtc_check()`: print active/enable/mode_changed/
+  active_changed and the active-without-enable rejection.
+- `drm_atomic_check_only()`: print the driver's atomic_check rc together with
+  allow_modeset, and the "requires full modeset but allow_modeset=0" rejection
+  with the CRTC's changed bits (the ATOMIC flags KWin passed are the likely
+  EINVAL source).
+- `exynos7580_atomic_check()`: dump every plane/crtc state in the incoming
+  changeset before and after `drm_atomic_helper_check()`.
+- `exynos7580_atomic_commit()`: stage logs for enable_link, prepare_planes,
+  swap_state and commit_tail, plus the full state dump on entry and on a
+  prepare_planes failure.
+- `exynos7580_plane_atomic_check()`: print the state, max_win, the
+  state_to_win rc and decoded destination; every `exynos7580_check_rect()`
+  rule now logs its failing values; the fractional 16.16 source rule logs the
+  raw values.
+- `exynos7580_fb_scanout()`: log fb/plane/format/pitch, bad fb/plane and the
+  final rc/address.
+
+Runtime: KWin's failing commit produces either a core rejection line (with the
+exact rule and CRTC bits) or the driver stage/plane line, which identifies the
+failing check and the values to relax.  All prints are one line per
+commit/plane and removable in a single hunk group.
+
+---
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -406,9 +406,12 @@
+ 	 * TODO: Add generic modeset state checks once we support those.
+ 	 */
+ 
++	pr_info("drm_atomic_crtc_check: crtc=%d active=%d enable=%d mode_changed=%d active_changed=%d\n",
++		crtc->base.id, state->active, state->enable,
++		state->mode_changed, state->active_changed);
+ 	if (state->active && !state->enable) {
+-		DRM_DEBUG_KMS("[CRTC:%d] active without enabled\n",
+-			      crtc->base.id);
++		pr_info("drm_atomic_crtc_check: FAIL crtc=%d active=1 enable=0\n",
++			crtc->base.id);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -587,12 +590,22 @@
+ 	unsigned int fb_width, fb_height;
+ 	unsigned int i;
+ 
++	/* int90 diagnostic: print the whole incoming plane state before any
++	 * core rule runs, so a rejected commit is fully described. */
++	pr_info("drm_atomic_plane_check: plane=%d crtc=%p fb=%p fmt=0x%08x src=(0x%x,0x%x,0x%x,0x%x) dst=%ux%u%+d%+d\n",
++		plane->base.id, state->crtc, state->fb,
++		state->fb ? state->fb->pixel_format : 0,
++		state->src_x, state->src_y, state->src_w, state->src_h,
++		state->crtc_w, state->crtc_h, state->crtc_x, state->crtc_y);
++
+ 	/* either *both* CRTC and FB must be set, or neither */
+ 	if (WARN_ON(state->crtc && !state->fb)) {
+-		DRM_DEBUG_KMS("CRTC set but no FB\n");
++		pr_info("drm_atomic_plane_check: FAIL plane=%d CRTC set but no FB\n",
++			plane->base.id);
+ 		return -EINVAL;
+ 	} else if (WARN_ON(state->fb && !state->crtc)) {
+-		DRM_DEBUG_KMS("FB set but no CRTC\n");
++		pr_info("drm_atomic_plane_check: FAIL plane=%d FB set but no CRTC\n",
++			plane->base.id);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -602,7 +615,8 @@
+ 
+ 	/* Check whether this plane is usable on this CRTC */
+ 	if (!(plane->possible_crtcs & drm_crtc_mask(state->crtc))) {
+-		DRM_DEBUG_KMS("Invalid crtc for plane\n");
++		pr_info("drm_atomic_plane_check: FAIL plane=%d crtc not in possible_crtcs=0x%x\n",
++			plane->base.id, plane->possible_crtcs);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -611,8 +625,9 @@
+ 		if (state->fb->pixel_format == plane->format_types[i])
+ 			break;
+ 	if (i == plane->format_count) {
+-		DRM_DEBUG_KMS("Invalid pixel format 0x%08x\n",
+-			      state->fb->pixel_format);
++		pr_info("drm_atomic_plane_check: FAIL plane=%d fmt=0x%08x not in %d formats\n",
++			plane->base.id, state->fb->pixel_format,
++			plane->format_count);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -621,9 +636,9 @@
+ 	    state->crtc_x > INT_MAX - (int32_t) state->crtc_w ||
+ 	    state->crtc_h > INT_MAX ||
+ 	    state->crtc_y > INT_MAX - (int32_t) state->crtc_h) {
+-		DRM_DEBUG_KMS("Invalid CRTC coordinates %ux%u+%d+%d\n",
+-			      state->crtc_w, state->crtc_h,
+-			      state->crtc_x, state->crtc_y);
++		pr_info("drm_atomic_plane_check: FAIL plane=%d dst=%ux%u%+d%+d overflows\n",
++			plane->base.id, state->crtc_w, state->crtc_h,
++			state->crtc_x, state->crtc_y);
+ 		return -ERANGE;
+ 	}
+ 
+@@ -635,12 +650,10 @@
+ 	    state->src_x > fb_width - state->src_w ||
+ 	    state->src_h > fb_height ||
+ 	    state->src_y > fb_height - state->src_h) {
+-		DRM_DEBUG_KMS("Invalid source coordinates "
+-			      "%u.%06ux%u.%06u+%u.%06u+%u.%06u\n",
+-			      state->src_w >> 16, ((state->src_w & 0xffff) * 15625) >> 10,
+-			      state->src_h >> 16, ((state->src_h & 0xffff) * 15625) >> 10,
+-			      state->src_x >> 16, ((state->src_x & 0xffff) * 15625) >> 10,
+-			      state->src_y >> 16, ((state->src_y & 0xffff) * 15625) >> 10);
++		pr_info("drm_atomic_plane_check: FAIL plane=%d src outside fb %ux%u: src=0x%x,0x%x,0x%x,0x%x\n",
++			plane->base.id, state->fb->width, state->fb->height,
++			state->src_x, state->src_y,
++			state->src_w, state->src_h);
+ 		return -ENOSPC;
+ 	}
+ 
+@@ -1095,8 +1108,11 @@
+ 		}
+ 	}
+ 
+-	if (config->funcs->atomic_check)
++	if (config->funcs->atomic_check) {
+ 		ret = config->funcs->atomic_check(state->dev, state);
++		pr_info("drm_atomic_check_only: driver atomic_check rc=%d allow_modeset=%d\n",
++			ret, state->allow_modeset);
++	}
+ 
+ 	if (!state->allow_modeset) {
+ 		for (i = 0; i < ncrtcs; i++) {
+@@ -1108,8 +1124,10 @@
+ 
+ 			if (crtc_state->mode_changed ||
+ 			    crtc_state->active_changed) {
+-				DRM_DEBUG_KMS("[CRTC:%d] requires full modeset\n",
+-					      crtc->base.id);
++				pr_info("drm_atomic_check_only: FAIL crtc=%d requires full modeset (mode_changed=%d active_changed=%d) but allow_modeset=0\n",
++					crtc->base.id,
++					crtc_state->mode_changed,
++					crtc_state->active_changed);
+ 				return -EINVAL;
+ 			}
+ 		}
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_crtc.c
+@@ -579,10 +579,53 @@
+  * fb_create).  Reported to the integration seat; no header edit was made.
+  */
+ 
++/* int90 diagnostic: one line per plane/crtc in a commit state. */
++static void exynos7580_dump_atomic_state(const char *where,
++					 struct drm_device *drm,
++					 struct drm_atomic_state *state)
++{
++	int i;
++
++	pr_info("exynos7580_atomic[%s]: state=%p allow_modeset=%d nplanes=%d ncrtcs=%d by %s\n",
++		where, state, state->allow_modeset,
++		drm->mode_config.num_total_plane, drm->mode_config.num_crtc,
++		current->comm);
++	for (i = 0; i < drm->mode_config.num_total_plane; i++) {
++		struct drm_plane *p = state->planes[i];
++		struct drm_plane_state *ps = state->plane_states[i];
++
++		if (!p)
++			continue;
++		pr_info("  plane[%d] id=%d crtc=%p fb=%p fmt=0x%08x src=(0x%x,0x%x,0x%x,0x%x) dst=%ux%u%+d%+d\n",
++			i, p->base.id, ps->crtc, ps->fb,
++			ps->fb ? ps->fb->pixel_format : 0,
++			ps->src_x, ps->src_y, ps->src_w, ps->src_h,
++			ps->crtc_w, ps->crtc_h, ps->crtc_x, ps->crtc_y);
++	}
++	for (i = 0; i < drm->mode_config.num_crtc; i++) {
++		struct drm_crtc *c = state->crtcs[i];
++		struct drm_crtc_state *cs = state->crtc_states[i];
++
++		if (!c)
++			continue;
++		pr_info("  crtc[%d] id=%d active=%d enable=%d mode_changed=%d active_changed=%d planes_changed=%d mode_blob=%p\n",
++			i, c->base.id, cs->active, cs->enable,
++			cs->mode_changed, cs->active_changed,
++			cs->planes_changed, cs->mode_blob);
++	}
++}
++
+ int exynos7580_atomic_check(struct drm_device *drm,
+ 			    struct drm_atomic_state *state)
+ {
+-	return drm_atomic_helper_check(drm, state);
++	int ret;
++
++	exynos7580_dump_atomic_state("check-enter", drm, state);
++	ret = drm_atomic_helper_check(drm, state);
++	pr_info("exynos7580_atomic_check: drm_atomic_helper_check rc=%d\n", ret);
++	if (ret)
++		exynos7580_dump_atomic_state("check-failed", drm, state);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(exynos7580_atomic_check);
+ 
+@@ -595,6 +638,8 @@
+ 	if (WARN_ON(!ex || !ex->decon))
+ 		return -ENODEV;
+ 
++	exynos7580_dump_atomic_state("commit-enter", drm, state);
++
+ 	/*
+ 	 * Step (a): bring the display up before the software state is swapped,
+ 	 * so a failing DSI link / panel init aborts the commit cleanly and
+@@ -610,6 +655,7 @@
+ 			continue;
+ 
+ 		ret = exynos7580_crtc_enable_link(ex);
++		pr_info("exynos7580_atomic_commit: enable_link rc=%d\n", ret);
+ 		if (ret) {
+ 			DRM_ERROR("commit aborted: DECON/DSI bring-up failed: %d\n",
+ 				  ret);
+@@ -619,11 +665,15 @@
+ 
+ 	/* Step (b) */
+ 	ret = drm_atomic_helper_prepare_planes(drm, state);
+-	if (ret)
++	pr_info("exynos7580_atomic_commit: prepare_planes rc=%d\n", ret);
++	if (ret) {
++		exynos7580_dump_atomic_state("prepare-failed", drm, state);
+ 		return ret;
++	}
+ 
+ 	/* Step (c) */
+ 	drm_atomic_helper_swap_state(drm, state);
++	pr_info("exynos7580_atomic_commit: swap_state done\n");
+ 
+ 	/*
+ 	 * Step (d): KmsFence's complete tail (pre/commit/post planes, flip event
+@@ -642,6 +692,7 @@
+ 				     struct drm_crtc, head)->primary->state->fb : NULL : NULL,
+ 		current->comm);
+ 	exynos7580_commit_tail(state);
++	pr_info("exynos7580_atomic_commit: commit_tail done\n");
+ 
+ 	/*
+ 	 * int82: the 3.10 legacy fields are still consulted by the core:
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_plane.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_plane.c
+@@ -136,33 +136,53 @@
+ {
+ 	unsigned int align, width;
+ 
+-	if (src->w == 0 || src->h == 0 || dst->w == 0 || dst->h == 0)
++	if (src->w == 0 || src->h == 0 || dst->w == 0 || dst->h == 0) {
++		pr_info("exynos7580_check_rect: FAIL zero size src=%ux%u dst=%ux%u\n",
++			src->w, src->h, dst->w, dst->h);
+ 		return -EINVAL;
+-	if (src->x < 0 || src->y < 0 || dst->x < 0 || dst->y < 0)
++	}
++	if (src->x < 0 || src->y < 0 || dst->x < 0 || dst->y < 0) {
++		pr_info("exynos7580_check_rect: FAIL negative pos src=%+d%+d dst=%+d%+d\n",
++			src->x, src->y, dst->x, dst->y);
+ 		return -EINVAL;
++	}
+ 
+ 	/* The window engine cannot scale. */
+-	if (src->w != dst->w || src->h != dst->h)
++	if (src->w != dst->w || src->h != dst->h) {
++		pr_info("exynos7580_check_rect: FAIL scaling src=%ux%u dst=%ux%u\n",
++			src->w, src->h, dst->w, dst->h);
+ 		return -EINVAL;
++	}
+ 
+-	if (src->f_w == 0 || src->f_h == 0)
+-		return -EINVAL;
+-	if (src->f_w < (u32)src->x + src->w)
++	if (src->f_w == 0 || src->f_h == 0) {
++		pr_info("exynos7580_check_rect: FAIL zero stride f_w=%u f_h=%u\n",
++			src->f_w, src->f_h);
+ 		return -EINVAL;
+-	if (src->f_h < (u32)src->y + src->h)
+-		return -EINVAL;
+-	if (src->f_w < dst->w)
++	}
++	if (src->f_w < (u32)src->x + src->w ||
++	    src->f_h < (u32)src->y + src->h ||
++	    src->f_w < dst->w) {
++		pr_info("exynos7580_check_rect: FAIL outside fb src=%+d%+d %ux%u f=%ux%u dst_w=%u\n",
++			src->x, src->y, src->w, src->h,
++			src->f_w, src->f_h, dst->w);
+ 		return -EINVAL;
++	}
+ 
+ 	if (fmt->bpp > 12) {
+ 		width = dst->w * fmt->bpp / 8;
+-		if (width < 128)
++		if (width < 128) {
++			pr_info("exynos7580_check_rect: FAIL width %u B < 128 (w=%u bpp=%u)\n",
++				width, dst->w, fmt->bpp);
+ 			return -EINVAL;
++		}
+ 
+ 		align = 32 / fmt->bpp;
+ 		if (align > 1 &&
+-		    ((dst->x % align) || ((dst->x + dst->w) % align)))
++		    ((dst->x % align) || ((dst->x + dst->w) % align))) {
++			pr_info("exynos7580_check_rect: FAIL x align=%u x=%d w=%u\n",
++				align, dst->x, dst->w);
+ 			return -EINVAL;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -214,8 +234,12 @@
+ 	}
+ 
+ 	/* 16.16 fixed point: no fractional source position or size. */
+-	if ((state->src_x | state->src_y | state->src_w | state->src_h) & 0xffff)
++	if ((state->src_x | state->src_y | state->src_w | state->src_h) & 0xffff) {
++		pr_info("[PLANE:%d] FAIL fractional src=0x%x,0x%x,0x%x,0x%x (16.16)\n",
++			state->plane->base.id, state->src_x, state->src_y,
++			state->src_w, state->src_h);
+ 		return -EINVAL;
++	}
+ 
+ 	win->state = DECON_KMS_WIN_BUFFER;
+ 	win->fourcc = fb->pixel_format;
+@@ -381,20 +405,42 @@
+ 	struct decon_kms_win win;
+ 	unsigned int idx = exynos7580_plane_index(ex, plane);
+ 
++	pr_info("exynos7580_plane_atomic_check: plane=%d idx=%u crtc=%p fb=%p fmt=0x%08x src=(0x%x,0x%x,0x%x,0x%x) dst=%ux%u%+d%+d pitch=%u max_win=%u\n",
++		plane->base.id, idx, state->crtc, state->fb,
++		state->fb ? state->fb->pixel_format : 0,
++		state->src_x, state->src_y, state->src_w, state->src_h,
++		state->crtc_w, state->crtc_h, state->crtc_x, state->crtc_y,
++		state->fb ? state->fb->pitches[0] : 0,
++		caps ? caps->max_win : 0);
++
+ 	if (!state->crtc && !state->fb)
+ 		return 0;
+-	if (!state->crtc || !state->fb)
++	if (!state->crtc || !state->fb) {
++		pr_info("exynos7580_plane_atomic_check: FAIL plane=%d crtc/fb half-set crtc=%p fb=%p\n",
++			plane->base.id, state->crtc, state->fb);
+ 		return -EINVAL;
++	}
+ 
+ 	/*
+ 	 * Window shortage: the plane exists but the vendor instance has fewer
+ 	 * windows than the DT advertised.  -ENOSPC makes KWin drop the plane
+ 	 * when it tests the atomic commit.
+ 	 */
+-	if (!caps || idx >= caps->max_win)
++	if (!caps || idx >= caps->max_win) {
++		pr_warn("exynos7580_plane_atomic_check: plane=%d idx=%u beyond max_win=%u -> -ENOSPC\n",
++			plane->base.id, idx, caps ? caps->max_win : 0);
+ 		return -ENOSPC;
++	}
+ 
+-	return exynos7580_plane_state_to_win(ex, idx, state, &win, false);
++	{
++		int ret = exynos7580_plane_state_to_win(ex, idx, state, &win,
++							false);
++
++		pr_info("exynos7580_plane_atomic_check: plane=%d state_to_win rc=%d win=%ux%u%+d%+d\n",
++			plane->base.id, ret, win.dst.w, win.dst.h,
++			win.dst.x, win.dst.y);
++		return ret;
++	}
+ }
+ 
+ int exynos7580_plane_atomic_update(struct drm_plane *plane,
+--- a/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
++++ b/drivers/gpu/drm/exynos7580/exynos_drm7580_dmabuf.c
+@@ -464,15 +464,29 @@
+ int exynos7580_fb_scanout(struct drm_framebuffer *fb, unsigned int plane,
+ 			  dma_addr_t *addr)
+ {
++	int ret;
++
++	pr_info("exynos7580_fb_scanout: fb=%p plane=%u fmt=0x%08x %ux%u pitch=%u\n",
++		fb, plane, fb ? fb->pixel_format : 0,
++		fb ? fb->width : 0, fb ? fb->height : 0,
++		(fb && plane < 4) ? fb->pitches[plane] : 0);
++
+ 	if (!fb || !addr)
+ 		return -EINVAL;
+-	if (plane >= 4 || !fb->pitches[plane])
++	if (plane >= 4 || !fb->pitches[plane]) {
++		pr_info("exynos7580_fb_scanout: FAIL bad fb/plane=%u pitch=%u\n",
++			plane, fb->pitches[0]);
+ 		return -EINVAL;
++	}
+ 
+ 	if (fb->funcs == &exynos7580_fb_funcs)
+-		return exynos7580_own_scanout(fb, plane, addr);
++		ret = exynos7580_own_scanout(fb, plane, addr);
++	else
++		ret = exynos7580_foreign_scanout(fb, plane, addr);
+ 
+-	return exynos7580_foreign_scanout(fb, plane, addr);
++	pr_info("exynos7580_fb_scanout: fb=%p plane=%u rc=%d addr=0x%llx\n",
++		fb, plane, ret, (ret == 0) ? (unsigned long long)*addr : 0ULL);
++	return ret;
+ }
+ 
+ /* ---------- dma-buf import ---------- */
