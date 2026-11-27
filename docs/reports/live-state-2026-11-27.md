@@ -83,3 +83,24 @@ Written after context compaction risk; this file is the authoritative
   kms_swrast swap/callback (LOG `WAYLAND_DEBUG=1` on a client, KWin's
   `kwin_scene_opengl`/swap debug, and whether a second atomic commit ever
   reaches `exynos7580_plane_commit_frame`).
+
+## Update 23:5x UTC — shadow OOB fix, commits flowing
+
+- **int126**: `exynos7580_fb_shadow_write()` is bounded by the allocated
+  shadow size and the guard only caches frames >= 320x480. Root cause found in
+  the kernel log: `Unable to handle kernel paging request at ffffff800333e000`
+  in `exynos7580_fb_shadow_write+0x7c` — a 720x1280 blank frame tried to read a
+  shadow that had been sized 32x32 from an early cursor commit. The oops killed
+  KWin's commit thread, which is why presentation stopped after one frame.
+- After int126: KWin commits continuously (36+ frames), no oops, shell and a
+  `qmlscene` client both cause commits. DECON register dumps show the latch
+  working: programmed `addr=0x11000000` then `ADD0=0x11000000` after vsync,
+  next frame `ADD0=0x10c00000`.
+- Remaining: committed frames are 99.9 % black with a few grey/white samples
+  (the cursor/panel), i.e. KWin composites its own background but not the
+  client scene; the panel still shows an earlier blue image. Next checks:
+  (a) confirm the panel follows DECON by displaying a solid colour from a KMS
+  test pattern with KWin stopped; (b) confirm client buffers reach KWin
+  (shm vs dma-buf: plasmashell is `QT_QUICK_BACKEND=software`, qmlscene is GL).
+- Driver switch note: `modetest` cannot open card0 while KWin holds master;
+  stop the session first.
