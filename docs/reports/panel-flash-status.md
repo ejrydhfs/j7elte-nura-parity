@@ -31,13 +31,13 @@ This report lists only facts verified on hardware on 2026-11-27.
   bursts of `rawstat=0x02` IRQs.
 - With KWin SIGSTOPped (`kill -STOP`), a 6 s photo sample showed **zero panel
   flashing**; the panel resumed flashing after SIGCONT.
-- The panel is AMOLED; there is no valid backlight node to test dimming against.
+- The panel is AMOLED; there is no valid backlight node.
 
 ## Open questions
 
-- Whether the flashing follows DECON commit cadence (i.e. every presented
-  frame flips the panel between the boot/blank buffer and the composited
-  buffer) or is retriggered by panfrost job timeout recovery.
+- Whether the flashing follows DECON commit cadence (i.e. the panel flips
+  between two buffers on every presented frame) or is retriggered by panfrost
+  job timeout recovery.
 - Why all-zero buffers are still reaching scanout when the blank-frame guard is
   active, and which caller produces them.
 - Whether the panfrost timeouts (`js_status=0x08`, `head == tail`) are a cause
