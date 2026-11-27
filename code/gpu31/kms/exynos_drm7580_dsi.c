@@ -161,6 +161,23 @@ static void exynos7580_dsi_encoder_disable(struct drm_encoder *encoder)
 }
 
 /*
+ * int67: drm_atomic_helper's crtc_set_mode() calls encoder->funcs->mode_set()
+ * unconditionally (drivers/gpu/drm/drm_atomic_helper.c:753 in this tree), and
+ * this encoder had no such callback, so the first modeset jumped to NULL.
+ * The DSI link and DECON programming live in the CRTC (enable_link()), so the
+ * encoder hook is a logging no-op, as in the upstream drivers.
+ */
+static void
+exynos7580_dsi_encoder_mode_set(struct drm_encoder *encoder,
+				struct drm_display_mode *mode,
+				struct drm_display_mode *adjusted_mode)
+{
+	DRM_DEBUG_KMS("DSI encoder: mode_set %ux%u@%u (link handled by CRTC)\n",
+		      adjusted_mode->hdisplay, adjusted_mode->vdisplay,
+		      drm_mode_vrefresh(adjusted_mode));
+}
+
+/*
  * The CRTC hands us the requested mode; reject anything but the panel timing
  * and give the CRTC the exact values it must program into DECON and DSIM, so
  * a userspace-supplied variant of the same mode cannot slip through.
@@ -184,10 +201,15 @@ exynos7580_dsi_encoder_mode_fixup(struct drm_encoder *encoder,
 static const struct drm_encoder_helper_funcs exynos7580_dsi_encoder_helper_funcs = {
 	.disable	= exynos7580_dsi_encoder_disable,
 	.mode_fixup	= exynos7580_dsi_encoder_mode_fixup,
+	.mode_set	= exynos7580_dsi_encoder_mode_set,
 };
 
 static const struct drm_encoder_funcs exynos7580_dsi_encoder_funcs = {
-	/* drm_encoder_cleanup() is driven by drm_mode_config_cleanup(). */
+	/*
+	 * int69: drm_mode_config_cleanup() calls encoder->funcs->destroy()
+	 * unguarded, and it runs before the connectors/planes/CRTCs.
+	 */
+	.destroy	= drm_encoder_cleanup,
 };
 
 /* ------------------------------------------------------------------------
@@ -265,6 +287,8 @@ static const struct drm_connector_funcs exynos7580_dsi_connector_funcs = {
 	.fill_modes		= drm_helper_probe_single_connector_modes,
 	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
+	/* int69: mode_config_cleanup() calls destroy() unguarded. */
+	.destroy		= drm_connector_cleanup,
 	/*
 	 * no ->atomic_set_property: CRTC_ID is handled by the core
 	 * (drm_atomic.c:630) and the connector has no driver properties.  The

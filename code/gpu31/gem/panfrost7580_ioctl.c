@@ -42,6 +42,12 @@
 
 #include "drm_syncobj.h"		/* 0003 (staged by Makefile) */
 #include "panfrost7580_gem.h"
+/* Probe-snapshot GET_PARAM backend (main.c).  Declared here instead of
+ * including panfrost7580_drv.h, whose jobs slice mirrors struct
+ * p7580_submit locally in this TU. */
+struct drm_device;
+int p7580_drv_get_param(struct drm_device *ddev, uint32_t param,
+			uint64_t *value);
 #include "panfrost7580_ioctl.h"
 #include "panfrost_drm.h"
 /* ABI gate (gpu31-abialign): v5.2/Mesa-20.3 wire sizes + offsets. The
@@ -155,24 +161,31 @@ int panfrost_ioctl_get_param(struct drm_device *dev, void *data,
 			     struct drm_file *file_priv)
 {
 	struct drm_panfrost_get_param *args = data;
+	int ret;
 
-	(void)dev;
 	(void)file_priv;
 	/* ABI gate: run the build-time checks on every call path so a
 	 * header drift cannot slip past an unbuilt TU. Cheap (constant). */
 	p7580_abi_check_get_param();
-	/* Mesa 20.3 panfrost_query_raw zeroes the struct, sets param, and
-	 * issues the IOWR(0x44/16 B) ioctl; non-PROD_ID probes arrive with
-	 * pad == 0 and must fail -EINVAL (NOT success-with-garbage): the
-	 * caller asserts !required and falls back to compiled-in defaults.
-	 * Upstream v5.2 panfrost_ioctl_get_param has the identical gate. */
-	if (args->param != DRM_PANFROST_PARAM_GPU_PROD_ID)
+	/* Mesa 20.3 and 26+ both zero the struct, set param and issue the
+	 * IOWR(0x44/16 B) ioctl.  Mesa 26 requires a whole feature set (its
+	 * panfrost/kmod backend asserts on a failed required query in debug
+	 * builds, and compiles zeros otherwise), so answer every
+	 * DRM_PANFROST_PARAM_* this part has a register for from the probe
+	 * snapshot.  Unknown/unsupported ids stay -EINVAL: Mesa gates the
+	 * 1.3/1.5/1.6-only params on the DRM version and tolerates the
+	 * failure.  The log is the evidence for which ids Mesa actually
+	 * asks for. */
+	if (args->pad) {
+		pr_info("p7580_get_param: pad=0x%x param=%u rc=-EINVAL\n",
+			args->pad, args->param);
 		return -EINVAL;
-	if (args->pad)
-		return -EINVAL;
-	args->value = P7580_GPU_PROD_ID;
-	args->pad = 0;
-	return 0;
+	}
+	ret = p7580_drv_get_param(dev, args->param, &args->value);
+	pr_info("p7580_get_param: param=%u value=0x%llx rc=%d%s\n",
+		args->param, (unsigned long long)args->value, ret,
+		ret ? " (unknown/unsupported)" : "");
+	return ret;
 }
 
 int panfrost_ioctl_create_bo(struct drm_device *dev, void *data,
@@ -185,10 +198,25 @@ int panfrost_ioctl_create_bo(struct drm_device *dev, void *data,
 	uint32_t handle;
 	int ret;
 
-	if (args->flags)
+	if (!args->size || args->pad) {
+		pr_info("p7580_create_bo: bad args size=0x%x pad=0x%x rc=-EINVAL\n",
+			args->size, args->pad);
 		return -EINVAL;
-	if (!args->size)
-		return -EINVAL;
+	}
+	/* Modern Mesa (kernel 1.1+) passes PANFROST_BO_NOEXEC (non-executable
+	 * BO) and PANFROST_BO_HEAP (alloc-on-fault tiler heap).  Backing here
+	 * is always pre-faulted SHMEM, so both are hints: accept and record
+	 * them; ignore, with a warning, any bit this driver does not know
+	 * instead of failing the allocation. */
+	if (args->flags & ~(PANFROST_BO_NOEXEC | PANFROST_BO_HEAP |
+			    PANFROST_BO_WB_MMAP))
+		pr_warn("p7580_create_bo: unknown flags 0x%x ignored (size=0x%x)\n",
+			args->flags, args->size);
+	pr_info("p7580_create_bo: enter size=0x%x flags=0x%x abi sizeof=%zu flags_off=%zu pad_off=%zu offset_off=%zu\n",
+		args->size, args->flags, sizeof(*args),
+		offsetof(struct drm_panfrost_create_bo, flags),
+		offsetof(struct drm_panfrost_create_bo, pad),
+		offsetof(struct drm_panfrost_create_bo, offset));
 
 	/* SHMEM for general BOs (upstream panfrost uses drm_gem_shmem;
 	 * CMA carries no size beyond the display window and fails 8 MiB+
@@ -210,6 +238,10 @@ int panfrost_ioctl_create_bo(struct drm_device *dev, void *data,
 	bo = to_p7580_bo(obj);
 	args->handle = handle;
 	args->offset = (uint64_t)bo->iova;
+	pr_info("p7580_create_bo: size=0x%x flags=0x%x handle=%u iova=0x%llx offset_valid=%u node_start=0x%llx rc=0\n",
+		args->size, args->flags, handle,
+		(unsigned long long)bo->iova, bo->offset_valid,
+		(unsigned long long)bo->offset_node.start);
 	return 0;
 }
 
@@ -217,23 +249,47 @@ int panfrost_ioctl_mmap_bo(struct drm_device *dev, void *data,
 			   struct drm_file *file_priv)
 {
 	struct drm_panfrost_mmap_bo *args = data;
+	struct p7580_dev *gd = dev->dev_private;
 	struct drm_gem_object *obj;
-	unsigned long fake_offset;
+	struct p7580_bo *bo;
+	uint64_t fake_offset = 0;
 
 	if (args->flags)
-		return -EINVAL;
+		pr_warn("p7580_mmap_bo: flags=0x%x ignored (currently no meaning)\n",
+			args->flags);
+	if (!gd)
+		return -ENODEV;
 
 	/* drm_gem_object_lookup takes the reference internally (no
 	 * outer struct_mutex needed; lookup is idr + kref_get). */
 	obj = drm_gem_object_lookup(dev, file_priv, args->handle);
-	if (!obj)
+	if (!obj) {
+		pr_info("p7580_mmap_bo: handle=%u lookup MISS rc=-ENOENT\n",
+			args->handle);
 		return -ENOENT;
-	/* Same fake-offset encoding as drm_gem_cma_dumb_map_offset:
-	 * map_list.hash.key << PAGE_SHIFT (drm_gem_cma_helper.c). */
-	fake_offset = (unsigned long)obj->map_list.hash.key << PAGE_SHIFT;
+	}
+	bo = to_p7580_bo(obj);
+	/* gpu31-mmlock: same fake-offset encoding as before (page index
+	 * << PAGE_SHIFT), now read from the driver-owned manager. The
+	 * lookup reference keeps the object -- and therefore its offset --
+	 * alive for the read; the lock makes the read atomic against a
+	 * free that can run on the sched workqueue. */
+	mutex_lock(&gd->mmap_offset_lock);
+	if (bo->offset_valid)
+		fake_offset = (uint64_t)bo->offset_node.start << PAGE_SHIFT;
+	mutex_unlock(&gd->mmap_offset_lock);
+	pr_info("p7580_mmap_bo: handle=%u offset_valid=%u node_start=0x%llx fake_offset=0x%llx iova=0x%llx\n",
+		args->handle, bo->offset_valid,
+		(unsigned long long)bo->offset_node.start,
+		(unsigned long long)fake_offset,
+		(unsigned long long)bo->iova);
 	drm_gem_object_unreference_unlocked(obj);
+	if (!fake_offset) {
+		pr_info("p7580_mmap_bo: no fake offset rc=-ENOENT\n");
+		return -ENOENT;
+	}
 
-	args->offset = (uint64_t)fake_offset;
+	args->offset = fake_offset;
 	return 0;
 }
 
@@ -282,6 +338,22 @@ int panfrost_ioctl_wait_bo(struct drm_device *dev, void *data,
 		timeout = nsecs_to_jiffies((uint64_t)remain_ns);
 
 	timeout = p7580_gem_wait(dev, file_priv, args->handle, timeout, 1);
+	/* gpu31-storm58: dma_resv_wait_timeout() returns >0 (jiffies
+	 * left) when the object is idle, 0 when the budget ran out and
+	 * <0 for an error -- exactly v5.2 panfrost_wait_bo's contract,
+	 * including the non-blocking poll: timeout_ns = 0 (a past
+	 * absolute stamp) becomes a 0-jiffy wait and returns 0 for a
+	 * still-pending fence. The old code mapped only <0 to an error
+	 * and returned 0 for BOTH 0 and >0, so WAIT_BO answered
+	 * "ready" for a busy BO. Mesa's BO-cache fetch uses exactly
+	 * that poll (panfrost_bo_wait(bo, 0, RW)) before handing a
+	 * cached BO back to the next batch, so it reused pages that an
+	 * in-flight submit still owned -- measured on int42 as 4
+	 * re-fetches of handle 6 (64 KiB descriptor slab) inside a
+	 * 60 s window in which that submit's fence never signaled.
+	 * Report 0 as -ETIMEDOUT like upstream. */
+	if (timeout == 0)
+		return -ETIMEDOUT;
 	if (timeout < 0)
 		return (int)timeout;
 	return 0;

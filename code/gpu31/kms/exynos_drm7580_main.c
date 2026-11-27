@@ -175,7 +175,18 @@ static struct sg_table *exynos7580_gem_prime_get_sg_table(
 		return ERR_PTR(ret);
 	}
 
-	sg_set_buf(sgt->sgl, cma_obj->vaddr, obj->size);
+	/*
+	 * int111: sg_set_buf() would take virt_to_page(cma_obj->vaddr).  For a
+	 * multi-MB dma_alloc_coherent() buffer vaddr is vmalloc-mapped, so that
+	 * page is meaningless and the importer (panfrost via kmsro) maps
+	 * garbage into its address space -- the AS0 TRANSLATION_FAULT/READ
+	 * storm in dmesg.  Use the physical base that drm_gem_cma_object
+	 * already carries.
+	 */
+	pr_info("exynos7580_prime_get_sg_table: obj=%p import_attach=%p paddr=%pad vaddr=%p size=%zu\n",
+		obj, obj->import_attach, &cma_obj->paddr, cma_obj->vaddr, obj->size);
+	sg_set_page(sgt->sgl, phys_to_page(cma_obj->paddr), obj->size,
+		    cma_obj->paddr & ~PAGE_MASK);
 	sg_dma_address(sgt->sgl) = cma_obj->paddr;
 	sg_dma_len(sgt->sgl) = obj->size;
 
@@ -237,20 +248,79 @@ static const struct drm_mode_config_funcs exynos7580_mode_config_funcs = {
 static int exynos7580_initial_modeset(struct exynos7580_device *ex,
 				      struct drm_device *drm)
 {
+	struct drm_plane *plane = ex->crtc.primary;
+	struct drm_plane_state *pstate;
+	struct drm_framebuffer *fb = NULL;
+	bool ok;
 	int ret = 0;
 
 	drm_modeset_lock_all(drm);
 
-	if (!ex->crtc.state || !ex->crtc.state->enable) {
-		DRM_ERROR("CRTC is not active after the initial modeset\n");
-		ret = -EIO;
-	} else if (!ex->crtc.primary || !ex->crtc.primary->fb) {
-		DRM_ERROR("primary plane has no fb0 after the initial modeset\n");
-		ret = -EIO;
+	/*
+	 * int76: the postcondition must use the atomic state, not the legacy
+	 * crtc->state->enable / plane->fb fields (the atomic commit path does
+	 * not maintain them; int74 fixed the same mistake in the fbdev slice).
+	 * Log every field so a real mismatch is unambiguous.
+	 */
+	pstate = plane ? plane->state : NULL;
+	DRM_INFO("initial modeset state: crtc id=%u enabled=%d state=%p active=%d enable=%d planes_empty=%d primary=%p pstate=%p pstate->fb=%p legacy->fb=%p\n",
+		 ex->crtc.base.id, ex->crtc.enabled, ex->crtc.state,
+		 ex->crtc.state ? ex->crtc.state->active : -1,
+		 ex->crtc.state ? ex->crtc.state->enable : -1,
+		 list_empty(&drm->mode_config.plane_list), plane, pstate,
+		 pstate ? pstate->fb : NULL, plane ? plane->fb : NULL);
+
+	ok = ex->crtc.state && ex->crtc.state->active && ex->crtc.enabled &&
+	     pstate && pstate->fb;
+	if (!ok) {
+		if (list_empty(&drm->mode_config.fb_list)) {
+			DRM_ERROR("initial modeset: no framebuffer to attach\n");
+			ret = -EIO;
+		} else {
+			fb = list_first_entry(&drm->mode_config.fb_list,
+					      struct drm_framebuffer, head);
+		}
+	}
+	drm_modeset_unlock_all(drm);
+	if (ret || ok)
+		return ret;
+
+	/*
+	 * int76: if the fb_helper path did not leave the primary plane
+	 * attached to fb0, make the first frame explicit instead of failing:
+	 * allocate a state, attach the fb to the primary plane and commit it
+	 * through our atomic_commit (without the modeset locks held).
+	 */
+	{
+		struct drm_atomic_state *state = drm_atomic_state_alloc(drm);
+		struct drm_plane_state *sp;
+
+		if (!state)
+			return -ENOMEM;
+		sp = drm_atomic_get_plane_state(state, plane);
+		if (IS_ERR(sp)) {
+			ret = PTR_ERR(sp);
+			drm_atomic_state_free(state);
+			return ret;
+		}
+		drm_atomic_set_fb_for_plane(sp, fb);
+		DRM_INFO("initial modeset: explicit commit of fb %p on plane %p\n", fb, plane);
+		ret = drm_atomic_commit(state);
+		DRM_INFO("initial modeset: explicit commit ret=%d\n", ret);
+		if (ret)
+			return ret;
 	}
 
+	drm_modeset_lock_all(drm);
+	pstate = plane ? plane->state : NULL;
+	if (!ex->crtc.state || !ex->crtc.state->active || !ex->crtc.enabled ||
+	    !pstate || pstate->fb != fb) {
+		DRM_ERROR("initial modeset still inconsistent after the explicit commit: active=%d enabled=%d pstate->fb=%p want=%p\n",
+			  ex->crtc.state ? ex->crtc.state->active : -1,
+			  ex->crtc.enabled, pstate ? pstate->fb : NULL, fb);
+		ret = -EIO;
+	}
 	drm_modeset_unlock_all(drm);
-
 	return ret;
 }
 
@@ -277,8 +347,14 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
 	drm->dev_private = ex;
 
 	drm_mode_config_init(drm);
-	drm->mode_config.min_width = 64;
-	drm->mode_config.min_height = 64;
+	/*
+	 * DECON's only hard limit is a 128-byte minimum stride, which
+	 * exy7580_fb_check() enforces per format.  A 32x32 ARGB hardware
+	 * cursor is exactly 128 bytes wide and must be accepted: KWin
+	 * aborts when its cursor framebuffer cannot be created.
+	 */
+	drm->mode_config.min_width = 32;
+	drm->mode_config.min_height = 32;
 	drm->mode_config.max_width = 2048;
 	drm->mode_config.max_height = 2048;
 	drm->mode_config.funcs = &exynos7580_mode_config_funcs;
@@ -310,6 +386,7 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
 	 */
 	drm_mode_config_reset(drm);
 
+	dev_info(ex->dev, "exynos7580: load: dsi_init()\n");
 	ret = exynos7580_dsi_init(ex);
 	if (ret) {
 		DRM_ERROR("DSI encoder/connector init failed: %d\n", ret);
@@ -322,6 +399,7 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
 	 * Arm the FRAME interrupt before the first commit: the initial modeset
 	 * below arms its flip event from vblank, so the counter must advance.
 	 */
+	dev_info(ex->dev, "exynos7580: load: registering DECON FRAME callback\n");
 	ret = decon_kms_register_vblank_cb(ex->decon, exynos7580_vblank_isr, ex);
 	if (ret) {
 		DRM_ERROR("failed to arm DECON FRAME interrupt: %d\n", ret);
@@ -333,15 +411,19 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
 	 * modeset.  exynos7580_fbdev_init() must leave no fb0 behind when it
 	 * fails (otherwise the vendor fallback would only get fb1).
 	 */
+	dev_info(ex->dev, "exynos7580: load: fbdev_init() (card0 fb0)\n");
 	ret = exynos7580_fbdev_init(ex);
 	if (ret) {
 		DRM_ERROR("fbdev init failed: %d\n", ret);
 		goto err_vblank;
 	}
 
+	dev_info(ex->dev, "exynos7580: load: initial modeset\n");
 	ret = exynos7580_initial_modeset(ex, drm);
-	if (ret)
+	if (ret) {
+		dev_err(ex->dev, "exynos7580: load: initial modeset failed (%d)\n", ret);
 		goto err_vblank;
+	}
 
 	DRM_INFO("exynos7580: %s bound, card0 ready (atomic)\n",
 		 DECON_COMPATIBLE);
@@ -350,6 +432,7 @@ static int exynos7580_load(struct drm_device *drm, unsigned long flags)
 
 err_vblank:
 	decon_kms_register_vblank_cb(ex->decon, NULL, NULL);
+	exynos7580_fbdev_fini();
 	drm_vblank_cleanup(drm);
 err_config:
 	drm_mode_config_cleanup(drm);
@@ -367,6 +450,15 @@ static int exynos7580_unload(struct drm_device *drm)
 
 	atomic_set(&exynos7580_vblank_users, 0);
 	decon_kms_register_vblank_cb(ex->decon, NULL, NULL);
+
+	/*
+	 * fb0 first: drm_fbdev_cma_fini() destroys the fb helper and its
+	 * private framebuffer, so it must not run after
+	 * drm_mode_config_cleanup() has freed the CRTCs/planes/framebuffers it
+	 * still points at (the devres action that used to do this runs after
+	 * ->unload()).
+	 */
+	exynos7580_fbdev_fini();
 
 	drm_vblank_cleanup(drm);
 	drm_mode_config_cleanup(drm);
@@ -401,6 +493,14 @@ static struct drm_driver exynos7580_drm_driver = {
 	.gem_prime_vmap		= exynos7580_gem_prime_vmap,
 	.gem_prime_vunmap	= exynos7580_gem_prime_vunmap,
 	.gem_prime_import	= exynos7580_gem_prime_import,
+	/*
+	 * int84: DRM_PRIME alone does not fill DRM_CAP_PRIME; kmsro's first
+	 * allocation step is drmPrimeHandleToFD(card0, dumb_handle), so the
+	 * card0 drm_driver needs the two prime ioctl hooks as well (they were
+	 * missing, hence DRM_CAP_PRIME=0x0 on int83).
+	 */
+	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
+	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
 	.dumb_create		= drm_gem_cma_dumb_create,
 	.dumb_map_offset	= drm_gem_cma_dumb_map_offset,
 	.dumb_destroy		= drm_gem_cma_dumb_destroy,
@@ -413,6 +513,31 @@ static struct drm_driver exynos7580_drm_driver = {
 	.patchlevel		= DRIVER_PATCHLEVEL,
 };
 
+/*
+ * KWin opens card0 without O_NONBLOCK and reads DRM events from its main
+ * loop.  drm_read() then sleeps until an event arrives; on this driver the
+ * event queue can stay empty (no page-flip events), which wedges the
+ * compositor: it stops servicing Wayland/DBus clients entirely.
+ * Force non-blocking semantics for the read call so an empty queue returns
+ * -EAGAIN and the caller's poll() keeps working.
+ */
+static ssize_t exynos7580_read(struct file *filp, char __user *buffer,
+			       size_t count, loff_t *offset)
+{
+	struct drm_file *file_priv = filp->private_data;
+
+	/*
+	 * This tree's drm_read() has no O_NONBLOCK branch: it always sleeps
+	 * in wait_event_interruptible().  KWin reads DRM events from its main
+	 * loop and blocks there forever, so the compositor stops servicing
+	 * Wayland clients.  Return -EAGAIN when the queue is empty instead.
+	 */
+	if (!file_priv || list_empty(&file_priv->event_list))
+		return -EAGAIN;
+
+	return drm_read(filp, buffer, count, offset);
+}
+
 static const struct file_operations exynos7580_fops = {
 	.owner		= THIS_MODULE,
 	.open		= drm_open,
@@ -422,7 +547,7 @@ static const struct file_operations exynos7580_fops = {
 	.compat_ioctl	= drm_compat_ioctl,
 #endif
 	.poll		= drm_poll,
-	.read		= drm_read,
+	.read		= exynos7580_read,
 	.mmap		= drm_gem_cma_mmap,
 };
 
@@ -434,6 +559,7 @@ static int exynos7580_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct exynos7580_device *ex;
+	const struct decon_kms_caps *caps;
 	int ret;
 
 	/* Match the DECON node only, and never the dsim/panel nodes. */
@@ -451,7 +577,9 @@ static int exynos7580_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ex->dev = dev;
-	platform_set_drvdata(pdev, ex);
+
+	dev_info(dev, "exynos7580: probe entry (DECON node %s), binding card0\n",
+		 of_node_full_name(dev->of_node));
 
 	/*
 	 * Hand-off with the vendor DECON core.  In KMS mode the vendor
@@ -460,23 +588,41 @@ static int exynos7580_probe(struct platform_device *pdev)
 	 * mapping, runtime PM/iovmm and the panel hand-off.  If it cannot, the
 	 * probe fails here, before any DRM object exists.
 	 */
+	dev_info(dev, "exynos7580: probe: calling decon_kms_get()\n");
 	ex->decon = decon_kms_get(dev);
 	if (IS_ERR(ex->decon)) {
 		ret = PTR_ERR(ex->decon);
 		ex->decon = NULL;
-		dev_err(dev, "DECON handle unavailable (%d), vendor fbdev fallback\n",
-			ret);
+		dev_err(dev, "exynos7580: probe: decon_kms_get failed (%d)\n", ret);
+		if (ret == -ENODEV || ret == -EPROBE_DEFER) {
+			/* exynos-mdev / DSIM / panel not up yet: retry later. */
+			dev_info(dev, "exynos7580: DECON/DSIM not ready, deferring probe\n");
+			ret = -EPROBE_DEFER;
+		}
 		goto err_drvdata;
 	}
+	caps = decon_kms_caps(ex->decon);
+	dev_info(dev, "exynos7580: probe: decon_kms_get ok (%u windows, default %u)\n",
+		 caps ? caps->max_win : 0, caps ? caps->default_win : 0);
+	/*
+	 * Publish our own drvdata only now.  decon_kms_get() reads
+	 * platform_get_drvdata() and expects the vendor decon_device (or
+	 * NULL): installing struct exynos7580_device before the call made it
+	 * read a bogus kms_owned and reject the hand-off with -EBUSY
+	 * ("DECON already owned by the fbdev driver").
+	 */
+	platform_set_drvdata(pdev, ex);
+	dev_info(dev, "exynos7580: probe: decon ok, drvdata published\n");
 
+	dev_info(dev, "exynos7580: probe: calling drm_platform_init()\n");
 	ret = drm_platform_init(&exynos7580_drm_driver, pdev);
 	if (ret) {
-		dev_err(dev, "drm_platform_init failed (%d), vendor fbdev fallback\n",
-			ret);
+		dev_err(dev, "exynos7580: probe: drm_platform_init failed (%d)\n", ret);
 		goto err_decon;
 	}
 
 	exynos7580_device = ex;
+	dev_info(dev, "exynos7580: probe: success, card0 registered\n");
 
 	return 0;
 
@@ -530,8 +676,35 @@ static int __init exynos7580_drm_init(void)
 {
 	return platform_driver_register(&exynos7580_drm_platform_driver);
 }
-late_initcall(exynos7580_drm_init);
+
+#ifdef MODULE
+/*
+ * int53: built as a loadable module.  module_init is level 6, which is
+ * fine because nothing binds at boot: the module is only loaded by hand
+ * after the vendor fbdev driver has been unbound, i.e. after the panel
+ * driver and the vendor stack are fully up.  The built-in image keeps the
+ * level-7 late_initcall so the vendor fbdev fallback ordering is
+ * unchanged.
+ */
+static void __exit exynos7580_drm_exit(void)
+{
+	platform_driver_unregister(&exynos7580_drm_platform_driver);
+}
+
+module_init(exynos7580_drm_init);
+module_exit(exynos7580_drm_exit);
+#else
+/*
+ * int61: run at late_initcall_sync, after every late_initcall (the DSIM
+ * driver, the panel driver and exynos-mdev all register at late_initcall or
+ * earlier).  This is our driver, not the vendor DECON one, so the int58
+ * hazard (moving the *vendor* fbdev driver to sync) does not apply: if the
+ * panel/mdev is still absent the probe defers and the driver core retries.
+ */
+late_initcall_sync(exynos7580_drm_init);
+#endif
 
 MODULE_AUTHOR("gpu31-kms");
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
+MODULE_VERSION("int121");

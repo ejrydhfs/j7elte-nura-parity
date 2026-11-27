@@ -159,6 +159,16 @@ void pf7580_power_remove(struct pf7580_power *p);
 int pf7580_runtime_suspend(struct pf7580_power *p);
 int pf7580_runtime_resume(struct pf7580_power *p);
 
+/* Fault-recovery core power cycle (gpu31-readback): cores off + clock
+ * gate, then the full power-on sequence (clock, SOFT/HARD_RESET with
+ * RESET_COMPLETED poll, L2/shader/tiler PWRON with READY polls). Needed
+ * because a JM POWER_FAULT latch (JS_STATUS 0x41) survives the GPU
+ * SOFT/HARD reset issued by p7580_job_recover(): without a cycle every
+ * following job on that slot reports the same fault. Process context,
+ * caller holds a runtime-PM ref; the MMU AS0 reprogram and JOB_INT
+ * re-arm are done by the jobs slice after this returns. */
+int pf7580_power_cycle(struct pf7580_power *p);
+
 /*
  * System-sleep callbacks:
  *  - suspend: if the device is not already runtime-suspended, run the

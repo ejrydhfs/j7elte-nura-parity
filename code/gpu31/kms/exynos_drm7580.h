@@ -113,3 +113,7 @@ int exynos7580_fbdev_init(struct exynos7580_device *ex);
 void exynos7580_fbdev_fini(void);
 
 #endif /* __EXYNOS_DRM7580_H__ */
+
+extern unsigned int exynos7580_dump_fb;
+void exynos7580_dump_scanout(struct drm_framebuffer *fb);
+bool exynos7580_fb_is_blank(struct drm_framebuffer *fb);

@@ -27,6 +27,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/types.h>
+#include <linux/exynos_decon_kms.h>
 
 #include <drm/drmP.h>
 #include <drm/drm_crtc.h>
@@ -52,10 +53,11 @@ MODULE_PARM_DESC(fbdev_bpp,
 		 "Preferred fb0 bits per pixel: 32, 24, 16, 15 or 8 (default: 32)");
 
 /*
- * Handle of the single fbdev this driver owns. The contract header
- * deliberately has no fbdev member and no new cross-slice global may be
- * added, so it stays file-private and is released through a devres action
- * when the DECON device goes away.
+ * Handle of the single fbdev this driver owns. The contract header has no
+ * fbdev member, so it stays file-private; exynos7580_fbdev_fini() releases it
+ * explicitly from ->unload() (before the core frees the mode objects it points
+ * at), and the devres action is the fallback for a detach that never reaches
+ * ->unload().
  */
 static struct drm_fbdev_cma *exynos7580_fbdev;
 
@@ -96,15 +98,31 @@ static struct fb_info *exynos7580_fb0(struct exynos7580_device *ex)
 	return info;
 }
 
-static void exynos7580_fbdev_devm_release(void *data)
+/*
+ * Tear /dev/fb0 and the fb helper down. Must run from ->unload() before
+ * drm_mode_config_cleanup(): drm_fbdev_cma_fini() destroys the fbdev
+ * framebuffer (drm_framebuffer_cleanup() list_del, drm_fb_helper_fini()), so
+ * running it after the core freed the CRTCs/planes/framebuffers it points at
+ * dereferences dead mode objects. Idempotent: the devres action becomes a
+ * no-op once this has cleared the handle.
+ */
+void exynos7580_fbdev_fini(void)
 {
-	struct drm_fbdev_cma *fbdev = data;
+	struct drm_fbdev_cma *fbdev = exynos7580_fbdev;
 
-	if (exynos7580_fbdev != fbdev)
+	if (!fbdev)
 		return;
 
 	exynos7580_fbdev = NULL;
 	drm_fbdev_cma_fini(fbdev);
+}
+
+static void exynos7580_fbdev_devm_release(void *data)
+{
+	if (exynos7580_fbdev != data)
+		return;
+
+	exynos7580_fbdev_fini();
 }
 
 /*
@@ -134,7 +152,11 @@ static int exynos7580_fbdev_start_scanout(struct exynos7580_device *ex,
 
 	fb = list_first_entry(&drm->mode_config.fb_list, struct drm_framebuffer, head);
 
+	pr_info("exynos7580_fbdev: restore_mode enter (mutex_locked=%d acquire_ctx=%p)\n",
+		mutex_is_locked(&drm->mode_config.mutex), drm->mode_config.acquire_ctx);
 	drm_fbdev_cma_restore_mode(fbdev);
+	pr_info("exynos7580_fbdev: restore_mode exit (mutex_locked=%d acquire_ctx=%p)\n",
+		mutex_is_locked(&drm->mode_config.mutex), drm->mode_config.acquire_ctx);
 
 	info = exynos7580_fb0(ex);
 	if (!info) {
@@ -142,8 +164,35 @@ static int exynos7580_fbdev_start_scanout(struct exynos7580_device *ex,
 		return -ENODEV;
 	}
 
-	if (ex->crtc.primary->fb != fb || !ex->crtc.state || !ex->crtc.state->enable) {
-		dev_err(ex->dev, "CRTC does not scan fb0 out\n");
+	/*
+	 * int74: after drm_fbdev_cma_init() + restore_mode() the authoritative
+	 * state is the atomic one: crtc->state->active and
+	 * primary->state->fb.  crtc->primary->fb and state->enable are legacy
+	 * fields that the atomic commit path does not maintain, so the old
+	 * predicate failed on a pipe that was demonstrably scanning
+	 * (VIDINTCON0=0x8803, FRAME IRQ firing).
+	 */
+	if (!ex->crtc.state || !ex->crtc.state->active ||
+	    !ex->crtc.enabled ||
+	    !ex->crtc.primary || !ex->crtc.primary->state ||
+	    ex->crtc.primary->state->fb != fb) {
+		dev_err(ex->dev,
+			"CRTC does not scan fb0 out: crtc id=%u enabled=%d state=%p active=%d state->crtc=%p primary->state=%p primary->state->fb=%p legacy primary->fb=%p want=%p\n",
+			ex->crtc.base.id, ex->crtc.enabled, ex->crtc.state,
+			ex->crtc.state ? ex->crtc.state->active : -1,
+			ex->crtc.state ? ex->crtc.state->crtc : NULL,
+			ex->crtc.primary ? ex->crtc.primary->state : NULL,
+			ex->crtc.primary && ex->crtc.primary->state ?
+				ex->crtc.primary->state->fb : NULL,
+			ex->crtc.primary ? ex->crtc.primary->fb : NULL, fb);
+		/* int75: keep the reason at KERN_ERR in the persisted trace. */
+		pr_err("exynos7580: fbdev scanout failed: crtc id=%u enabled=%d active=%d primary->state->fb=%p want=%p\n",
+		       ex->crtc.base.id, ex->crtc.enabled,
+		       ex->crtc.state ? ex->crtc.state->active : -1,
+		       ex->crtc.primary && ex->crtc.primary->state ?
+				ex->crtc.primary->state->fb : NULL, fb);
+		/* int70: name the register state that made the check fail. */
+		decon_kms_log_state(ex->decon, "fbdev scanout failed");
 		return -EIO;
 	}
 

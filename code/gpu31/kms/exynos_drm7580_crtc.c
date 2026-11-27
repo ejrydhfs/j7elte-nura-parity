@@ -108,6 +108,13 @@ int exynos7580_crtc_enable_link(struct exynos7580_device *ex)
 	mutex_lock(&crtc_lock);
 
 	if (crtc_link.on) {
+		/* The link is up, so whatever asked for a full modeset has been
+		 * satisfied already; a stale flag must not leak into the next
+		 * atomic_check(). */
+		if (crtc_link.needs_full_modeset) {
+			pr_info("exynos7580_crtc_enable_link: link already on, clearing stale needs_full_modeset\n");
+			crtc_link.needs_full_modeset = false;
+		}
 		mutex_unlock(&crtc_lock);
 		return 0;
 	}
@@ -135,10 +142,15 @@ int exynos7580_crtc_enable_link(struct exynos7580_device *ex)
 	}
 
 	crtc_link.on = true;
+	/* DispPower 5.1 is satisfied: DECON was re-initialised by
+	 * decon_kms_enable() above, so the next commit no longer needs a full
+	 * modeset.  Clearing here (and not only in crtc->mode_set) also covers
+	 * the atomic_commit() enable path, which never calls mode_set(). */
+	crtc_link.needs_full_modeset = false;
 
 	mutex_unlock(&crtc_lock);
 
-	DRM_DEBUG_KMS("DECON link enabled\n");
+	pr_info("exynos7580_crtc_enable_link: link on, needs_full_modeset cleared\n");
 
 	return 0;
 }
@@ -160,6 +172,8 @@ void exynos7580_crtc_disable_link(struct exynos7580_device *ex)
 		return;
 	}
 
+	pr_info("exynos7580_crtc_disable_link: disabling link state (by %s)\n",
+		current->comm);
 	decon_kms_disable(ex->decon);	/* s_stream(0) then reg_stop, vendor order */
 	decon_kms_power_put(ex->decon);
 
@@ -283,6 +297,7 @@ static void exynos7580_crtc_disable(struct drm_crtc *crtc)
 	 * core drop those references so a disable cannot leave the vblank
 	 * machinery on.
 	 */
+	pr_info("[CRTC:%d] crtc_disable by %s\n", crtc->base.id, current->comm);
 	drm_vblank_off(crtc->dev, drm_crtc_index(crtc));
 
 	/* Encoder ->disable already ran (s_stream(0)); this is idempotent. */
@@ -292,6 +307,8 @@ static void exynos7580_crtc_disable(struct drm_crtc *crtc)
 static void exynos7580_crtc_dpms(struct drm_crtc *crtc, int mode)
 {
 	/* Legacy/helper fallback only; the atomic path uses enable/disable. */
+	pr_info("[CRTC:%d] dpms mode=%d by %s\n", crtc->base.id, mode,
+		current->comm);
 	if (mode == DRM_MODE_DPMS_ON)
 		exynos7580_crtc_enable(crtc);
 	else
@@ -315,23 +332,54 @@ static int exynos7580_crtc_atomic_check(struct drm_crtc *crtc,
 	if (!state->active)
 		return 0;
 
-	modeset = state->mode_changed || state->active_changed;
-
 	/*
-	 * DispPower 5.1: nothing saves DECON register state across a
-	 * pm_runtime cycle, so after a link-off every commit must be a full
-	 * modeset.  Forcing mode_changed here makes the core reject a
-	 * plane-only commit that does not carry DRM_MODE_ATOMIC_ALLOW_MODESET
-	 * (drm_atomic_check_only()) and makes crtc_set_mode() re-run
-	 * mode_set() when it does, which re-programs the whole pipe.
+	 * int91: the link flags are only a hint for THIS commit.  The old code
+	 * forced mode_changed whenever needs_full_modeset was set and never
+	 * cleared it outside crtc->mode_set(), so a stale flag turned every
+	 * later plane-only commit into a full modeset and drm_atomic_check_only()
+	 * rejected it with -EINVAL when the client (KWin) did not pass
+	 * DRM_MODE_ATOMIC_ALLOW_MODESET.
+	 *
+	 * Decide from the real transition:
+	 *  - activating (inactive -> active): the commit already calls
+	 *    enable_link() (exynos7580_crtc_enabling()), so no forcing;
+	 *  - mode/active change: already a full modeset;
+	 *  - link really off while staying active (disable/pm cycle): DECON
+	 *    registers are gone, so this commit must re-init the pipe.  Only
+	 *    legal with ALLOW_MODESET; without it the commit cannot be served
+	 *    safely and is rejected (the log names link_off);
+	 *  - link on: a stale needs_full_modeset cannot force anything; the
+	 *    next enable_link()/mode_set() clears it.
 	 */
-	mutex_lock(&crtc_lock);
-	if (crtc_link.needs_full_modeset && !state->mode_changed)
-		state->mode_changed = true;
-	mutex_unlock(&crtc_lock);
+	{
+		bool link_on, needs, activating, forced = false;
 
-	if (state->mode_changed)
-		modeset = true;
+		mutex_lock(&crtc_lock);
+		link_on = crtc_link.on;
+		needs = crtc_link.needs_full_modeset;
+		mutex_unlock(&crtc_lock);
+
+		activating = state->active && state->enable &&
+			     (!crtc->state || !crtc->state->active);
+		modeset = state->mode_changed || state->active_changed ||
+			  activating;
+
+		if (!modeset && needs && !link_on) {
+			if (!astate->allow_modeset) {
+				pr_info("[CRTC:%d] atomic_check: link_off plane-only commit without ALLOW_MODESET -> -EINVAL (needs_full_modeset=%d link_on=%d)\n",
+					crtc->base.id, needs, link_on);
+				return -EINVAL;
+			}
+			state->mode_changed = true;
+			modeset = true;
+			forced = true;
+		}
+		pr_info("[CRTC:%d] atomic_check: needs_full_modeset=%d link_on=%d activating=%d mode_changed=%d active_changed=%d allow_modeset=%d modeset=%d%s\n",
+			crtc->base.id, needs, link_on, activating,
+			state->mode_changed, state->active_changed,
+			astate->allow_modeset, modeset,
+			forced ? " (forced: link_off)" : "");
+	}
 
 	/*
 	 * DeconPlane commits the frame from its last plane hook, so a commit
@@ -376,8 +424,30 @@ static void exynos7580_crtc_atomic_flush(struct drm_crtc *crtc)
 	DRM_DEBUG_KMS("[CRTC:%d] frame flush\n", crtc->base.id);
 }
 
+/*
+ * int69: the 3.10 fbdev path calls these unconditionally:
+ *   - drm_fb_helper_setcmap() ends with crtc_funcs->load_lut(crtc);
+ *   - drm_fb_helper_restore_lut_atomic()/drm_mode_gamma_set_ioctl() use
+ *     crtc->funcs->gamma_set (the ioctl rejects a NULL one, the restore path
+ *     checks it, but a no-op makes both harmless).
+ * The fbdev palette is a pseudo-palette in truecolor mode, so there is no
+ * hardware LUT to program: both are logging no-ops.
+ */
+static void exynos7580_crtc_load_lut(struct drm_crtc *crtc)
+{
+	DRM_DEBUG_KMS("load_lut (no HW LUT, pseudo-palette only)\n");
+}
+
+static void exynos7580_crtc_gamma_set(struct drm_crtc *crtc, u16 *r,
+				      u16 *g, u16 *b, uint32_t start,
+				      uint32_t size)
+{
+	DRM_DEBUG_KMS("gamma_set start=%u size=%u (no HW LUT)\n", start, size);
+}
+
 static const struct drm_crtc_helper_funcs exynos7580_crtc_helper_funcs = {
 	.dpms		= exynos7580_crtc_dpms,
+	.load_lut	= exynos7580_crtc_load_lut,
 	.mode_fixup	= exynos7580_crtc_mode_fixup,
 	.mode_set	= exynos7580_crtc_mode_set,
 	.disable	= exynos7580_crtc_disable,
@@ -395,8 +465,88 @@ static int exynos7580_crtc_page_flip(struct drm_crtc *crtc,
 				     struct drm_framebuffer *fb,
 				     struct drm_pending_vblank_event *event)
 {
-	/* 3.10's vtable has no flags argument; async flips are not supported. */
-	return drm_atomic_helper_page_flip(crtc, fb, event, 0);
+	struct drm_device *dev = crtc->dev;
+	struct drm_plane *plane = crtc->primary;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_state *state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_plane_state *plane_state;
+	int ret;
+
+	/*
+	 * A local acquire context, not the legacy global one: the global
+	 * context never drops the per-object modeset locks after a successful
+	 * commit, so the first flip worked and the second one blocked forever
+	 * in drm_atomic_get_crtc_state().  This mirrors the atomic ioctl and
+	 * releases every lock it took when it returns.
+	 */
+	drm_modeset_acquire_init(&ctx, 0);
+
+retry:
+	state = drm_atomic_state_alloc(dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	state->acquire_ctx = &ctx;
+
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto fail;
+	}
+	crtc_state->event = event;
+
+	plane_state = drm_atomic_get_plane_state(state, plane);
+	if (IS_ERR(plane_state)) {
+		ret = PTR_ERR(plane_state);
+		goto fail;
+	}
+	ret = drm_atomic_set_crtc_for_plane(plane_state, crtc);
+	if (ret)
+		goto fail;
+	drm_atomic_set_fb_for_plane(plane_state, fb);
+
+	/* Full-frame source/destination from the current mode. */
+	{
+		struct drm_display_mode *mode = &crtc->state->mode;
+
+		plane_state->src_x = 0;
+		plane_state->src_y = 0;
+		plane_state->src_w = mode->hdisplay << 16;
+		plane_state->src_h = mode->vdisplay << 16;
+		plane_state->crtc_x = 0;
+		plane_state->crtc_y = 0;
+		plane_state->crtc_w = mode->hdisplay;
+		plane_state->crtc_h = mode->vdisplay;
+	}
+
+	pr_info("exynos7580_page_flip: state=%p crtc event=%p fb=%p\n",
+		state, crtc_state->event, fb);
+
+	crtc->fb = fb;	/* legacy pre-check in drm_mode_page_flip_ioctl */
+
+	ret = drm_atomic_async_commit(state);
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+	if (ret)
+		goto fail;
+
+	plane->fb = plane->state->fb;
+	crtc->fb = plane->state->fb;
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return 0;
+
+fail:
+	drm_atomic_state_free(state);
+out:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
 }
 
 static void exynos7580_crtc_destroy(struct drm_crtc *crtc)
@@ -410,6 +560,7 @@ static const struct drm_crtc_funcs exynos7580_crtc_funcs = {
 	.reset			= drm_atomic_helper_crtc_reset,
 	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
+	.gamma_set		= exynos7580_crtc_gamma_set,
 	.destroy		= exynos7580_crtc_destroy,
 };
 
@@ -452,6 +603,19 @@ int exynos7580_crtc_init(struct exynos7580_device *ex)
 	drm_crtc_helper_add(crtc, &exynos7580_crtc_helper_funcs);
 
 	/*
+	 * int80: the legacy gamma ioctls require a non-zero gamma_size;
+	 * without it drm_mode_gamma_set_ioctl returns -EINVAL ("failed to set
+	 * gamma: Invalid argument").  The CRTC has no hardware LUT (truecolor),
+	 * so a 256-entry software store is enough for the ioctl to succeed and
+	 * .gamma_set/.load_lut stay no-ops.
+	 */
+	if (!crtc->gamma_size) {
+		crtc->gamma_size = 256;
+		crtc->gamma_store = kzalloc(crtc->gamma_size * 3 * sizeof(u16),
+					    GFP_KERNEL);
+	}
+
+	/*
 	 * drm_mode_config_reset() normally allocates the initial CRTC state; do
 	 * it here as well so a driver that never calls it cannot crash the
 	 * atomic helpers on a NULL crtc->state.
@@ -479,10 +643,53 @@ int exynos7580_crtc_init(struct exynos7580_device *ex)
  * fb_create).  Reported to the integration seat; no header edit was made.
  */
 
+/* int90 diagnostic: one line per plane/crtc in a commit state. */
+static void exynos7580_dump_atomic_state(const char *where,
+					 struct drm_device *drm,
+					 struct drm_atomic_state *state)
+{
+	int i;
+
+	pr_info("exynos7580_atomic[%s]: state=%p allow_modeset=%d nplanes=%d ncrtcs=%d by %s\n",
+		where, state, state->allow_modeset,
+		drm->mode_config.num_total_plane, drm->mode_config.num_crtc,
+		current->comm);
+	for (i = 0; i < drm->mode_config.num_total_plane; i++) {
+		struct drm_plane *p = state->planes[i];
+		struct drm_plane_state *ps = state->plane_states[i];
+
+		if (!p)
+			continue;
+		pr_info("  plane[%d] id=%d crtc=%p fb=%p fmt=0x%08x src=(0x%x,0x%x,0x%x,0x%x) dst=%ux%u%+d%+d\n",
+			i, p->base.id, ps->crtc, ps->fb,
+			ps->fb ? ps->fb->pixel_format : 0,
+			ps->src_x, ps->src_y, ps->src_w, ps->src_h,
+			ps->crtc_w, ps->crtc_h, ps->crtc_x, ps->crtc_y);
+	}
+	for (i = 0; i < drm->mode_config.num_crtc; i++) {
+		struct drm_crtc *c = state->crtcs[i];
+		struct drm_crtc_state *cs = state->crtc_states[i];
+
+		if (!c)
+			continue;
+		pr_info("  crtc[%d] id=%d active=%d enable=%d mode_changed=%d active_changed=%d planes_changed=%d mode_blob=%p\n",
+			i, c->base.id, cs->active, cs->enable,
+			cs->mode_changed, cs->active_changed,
+			cs->planes_changed, cs->mode_blob);
+	}
+}
+
 int exynos7580_atomic_check(struct drm_device *drm,
 			    struct drm_atomic_state *state)
 {
-	return drm_atomic_helper_check(drm, state);
+	int ret;
+
+	exynos7580_dump_atomic_state("check-enter", drm, state);
+	ret = drm_atomic_helper_check(drm, state);
+	pr_info("exynos7580_atomic_check: drm_atomic_helper_check rc=%d\n", ret);
+	if (ret)
+		exynos7580_dump_atomic_state("check-failed", drm, state);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(exynos7580_atomic_check);
 
@@ -494,6 +701,8 @@ int exynos7580_atomic_commit(struct drm_device *drm,
 
 	if (WARN_ON(!ex || !ex->decon))
 		return -ENODEV;
+
+	exynos7580_dump_atomic_state("commit-enter", drm, state);
 
 	/*
 	 * Step (a): bring the display up before the software state is swapped,
@@ -510,6 +719,7 @@ int exynos7580_atomic_commit(struct drm_device *drm,
 			continue;
 
 		ret = exynos7580_crtc_enable_link(ex);
+		pr_info("exynos7580_atomic_commit: enable_link rc=%d\n", ret);
 		if (ret) {
 			DRM_ERROR("commit aborted: DECON/DSI bring-up failed: %d\n",
 				  ret);
@@ -519,11 +729,15 @@ int exynos7580_atomic_commit(struct drm_device *drm,
 
 	/* Step (b) */
 	ret = drm_atomic_helper_prepare_planes(drm, state);
-	if (ret)
+	pr_info("exynos7580_atomic_commit: prepare_planes rc=%d\n", ret);
+	if (ret) {
+		exynos7580_dump_atomic_state("prepare-failed", drm, state);
 		return ret;
+	}
 
 	/* Step (c) */
 	drm_atomic_helper_swap_state(drm, state);
+	pr_info("exynos7580_atomic_commit: swap_state done\n");
 
 	/*
 	 * Step (d): KmsFence's complete tail (pre/commit/post planes, flip event
@@ -531,7 +745,38 @@ int exynos7580_atomic_commit(struct drm_device *drm,
 	 * M1 is synchronous: a NONBLOCK/PAGE_FLIP_EVENT request gets exactly the
 	 * same tail and is completed by the event, which is what KWin requires.
 	 */
+	pr_info("exynos7580_atomic_commit: async=%d crtc->fb=%p primary->state->fb=%p by %s\n",
+		async, drm->mode_config.crtc_list.next ?
+			container_of(drm->mode_config.crtc_list.next,
+				     struct drm_crtc, head)->fb : NULL,
+		drm->mode_config.crtc_list.next ?
+			container_of(drm->mode_config.crtc_list.next,
+				     struct drm_crtc, head)->primary->state ?
+			container_of(drm->mode_config.crtc_list.next,
+				     struct drm_crtc, head)->primary->state->fb : NULL : NULL,
+		current->comm);
 	exynos7580_commit_tail(state);
+	pr_info("exynos7580_atomic_commit: commit_tail done\n");
+
+	/*
+	 * int82: the 3.10 legacy fields are still consulted by the core:
+	 * drm_mode_page_flip_ioctl() returns -EBUSY when crtc->fb is NULL, and
+	 * drm_crtc_helper paths read crtc->fb.  The atomic commit path does not
+	 * maintain them, so sync them here (plane->fb is handled by the
+	 * helper's page_flip TODO; do it for all cases).
+	 */
+	{
+		struct drm_crtc *c;
+
+		list_for_each_entry(c, &drm->mode_config.crtc_list, head) {
+			struct drm_plane *p = c->primary;
+
+			if (p && p->state) {
+				p->fb = p->state->fb;
+				c->fb = p->state->fb;
+			}
+		}
+	}
 
 	return 0;
 }

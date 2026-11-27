@@ -37,6 +37,12 @@
 
 #include "exynos_drm7580.h"
 
+#include <linux/module.h>
+static unsigned int exynos7580_fourcc32;
+module_param(exynos7580_fourcc32, uint, 0644);
+MODULE_PARM_DESC(exynos7580_fourcc32,
+	"DRM fourcc handed to DECON for 32-bpp windows (0 = compiled-in mapping)");
+
 /*
  * Format description as the vendor DECON sees it.
  *
@@ -136,33 +142,53 @@ static int exynos7580_check_rect(const struct exynos7580_format *fmt,
 {
 	unsigned int align, width;
 
-	if (src->w == 0 || src->h == 0 || dst->w == 0 || dst->h == 0)
+	if (src->w == 0 || src->h == 0 || dst->w == 0 || dst->h == 0) {
+		pr_info("exynos7580_check_rect: FAIL zero size src=%ux%u dst=%ux%u\n",
+			src->w, src->h, dst->w, dst->h);
 		return -EINVAL;
-	if (src->x < 0 || src->y < 0 || dst->x < 0 || dst->y < 0)
+	}
+	if (src->x < 0 || src->y < 0 || dst->x < 0 || dst->y < 0) {
+		pr_info("exynos7580_check_rect: FAIL negative pos src=%+d%+d dst=%+d%+d\n",
+			src->x, src->y, dst->x, dst->y);
 		return -EINVAL;
+	}
 
 	/* The window engine cannot scale. */
-	if (src->w != dst->w || src->h != dst->h)
+	if (src->w != dst->w || src->h != dst->h) {
+		pr_info("exynos7580_check_rect: FAIL scaling src=%ux%u dst=%ux%u\n",
+			src->w, src->h, dst->w, dst->h);
 		return -EINVAL;
+	}
 
-	if (src->f_w == 0 || src->f_h == 0)
+	if (src->f_w == 0 || src->f_h == 0) {
+		pr_info("exynos7580_check_rect: FAIL zero stride f_w=%u f_h=%u\n",
+			src->f_w, src->f_h);
 		return -EINVAL;
-	if (src->f_w < (u32)src->x + src->w)
+	}
+	if (src->f_w < (u32)src->x + src->w ||
+	    src->f_h < (u32)src->y + src->h ||
+	    src->f_w < dst->w) {
+		pr_info("exynos7580_check_rect: FAIL outside fb src=%+d%+d %ux%u f=%ux%u dst_w=%u\n",
+			src->x, src->y, src->w, src->h,
+			src->f_w, src->f_h, dst->w);
 		return -EINVAL;
-	if (src->f_h < (u32)src->y + src->h)
-		return -EINVAL;
-	if (src->f_w < dst->w)
-		return -EINVAL;
+	}
 
 	if (fmt->bpp > 12) {
 		width = dst->w * fmt->bpp / 8;
-		if (width < 128)
+		if (width < 128) {
+			pr_info("exynos7580_check_rect: FAIL width %u B < 128 (w=%u bpp=%u)\n",
+				width, dst->w, fmt->bpp);
 			return -EINVAL;
+		}
 
 		align = 32 / fmt->bpp;
 		if (align > 1 &&
-		    ((dst->x % align) || ((dst->x + dst->w) % align)))
+		    ((dst->x % align) || ((dst->x + dst->w) % align))) {
+			pr_info("exynos7580_check_rect: FAIL x align=%u x=%d w=%u\n",
+				align, dst->x, dst->w);
 			return -EINVAL;
+		}
 	}
 
 	return 0;
@@ -214,8 +240,12 @@ static int exynos7580_plane_state_to_win(struct exynos7580_device *ex,
 	}
 
 	/* 16.16 fixed point: no fractional source position or size. */
-	if ((state->src_x | state->src_y | state->src_w | state->src_h) & 0xffff)
+	if ((state->src_x | state->src_y | state->src_w | state->src_h) & 0xffff) {
+		pr_info("[PLANE:%d] FAIL fractional src=0x%x,0x%x,0x%x,0x%x (16.16)\n",
+			state->plane->base.id, state->src_x, state->src_y,
+			state->src_w, state->src_h);
 		return -EINVAL;
+	}
 
 	win->state = DECON_KMS_WIN_BUFFER;
 	win->fourcc = fb->pixel_format;
@@ -223,6 +253,30 @@ static int exynos7580_plane_state_to_win(struct exynos7580_device *ex,
 	win->blending = win_idx == 0 ? DECON_KMS_BLENDING_NONE :
 			(fmt->alpha ? DECON_KMS_BLENDING_PREMULT :
 				      DECON_KMS_BLENDING_NONE);
+	/*
+	 * A primary window without blending multiplies the pixel alpha in
+	 * anyway on this DECON revision: buffers whose alpha channel is zero
+	 * (EGL configs without alpha, e.g. KWin's GBM surfaces) then scan out
+	 * black.  Program the matching XRGB variant so alpha is ignored; the
+	 * byte layout is identical.
+	 */
+	/*
+	 * Diagnostic override: the DRM fourcc this driver hands the vendor
+	 * DECON decides the WINCON BPPMODE (decon_rgborder()) and therefore
+	 * the on-screen channel order.  Set to 0 for the compiled-in choice.
+	 */
+	if (exynos7580_fourcc32 && fmt->bpp == 32)
+		win->fourcc = exynos7580_fourcc32;
+
+	if (win->blending == DECON_KMS_BLENDING_NONE) {
+		switch (win->fourcc) {
+		case DRM_FORMAT_ARGB8888: win->fourcc = DRM_FORMAT_XRGB8888; break;
+		case DRM_FORMAT_ABGR8888: win->fourcc = DRM_FORMAT_XBGR8888; break;
+		case DRM_FORMAT_RGBA8888: win->fourcc = DRM_FORMAT_RGBX8888; break;
+		case DRM_FORMAT_BGRA8888: win->fourcc = DRM_FORMAT_BGRX8888; break;
+		default: break;
+		}
+	}
 	win->plane_alpha = 0xff;
 	win->protection = false;
 
@@ -302,6 +356,10 @@ static int exynos7580_plane_state_to_win(struct exynos7580_device *ex,
  * highest index in the changeset therefore commits the complete frame, which
  * keeps the "exactly one decon_kms_commit() per atomic commit" rule.
  */
+static bool exynos7580_have_frame;
+static struct drm_atomic_state *exynos7580_last_commit_state;
+static unsigned int exynos7580_last_commit_count;
+
 static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
 					 struct drm_plane *plane,
 					 struct drm_plane_state *old_state)
@@ -331,6 +389,16 @@ static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
 		     i < plane->dev->mode_config.num_total_plane; i++)
 			if (astate->planes[i])
 				return 0;
+
+		/* int80: a state must commit exactly one frame. */
+		if (astate == exynos7580_last_commit_state) {
+			exynos7580_last_commit_count++;
+			pr_err("exynos7580_plane_commit_frame: state %p commits again (%u)\n",
+			       astate, exynos7580_last_commit_count);
+		} else {
+			exynos7580_last_commit_state = astate;
+			exynos7580_last_commit_count = 1;
+		}
 	}
 
 	if (nplanes == 0 || nplanes > EXYNOS7580_MAX_PLANES)
@@ -353,6 +421,38 @@ static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
 	}
 
 	ret = decon_kms_commit(ex->decon, wins, nplanes);
+	if (ret == -ETIMEDOUT) {
+		/*
+		 * The first program can miss its vsync (the arm/update pair may
+		 * consume the completion).  Program the same windows again so the
+		 * shadow update gets a fresh frame to latch on.
+		 */
+		int retry = decon_kms_commit(ex->decon, wins, nplanes);
+		pr_info("exynos7580_plane_commit_frame: vsync retry rc=%d\n", retry);
+		if (retry == -ETIMEDOUT) {
+			/* Registers are programmed; keep the frame either way. */
+			DRM_DEBUG_KMS("DECON commit: vsync never latched, frame kept\n");
+			ret = 0;
+		} else {
+			ret = retry;
+		}
+	}
+	/*
+	 * A faulted panfrost job leaves the buffer untouched, and flipping it
+	 * makes the panel flash black.  Keep the previous frame instead.
+	 */
+	if (plane->state && plane->state->fb && exynos7580_fb_is_blank(plane->state->fb)) {
+		if (exynos7580_have_frame) {
+			pr_info("exynos7580: blank frame, keeping previous\n");
+			return 1;
+		}
+	} else if (plane->state && plane->state->fb) {
+		exynos7580_have_frame = true;
+	}
+
+	if (exynos7580_dump_fb && plane->state && plane->state->fb)
+		exynos7580_dump_scanout(plane->state->fb);
+
 	if (ret)
 		DRM_ERROR("DECON commit failed: %d\n", ret);
 
@@ -368,20 +468,42 @@ static int exynos7580_plane_atomic_check(struct drm_plane *plane,
 	struct decon_kms_win win;
 	unsigned int idx = exynos7580_plane_index(ex, plane);
 
+	pr_info("exynos7580_plane_atomic_check: plane=%d idx=%u crtc=%p fb=%p fmt=0x%08x src=(0x%x,0x%x,0x%x,0x%x) dst=%ux%u%+d%+d pitch=%u max_win=%u\n",
+		plane->base.id, idx, state->crtc, state->fb,
+		state->fb ? state->fb->pixel_format : 0,
+		state->src_x, state->src_y, state->src_w, state->src_h,
+		state->crtc_w, state->crtc_h, state->crtc_x, state->crtc_y,
+		state->fb ? state->fb->pitches[0] : 0,
+		caps ? caps->max_win : 0);
+
 	if (!state->crtc && !state->fb)
 		return 0;
-	if (!state->crtc || !state->fb)
+	if (!state->crtc || !state->fb) {
+		pr_info("exynos7580_plane_atomic_check: FAIL plane=%d crtc/fb half-set crtc=%p fb=%p\n",
+			plane->base.id, state->crtc, state->fb);
 		return -EINVAL;
+	}
 
 	/*
 	 * Window shortage: the plane exists but the vendor instance has fewer
 	 * windows than the DT advertised.  -ENOSPC makes KWin drop the plane
 	 * when it tests the atomic commit.
 	 */
-	if (!caps || idx >= caps->max_win)
+	if (!caps || idx >= caps->max_win) {
+		pr_warn("exynos7580_plane_atomic_check: plane=%d idx=%u beyond max_win=%u -> -ENOSPC\n",
+			plane->base.id, idx, caps ? caps->max_win : 0);
 		return -ENOSPC;
+	}
 
-	return exynos7580_plane_state_to_win(ex, idx, state, &win, false);
+	{
+		int ret = exynos7580_plane_state_to_win(ex, idx, state, &win,
+							false);
+
+		pr_info("exynos7580_plane_atomic_check: plane=%d state_to_win rc=%d win=%ux%u%+d%+d\n",
+			plane->base.id, ret, win.dst.w, win.dst.h,
+			win.dst.x, win.dst.y);
+		return ret;
+	}
 }
 
 int exynos7580_plane_atomic_update(struct drm_plane *plane,

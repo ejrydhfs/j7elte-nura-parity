@@ -48,6 +48,12 @@ struct p7580_submit_job {
 	/* Routing + HW program. */
 	int slot;			/* 0..2, from requirements */
 	uint64_t jc;			/* GPU address of job descriptor */
+	/* gpu31-firstfault: the live descriptor this job's shadow copy
+	 * was taken from (the chain node's original GPU address), or 0
+	 * when the dispatched jc IS the original descriptor. The
+	 * fault-time page dump prints both pages so the shadow copy and
+	 * the Mesa page can be compared word for word. */
+	uint64_t src_jc;
 	uint32_t requirements;		/* PANFROST_JD_REQ_* */
 	uint32_t as_nr;			/* address space bound to slot */
 	uint64_t affinity;		/* shader-present mask */
@@ -89,12 +95,7 @@ struct p7580_submit_job {
 	uint32_t in_fence_count;
 	/* BO reservation set (file-private handles + resv pointers). */
 	uint32_t *bo_handles;
-	uint32_t bo_count;		/* valid entries in bo_handles AND bos[].
-					 * Driver stamps this when it transfers
-					 * the lookup refs onto bos[] (F-JT2);
-					 * every consumer (PTEWALK snapshot,
-					 * pre-signal sync, excl publish,
-					 * free_job unref) keys off it. */
+	uint32_t bo_count;
 	/* Dispatch context stamped at SUBMIT (probenumeric): the async
 	 * run_job/timedout_job/free_job workers must NOT re-derive the
 	 * file state from the entity pointer (container_of(ent, ...,
@@ -104,6 +105,10 @@ struct p7580_submit_job {
 	 * p7580_drv_file / struct p7580_drv. */
 	void *file_priv;
 	void *drv_priv;
+	/* Opaque owning drm_sched_job: the IRQ fault leg kicks this job's
+	 * timeout/recovery work immediately through the 0004 shim instead
+	 * of leaving the fence unsignalled for the full retry budget. */
+	void *sched_job;
 	/* Monotonic run_job entry count (probenumeric): incremented as
 	 * the first statement of p7580_drv_run_job, printed by free_job
 	 * as ran=N. Proves call order even if a print is lost. */
@@ -129,6 +134,20 @@ struct p7580_submit_job {
 	void *chain_shadow;
 	uint32_t chain_pos;
 	uint32_t chain_len;
+	/* gpu31-storm58: first-fault page inputs, captured at SUBMIT.
+	 * fbd is descriptor word 10 for a fragment node (type 9), read
+	 * from the descriptor BO during the chain walk: the one-shot
+	 * dump needs the SFBD address, and desc[] is only 8 words, so
+	 * the old job->desc[10] read was out of bounds (on int42 it
+	 * fed an unrelated pointer into the "fbd" page dump).
+	 * jc_age counts SUBMITs this file made between the last one
+	 * that touched the BO holding jc and this job: 1 means the
+	 * descriptor page was written by the previous SUBMIT, 2 by the
+	 * previous frame's FS submit. A small age at fault time is a
+	 * recycled BO, and if a job is still in flight on it that is
+	 * the storm's userspace-write race. */
+	uint32_t fbd;
+	uint32_t jc_age;
 };
 
 /* Per-file submit context: one sched entity per slot. */
@@ -137,6 +156,42 @@ struct p7580_file_ctx {
 	void *sched_entity[P7580_NUM_JOB_SLOTS];
 	void *syncobj_mgr;		/* backport drm_syncobj_manager */
 };
+/* ------------------------------------------------------------------ */
+/* gpu31-firstfault: in-memory job-event ring.                        */
+/*                                                                    */
+/* The long-run fault is rare (one frame in tens/hundreds) and the    */
+/* serial console cannot carry a per-dispatch trace without perturbing*/
+/* the timing that triggers it. So the dispatch, IRQ, timeout,        */
+/* recovery and runtime-PM events are recorded into a fixed ring in   */
+/* RAM (a few stores, no printk, no MMIO unless the ring is armed)    */
+/* and dumped once, with the descriptor pages, at the first fault.    */
+/* all-zero jc/a/b/c rings are still useful: they show the ordering.  */
+/* ------------------------------------------------------------------ */
+#define P7580_EV_MAX	128u
+enum p7580_ev_kind {
+	P7580_EV_START = 1,	/* hw_submit: a=status pre, b=cmd post,
+				 * c=status post (armed: MMIO probed) */
+	P7580_EV_DONE,		/* IRQ DONE: a=js_status, b=int bits */
+	P7580_EV_ERR,		/* IRQ ERR: a=js_status, b=int bits */
+	P7580_EV_TIMEOUT,	/* timedout: a=js_status */
+	P7580_EV_RECOVER,	/* recover: a=latched, b=cycled, c=rc */
+	P7580_EV_SUSPEND,	/* runtime suspend accepted */
+	P7580_EV_SUSPEND_BUSY,	/* runtime suspend refused (-EBUSY) */
+	P7580_EV_RESUME,	/* runtime resume */
+	P7580_EV_CYCLE,		/* power cycle completed: a=rc */
+	P7580_EV_DUMP,		/* ring dump marker */
+};
+struct p7580_ev {
+	uint64_t ns;		/* ktime_get() at record time */
+	uint64_t jc;
+	uint32_t kind;		/* enum p7580_ev_kind */
+	uint32_t slot;
+	uint32_t seq;
+	uint32_t a;
+	uint32_t b;
+	uint32_t c;
+};
+
 /* Last-job snapshot: what the ERR pins and the dump knob report. */
 /* Updated (under hw_lock) at every hw_submit dispatch for the next */
 /* OUTCOME print (DONE/ERR/timeout), so the fault register capture */
@@ -189,6 +244,16 @@ struct p7580_job_dev {
 	void *pm_dev;
 	int (*pm_get)(void *dev);
 	void (*pm_put)(void *dev);
+	/* Fault-recovery core power cycle (gpu31-readback), wired by
+	 * p7580_job_dev_init from the driver TU (the jobs slice never
+	 * includes the power slice). Called from p7580_job_recover()
+	 * with reset_lock held and a live PM ref owned by the caller,
+	 * only when a POWER_FAULT latch survived the GPU reset: that
+	 * latch is only cleared by cycling the cores, and until it is
+	 * cleared every following job on the slot reports 0x41 again.
+	 * MMU AS0 reprogram + JOB_INT re-arm happen after it returns.
+	 * NULL when unwired: recovery then behaves as before. */
+	int (*power_cycle)(void *dev);
 	/* Chain-bit experiment (gpu31-lastjob): runtime switch, no
 	 * rebuild needed to A/B. 0 = off (both variants disabled,
 	 * submit bytes untouched); 1 = variant A (set JS_CONFIG
@@ -206,6 +271,39 @@ struct p7580_job_dev {
 			    const uint32_t *handles, const uint64_t *addrs,
 			    const uint32_t *sizes, uint32_t n);
 	void *iova_resolve_priv;
+	/* gpu31-firstfault: event ring + first-fault dump (declarations
+	 * above). ev_arm is set by the ev_arm debugfs knob; it enables
+	 * the per-dispatch MMIO probes (status/command) AND the one-shot
+	 * ring + page dump at the first fault/timeout. ev_dumped makes
+	 * the dump one-shot (re-arm with a new ev_arm write). */
+	struct p7580_ev ev[P7580_EV_MAX];
+	unsigned int ev_head;
+	unsigned int ev_arm;
+	unsigned int ev_dumped;
+	/* gpu31-firstfault: descriptor-page dumper (driver-owned, process
+	 * context only: resolves the IOVA to a BO and kmaps it). The jobs
+	 * slice never dereferences GEM; NULL when unwired. */
+	int (*desc_dump)(void *priv, uint64_t gpu, const char *tag);
+	void *desc_dump_priv;
+	/* gpu31-firstfault: 1 = queue the FS (slot 0) submit on the
+	 * chain slot's entity so it is strictly ordered behind the
+	 * tiler by one FIFO instead of relying on the cross-entity
+	 * dependency alone. Runtime A/B knob (serialize_fs). */
+	unsigned int serialize_fs;
+	/* gpu31-watchdog: deterministic silent-hang injection. hang_arm
+	 * = number of upcoming dispatches whose slot DONE+ERR bits are
+	 * masked at START, so the job runs and retires in hardware but
+	 * no IRQ is ever delivered: the exact silent signature (fence
+	 * unsignalled, STAT/RAWSTAT 0, COMMAND_NEXT drained) that only
+	 * the sched timeout can break. The timeout/recover path re-arms
+	 * the mask. Debugfs hang_inject, default 0 (inert). */
+	unsigned int hang_arm;
+	/* gpu31-watchdog: sched dispatch-timeout accessors (job_timeout_ms
+	 * debugfs). The timeout lives in the driver's drm_sched seed, so
+	 * the jobs slice only forwards; NULL set = read-only knob. */
+	unsigned int (*get_timeout_ms)(void *priv);
+	int (*set_timeout_ms)(void *priv, unsigned int ms);
+	void *timeout_priv;
 };
 #else
 struct p7580_job_dev {
@@ -228,7 +326,8 @@ struct p7580_job_dev {
 int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 		       uint32_t js_present, uint64_t shader_present,
 		       dma_addr_t pgd_dma, void *pm_dev,
-		       int (*pm_get)(void *dev), void (*pm_put)(void *dev));
+		       int (*pm_get)(void *dev), void (*pm_put)(void *dev),
+		       int (*power_cycle)(void *dev));
 #else
 #include <stdint.h>
 typedef uint64_t p7580_dma_addr_t;
@@ -237,6 +336,14 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void *regs,
 		       p7580_dma_addr_t pgd_dma);
 #endif
 void p7580_job_dev_fini(struct p7580_job_dev *jd);
+/* True when a present job slot still reports a latched HW fault code in
+ * JS_STATUS after a reset/power-on (POWER_FAULT 0x41 and friends; our
+ * own HARD_STOP's INTERRUPTED/STOPPED/TERMINATED are not faults). The
+ * driver's resume path uses it to clear such a latch with a core power
+ * cycle before the first job is dispatched; recover() uses it for the
+ * same reason after the GPU-level reset. Process context, block must be
+ * powered (runtime-PM ref held). */
+int p7580_job_slots_latched_fault(struct p7580_job_dev *jd);
 /* Debug knobs (errtrace): re-arm the trace budget (copies N into both
  * trace_arm and trace_left under hw_lock; N=0 stops tracing). Dump
  * renders the last-dispatch snapshot + live slot registers into buf
@@ -301,5 +408,31 @@ void p7580_job_set_iova_resolver(struct p7580_job_dev *jd,
 
 /* Idle check for suspend/close paths. */
 int p7580_job_is_idle(struct p7580_job_dev *jd);
+
+/* gpu31-firstfault: event ring + first-fault descriptor-page dump.
+ * p7580_job_ev() appends one record (IRQ-safe: one spinlock, no MMIO,
+ * no printk); kind is enum p7580_ev_kind. p7580_job_ev_arm() resets
+ * the ring and arms/disarms the per-dispatch MMIO probes and the
+ * one-shot dump. p7580_job_set_desc_dump() registers the driver's
+ * page dumper (process context). p7580_job_first_fault() is called by
+ * the timeout/fault paths with the faulting job and dumps ring + pages
+ * once per arm. */
+void p7580_job_ev(struct p7580_job_dev *jd, unsigned int kind, int slot,
+		  uint32_t seq, uint64_t jc, uint32_t a, uint32_t b,
+		  uint32_t c);
+void p7580_job_ev_arm(struct p7580_job_dev *jd, unsigned int on);
+void p7580_job_set_desc_dump(struct p7580_job_dev *jd,
+			     int (*fn)(void *priv, uint64_t gpu,
+				       const char *tag), void *priv);
+/* gpu31-watchdog: sched dispatch-timeout accessors behind the
+ * job_timeout_ms debugfs knob. The driver owns the timeout (it is the
+ * drm_sched seed), so the jobs slice only forwards get/set; NULL set
+ * leaves the knob read-only. Process context, no MMIO. */
+void p7580_job_set_timeout_hooks(struct p7580_job_dev *jd,
+				 unsigned int (*get)(void *priv),
+				 int (*set)(void *priv, unsigned int ms),
+				 void *priv);
+void p7580_job_first_fault(struct p7580_job_dev *jd,
+			   struct p7580_submit_job *job, uint32_t status);
 
 #endif /* PANFROST7580_JOB_H */

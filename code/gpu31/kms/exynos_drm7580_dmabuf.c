@@ -46,6 +46,7 @@
  */
 
 #include <linux/dma-buf.h>
+#include <linux/module.h>
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/exynos_iovmm.h>
@@ -58,6 +59,151 @@
 #include <drm/drm_fourcc.h>
 
 #include "exynos_drm7580.h"
+#include <linux/dma-buf.h>
+#include <linux/module.h>
+
+unsigned int exynos7580_dump_fb;
+module_param(exynos7580_dump_fb, uint, 0644);
+MODULE_PARM_DESC(exynos7580_dump_fb,
+	"1 = log three scanout pixels of the next committed frame, then clear");
+
+/*
+ * Sample the pixels the DECON is about to scan out.  The buffer is an
+ * imported dma-buf (panfrost GBM), so map it through the exporter instead of
+ * assuming any CPU address.
+ */
+static void exynos7580_dump_pixels(struct drm_framebuffer *fb, const char *tag)
+{
+	struct drm_gem_object *obj;
+	void *map;
+	const u32 ys[3] = { 100, 640, 1200 };
+	unsigned int pitch, i;
+
+	if (!fb || !fb->pitches[0])
+		return;
+	obj = drm_fb_cma_get_gem_obj(fb, 0);
+	if (!obj || !obj->import_attach || !obj->import_attach->dmabuf) {
+		pr_info("scanout-dump[%s]: no imported dmabuf\n", tag);
+		return;
+	}
+	if (dma_buf_begin_cpu_access(obj->import_attach->dmabuf, 0,
+				     obj->size, DMA_FROM_DEVICE)) {
+		pr_info("scanout-dump[%s]: begin_cpu_access failed\n", tag);
+		return;
+	}
+	map = dma_buf_vmap(obj->import_attach->dmabuf);
+	if (!map) {
+		pr_info("scanout-dump[%s]: vmap failed\n", tag);
+		dma_buf_end_cpu_access(obj->import_attach->dmabuf, 0,
+				       obj->size, DMA_FROM_DEVICE);
+		return;
+	}
+	pitch = fb->pitches[0];
+	for (i = 0; i < 3; i++) {
+		unsigned int y = ys[i] < fb->height ? ys[i] : fb->height - 1;
+		u32 px = ((const u32 *)((const u8 *)map + y * pitch))[360];
+		pr_info("scanout-dump[%s]: %ux%u y=%u px=%08x\n",
+			tag, fb->width, fb->height, y, px);
+	}
+	dma_buf_vunmap(obj->import_attach->dmabuf, map);
+	dma_buf_end_cpu_access(obj->import_attach->dmabuf, 0, obj->size,
+			       DMA_FROM_DEVICE);
+}
+
+static struct drm_framebuffer *exynos7580_dump_late_fb;
+static void exynos7580_dump_late_fn(struct work_struct *w)
+{
+	if (exynos7580_dump_late_fb) {
+		exynos7580_dump_pixels(exynos7580_dump_late_fb, "t200ms");
+		drm_framebuffer_unreference(exynos7580_dump_late_fb);
+		exynos7580_dump_late_fb = NULL;
+	}
+}
+static DECLARE_DELAYED_WORK(exynos7580_dump_late_work, exynos7580_dump_late_fn);
+
+/*
+ * Sample the frame twice: right after the commit returns and again 200 ms
+ * later.  This tree's struct dma_buf carries no reservation object, so there
+ * is nothing to wait on directly; the two samples distinguish "rendering
+ * finishes late" from "rendering never completes".
+ */
+void exynos7580_dump_scanout(struct drm_framebuffer *fb)
+{
+	if (!fb)
+		return;
+	exynos7580_dump_fb = 0;
+	exynos7580_dump_pixels(fb, "t0");
+	drm_framebuffer_reference(fb);
+	exynos7580_dump_late_fb = fb;
+	schedule_delayed_work(&exynos7580_dump_late_work, msecs_to_jiffies(200));
+}
+EXPORT_SYMBOL_GPL(exynos7580_dump_scanout);
+
+/**
+ * exynos7580_fb_is_blank() - is the whole scanout buffer zero?
+ *
+ * A panfrost job that faults leaves KWin's buffer untouched (all zeroes,
+ * alpha included).  Programming that frame makes the panel flash black for
+ * one refresh; the plane code uses this to keep the previous frame instead.
+ * The check is a cheap vmap of four rows, not a full scan.
+ */
+bool exynos7580_fb_is_blank(struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj;
+	void *map;
+	u32 seen[4] = { 0, 0, 0, 0 };
+	unsigned int nseen = 0, y, x, i;
+	bool few = true, dup;
+
+	if (!fb || !fb->pitches[0] || !fb->height)
+		return false;
+	obj = drm_fb_cma_get_gem_obj(fb, 0);
+	if (!obj || !obj->import_attach || !obj->import_attach->dmabuf)
+		return false;
+	if (dma_buf_begin_cpu_access(obj->import_attach->dmabuf, 0,
+				     obj->size, DMA_FROM_DEVICE))
+		return false;
+	map = dma_buf_vmap(obj->import_attach->dmabuf);
+	if (!map) {
+		dma_buf_end_cpu_access(obj->import_attach->dmabuf, 0,
+				       obj->size, DMA_FROM_DEVICE);
+		return false;
+	}
+	/*
+	 * An unrendered KWin frame is a clear colour or two (00000000 /
+	 * ff000000 / ff161616), never a picture.  Stop as soon as a fourth
+	 * distinct sampled value shows up: that is real content.
+	 */
+	for (y = 0; y < fb->height && few; y++) {
+		const u32 *row = (const u32 *)((const u8 *)map + y * fb->pitches[0]);
+
+		for (x = 0; x < fb->width; x += 4) {
+			u32 cur = row[x];
+
+			dup = false;
+			for (i = 0; i < nseen; i++)
+				if (seen[i] == cur) {
+					dup = true;
+					break;
+				}
+			if (dup)
+				continue;
+			if (nseen == 3) {	/* fourth colour: real content */
+				few = false;
+				break;
+			}
+			seen[nseen++] = cur;
+		}
+	}
+	dma_buf_vunmap(obj->import_attach->dmabuf, map);
+	dma_buf_end_cpu_access(obj->import_attach->dmabuf, 0, obj->size,
+			       DMA_FROM_DEVICE);
+	pr_info("exynos7580: fb %u blank=%d colours=%u %08x %08x %08x %08x\n",
+		fb->base.id, few, nseen, seen[0], seen[1], seen[2], seen[3]);
+	return few;
+}
+EXPORT_SYMBOL_GPL(exynos7580_fb_is_blank);
+
 
 /* DECON windows are programmed with SYSMMU/IOVMM addresses; iovmm_map() only
  * exists with one of these, and the display does not work without it. */
@@ -353,10 +499,25 @@ static int exynos7580_own_scanout(struct drm_framebuffer *fb,
 	if (!efb->cma->vaddr)
 		return -ENODEV;
 
-	ret = sg_alloc_table(&sgt, 1, GFP_KERNEL);
-	if (ret)
-		return -ENODEV;
-	sg_set_buf(sgt.sgl, efb->cma->vaddr, obj->size);
+	/*
+	 * cma->vaddr is only the CPU mapping; the IOMMU needs the backing
+	 * pages, so build one sg entry per page from paddr.  Using vaddr here
+	 * (sg_set_buf) maps vmalloc memory and the panel shows stripes.
+	 */
+	{
+		unsigned long pfn = PFN_DOWN(efb->cma->paddr);
+		unsigned int npages = DIV_ROUND_UP(obj->size + (efb->cma->paddr & ~PAGE_MASK),
+						   PAGE_SIZE);
+		unsigned int i;
+		struct scatterlist *sg;
+
+		ret = sg_alloc_table(&sgt, npages, GFP_KERNEL);
+		if (ret)
+			return -ENODEV;
+		for_each_sg(sgt.sgl, sg, npages, i)
+			sg_set_page(sg, pfn_to_page(pfn + i), PAGE_SIZE,
+				    i == 0 ? (efb->cma->paddr & ~PAGE_MASK) : 0);
+	}
 	ret = exynos7580_map_plane(fb, plane, &sgt, addr);
 	sg_free_table(&sgt);
 
@@ -419,15 +580,30 @@ static int exynos7580_foreign_scanout(struct drm_framebuffer *fb,
 		goto out;
 	}
 
-	ret = sg_alloc_table(&sgt, 1, GFP_KERNEL);
-	if (ret) {
-		ret = -ENODEV;
-		goto out;
-	}
-	sg_set_buf(sgt.sgl, cma->vaddr, cma->base.size);
+	/*
+	 * cma->vaddr is the CPU mapping, not the backing storage: building the
+	 * sg from it (sg_set_buf) maps the vmalloc range and the controller
+	 * then scans unrelated memory (visible as stripe garbage).  CMA memory
+	 * is physically contiguous, so build one sg entry per page from paddr.
+	 */
+	{
+		unsigned long pfn = PFN_DOWN(cma->paddr + fb->offsets[plane]);
+		unsigned int npages = DIV_ROUND_UP(size + (cma->paddr + fb->offsets[plane]) % PAGE_SIZE,
+						   PAGE_SIZE);
+		unsigned int i;
+		struct scatterlist *sg;
 
-	iova = iovmm_map(ex->dev, sgt.sgl, fb->offsets[plane], size,
-			 DMA_TO_DEVICE, 0);
+		ret = sg_alloc_table(&sgt, npages, GFP_KERNEL);
+		if (ret) {
+			ret = -ENODEV;
+			goto out;
+		}
+		for_each_sg(sgt.sgl, sg, npages, i)
+			sg_set_page(sg, pfn_to_page(pfn + i), PAGE_SIZE,
+				    i == 0 ? (cma->paddr + fb->offsets[plane]) % PAGE_SIZE : 0);
+	}
+
+	iova = iovmm_map(ex->dev, sgt.sgl, 0, size, DMA_TO_DEVICE, 0);
 	sg_free_table(&sgt);
 	if (IS_ERR_VALUE(iova)) {
 		DRM_ERROR("iovmm_map() of CMA fb %d failed: %d\n",
@@ -464,15 +640,29 @@ out:
 int exynos7580_fb_scanout(struct drm_framebuffer *fb, unsigned int plane,
 			  dma_addr_t *addr)
 {
+	int ret;
+
+	pr_info("exynos7580_fb_scanout: fb=%p plane=%u fmt=0x%08x %ux%u pitch=%u\n",
+		fb, plane, fb ? fb->pixel_format : 0,
+		fb ? fb->width : 0, fb ? fb->height : 0,
+		(fb && plane < 4) ? fb->pitches[plane] : 0);
+
 	if (!fb || !addr)
 		return -EINVAL;
-	if (plane >= 4 || !fb->pitches[plane])
+	if (plane >= 4 || !fb->pitches[plane]) {
+		pr_info("exynos7580_fb_scanout: FAIL bad fb/plane=%u pitch=%u\n",
+			plane, fb->pitches[0]);
 		return -EINVAL;
+	}
 
 	if (fb->funcs == &exynos7580_fb_funcs)
-		return exynos7580_own_scanout(fb, plane, addr);
+		ret = exynos7580_own_scanout(fb, plane, addr);
+	else
+		ret = exynos7580_foreign_scanout(fb, plane, addr);
 
-	return exynos7580_foreign_scanout(fb, plane, addr);
+	pr_info("exynos7580_fb_scanout: fb=%p plane=%u rc=%d addr=0x%llx\n",
+		fb, plane, ret, (ret == 0) ? (unsigned long long)*addr : 0ULL);
+	return ret;
 }
 
 /* ---------- dma-buf import ---------- */
@@ -506,6 +696,9 @@ struct drm_gem_object *exynos7580_gem_prime_import(struct drm_device *drm,
 	struct sg_table *sgt;
 	size_t size;
 	int ret;
+
+	pr_info("exynos7580_gem_prime_import: enter dma_buf=%p size=%zu by %s\n",
+		dma_buf, dma_buf ? dma_buf->size : 0, current->comm);
 
 	if (!drm || !drm->dev || !dma_buf || !dma_buf->size)
 		return ERR_PTR(-EINVAL);
@@ -549,6 +742,8 @@ struct drm_gem_object *exynos7580_gem_prime_import(struct drm_device *drm,
 
 	DRM_DEBUG_PRIME("imported %zu bytes, %d sg entries\n",
 			dma_buf->size, sgt->nents);
+	pr_info("exynos7580_gem_prime_import: ok obj=%p import_attach=%p sgt=%p\n",
+		&cma->base, attach, sgt);
 
 	return &cma->base;
 
@@ -589,6 +784,13 @@ struct drm_framebuffer *exynos7580_fb_create(struct drm_device *drm,
 
 	if (!drm || !file || !mode_cmd)
 		return ERR_PTR(-EINVAL);
+
+	pr_info("exynos7580_fb_create: %ux%u fmt=%08x handles=%u,%u,%u,%u pitches=%u,%u offsets=%u,%u\n",
+		mode_cmd->width, mode_cmd->height, mode_cmd->pixel_format,
+		mode_cmd->handles[0], mode_cmd->handles[1],
+		mode_cmd->handles[2], mode_cmd->handles[3],
+		mode_cmd->pitches[0], mode_cmd->pitches[1],
+		mode_cmd->offsets[0], mode_cmd->offsets[1]);
 
 	obj = drm_gem_object_lookup(drm, file, mode_cmd->handles[0]);
 	if (!obj)

@@ -1,7 +1,7 @@
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/drivers/gpu/drm/panfrost/panfrost7580_drv.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_drv.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,180 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_drv.h	2026-11-27 00:00:00.000000000 -0500
+@@ -0,0 +1,211 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_drv.h - shared device/file state for the panfrost7580
@@ -80,7 +80,38 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +	struct mutex bo_lock;		/* serialises bo_list */
 +	struct list_head bo_list;
 +	atomic_t pm_ref;		/* live-job runtime-PM refs (see submit.c) */
++	/* Mesa 26 GET_PARAM snapshot: read once at probe while the block is
++	 * powered (values are constant for the part). */
++	struct {
++		uint64_t gpu_id;		/* GPU_ID register */
++		uint64_t shader_present;
++		uint64_t tiler_present;
++		uint64_t l2_present;
++		uint64_t stack_present;
++		uint32_t as_present;
++		uint32_t js_present;
++		uint32_t l2_features;
++		uint32_t core_features;
++		uint32_t tiler_features;
++		uint32_t mem_features;
++		uint32_t mmu_features;
++		uint32_t thread_features;
++		uint32_t max_threads;
++		uint32_t thread_max_workgroup_sz;
++		uint32_t thread_max_barrier_sz;
++		uint32_t coherency_features;
++		uint32_t afbc_features;
++		uint32_t texture_features[4];
++		uint32_t js_features[16];
++		uint32_t nr_core_groups;
++		uint32_t thread_tls_alloc;
++	} feat;
 +};
++
++struct drm_device;
++/* Fill *value for one DRM_PANFROST_PARAM_* from the probe snapshot.
++ * Returns -EINVAL for parameters this driver does not expose. */
++int p7580_drv_get_param(struct drm_device *ddev, uint32_t param, uint64_t *value);
 +
 +/* gpu31-storm58: bounded BO-age ledger size (see p7580_drv_file). */
 +#define P7580_BO_AGE_SLOTS	64u
@@ -184,8 +215,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_drv.h b/d
 +#endif /* PANFROST7580_DRV_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/drivers/gpu/drm/panfrost/panfrost7580_gem.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1807 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.c	2026-11-27 00:00:00.000000000 -0500
+@@ -0,0 +1,1850 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_gem.c - BO alloc/import/export/mmap for the T720 port.
@@ -830,11 +861,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	hole = drm_mm_search_free(&gd->offset_mm, npages, 0, false);
 +	if (!hole) {
 +		ret = -ENOSPC;
++		pr_info("p7580_offset_alloc: no hole npages=%lu rc=%d\n",
++			npages, ret);
 +		goto out;
 +	}
 +	memset(&bo->offset_node, 0, sizeof(bo->offset_node));
 +	if (drm_mm_insert_node(&gd->offset_mm, &bo->offset_node, npages, 0)) {
 +		ret = -ENOMEM;
++		pr_info("p7580_offset_alloc: insert failed npages=%lu rc=%d\n",
++			npages, ret);
 +		goto out;
 +	}
 +	memset(&bo->offset_hash, 0, sizeof(bo->offset_hash));
@@ -842,9 +877,13 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	if (drm_ht_insert_item(&gd->offset_hash, &bo->offset_hash)) {
 +		drm_mm_remove_node(&bo->offset_node);
 +		ret = -ENOMEM;
++		pr_info("p7580_offset_alloc: hash insert failed npages=%lu rc=%d\n",
++			npages, ret);
 +		goto out;
 +	}
 +	bo->offset_valid = 1;
++	pr_info("p7580_offset_alloc: npages=%lu start=0x%lx rc=0\n",
++		npages, bo->offset_node.start);
 +out:
 +	mutex_unlock(&gd->mmap_offset_lock);
 +	return ret;
@@ -1478,6 +1517,9 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	 * shape as the udl fault handler; avoids taking struct_mutex in
 +	 * fault context at all. */
 +	ret = p7580_map_page(bo, vma, f_vaddr, page_offset);
++	pr_info_ratelimited("p7580_gem_fault: page=0x%lx vaddr=0x%lx vflags=0x%lx backing=%u pages=%p sgt=%p rc=%d\n",
++		(unsigned long)page_offset, f_vaddr, vma->vm_flags,
++		bo->backing, bo->pages, bo->sgt, ret);
 +	return p7580_fault_err(ret);
 +}
 +
@@ -1549,13 +1591,31 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	 * already dying (kref_get_unless_zero), in which case the offset
 +	 * is stale. An offset we never handed out is not ours: keep the
 +	 * core legacy-map fallback exactly as drm_gem_mmap() did. */
-+	obj = p7580_offset_lookup(gd, vma->vm_pgoff);
-+	if (!obj)
-+		return drm_mmap(filp, vma);
-+
 +	vm_size = vma->vm_end - vma->vm_start;
++	pr_info("p7580_gem_mmap: enter fop=%pS fop_mmap=%pS fop_ioctl=%pS pgoff=0x%lx vm=0x%lx vflags=0x%lx minor_type=%d minor_idx=%d drv=%s gem_vm_ops=%p\n",
++		filp->f_op, filp->f_op ? filp->f_op->mmap : NULL,
++		filp->f_op ? filp->f_op->unlocked_ioctl : NULL,
++		vma->vm_pgoff, vm_size, vma->vm_flags,
++		priv->minor->type, priv->minor->index,
++		dev->driver->name ? dev->driver->name : "?",
++		dev->driver->gem_vm_ops);
++
++	obj = p7580_offset_lookup(gd, vma->vm_pgoff);
++	if (!obj) {
++		int drc;
++
++		pr_info("p7580_gem_mmap: offset_lookup MISS pgoff=0x%lx\n",
++			vma->vm_pgoff);
++		drc = drm_mmap(filp, vma);
++		pr_info("p7580_gem_mmap: drm_mmap fallback rc=%d pgoff=0x%lx\n",
++			drc, vma->vm_pgoff);
++		return drc;
++	}
++
 +	if (vm_size > obj->size ||
 +	    !dev->driver->gem_vm_ops) {
++		pr_info("p7580_gem_mmap: bad request vm=0x%lx obj_size=0x%zx gem_vm_ops=%p rc=-EINVAL\n",
++			vm_size, obj->size, dev->driver->gem_vm_ops);
 +		drm_gem_object_unreference_unlocked(obj);
 +		return -EINVAL;
 +	}
@@ -1577,6 +1637,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	vma->vm_pgoff = 0;
 +
 +	bo = to_p7580_bo(obj);
++	pr_info("p7580_gem_mmap: hit obj_size=0x%zx offset_valid=%u node_start=0x%llx backing=%u sgt=%p pages=%p nr_pages=%u cache_attr=0x%x\n",
++		obj->size, bo->offset_valid,
++		(unsigned long long)bo->offset_node.start, bo->backing,
++		bo->sgt, bo->pages, bo->nr_pages, bo->cache_attr);
 +
 +	/* WC default (covers both SHMEM CREATE_BO and CMA scanout), cached
 +	 * opt-in (exynos update_vm_cache_attr shape). COHERENCY_NONE: WC is
@@ -1595,6 +1659,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +		dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
 +		ret = dma_mmap_attrs(obj->dev->dev, vma, bo->cma_vaddr,
 +				     bo->cma_paddr, obj->size, &attrs);
++		pr_info("p7580_gem_mmap: cma dma_mmap_attrs rc=%d size=0x%zx paddr=%pa\n",
++			ret, obj->size, &bo->cma_paddr);
 +		if (ret)
 +			goto err_close;
 +		return 0;
@@ -1609,6 +1675,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +			pfn = __phys_to_pfn(sg_phys(sgl));
 +			ret = remap_pfn_range(vma, vma->vm_start + off, pfn,
 +					chunk, vma->vm_page_prot);
++			pr_info("p7580_gem_mmap: sgt chunk=%u off=0x%lx pfn=0x%lx rc=%d\n",
++				i, off, pfn, ret);
 +			if (ret)
 +				goto err_close;
 +			off += sgl->length;
@@ -1620,6 +1688,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +
 +	if (!bo->pages) {
 +		ret = -ENODEV;
++		pr_info("p7580_gem_mmap: no pages/sgt backing=%u rc=-ENODEV\n",
++			bo->backing);
 +		goto err_close;
 +	}
 +
@@ -1630,6 +1700,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	 * last close of another mapping of the same BO. */
 +	vma->vm_flags &= ~VM_PFNMAP;
 +	vma->vm_flags |= VM_MIXEDMAP | VM_DONTCOPY;
++	pr_info("p7580_gem_mmap: mixedmap vflags=0x%lx vma_refs(before)=%u npages=%u rc=0\n",
++		vma->vm_flags, bo->vma_refs, bo->nr_pages);
 +	mutex_lock(&obj->dev->struct_mutex);
 +	p7580_gem_vm_get(bo);
 +	mutex_unlock(&obj->dev->struct_mutex);
@@ -1639,6 +1711,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +	/* The VMA reference taken by the lookup (and registered with
 +	 * drm_vm_open_locked above) is dropped by the core close helper,
 +	 * exactly as the old drm_gem_mmap() error path did. */
++	pr_info("p7580_gem_mmap: FAIL branch rc=%d pgoff=0x%lx vm=0x%lx\n",
++		ret, vma->vm_pgoff, vm_size);
 +	drm_gem_vm_close(vma);
 +	return ret;
 +}
@@ -1995,7 +2069,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/drivers/gpu/drm/panfrost/panfrost7580_gem.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_gem.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_gem.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,294 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -2293,8 +2367,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_gem.h b/d
 +#endif /* PANFROST7580_GEM_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,401 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c	2026-11-27 00:00:00.000000000 -0500
+@@ -0,0 +1,444 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_ioctl.c - six v5.2 ioctl handlers on the GEM core.
@@ -2339,6 +2413,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +
 +#include "drm_syncobj.h"		/* 0003 (staged by Makefile) */
 +#include "panfrost7580_gem.h"
++/* Probe-snapshot GET_PARAM backend (main.c).  Declared here instead of
++ * including panfrost7580_drv.h, whose jobs slice mirrors struct
++ * p7580_submit locally in this TU. */
++struct drm_device;
++int p7580_drv_get_param(struct drm_device *ddev, uint32_t param,
++			uint64_t *value);
 +#include "panfrost7580_ioctl.h"
 +#include "panfrost_drm.h"
 +/* ABI gate (gpu31-abialign): v5.2/Mesa-20.3 wire sizes + offsets. The
@@ -2452,24 +2532,31 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +			     struct drm_file *file_priv)
 +{
 +	struct drm_panfrost_get_param *args = data;
++	int ret;
 +
-+	(void)dev;
 +	(void)file_priv;
 +	/* ABI gate: run the build-time checks on every call path so a
 +	 * header drift cannot slip past an unbuilt TU. Cheap (constant). */
 +	p7580_abi_check_get_param();
-+	/* Mesa 20.3 panfrost_query_raw zeroes the struct, sets param, and
-+	 * issues the IOWR(0x44/16 B) ioctl; non-PROD_ID probes arrive with
-+	 * pad == 0 and must fail -EINVAL (NOT success-with-garbage): the
-+	 * caller asserts !required and falls back to compiled-in defaults.
-+	 * Upstream v5.2 panfrost_ioctl_get_param has the identical gate. */
-+	if (args->param != DRM_PANFROST_PARAM_GPU_PROD_ID)
++	/* Mesa 20.3 and 26+ both zero the struct, set param and issue the
++	 * IOWR(0x44/16 B) ioctl.  Mesa 26 requires a whole feature set (its
++	 * panfrost/kmod backend asserts on a failed required query in debug
++	 * builds, and compiles zeros otherwise), so answer every
++	 * DRM_PANFROST_PARAM_* this part has a register for from the probe
++	 * snapshot.  Unknown/unsupported ids stay -EINVAL: Mesa gates the
++	 * 1.3/1.5/1.6-only params on the DRM version and tolerates the
++	 * failure.  The log is the evidence for which ids Mesa actually
++	 * asks for. */
++	if (args->pad) {
++		pr_info("p7580_get_param: pad=0x%x param=%u rc=-EINVAL\n",
++			args->pad, args->param);
 +		return -EINVAL;
-+	if (args->pad)
-+		return -EINVAL;
-+	args->value = P7580_GPU_PROD_ID;
-+	args->pad = 0;
-+	return 0;
++	}
++	ret = p7580_drv_get_param(dev, args->param, &args->value);
++	pr_info("p7580_get_param: param=%u value=0x%llx rc=%d%s\n",
++		args->param, (unsigned long long)args->value, ret,
++		ret ? " (unknown/unsupported)" : "");
++	return ret;
 +}
 +
 +int panfrost_ioctl_create_bo(struct drm_device *dev, void *data,
@@ -2482,10 +2569,25 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +	uint32_t handle;
 +	int ret;
 +
-+	if (args->flags)
++	if (!args->size || args->pad) {
++		pr_info("p7580_create_bo: bad args size=0x%x pad=0x%x rc=-EINVAL\n",
++			args->size, args->pad);
 +		return -EINVAL;
-+	if (!args->size)
-+		return -EINVAL;
++	}
++	/* Modern Mesa (kernel 1.1+) passes PANFROST_BO_NOEXEC (non-executable
++	 * BO) and PANFROST_BO_HEAP (alloc-on-fault tiler heap).  Backing here
++	 * is always pre-faulted SHMEM, so both are hints: accept and record
++	 * them; ignore, with a warning, any bit this driver does not know
++	 * instead of failing the allocation. */
++	if (args->flags & ~(PANFROST_BO_NOEXEC | PANFROST_BO_HEAP |
++			    PANFROST_BO_WB_MMAP))
++		pr_warn("p7580_create_bo: unknown flags 0x%x ignored (size=0x%x)\n",
++			args->flags, args->size);
++	pr_info("p7580_create_bo: enter size=0x%x flags=0x%x abi sizeof=%zu flags_off=%zu pad_off=%zu offset_off=%zu\n",
++		args->size, args->flags, sizeof(*args),
++		offsetof(struct drm_panfrost_create_bo, flags),
++		offsetof(struct drm_panfrost_create_bo, pad),
++		offsetof(struct drm_panfrost_create_bo, offset));
 +
 +	/* SHMEM for general BOs (upstream panfrost uses drm_gem_shmem;
 +	 * CMA carries no size beyond the display window and fails 8 MiB+
@@ -2507,6 +2609,10 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +	bo = to_p7580_bo(obj);
 +	args->handle = handle;
 +	args->offset = (uint64_t)bo->iova;
++	pr_info("p7580_create_bo: size=0x%x flags=0x%x handle=%u iova=0x%llx offset_valid=%u node_start=0x%llx rc=0\n",
++		args->size, args->flags, handle,
++		(unsigned long long)bo->iova, bo->offset_valid,
++		(unsigned long long)bo->offset_node.start);
 +	return 0;
 +}
 +
@@ -2520,15 +2626,19 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +	uint64_t fake_offset = 0;
 +
 +	if (args->flags)
-+		return -EINVAL;
++		pr_warn("p7580_mmap_bo: flags=0x%x ignored (currently no meaning)\n",
++			args->flags);
 +	if (!gd)
 +		return -ENODEV;
 +
 +	/* drm_gem_object_lookup takes the reference internally (no
 +	 * outer struct_mutex needed; lookup is idr + kref_get). */
 +	obj = drm_gem_object_lookup(dev, file_priv, args->handle);
-+	if (!obj)
++	if (!obj) {
++		pr_info("p7580_mmap_bo: handle=%u lookup MISS rc=-ENOENT\n",
++			args->handle);
 +		return -ENOENT;
++	}
 +	bo = to_p7580_bo(obj);
 +	/* gpu31-mmlock: same fake-offset encoding as before (page index
 +	 * << PAGE_SHIFT), now read from the driver-owned manager. The
@@ -2539,9 +2649,16 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +	if (bo->offset_valid)
 +		fake_offset = (uint64_t)bo->offset_node.start << PAGE_SHIFT;
 +	mutex_unlock(&gd->mmap_offset_lock);
++	pr_info("p7580_mmap_bo: handle=%u offset_valid=%u node_start=0x%llx fake_offset=0x%llx iova=0x%llx\n",
++		args->handle, bo->offset_valid,
++		(unsigned long long)bo->offset_node.start,
++		(unsigned long long)fake_offset,
++		(unsigned long long)bo->iova);
 +	drm_gem_object_unreference_unlocked(obj);
-+	if (!fake_offset)
++	if (!fake_offset) {
++		pr_info("p7580_mmap_bo: no fake offset rc=-ENOENT\n");
 +		return -ENOENT;
++	}
 +
 +	args->offset = fake_offset;
 +	return 0;
@@ -2698,7 +2815,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,52 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -2754,7 +2871,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_ioctl.h b
 +#endif /* PANFROST7580_IOCTL_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,390 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -3148,8 +3265,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_jm_hw.h b
 +#endif /* PANFROST7580_JM_HW_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/drivers/gpu/drm/panfrost/panfrost7580_job.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,1955 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.c	2026-11-27 00:00:00.000000000 -0500
+@@ -0,0 +1,1989 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_job.c - job slot management and SUBMIT path for the
@@ -4703,6 +4820,40 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +		dma_fence_signal( /* 0001 */
 +			(struct dma_fence *)fault_job->done_fence);
 +	}
++
++	/*
++	 * Recovery hard-stopped every slot, so any other job still parked in
++	 * jd->in_flight[] has an orphaned fence: nobody will ever signal it and
++	 * its BO waiters (KWin's WAIT_BO) block forever.  Sweep every slot,
++	 * taking a fence reference while hw_lock is held so the scheduler
++	 * cannot free the job under us; signal and drop it outside the lock.
++	 */
++	{
++		int s;
++
++		for (s = 0; s < P7580_NUM_JOB_SLOTS; s++) {
++			struct dma_fence *f = NULL;
++			unsigned long fl;
++
++			spin_lock_irqsave(&jd->hw_lock, fl);
++			if (jd->in_flight[s]) {
++				void *df = jd->in_flight[s]->done_fence;
++
++				jd->in_flight[s] = NULL;
++				if (df) {
++					f = (struct dma_fence *)df;
++					dma_fence_get(f);	/* 3.10 returns void */
++				}
++			}
++			spin_unlock_irqrestore(&jd->hw_lock, fl);
++
++			if (!f)
++				continue;
++			if (!dma_fence_is_signaled(f))
++				dma_fence_signal(f);
++			dma_fence_put(f);
++		}
++	}
 +	(void)status;
 +	return ret;
 +}
@@ -5107,7 +5258,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/drivers/gpu/drm/panfrost/panfrost7580_job.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_job.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_job.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,438 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -5549,8 +5700,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_job.h b/d
 +#endif /* PANFROST7580_JOB_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/drivers/gpu/drm/panfrost/panfrost7580_main.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_main.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,760 @@
++++ b/drivers/gpu/drm/panfrost/panfrost7580_main.c	2026-11-27 00:00:00.000000000 -0500
+@@ -0,0 +1,960 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * panfrost7580_main.c - render-minor-only platform driver for Mali-T720
@@ -5652,10 +5803,18 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +						P7580_MMU_AS_BASE +
 +						as * P7580_MMU_AS_STRIDE +
 +						P7580_AS_FAULTSTATUS);
++				u32 flo = readl(drv->regs + P7580_MMU_AS_BASE +
++						as * P7580_MMU_AS_STRIDE +
++						P7580_AS_FAULTADDR_LO);
++				u32 fhi = readl(drv->regs + P7580_MMU_AS_BASE +
++						as * P7580_MMU_AS_STRIDE +
++						P7580_AS_FAULTADDR_HI);
++
 +				dev_err(drv->dev,
-+					"panfrost7580: MMU fault AS%u: %s/%s stat %08x\n",
++					"panfrost7580: MMU fault AS%u: %s/%s stat %08x addr %08x%08x\n",
 +					as, p7580_mmu_fault_code(fst),
-+					p7580_mmu_fault_atype(fst), fst);
++					p7580_mmu_fault_atype(fst), fst,
++					fhi, flo);
 +			}
 +		}
 +	}
@@ -5856,8 +6015,12 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	.name = "panfrost",
 +	.desc = "Mali-T720 render-only (Exynos 7580)",
 +	.date = "20261119",
++	/* 1.1: the first version Mesa 26/27 accepts (its panfrost/kmod backend
++	 * refuses < 1.1).  1.3 adds SYSTEM_TIMESTAMP, 1.4 SET_LABEL_BO and 1.6
++	 * QUERY_BO_INFO, none of which this ioctl table implements, so stop at
++	 * 1.1: BO_HEAP/NOEXEC flags and the GET_BO_OFFSET import path only. */
 +	.major = 1,
-+	.minor = 0,
++	.minor = 1,
 +	.patchlevel = 0,
 +};
 +
@@ -5998,12 +6161,92 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +};
 +MODULE_DEVICE_TABLE(of, p7580_of_match);
 +
-+/* GPU feature registers (MIDGARD, kbase mali_midg_regmap.h). */
++/* GPU feature registers (MIDGARD, mainline panfrost_regs.h / kbase
++ * mali_midg_regmap.h).  These are the GPU block offsets, not the JOB/MMU
++ * interrupt offsets used further down this file. */
 +#define P7580_GPU_ID			0x000u
-+#define P7580_GPU_L2_FEATURES		0x02Cu
-+#define P7580_GPU_CORE_FEATURES		0x030u
++#define P7580_GPU_L2_FEATURES		0x004u
++#define P7580_GPU_CORE_FEATURES		0x008u
++#define P7580_GPU_TILER_FEATURES	0x00Cu
++#define P7580_GPU_MEM_FEATURES		0x010u
++#define P7580_GPU_MMU_FEATURES		0x014u
++#define P7580_GPU_AS_PRESENT		0x018u
 +#define P7580_GPU_JS_PRESENT		0x01Cu
++#define P7580_GPU_AFBC_FEATURES		0x04Cu
++#define P7580_GPU_THREAD_MAX_THREADS	0x0A0u
++#define P7580_GPU_THREAD_MAX_WORKGROUP	0x0A4u
++#define P7580_GPU_THREAD_MAX_BARRIER	0x0A8u
++#define P7580_GPU_THREAD_FEATURES	0x0ACu
++#define P7580_GPU_TEXTURE_FEATURES(n)	(0x0B0u + ((n) * 4u))
++#define P7580_GPU_JS_FEATURES(n)	(0x0C0u + ((n) * 4u))
 +#define P7580_GPU_SHADER_PRESENT_LO	0x100u
++#define P7580_GPU_SHADER_PRESENT_HI	0x104u
++#define P7580_GPU_TILER_PRESENT_LO	0x110u
++#define P7580_GPU_TILER_PRESENT_HI	0x114u
++#define P7580_GPU_L2_PRESENT_LO		0x120u
++#define P7580_GPU_L2_PRESENT_HI		0x124u
++#define P7580_GPU_COHERENCY_FEATURES	0x300u
++#define P7580_GPU_THREAD_TLS_ALLOC	0x310u
++#define P7580_GPU_STACK_PRESENT_LO	0xE00u
++#define P7580_GPU_STACK_PRESENT_HI	0xE04u
++
++/* Experimental (Mesa 26) convergence: snapshot the feature registers once,
++ * while probe holds the block powered, and answer GET_PARAM from it.  Reads
++ * follow the mainline panfrost_gpu_init_features() order/offsets. */
++static void p7580_capture_features(struct p7580_drv *drv)
++{
++	void __iomem *regs = drv->regs;
++	unsigned int i, njs;
++
++	drv->feat.gpu_id = readl(regs + P7580_GPU_ID);
++	drv->feat.l2_features = readl(regs + P7580_GPU_L2_FEATURES);
++	drv->feat.core_features = readl(regs + P7580_GPU_CORE_FEATURES);
++	drv->feat.tiler_features = readl(regs + P7580_GPU_TILER_FEATURES);
++	drv->feat.mem_features = readl(regs + P7580_GPU_MEM_FEATURES);
++	drv->feat.mmu_features = readl(regs + P7580_GPU_MMU_FEATURES);
++	drv->feat.as_present = readl(regs + P7580_GPU_AS_PRESENT);
++	drv->feat.js_present = readl(regs + P7580_GPU_JS_PRESENT) & 0x7u;
++	drv->feat.thread_features = readl(regs + P7580_GPU_THREAD_FEATURES);
++	drv->feat.max_threads = readl(regs + P7580_GPU_THREAD_MAX_THREADS);
++	drv->feat.thread_max_workgroup_sz =
++		readl(regs + P7580_GPU_THREAD_MAX_WORKGROUP);
++	drv->feat.thread_max_barrier_sz =
++		readl(regs + P7580_GPU_THREAD_MAX_BARRIER);
++	drv->feat.coherency_features = readl(regs + P7580_GPU_COHERENCY_FEATURES);
++	drv->feat.afbc_features = readl(regs + P7580_GPU_AFBC_FEATURES);
++	for (i = 0; i < 4; i++)
++		drv->feat.texture_features[i] =
++			readl(regs + P7580_GPU_TEXTURE_FEATURES(i));
++	drv->feat.shader_present = readl(regs + P7580_GPU_SHADER_PRESENT_LO);
++	drv->feat.shader_present |=
++		(uint64_t)readl(regs + P7580_GPU_SHADER_PRESENT_HI) << 32;
++	drv->feat.tiler_present = readl(regs + P7580_GPU_TILER_PRESENT_LO);
++	drv->feat.tiler_present |=
++		(uint64_t)readl(regs + P7580_GPU_TILER_PRESENT_HI) << 32;
++	drv->feat.l2_present = readl(regs + P7580_GPU_L2_PRESENT_LO);
++	drv->feat.l2_present |=
++		(uint64_t)readl(regs + P7580_GPU_L2_PRESENT_HI) << 32;
++	drv->feat.stack_present = readl(regs + P7580_GPU_STACK_PRESENT_LO);
++	drv->feat.stack_present |=
++		(uint64_t)readl(regs + P7580_GPU_STACK_PRESENT_HI) << 32;
++	drv->feat.thread_tls_alloc = readl(regs + P7580_GPU_THREAD_TLS_ALLOC);
++	drv->feat.nr_core_groups = hweight64(drv->feat.l2_present);
++	njs = hweight32(drv->feat.js_present);
++	for (i = 0; i < 16; i++)
++		drv->feat.js_features[i] = (i < njs) ?
++			readl(regs + P7580_GPU_JS_FEATURES(i)) : 0;
++	pr_info("p7580_features: gpu_id=0x%llx rev=0x%llx l2=0x%08x core=0x%08x tiler=0x%08x mem=0x%08x mmu=0x%08x as=0x%x js=0x%x shader=0x%llx l2_present=0x%llx max_threads=%u thread_feat=0x%08x tls=%u afbc=0x%08x\n",
++		(unsigned long long)drv->feat.gpu_id,
++		(unsigned long long)(drv->feat.gpu_id & 0xffff),
++		drv->feat.l2_features, drv->feat.core_features,
++		drv->feat.tiler_features, drv->feat.mem_features,
++		drv->feat.mmu_features, drv->feat.as_present,
++		drv->feat.js_present,
++		(unsigned long long)drv->feat.shader_present,
++		(unsigned long long)drv->feat.l2_present,
++		drv->feat.max_threads, drv->feat.thread_features,
++		drv->feat.thread_tls_alloc, drv->feat.afbc_features);
++}
 +
 +/* PM wrappers for the jobs-slice dump path (void-arg, device-direct):
 + * the jobs slice never includes pm_runtime.h; these live in the driver
@@ -6051,6 +6294,113 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +	if (!drv || !drv->power)
 +		return -ENODEV;
 +	return pf7580_power_cycle(drv->power);
++}
++
++int p7580_drv_get_param(struct drm_device *ddev, uint32_t param,
++		       uint64_t *value)
++{
++	struct p7580_drv *drv = ddev ? ddev->dev_private : NULL;
++
++	if (!drv || !value)
++		return -ENODEV;
++
++	switch (param) {
++	case DRM_PANFROST_PARAM_GPU_PROD_ID:
++		*value = drv->feat.gpu_id >> 16;
++		break;
++	case DRM_PANFROST_PARAM_GPU_REVISION:
++		*value = drv->feat.gpu_id & 0xffff;
++		break;
++	case DRM_PANFROST_PARAM_SHADER_PRESENT:
++		*value = drv->feat.shader_present;
++		break;
++	case DRM_PANFROST_PARAM_TILER_PRESENT:
++		*value = drv->feat.tiler_present;
++		break;
++	case DRM_PANFROST_PARAM_L2_PRESENT:
++		*value = drv->feat.l2_present;
++		break;
++	case DRM_PANFROST_PARAM_STACK_PRESENT:
++		*value = drv->feat.stack_present;
++		break;
++	case DRM_PANFROST_PARAM_AS_PRESENT:
++		*value = drv->feat.as_present;
++		break;
++	case DRM_PANFROST_PARAM_JS_PRESENT:
++		*value = drv->feat.js_present;
++		break;
++	case DRM_PANFROST_PARAM_L2_FEATURES:
++		*value = drv->feat.l2_features;
++		break;
++	case DRM_PANFROST_PARAM_CORE_FEATURES:
++		*value = drv->feat.core_features;
++		break;
++	case DRM_PANFROST_PARAM_TILER_FEATURES:
++		*value = drv->feat.tiler_features;
++		break;
++	case DRM_PANFROST_PARAM_MEM_FEATURES:
++		*value = drv->feat.mem_features;
++		break;
++	case DRM_PANFROST_PARAM_MMU_FEATURES:
++		*value = drv->feat.mmu_features;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_FEATURES:
++		*value = drv->feat.thread_features;
++		break;
++	case DRM_PANFROST_PARAM_MAX_THREADS:
++		*value = drv->feat.max_threads;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ:
++		*value = drv->feat.thread_max_workgroup_sz;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
++		*value = drv->feat.thread_max_barrier_sz;
++		break;
++	case DRM_PANFROST_PARAM_COHERENCY_FEATURES:
++		*value = drv->feat.coherency_features;
++		break;
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES0:
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES1:
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES2:
++	case DRM_PANFROST_PARAM_TEXTURE_FEATURES3:
++		*value = drv->feat.texture_features[param -
++			DRM_PANFROST_PARAM_TEXTURE_FEATURES0];
++		break;
++	case DRM_PANFROST_PARAM_JS_FEATURES0:
++	case DRM_PANFROST_PARAM_JS_FEATURES1:
++	case DRM_PANFROST_PARAM_JS_FEATURES2:
++	case DRM_PANFROST_PARAM_JS_FEATURES3:
++	case DRM_PANFROST_PARAM_JS_FEATURES4:
++	case DRM_PANFROST_PARAM_JS_FEATURES5:
++	case DRM_PANFROST_PARAM_JS_FEATURES6:
++	case DRM_PANFROST_PARAM_JS_FEATURES7:
++	case DRM_PANFROST_PARAM_JS_FEATURES8:
++	case DRM_PANFROST_PARAM_JS_FEATURES9:
++	case DRM_PANFROST_PARAM_JS_FEATURES10:
++	case DRM_PANFROST_PARAM_JS_FEATURES11:
++	case DRM_PANFROST_PARAM_JS_FEATURES12:
++	case DRM_PANFROST_PARAM_JS_FEATURES13:
++	case DRM_PANFROST_PARAM_JS_FEATURES14:
++	case DRM_PANFROST_PARAM_JS_FEATURES15:
++		*value = drv->feat.js_features[param -
++			DRM_PANFROST_PARAM_JS_FEATURES0];
++		break;
++	case DRM_PANFROST_PARAM_NR_CORE_GROUPS:
++		*value = drv->feat.nr_core_groups;
++		break;
++	case DRM_PANFROST_PARAM_THREAD_TLS_ALLOC:
++		*value = drv->feat.thread_tls_alloc;
++		break;
++	case DRM_PANFROST_PARAM_AFBC_FEATURES:
++		*value = drv->feat.afbc_features;
++		break;
++	default:
++		/* SYSTEM_TIMESTAMP*, ALLOWED_JM_CTX_PRIORITIES and
++		 * SELECTED_COHERENCY belong to 1.3/1.5/1.6; Mesa tolerates
++		 * -EINVAL there because it gates them on the version. */
++		return -EINVAL;
++	}
++	return 0;
 +}
 +
 +static int p7580_drv_probe(struct platform_device *pdev)
@@ -6115,6 +6465,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +		ret = -ENODEV;
 +		goto err_pm;
 +	}
++	p7580_capture_features(drv);
 +
 +	/* GEM allocator (IOVA window; no MMIO). */
 +	ret = p7580_dev_init(&drv->gd, &pdev->dev);
@@ -6313,7 +6664,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_main.c b/
 +MODULE_ALIAS("platform:panfrost");
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.c	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,447 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -6764,7 +7115,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.c b/d
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_mmu.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -6939,7 +7290,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_mmu.h b/d
 +#endif /* PANFROST7580_MMU_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b/drivers/gpu/drm/panfrost/panfrost7580_power.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.c	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,603 @@
 +/*
 + * panfrost7580_power.c - PM / clock / reset sequencing for Mali-T720
@@ -7546,7 +7897,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.c b
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b/drivers/gpu/drm/panfrost/panfrost7580_power.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_power.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_power.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,211 @@
 +/*
 + * panfrost7580_power.h - PM / clock / reset sequencing for Mali-T720
@@ -7761,7 +8112,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_power.h b
 +#endif /* PANFROST7580_POWER_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c b/drivers/gpu/drm/panfrost/panfrost7580_submit.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_submit.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_submit.c	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,2258 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -10023,7 +10374,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_submit.c 
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 --- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,859 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -10886,7 +11237,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.c
 +#endif
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
 --- a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,70 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -10960,8 +11311,8 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost7580_syncobj.h
 +#endif /* PANFROST7580_SYNCOBJ_H */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drivers/gpu/drm/panfrost/panfrost_drm.h
 --- a/drivers/gpu/drm/panfrost/panfrost_drm.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-21 00:00:00.000000000 -0500
-@@ -0,0 +1,155 @@
++++ b/drivers/gpu/drm/panfrost/panfrost_drm.h	2026-11-27 00:00:00.000000000 -0500
+@@ -0,0 +1,211 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * Copyright © 2014-2018 Broadcom
@@ -11054,6 +11405,15 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drive
 + * There are currently no values for the flags argument, but it may be
 + * used in a future extension.
 + */
++/* Valid flags for drm_panfrost_create_bo (modern uapi; 1.1 and later).
++ * PANFROST_BO_NOEXEC/HEAP are hints to the kernel: this driver always backs
++ * CREATE_BO with pre-faulted SHMEM, so they are accepted and recorded only.
++ * PANFROST_BO_WB_MMAP is accepted for ABI completeness (WC is the default
++ * mapping; the flag is a no-op here). */
++#define PANFROST_BO_NOEXEC	1
++#define PANFROST_BO_HEAP	2
++#define PANFROST_BO_WB_MMAP	4
++
 +struct drm_panfrost_create_bo {
 +	__u32 size;
 +	__u32 flags;
@@ -11091,8 +11451,55 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drive
 +	__u64 offset;
 +};
 +
++/* Queryable parameters.  The order and values are the modern uapi
++ * (Mesa 26+); the first entry is the v5.2 GPU_PROD_ID so old and new
++ * userspace read the same handshake. */
 +enum drm_panfrost_param {
 +	DRM_PANFROST_PARAM_GPU_PROD_ID,
++	DRM_PANFROST_PARAM_GPU_REVISION,
++	DRM_PANFROST_PARAM_SHADER_PRESENT,
++	DRM_PANFROST_PARAM_TILER_PRESENT,
++	DRM_PANFROST_PARAM_L2_PRESENT,
++	DRM_PANFROST_PARAM_STACK_PRESENT,
++	DRM_PANFROST_PARAM_AS_PRESENT,
++	DRM_PANFROST_PARAM_JS_PRESENT,
++	DRM_PANFROST_PARAM_L2_FEATURES,
++	DRM_PANFROST_PARAM_CORE_FEATURES,
++	DRM_PANFROST_PARAM_TILER_FEATURES,
++	DRM_PANFROST_PARAM_MEM_FEATURES,
++	DRM_PANFROST_PARAM_MMU_FEATURES,
++	DRM_PANFROST_PARAM_THREAD_FEATURES,
++	DRM_PANFROST_PARAM_MAX_THREADS,
++	DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ,
++	DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ,
++	DRM_PANFROST_PARAM_COHERENCY_FEATURES,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES0,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES1,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES2,
++	DRM_PANFROST_PARAM_TEXTURE_FEATURES3,
++	DRM_PANFROST_PARAM_JS_FEATURES0,
++	DRM_PANFROST_PARAM_JS_FEATURES1,
++	DRM_PANFROST_PARAM_JS_FEATURES2,
++	DRM_PANFROST_PARAM_JS_FEATURES3,
++	DRM_PANFROST_PARAM_JS_FEATURES4,
++	DRM_PANFROST_PARAM_JS_FEATURES5,
++	DRM_PANFROST_PARAM_JS_FEATURES6,
++	DRM_PANFROST_PARAM_JS_FEATURES7,
++	DRM_PANFROST_PARAM_JS_FEATURES8,
++	DRM_PANFROST_PARAM_JS_FEATURES9,
++	DRM_PANFROST_PARAM_JS_FEATURES10,
++	DRM_PANFROST_PARAM_JS_FEATURES11,
++	DRM_PANFROST_PARAM_JS_FEATURES12,
++	DRM_PANFROST_PARAM_JS_FEATURES13,
++	DRM_PANFROST_PARAM_JS_FEATURES14,
++	DRM_PANFROST_PARAM_JS_FEATURES15,
++	DRM_PANFROST_PARAM_NR_CORE_GROUPS,
++	DRM_PANFROST_PARAM_THREAD_TLS_ALLOC,
++	DRM_PANFROST_PARAM_AFBC_FEATURES,
++	DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP,
++	DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY,
++	DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES,
++	DRM_PANFROST_PARAM_SELECTED_COHERENCY,
 +};
 +
 +struct drm_panfrost_get_param {
@@ -11119,7 +11526,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/panfrost_drm.h b/drive
 +#endif /* _PANFROST_DRM_H_ */
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/drivers/gpu/drm/panfrost/pf7580_devfreq.c
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.c	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.c	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,355 @@
 +/*
 + * pf7580_devfreq.c - panfrost devfreq/DVFS for Mali-T720 on 3.10.108.
@@ -11478,7 +11885,7 @@ diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.c b/dri
 +}
 diff -u '--exclude=.git' -Naur a/drivers/gpu/drm/panfrost/pf7580_devfreq.h b/drivers/gpu/drm/panfrost/pf7580_devfreq.h
 --- a/drivers/gpu/drm/panfrost/pf7580_devfreq.h	1969-12-31 19:00:00.000000000 -0500
-+++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-21 00:00:00.000000000 -0500
++++ b/drivers/gpu/drm/panfrost/pf7580_devfreq.h	2026-11-27 00:00:00.000000000 -0500
 @@ -0,0 +1,251 @@
 +/*
 + * pf7580_devfreq.h - panfrost devfreq/DVFS for Mali-T720 (Exynos 7580,

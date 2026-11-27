@@ -194,6 +194,8 @@ static void exynos7580_complete_crtc_event(struct drm_device *drm,
 	if (!e)
 		return;
 
+	pr_info("exynos7580_event: crtc pipe=%u event=%p\n", pipe, e);
+
 	/* Ownership moves to the core (or to userspace) right here. */
 	state->event = NULL;
 
@@ -210,22 +212,26 @@ static void exynos7580_complete_crtc_event(struct drm_device *drm,
 	}
 
 	/*
-	 * Take the interrupt reference first, then arm.  The order matters:
-	 * the arm must never be visible without a reference, because
-	 * drm_handle_vblank_events() drops exactly one reference per event.
+	 * int109: deliver immediately instead of arming for a vblank.
+	 *
+	 * The DECON frame interrupt is dead on this stack: /proc/interrupts
+	 * shows line 234 (14830000.decon_fb) frozen while the DSI line
+	 * advances at 60 Hz, so drm_handle_vblank() never runs and every
+	 * armed flip event is lost.  KWin then reports "Pageflip timed out"
+	 * and stops presenting even though the (synchronous) DECON commit
+	 * already latched the frame.
+	 *
+	 * The vendor commit ran decon_wait_for_vsync()/decon_update_regs()
+	 * before this point, so the scanout buffer is programmed; completing
+	 * the event here is what userspace needs to release its buffer.
 	 */
-	if (!exynos7580_vblank_available(drm, pipe) ||
-	    drm_vblank_get(drm, pipe) != 0) {
-		dev_dbg(drm->dev,
-			"crtc %u: no vblank, completing flip event immediately\n",
-			pipe);
-		exynos7580_send_event_now(drm, -1, e);
-		return;
-	}
-
-	spin_lock_irqsave(&drm->event_lock, flags);
-	exynos7580_arm_vblank_event(drm, pipe, e);
-	spin_unlock_irqrestore(&drm->event_lock, flags);
+	/*
+	 * int110: pipe -1, not pipe.  drm_send_vblank_event() stamps the event
+	 * from the pipe's vblank timestamp, which is never initialised on this
+	 * stack, so KWin logged "Got invalid timestamp (sec: 0, usec: 0)".
+	 * Passing -1 makes the core use getnstimeofday() instead.
+	 */
+	exynos7580_send_event_now(drm, -1, e);
 }
 
 /**

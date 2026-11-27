@@ -11,16 +11,19 @@
  *    CREATE_BO allocates SHMEM (general BOs carry no contiguity
  *    requirement, so Mesa's 16 MiB tiler heap succeeds where CMA/swiotlb
  *    fails ENOMEM). The CMA path (drm_gem_object_init + dma_alloc_attrs
- *    WRITE_COMBINE + drm_gem_create_mmap_offset, exynos/drm_gem_cma shape)
- *    is retained for WC scanout sharing only, never CREATE_BO. CMA uses
+ *    WRITE_COMBINE, exynos/drm_gem_cma shape) is retained for WC scanout
+ *    sharing only, never CREATE_BO. CMA uses
  *    plain WRITE_COMBINE only (arm64 dma-mapping honours exactly this
  *    attr; NO_KERNEL_MAPPING is ignored by the arm64 backend and
  *    FORCE_CONTIGUOUS is a display-side mistaken carry-over, so neither
  *    is set here).
  *  - CPU mmap is FAULT-DRIVEN for local SHMEM BOs (gpu31-mmaprefs).
- *    drm_gem_mmap() installs this driver's gem_vm_ops and the
- *    VM_IO|VM_PFNMAP|VM_DONTEXPAND|VM_DONTDUMP flags; the handler
- *    clears VM_PFNMAP, sets VM_MIXEDMAP and leaves the faults to
+ *    The driver's own .mmap resolves the fake offset in its own
+ *    manager (gpu31-mmlock: the 3.10 core offset manager is unlocked
+ *    and unsafe from the free_job workqueue), installs this driver's
+ *    gem_vm_ops and the VM_IO|VM_PFNMAP|VM_DONTEXPAND|VM_DONTDUMP
+ *    flags; the handler clears VM_PFNMAP, sets VM_MIXEDMAP and leaves
+ *    the faults to
  *    p7580_gem_fault(), which inserts bo->pages[off] with
  *    vm_insert_page() -- the udl_gem_mmap/udl_gem_fault shape, the
  *    in-tree 3.10 precedent (no vm_ops swap, no second ops table; the
@@ -454,8 +457,9 @@ void p7580_gem_submit_sync(struct drm_gem_object *obj)
 
 /* gpu31-iova (stale-TLB lifetime fix): free-time GPU unmap.
  * p7580_gem_free_object calls p7580_gem_gpu_unmap (driver snapshot,
- * submit.c: PM-held TLB invalidate + bo_list unlink + ref drop)
- * BEFORE iova_free returns the range and before pages are released.
+ * submit.c: PM-held TLB invalidate + bo_list unlink) BEFORE iova_free
+ * returns the range and before pages are released. The unlink drops no
+ * reference: the entry is weak (gpu31-boleak).
  * p7580_gem_mmu_register_notify is a link-compat no-op (an earlier
  * draft registered a callback; the landed design links directly so
  * GEM never dereferences driver state). */
@@ -515,6 +519,14 @@ phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx)
  * passed while only the GPU alias was wrong (gpu31-mmap.md).
  * ------------------------------------------------------------------ */
 
+/* Fake-mmap-offset window, in PAGE INDICES: the same 64-bit layout
+ * drm_gem.c uses for its private DRM_FILE_PAGE_OFFSET_* (they are
+ * defined inside drm_gem.c, not in a header, on 3.10). Page units
+ * because drm_mm addresses the window in pages; the byte offset handed
+ * to userspace is node.start << PAGE_SHIFT, exactly as before. */
+#define P7580_OFFSET_START	((0xFFFFFFFUL >> PAGE_SHIFT) + 1)
+#define P7580_OFFSET_SIZE	((0xFFFFFFFUL >> PAGE_SHIFT) * 16)
+
 int p7580_dev_init(struct p7580_dev *gd, struct device *dev)
 {
 	int ret;
@@ -523,9 +535,26 @@ int p7580_dev_init(struct p7580_dev *gd, struct device *dev)
 		return -EINVAL;
 	gd->dev = dev;
 	mutex_init(&gd->iova_lock);
+	mutex_init(&gd->mmap_offset_lock);
 	ret = drm_mm_init(&gd->iova_mm, P7580_IOVA_START >> PAGE_SHIFT,
 			  P7580_IOVA_SIZE >> PAGE_SHIFT);
 	if (ret) {
+		gd->dev = NULL;
+		return ret;
+	}
+	/* gpu31-mmlock: fake-mmap-offset window, same page-index range the
+	 * core's drm_gem_init() would have used (so MMAP_BO keeps handing
+	 * out the same kind of offset: page start << PAGE_SHIFT). */
+	if (drm_ht_create(&gd->offset_hash, 12)) {
+		drm_mm_takedown(&gd->iova_mm);
+		gd->dev = NULL;
+		return -ENOMEM;
+	}
+	ret = drm_mm_init(&gd->offset_mm, P7580_OFFSET_START,
+			  P7580_OFFSET_SIZE);
+	if (ret) {
+		drm_ht_remove(&gd->offset_hash);
+		drm_mm_takedown(&gd->iova_mm);
 		gd->dev = NULL;
 		return ret;
 	}
@@ -536,6 +565,8 @@ void p7580_dev_fini(struct p7580_dev *gd)
 {
 	if (!gd)
 		return;
+	drm_mm_takedown(&gd->offset_mm);
+	drm_ht_remove(&gd->offset_hash);
 	drm_mm_takedown(&gd->iova_mm);
 	gd->dev = NULL;
 }
@@ -576,6 +607,103 @@ static void p7580_iova_free(struct p7580_dev *gd, struct p7580_bo *bo)
 	drm_mm_remove_node(&bo->iova_node);
 	mutex_unlock(&gd->iova_lock);
 	bo->iova_valid = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Driver-owned fake-mmap-offset manager (gpu31-mmlock)               */
+/*                                                                    */
+/* The 3.10 core manager behind drm_gem_create_mmap_offset() /        */
+/* drm_gem_free_mmap_offset() is a bare drm_mm plus a bare drm_ht:    */
+/* neither has locking, and the create sequence is search_free()      */
+/* followed by get_block(), so two concurrent creators can both take  */
+/* the same hole and the second insert walks the first node's           */
+/* LIST_POISON next pointer (the observed oops:                   */
+/* drm_mm_insert_helper <- drm_gem_create_mmap_offset <- CREATE_BO).  */
+/* Free runs from the sched free_job workqueue, i.e. genuinely        */
+/* concurrent with CREATE_BO and with .mmap's lookup. Our own         */
+/* manager gives every one of those operations one mutex:             */
+/*   - search + insert is atomic (no other creator can take the hole);*/
+/*   - the hash insert is atomic with the drm_mm insert, so a lookup   */
+/*     can never find a half-built entry;                             */
+/*   - free removes the hash entry and the node under the same lock;  */
+/*   - .mmap looks the object up under the same lock and takes it with */
+/*     kref_get_unless_zero, so a dying object (refcount already 0,   */
+/*     free_object not yet done removing the offset) is never          */
+/*     resurrected -- core drm_gem_mmap() used a plain reference and   */
+/*     could hand back an object already being torn down.             */
+/* ------------------------------------------------------------------ */
+static int p7580_offset_alloc(struct p7580_dev *gd, struct p7580_bo *bo)
+{
+	unsigned long npages = bo->base.size >> PAGE_SHIFT;
+	struct drm_mm_node *hole;
+	int ret = 0;
+
+	mutex_lock(&gd->mmap_offset_lock);
+	hole = drm_mm_search_free(&gd->offset_mm, npages, 0, false);
+	if (!hole) {
+		ret = -ENOSPC;
+		pr_info("p7580_offset_alloc: no hole npages=%lu rc=%d\n",
+			npages, ret);
+		goto out;
+	}
+	memset(&bo->offset_node, 0, sizeof(bo->offset_node));
+	if (drm_mm_insert_node(&gd->offset_mm, &bo->offset_node, npages, 0)) {
+		ret = -ENOMEM;
+		pr_info("p7580_offset_alloc: insert failed npages=%lu rc=%d\n",
+			npages, ret);
+		goto out;
+	}
+	memset(&bo->offset_hash, 0, sizeof(bo->offset_hash));
+	bo->offset_hash.key = bo->offset_node.start;
+	if (drm_ht_insert_item(&gd->offset_hash, &bo->offset_hash)) {
+		drm_mm_remove_node(&bo->offset_node);
+		ret = -ENOMEM;
+		pr_info("p7580_offset_alloc: hash insert failed npages=%lu rc=%d\n",
+			npages, ret);
+		goto out;
+	}
+	bo->offset_valid = 1;
+	pr_info("p7580_offset_alloc: npages=%lu start=0x%lx rc=0\n",
+		npages, bo->offset_node.start);
+out:
+	mutex_unlock(&gd->mmap_offset_lock);
+	return ret;
+}
+
+static void p7580_offset_free(struct p7580_dev *gd, struct p7580_bo *bo)
+{
+	if (!gd || !bo->offset_valid)
+		return;
+	mutex_lock(&gd->mmap_offset_lock);
+	drm_ht_remove_item(&gd->offset_hash, &bo->offset_hash);
+	drm_mm_remove_node(&bo->offset_node);
+	bo->offset_valid = 0;
+	mutex_unlock(&gd->mmap_offset_lock);
+}
+
+/* Resolve a fake offset to a referenced object, or NULL. Callers hold
+ * the returned reference until drm_gem_vm_close()/unreference. */
+static struct drm_gem_object *p7580_offset_lookup(struct p7580_dev *gd,
+						  unsigned long pgoff)
+{
+	struct drm_hash_item *item;
+	struct p7580_bo *bo;
+	struct drm_gem_object *obj = NULL;
+
+	mutex_lock(&gd->mmap_offset_lock);
+	if (!drm_ht_find_item(&gd->offset_hash, pgoff, &item)) {
+		bo = drm_hash_entry(item, struct p7580_bo, offset_hash);
+		/* kref_get_unless_zero, not drm_gem_object_reference():
+		 * a zero refcount means free_object is already running
+		 * (the hash entry is removed before the BO is freed, and
+		 * both under this lock), so resurrecting it is illegal.
+		 * The object memory is still valid here: free_object only
+		 * kfree()s after p7580_offset_free() returned. */
+		if (kref_get_unless_zero(&bo->base.refcount))
+			obj = &bo->base;
+	}
+	mutex_unlock(&gd->mmap_offset_lock);
+	return obj;
 }
 
 /* ------------------------------------------------------------------ */
@@ -767,7 +895,7 @@ int p7580_gem_create(struct p7580_dev *gd, struct drm_device *dev,
 	}
 	dma_resv_init(&bo->resv);			/* 0002 */
 
-	ret = drm_gem_create_mmap_offset(&bo->base);
+	ret = p7580_offset_alloc(gd, bo);
 	if (ret)
 		goto err_resv;
 
@@ -779,7 +907,7 @@ int p7580_gem_create(struct p7580_dev *gd, struct drm_device *dev,
 	return 0;
 
 err_offset:
-	drm_gem_free_mmap_offset(&bo->base);
+	p7580_offset_free(gd, bo);
 err_resv:
 	dma_resv_fini(&bo->resv);			/* 0002 */
 err_obj:
@@ -870,7 +998,7 @@ int p7580_gem_create_with_handle(struct p7580_dev *gd,
 
 /* Forward: frees one live BO's GPU mapping before its IOVA is
  * recycled (p7580_gem_free_object below). Defined in the driver
- * snapshot (submit.c, PM-held TLB invalidate + bo_list drop); the
+ * snapshot (submit.c, PM-held TLB invalidate + bo_list unlink); the
  * linker resolves it inside panfrost7580. Keeps this TU decoupled
  * from drv/mmu structs (same opaque-void discipline as the
  * pre-signal-sync helper above). */
@@ -1000,7 +1128,9 @@ void p7580_gem_free_object(struct drm_gem_object *obj)
 	/* gpu31-iova: unmap GPU PTEs + flush TLB BEFORE the IOVA is
 	 * reusable. p7580_gem_gpu_unmap walks the driver's bo_list
 	 * entry: leaf-clear (CPU-side, PM-safe), PM-held TLB
-	 * invalidate, bo_list unlink + ref drop, DMA unbind. After
+	 * invalidate, bo_list unlink (weak entry, no ref drop -- this
+	 * is the unlink that lets the object finish dying,
+	 * gpu31-boleak), DMA unbind. After
 	 * this the IOVA range is unmapped everywhere; iova_free
 	 * below only then returns it to the allocator. Never-bound
 	 * BOs (never on bo_list) no-op inside; their DMA mapping is
@@ -1046,8 +1176,14 @@ void p7580_gem_free_object(struct drm_gem_object *obj)
 	if (WARN_ON_ONCE(bo->map_pinned))
 		p7580_gem_map_unpin(bo);
 
-	if (obj->map_list.map)
-		drm_gem_free_mmap_offset(obj);
+	if (bo->offset_valid) {
+		/* gpu31-mmlock: return the driver-owned fake offset.
+		 * Serialised with create/import and with .mmap's lookup
+		 * on gd->mmap_offset_lock; removing the hash entry is
+		 * also what makes a concurrent .mmap of this offset fail
+		 * instead of resurrecting the dying object. */
+		p7580_offset_free(gd, bo);
+	}
 	drm_gem_object_release(obj);
 
 	dma_resv_fini(&bo->resv);			/* 0002 */
@@ -1099,7 +1235,7 @@ static unsigned int p7580_fault_err(int ret)
  *    which vm_insert_page permits because VM_MIXEDMAP is already set
  *    (see its BUG_ONs).
  *
- *  - CMA / PRIME-imported (still VM_PFNMAP from drm_gem_mmap, mapped
+ *  - CMA / PRIME-imported (still VM_PFNMAP from .mmap's setup, mapped
  *    immediately by p7580_gem_mmap, so normally never faulted):
  *    vm_insert_pfn() of the CMA page or the attachment page, which is
  *    the only insert helper legal on a PFNMAP-only VMA (vm_insert_mixed
@@ -1162,6 +1298,9 @@ int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	 * shape as the udl fault handler; avoids taking struct_mutex in
 	 * fault context at all. */
 	ret = p7580_map_page(bo, vma, f_vaddr, page_offset);
+	pr_info_ratelimited("p7580_gem_fault: page=0x%lx vaddr=0x%lx vflags=0x%lx backing=%u pages=%p sgt=%p rc=%d\n",
+		(unsigned long)page_offset, f_vaddr, vma->vm_flags,
+		bo->backing, bo->pages, bo->sgt, ret);
 	return p7580_fault_err(ret);
 }
 
@@ -1178,72 +1317,111 @@ const struct vm_operations_struct p7580_gem_vm_ops = {
 	.close = p7580_gem_vm_close,
 };
 
-/* Driver .fops mmap (GEM path): resolve the fake offset to the BO via
- * drm_gem_mmap, then set the VMA up for the BO's backing.
+/* Driver .fops mmap (GEM path): resolve the fake offset in the
+ * driver-owned table (gpu31-mmlock), then set the VMA up for the BO's
+ * backing.
  *
  *  - CMA (WC scanout): dma_mmap_attrs() immediately, unchanged. The
  *    arm32 arm_dma_mmap backend treats vma->vm_pgoff as a page index
- *    into the buffer, so it is reset to 0 first -- the GEM fake key >>
+ *    into the buffer, so it is reset to 0 first -- the fake key >>
  *    PAGE_SHIFT is NOT a buffer index (gpu31-mmap2).
  *  - PRIME-imported BOs: remap_pfn_range() per attachment sg chunk,
  *    unchanged. The pages belong to the exporter and are pinned by
  *    bo->sgt / the live dma_buf attachment, so no local reference is
  *    taken.
- *  - local SHMEM BOs: NO immediate mapping. The flags drm_gem_mmap()
- *    installed (VM_IO|VM_PFNMAP|VM_DONTEXPAND|VM_DONTDUMP) are turned
- *    into the fault-driven VM_MIXEDMAP shape: clear VM_PFNMAP, set
- *    VM_MIXEDMAP|VM_DONTCOPY, keep the vm_ops the core installed. This
- *    is verbatim the in-tree udl_gem_mmap() shape
- *    (drivers/gpu/drm/udl/udl_gem.c) and needs no second ops table.
- *    Each PTE is installed later by p7580_gem_fault() ->
- *    vm_insert_page(), which is what gives the mapping real page
- *    references; on top of that the mapping pins every page of the BO
- *    for its lifetime (p7580_gem_vm_get) and drops them on the last
- *    close (p7580_gem_vm_put). VM_DONTCOPY matches the vendor kbase
- *    user mapping on this device (mali_kbase_mem_linux.c) and keeps a
- *    fork from duplicating the VMA: dup_mmap does not call ->open, so
- *    the child's close would release a reference no take ever paired.
+ *  - local SHMEM BOs: NO immediate mapping. The flags installed above
+ *    (VM_IO|VM_PFNMAP|VM_DONTEXPAND|VM_DONTDUMP) are turned into the
+ *    fault-driven VM_MIXEDMAP shape: clear VM_PFNMAP, set
+ *    VM_MIXEDMAP|VM_DONTCOPY, keep the vm_ops. This is verbatim the
+ *    in-tree udl_gem_mmap() shape (drivers/gpu/drm/udl/udl_gem.c) and
+ *    needs no second ops table. Each PTE is installed later by
+ *    p7580_gem_fault() -> vm_insert_page(), which is what gives the
+ *    mapping real page references; on top of that the mapping pins
+ *    every page of the BO for its lifetime (p7580_gem_vm_get) and
+ *    drops them on the last close (p7580_gem_vm_put). VM_DONTCOPY
+ *    matches the vendor kbase user mapping on this device
+ *    (mali_kbase_mem_linux.c) and keeps a fork from duplicating the
+ *    VMA: dup_mmap does not call ->open, so the child's close would
+ *    release a reference no take ever paired.
  *
  * WC default (covers both SHMEM CREATE_BO and CMA scanout), cached
  * opt-in (exynos update_vm_cache_attr shape). COHERENCY_NONE: WC is
  * MT_NORMAL_NC, so no CPU cache lines exist to flush on either path;
  * the GPU PTW side is synced by the driver's map_bo dma_sync
- * maintenance, not here.
- *
- * Temporary entry/exit pr_info (mmap2 ticket): prints the fake pgoff
- * installed by drm_gem_mmap and the final return code, so silicon
- * dmesg proves whether the handler ran and where it failed. */
+ * maintenance, not here. */
 int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 {
+	struct drm_file *priv = filp->private_data;
+	struct drm_device *dev = priv->minor->dev;
+	struct p7580_dev *gd = dev->dev_private;
 	struct drm_gem_object *obj;
 	struct p7580_bo *bo;
 	struct scatterlist *sgl;
-	unsigned long vm_size, pfn, off, fake_pgoff;
-	unsigned int i, npages;
+	unsigned long vm_size, pfn, off;
+	unsigned int i;
 	int ret;
 
-	fake_pgoff = vma->vm_pgoff;
-	pr_info("p7580_gem_mmap: enter pgoff=0x%lx len=0x%lx\n",
-		fake_pgoff, vma->vm_end - vma->vm_start);
-	ret = drm_gem_mmap(filp, vma);
-	if (ret) {
-		pr_info("p7580_gem_mmap: drm_gem_mmap failed rc=%d pgoff=0x%lx\n",
-			ret, fake_pgoff);
-		return ret;
+	if (!gd || drm_device_is_unplugged(dev))
+		return -ENODEV;
+
+	/* gpu31-mmlock: resolve the fake offset in the driver's own table
+	 * under mmap_offset_lock (core drm_gem_mmap() walked the unlocked
+	 * core hash while free_job could be removing an entry from it).
+	 * The lookup returns the object with a reference taken -- the VMA
+	 * reference the core helper used to take -- unless the object is
+	 * already dying (kref_get_unless_zero), in which case the offset
+	 * is stale. An offset we never handed out is not ours: keep the
+	 * core legacy-map fallback exactly as drm_gem_mmap() did. */
+	vm_size = vma->vm_end - vma->vm_start;
+	pr_info("p7580_gem_mmap: enter fop=%pS fop_mmap=%pS fop_ioctl=%pS pgoff=0x%lx vm=0x%lx vflags=0x%lx minor_type=%d minor_idx=%d drv=%s gem_vm_ops=%p\n",
+		filp->f_op, filp->f_op ? filp->f_op->mmap : NULL,
+		filp->f_op ? filp->f_op->unlocked_ioctl : NULL,
+		vma->vm_pgoff, vm_size, vma->vm_flags,
+		priv->minor->type, priv->minor->index,
+		dev->driver->name ? dev->driver->name : "?",
+		dev->driver->gem_vm_ops);
+
+	obj = p7580_offset_lookup(gd, vma->vm_pgoff);
+	if (!obj) {
+		int drc;
+
+		pr_info("p7580_gem_mmap: offset_lookup MISS pgoff=0x%lx\n",
+			vma->vm_pgoff);
+		drc = drm_mmap(filp, vma);
+		pr_info("p7580_gem_mmap: drm_mmap fallback rc=%d pgoff=0x%lx\n",
+			drc, vma->vm_pgoff);
+		return drc;
 	}
+
+	if (vm_size > obj->size ||
+	    !dev->driver->gem_vm_ops) {
+		pr_info("p7580_gem_mmap: bad request vm=0x%lx obj_size=0x%zx gem_vm_ops=%p rc=-EINVAL\n",
+			vm_size, obj->size, dev->driver->gem_vm_ops);
+		drm_gem_object_unreference_unlocked(obj);
+		return -EINVAL;
+	}
+
+	/* VMA shape drm_gem_mmap() installed: PFNMAP until the SHMEM arm
+	 * below turns it into the fault-driven VM_MIXEDMAP form; the
+	 * driver's gem_vm_ops; WC prot. The reference taken above becomes
+	 * the mapping reference (vm_close drops it). */
+	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+	vma->vm_ops = dev->driver->gem_vm_ops;
+	vma->vm_private_data = obj;
+	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+	mutex_lock(&dev->struct_mutex);
+	drm_vm_open_locked(dev, vma);
+	mutex_unlock(&dev->struct_mutex);
+
 	/* The fake offset key served its purpose (BO lookup); from here
 	 * on vma describes a byte range inside THIS BO, starting at 0. */
 	vma->vm_pgoff = 0;
 
-	obj = vma->vm_private_data;
 	bo = to_p7580_bo(obj);
-	npages = obj->size >> PAGE_SHIFT;
-	vm_size = vma->vm_end - vma->vm_start;
-
-	if (vm_size > obj->size) {
-		ret = -EINVAL;
-		goto err_close;
-	}
+	pr_info("p7580_gem_mmap: hit obj_size=0x%zx offset_valid=%u node_start=0x%llx backing=%u sgt=%p pages=%p nr_pages=%u cache_attr=0x%x\n",
+		obj->size, bo->offset_valid,
+		(unsigned long long)bo->offset_node.start, bo->backing,
+		bo->sgt, bo->pages, bo->nr_pages, bo->cache_attr);
 
 	/* WC default (covers both SHMEM CREATE_BO and CMA scanout), cached
 	 * opt-in (exynos update_vm_cache_attr shape). COHERENCY_NONE: WC is
@@ -1262,8 +1440,8 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 		dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
 		ret = dma_mmap_attrs(obj->dev->dev, vma, bo->cma_vaddr,
 				     bo->cma_paddr, obj->size, &attrs);
-		pr_info("p7580_gem_mmap: dma_mmap_attrs rc=%d size=0x%zx paddr=0x%llx\n",
-			ret, obj->size, (unsigned long long)bo->cma_paddr);
+		pr_info("p7580_gem_mmap: cma dma_mmap_attrs rc=%d size=0x%zx paddr=%pa\n",
+			ret, obj->size, &bo->cma_paddr);
 		if (ret)
 			goto err_close;
 		return 0;
@@ -1278,6 +1456,8 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 			pfn = __phys_to_pfn(sg_phys(sgl));
 			ret = remap_pfn_range(vma, vma->vm_start + off, pfn,
 					chunk, vma->vm_page_prot);
+			pr_info("p7580_gem_mmap: sgt chunk=%u off=0x%lx pfn=0x%lx rc=%d\n",
+				i, off, pfn, ret);
 			if (ret)
 				goto err_close;
 			off += sgl->length;
@@ -1289,6 +1469,8 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	if (!bo->pages) {
 		ret = -ENODEV;
+		pr_info("p7580_gem_mmap: no pages/sgt backing=%u rc=-ENODEV\n",
+			bo->backing);
 		goto err_close;
 	}
 
@@ -1299,16 +1481,19 @@ int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	 * last close of another mapping of the same BO. */
 	vma->vm_flags &= ~VM_PFNMAP;
 	vma->vm_flags |= VM_MIXEDMAP | VM_DONTCOPY;
+	pr_info("p7580_gem_mmap: mixedmap vflags=0x%lx vma_refs(before)=%u npages=%u rc=0\n",
+		vma->vm_flags, bo->vma_refs, bo->nr_pages);
 	mutex_lock(&obj->dev->struct_mutex);
 	p7580_gem_vm_get(bo);
 	mutex_unlock(&obj->dev->struct_mutex);
-	pr_info("p7580_gem_mmap: ok mixedmap obj_size=0x%zx vm=0x%lx npages=%u\n",
-		obj->size, vm_size, npages);
 	return 0;
 
 err_close:
-	pr_info("p7580_gem_mmap: fail rc=%d vm=0x%lx obj=0x%zx\n",
-		ret, vm_size, obj->size);
+	/* The VMA reference taken by the lookup (and registered with
+	 * drm_vm_open_locked above) is dropped by the core close helper,
+	 * exactly as the old drm_gem_mmap() error path did. */
+	pr_info("p7580_gem_mmap: FAIL branch rc=%d pgoff=0x%lx vm=0x%lx\n",
+		ret, vma->vm_pgoff, vm_size);
 	drm_gem_vm_close(vma);
 	return ret;
 }
@@ -1435,12 +1620,20 @@ struct sg_table *p7580_gem_prime_get_sg_table(struct drm_gem_object *obj)
 struct drm_gem_object *p7580_gem_prime_import_sg_table(
 		struct drm_device *dev, size_t size, struct sg_table *sgt)
 {
+	struct p7580_dev *gd;
 	struct p7580_bo *bo;
 	int ret;
 
 	size = round_up(size, PAGE_SIZE);
-	if (!sgt || !size)
+	if (!dev || !sgt || !size)
 		return ERR_PTR(-EINVAL);
+	/* Importing can only happen on a bound device: the IOVA and
+	 * fake-offset allocators both live in dev_private. Fail closed
+	 * instead of guessing (a NULL here used to be silently skipped
+	 * on the IOVA leg and would crash the offset leg). */
+	gd = dev->dev_private;
+	if (!gd)
+		return ERR_PTR(-ENODEV);
 
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
 	if (!bo)
@@ -1458,7 +1651,7 @@ struct drm_gem_object *p7580_gem_prime_import_sg_table(
 
 	dma_resv_init(&bo->resv);			/* 0002 */
 
-	ret = drm_gem_create_mmap_offset(&bo->base);
+	ret = p7580_offset_alloc(gd, bo);
 	if (ret) {
 		dma_resv_fini(&bo->resv);
 		drm_gem_object_release(&bo->base);
@@ -1470,8 +1663,7 @@ struct drm_gem_object *p7580_gem_prime_import_sg_table(
 	 * GEM mmap-offset manager). Imported BOs carry the exporter's
 	 * attachment mapping in bo->sgt; the node owns the new range
 	 * and free removes it. */
-	if (dev->dev_private) {
-		struct p7580_dev *gd = dev->dev_private;
+	{
 		unsigned long npages = size >> PAGE_SHIFT;
 		struct drm_mm_node *hole;
 		int alloc_ret = -ENOSPC;
@@ -1489,7 +1681,7 @@ struct drm_gem_object *p7580_gem_prime_import_sg_table(
 		}
 		mutex_unlock(&gd->iova_lock);
 		if (alloc_ret) {
-			drm_gem_free_mmap_offset(&bo->base);
+			p7580_offset_free(gd, bo);
 			dma_resv_fini(&bo->resv);
 			drm_gem_object_release(&bo->base);
 			kfree(bo);

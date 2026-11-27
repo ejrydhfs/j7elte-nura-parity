@@ -53,6 +53,8 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include <linux/ktime.h>
+#include <linux/string.h>
 
 /* At integration these resolve to the landed backport files:
  *  drivers/base/{dma-fence,dma-resv}.{c,h} (0001/0002) and
@@ -150,6 +152,190 @@ static void p7580_job_err_pin(int slot, uint32_t js_status,
 			map[sizeof(map) - 1] = '\0';
 			pr_err("p7580_job: ERR-MAP slot=%d seq=%u nbos=%u %s\n",
 				slot, seqno, n, map);
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* gpu31-firstfault: event ring + one-shot first-fault dump.          */
+/*                                                                    */
+/* Why a ring instead of printk: the long-run fault appears after a   */
+/* random number of clean frames (one in ~1-3 x 300-frame runs) and   */
+/* the serial console makes every traced dispatch ~10 ms, which both  */
+/* perturbs the race and overflows the dmesg ring (measured: the      */
+/* first 5 s of a faulting run were dropped). A 128-entry RAM ring    */
+/* costs a few stores per event and is dumped exactly once, with the  */
+/* descriptor pages, at the first fault or timeout.                   */
+/* ------------------------------------------------------------------ */
+static const char *p7580_ev_name(unsigned int kind)
+{
+	switch (kind) {
+	case P7580_EV_START:
+		return "start";
+	case P7580_EV_DONE:
+		return "done";
+	case P7580_EV_ERR:
+		return "err";
+	case P7580_EV_TIMEOUT:
+		return "timeout";
+	case P7580_EV_RECOVER:
+		return "recover";
+	case P7580_EV_SUSPEND:
+		return "suspend";
+	case P7580_EV_SUSPEND_BUSY:
+		return "suspend-busy";
+	case P7580_EV_RESUME:
+		return "resume";
+	case P7580_EV_CYCLE:
+		return "cycle";
+	case P7580_EV_DUMP:
+		return "dump";
+	default:
+		return "?";
+	}
+}
+
+void p7580_job_ev(struct p7580_job_dev *jd, unsigned int kind, int slot,
+		  uint32_t seq, uint64_t jc, uint32_t a, uint32_t b,
+		  uint32_t c)
+{
+	struct p7580_ev *e;
+	unsigned long flags;
+
+	if (!jd || !jd->ev_arm)
+		return;
+	spin_lock_irqsave(&jd->hw_lock, flags);
+	e = &jd->ev[jd->ev_head & (P7580_EV_MAX - 1u)];
+	/* 3.10 has no ktime_get_ns(): convert explicitly. */
+	e->ns = (uint64_t)ktime_to_ns(ktime_get());
+	e->jc = jc;
+	e->kind = kind;
+	e->slot = (uint32_t)slot;
+	e->seq = seq;
+	e->a = a;
+	e->b = b;
+	e->c = c;
+	jd->ev_head++;
+	spin_unlock_irqrestore(&jd->hw_lock, flags);
+}
+
+void p7580_job_ev_arm(struct p7580_job_dev *jd, unsigned int on)
+{
+	unsigned long flags;
+
+	if (!jd)
+		return;
+	spin_lock_irqsave(&jd->hw_lock, flags);
+	jd->ev_head = 0;
+	jd->ev_arm = on ? 1u : 0u;
+	jd->ev_dumped = 0;
+	memset(jd->ev, 0, sizeof(jd->ev));
+	spin_unlock_irqrestore(&jd->hw_lock, flags);
+}
+
+void p7580_job_set_desc_dump(struct p7580_job_dev *jd,
+			     int (*fn)(void *priv, uint64_t gpu,
+				       const char *tag), void *priv)
+{
+	unsigned long flags;
+
+	if (!jd)
+		return;
+	spin_lock_irqsave(&jd->hw_lock, flags);
+	jd->desc_dump = fn;
+	jd->desc_dump_priv = priv;
+	spin_unlock_irqrestore(&jd->hw_lock, flags);
+}
+
+/* gpu31-watchdog: wire the driver's dispatch-timeout accessors. The
+ * timeout value itself lives with the drm_sched seed (driver), so the
+ * jobs slice only renders job_timeout_ms. */
+void p7580_job_set_timeout_hooks(struct p7580_job_dev *jd,
+				 unsigned int (*get)(void *priv),
+				 int (*set)(void *priv, unsigned int ms),
+				 void *priv)
+{
+	unsigned long flags;
+
+	if (!jd)
+		return;
+	spin_lock_irqsave(&jd->hw_lock, flags);
+	jd->get_timeout_ms = get;
+	jd->set_timeout_ms = set;
+	jd->timeout_priv = priv;
+	spin_unlock_irqrestore(&jd->hw_lock, flags);
+}
+
+/* Dump the ring (oldest first) and the pages that decide the fault:
+ * the dispatched descriptor's page, the live (Mesa) page it was copied
+ * from when the job ran from a shadow, the page holding the fragment
+ * framebuffer pointer from the inline payload (SFBD + tiler descriptor
+ * live there), and the first page of any >= 1 MiB BO in the job's
+ * submit snapshot (the Mesa tiler heap: producer/consumer handshake
+ * state). Process context (timeout work): the dumper may sleep. */
+void p7580_job_first_fault(struct p7580_job_dev *jd,
+			   struct p7580_submit_job *job, uint32_t status)
+{
+	unsigned int i, n, start;
+	uint64_t t0 = 0;
+
+	if (!jd || !jd->ev_arm || jd->ev_dumped)
+		return;
+	jd->ev_dumped = 1;
+
+	n = jd->ev_head < P7580_EV_MAX ? jd->ev_head : P7580_EV_MAX;
+	start = jd->ev_head - n;
+	pr_err("p7580_job: EVRING begin head=%u n=%u status=0x%08x jc=0x%llx seq=%u src=0x%llx fbd=0x%x jc_age=%u\n",
+	       jd->ev_head, n, status,
+	       job ? (unsigned long long)job->jc : 0ull,
+	       job ? job->seqno : 0u,
+	       job ? (unsigned long long)job->src_jc : 0ull,
+	       job ? job->fbd : 0u,
+	       job ? job->jc_age : 0u);
+	for (i = 0; i < n; i++) {
+		const struct p7580_ev *e =
+			&jd->ev[(start + i) & (P7580_EV_MAX - 1u)];
+
+		if (!t0)
+			t0 = e->ns;
+		pr_err("p7580_job: EV %-12s dt=%8llu us slot=%u seq=%u jc=0x%llx a=%08x b=%08x c=%08x\n",
+		       p7580_ev_name(e->kind),
+		       (unsigned long long)((e->ns - t0) / 1000ull),
+		       e->slot, e->seq, (unsigned long long)e->jc,
+		       e->a, e->b, e->c);
+	}
+	pr_err("p7580_job: EVRING end\n");
+
+	if (!jd->desc_dump)
+		return;
+	if (job) {
+		jd->desc_dump(jd->desc_dump_priv, job->jc, "jc");
+		if (job->src_jc && job->src_jc != job->jc)
+			jd->desc_dump(jd->desc_dump_priv, job->src_jc, "src");
+		/* Fragment job: payload word 10 (+40) is the framebuffer
+		 * descriptor (SFBD) and the SFBD's tiler section at
+		 * FBD+0xC0 names the polygon list + heap. Dump the page
+		 * the recorded SFBD pointer falls in (the address is
+		 * captured at SUBMIT: desc[] is only 8 words, so reading
+		 * desc[10] here was an out-of-bounds read that produced
+		 * a bogus address on int42). */
+		if (job->fbd)
+			jd->desc_dump(jd->desc_dump_priv,
+				      (uint64_t)job->fbd, "fbd");
+		/* Tiler heap candidate: the largest BO in the snapshot. */
+		if (job->iova_addrs && job->iova_sizes) {
+			unsigned int best = 0;
+			uint32_t bsz = 0;
+
+			for (i = 0; i < job->iova_bo_count; i++) {
+				if (job->iova_sizes[i] > bsz) {
+					bsz = job->iova_sizes[i];
+					best = i;
+				}
+			}
+			if (bsz >= 0x100000u)
+				jd->desc_dump(jd->desc_dump_priv,
+					      job->iova_addrs[best], "heap");
 		}
 	}
 }
@@ -304,7 +490,8 @@ static void p7580_job_debugfs_fini(struct p7580_job_dev *jd);
 int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 		       uint32_t js_present, uint64_t shader_present,
 		       dma_addr_t pgd_dma, void *pm_dev,
-		       int (*pm_get)(void *dev), void (*pm_put)(void *dev))
+		       int (*pm_get)(void *dev), void (*pm_put)(void *dev),
+		       int (*power_cycle)(void *dev))
 {
 	int i;
 	uint32_t mask = 0;
@@ -319,6 +506,7 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	jd->pm_dev = pm_dev;
 	jd->pm_get = pm_get;
 	jd->pm_put = pm_put;
+	jd->power_cycle = power_cycle;
 	spin_lock_init(&jd->hw_lock);
 	mutex_init(&jd->reset_lock);
 	/* Arm-time fence timelines (gpu31-armfence): one dma-fence
@@ -338,6 +526,20 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	jd->last.valid = 0;
 	jd->dbg_dir = NULL;
 	jd->chain_mode = 0;
+	/* gpu31-firstfault defaults: ring disarmed, no page dumper order
+	 * (wired at probe), FS keeps its own entity. Everything new is
+	 * inert until the ev_arm / serialize_fs knobs are written. */
+	jd->ev_head = 0;
+	jd->ev_arm = 0;
+	jd->ev_dumped = 0;
+	jd->desc_dump = NULL;
+	jd->desc_dump_priv = NULL;
+	jd->serialize_fs = 0;
+	/* gpu31-watchdog: injection disarmed, timeout knob unwired. */
+	jd->hang_arm = 0;
+	jd->get_timeout_ms = NULL;
+	jd->set_timeout_ms = NULL;
+	jd->timeout_priv = NULL;
 	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 		jd->in_flight[i] = NULL;
 		mask |= P7580_MK_JS_MASK(i);
@@ -390,7 +592,14 @@ void p7580_job_dev_rearm(struct p7580_job_dev *jd)
 		     mask & (jd->js_present | (jd->js_present << 16)));
 }
 
-/* Idle when no slot has a queued command and no job is in flight. */
+/* Idle when no slot has a queued command, no job is in flight and no
+ * present slot reports ACTIVE in JS_STATUS. gpu31-readback: the software
+ * view alone is not enough to gate a power-off -- recovery clears
+ * in_flight while the JM may still be executing, and a latched fault code
+ * (0x41 = ACTIVE|POWER_FAULT) reads COMMAND_NEXT==0. Powering the cores
+ * down in that window is a GPU power event (measured: 22 power-offs with
+ * "did not idle" per bench run, then POWER_FAULT storms). Our own HARD_STOP
+ * leaves STOPPED (0x03, bit 0 set) in the slot, which is not activity. */
 int p7580_job_is_idle(struct p7580_job_dev *jd)
 {
 	int i;
@@ -398,9 +607,16 @@ int p7580_job_is_idle(struct p7580_job_dev *jd)
 	if (!jd)
 		return 1;
 	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
+		uint32_t st;
+
 		if (p7580_js_read(jd, i, P7580_JS_COMMAND_NEXT))
 			return 0;
 		if (jd->in_flight[i])
+			return 0;
+		if (!(jd->js_present & (1u << i)))
+			continue;
+		st = p7580_js_read(jd, i, P7580_JS_STATUS);
+		if ((st & 0x1u) && !p7580_js_status_is_stop(st))
 			return 0;
 	}
 	return 1;
@@ -421,6 +637,13 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 	int slot = job->slot;
 	uint32_t lo = (uint32_t)(job->jc & 0xFFFFFFFFu);
 	uint32_t hi = (uint32_t)(job->jc >> 32);
+	/* gpu31-firstfault: armed probe values (JS_STATUS before START,
+	 * COMMAND_NEXT / JS_STATUS right after) + the in-flight slot
+	 * occupant seen before this dispatch (a non-NULL previous job
+	 * here would mean a double dispatch on one slot). */
+	uint32_t st_pre = 0, cmd_post = 0, st_post = 0;
+	struct p7580_submit_job *prev = NULL;
+	int armed = jd->ev_arm;
 
 	/* COMMAND_NEXT must be free: a stuck slot means recovery, not a
 	 * second submit on top. */
@@ -428,6 +651,27 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 		return;
 
 	spin_lock_irqsave(&jd->hw_lock, flags);
+
+	if (armed) {
+		prev = jd->in_flight[slot];
+		st_pre = p7580_js_read(jd, slot, P7580_JS_STATUS);
+	}
+
+	/* gpu31-watchdog hang_inject: mask this slot's DONE+ERR bits for
+	 * one dispatch. The job still runs and retires in hardware, but
+	 * no IRQ is delivered, so the fence waits for the sched timeout:
+	 * the deterministic form of the silent hang (STAT/RAWSTAT 0,
+	 * COMMAND_NEXT drained, NO_EXCEPTION 0x08). Recovery's
+	 * dev_rearm() restores the mask. hang_arm is 0 unless written
+	 * through debugfs, so the production path is untouched. */
+	if (jd->hang_arm) {
+		jd->hang_arm--;
+		p7580_writel(jd, P7580_JOB_INT_MASK,
+			     (jd->js_present | (jd->js_present << 16)) &
+			     ~P7580_MK_JS_MASK(slot));
+		pr_info("p7580_job: hang_inject slot=%d seq=%u irq-masked\n",
+			slot, job->seqno);
+	}
 
 	p7580_js_write(jd, slot, P7580_JS_HEAD_NEXT_LO, lo);
 	p7580_js_write(jd, slot, P7580_JS_HEAD_NEXT_HI, hi);
@@ -475,6 +719,10 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 	 * device-store barrier on this weakly-ordered SoC). */
 	wmb();
 	p7580_js_write(jd, slot, P7580_JS_COMMAND_NEXT, P7580_JS_CMD_START);
+	if (armed) {
+		cmd_post = p7580_js_read(jd, slot, P7580_JS_COMMAND_NEXT);
+		st_post = p7580_js_read(jd, slot, P7580_JS_STATUS);
+	}
 	/* One-shot RAWSTAT/JS_STATUS snapshot right after START (numeric,
 	 * unconditional for the first 8 dispatches only, then silent):
 	 * proves whether the slot latched the command or faulted
@@ -502,6 +750,16 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 	}
 
 	spin_unlock_irqrestore(&jd->hw_lock, flags);
+
+	/* gpu31-firstfault: ring the dispatch outside hw_lock (the ring
+	 * takes it). a = JS_STATUS before START (bit31 = the slot was
+	 * still occupied by a previous job when this START was written),
+	 * b = COMMAND_NEXT readback (0 = the JM consumed the START),
+	 * c = JS_STATUS right after (0x08 = not latched yet). */
+	if (armed)
+		p7580_job_ev(jd, P7580_EV_START, slot, job->seqno, job->jc,
+			     st_pre | (prev ? 0x80000000u : 0u),
+			     cmd_post, st_post);
 }
 /* ------------------------------------------------------------------ */
 /* IRQ handler: demux JOB_INT_STAT per slot. IRQ context: no sleeps,  */
@@ -523,7 +781,7 @@ void p7580_job_hw_submit(struct p7580_job_dev *jd,
 /* dispatched job completes when this handler observes               */
 /* STAT & MK_JS_MASK(slot) with the DONE bit set, clears the slot    */
 /* bit(s), syncs the BOs, and dma_fence_signal()s the in-flight      */
-/* fence -- the 5 s timeout (timedout_job -> recover) only fires     */
+/* fence -- the job timeout (timedout_job -> recover) only fires     */
 /* when no IRQ arrives.                                               */
 /* ------------------------------------------------------------------ */
 
@@ -636,20 +894,28 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 					job != NULL);
 			}
 			spin_unlock_irqrestore(&jd->hw_lock, flags);
+			/* gpu31-firstfault: ring the completion (outside
+			 * hw_lock). a = JS_STATUS at DONE, b = the STAT |
+			 * RAWSTAT bits that demuxed here. */
+			p7580_job_ev(jd, P7580_EV_DONE, j, seq, jc, js_status,
+				     status | rawstat, 0);
 			/* Coherency-race fix: invalidate the job's BOs BEFORE
 			 * the fence signals, so any waiter woken by the
 			 * signal (WAIT_BO dma_resv_wait, syncobj WAIT,
 			 * sched finish_cb) observes GPU-written bytes.
 			 * p7580_gem_job_bos_pre_signal_sync walks
-			 * job->bos/bo_count with dma_sync_single_for_cpu per
-			 * bound SHMEM page (no MMIO, no sleeps, no locks:
-			 * dcache-line ops + dsb only, IRQ-safe; the swiotlb
-			 * leg is the identity fast path). free_job keeps a
-			 * second (post-signal) job_done_sync + unref walk --
-			 * belt and braces for waiters that attach after the
-			 * free (mmap/CPU reads), and for paths where the
-			 * IRQ never fires (recover signals instead; see
-			 * timedout/recover below). */
+			 * job->bos/bo_count with the clean-then-invalidate
+			 * pair per bound SHMEM page (gpu31-cachedir: clean
+			 * = sync_for_device(TO_DEVICE), then invalidate =
+			 * sync_for_cpu(FROM_DEVICE); no MMIO, no sleeps,
+			 * no locks: dcache-line ops + dsb only, IRQ-safe;
+			 * the swiotlb leg is the identity fast path).
+			 * free_job keeps a second (post-signal)
+			 * job_done_sync + unref walk -- belt and braces for
+			 * waiters that attach after the free (mmap/CPU
+			 * reads), and for paths where the IRQ never fires
+			 * (recover signals instead; see timedout/recover
+			 * below). */
 			if (job && job->bo_count && job->bos)
 				p7580_gem_job_bos_pre_signal_sync(job->bos,
 								  job->bo_count);
@@ -679,6 +945,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			 * budget-gated startup detail. */
 			unsigned long flags;
 			uint32_t es;
+			struct p7580_submit_job *fault_job;
 			uint32_t head_lo, head_hi, tail_lo, tail_hi;
 			uint64_t head, tail;
 			unsigned int seq = 0;
@@ -691,6 +958,7 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 			uint32_t en = 0;
 
 			spin_lock_irqsave(&jd->hw_lock, flags);
+			fault_job = jd->in_flight[j];
 			es = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_STATUS));
 			head_lo = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_HEAD_LO));
 			head_hi = p7580_readl(jd, P7580_JS_REG(j, P7580_JS_HEAD_HI));
@@ -728,6 +996,29 @@ int p7580_job_irq(int irq, struct p7580_job_dev *jd)
 					p7580_js_status_name(es));
 			}
 			spin_unlock_irqrestore(&jd->hw_lock, flags);
+			/* gpu31-firstfault: ring the fault and request the
+			 * one-shot page dump. The dump needs process
+			 * context (GEM resolve + kmap), so it rides the
+			 * timeout work this ERR leg queues below: that
+			 * work sees jd->ev_dumped == 0 and dumps before
+			 * recovery mutates anything. */
+			p7580_job_ev(jd, P7580_EV_ERR, j, seq, jc, es,
+				     status | rawstat, 0);
+			/* Latency fix (gpu31-latency): before this kick the
+			 * faulted job's fence was only signalled by the full
+			 * sched timeout (timedout_job -> recover), so one
+			 * fault stalled the frame for the whole retry
+			 * budget (a 300-frame bench showed 28 fps instead
+			 * of 290 from two such stalls). Queue the job's
+			 * timeout work at delay 0: recovery still runs in
+			 * workqueue context on the same ordered wq (FIFO
+			 * order preserved) and still signals the fence, but
+			 * within milliseconds. A job whose fence already
+			 * signalled is skipped by drm_sched_job_timeout. */
+			if (fault_job && fault_job->sched_job)
+				drm_sched_job_kick_timeout(
+					(struct drm_sched_job *)
+						fault_job->sched_job);
 		}
 		status &= ~m;
 	}
@@ -837,6 +1128,14 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 		return;
 
 	status = p7580_js_read(jd, slot, P7580_JS_STATUS);
+	/* gpu31-firstfault: one-shot ring + descriptor-page dump BEFORE
+	 * recover() touches the slots. Arrives here either from the job
+	 * sched timeout (silent job) or from the ERR leg's delay-0 kick
+	 * (a real JS_STATUS fault), so both signatures are covered by
+	 * the same capture. */
+	p7580_job_ev(jd, P7580_EV_TIMEOUT, slot, job->seqno, job->jc,
+		     status, 0, 0);
+	p7580_job_first_fault(jd, job, status);
 	/* Always-on timeout line (never budgeted): slot + JS_STATUS +
 	 * JOB_INT views + HEAD/TAIL + last-dispatch jc, so a silent
 	 * slot (no IRQ at all) is still diagnosable after the budget
@@ -856,11 +1155,11 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 		t_hi = p7580_readl(jd, P7580_JS_REG(slot, P7580_JS_TAIL_HI));
 		head = ((uint64_t)h_hi << 32) | h_lo;
 		tail = ((uint64_t)t_hi << 32) | t_lo;
-		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+		pr_err("p7580_job: TIMEOUT slot=%d js_status=0x%08x (%s) stat=0x%08x rawstat=0x%08x head=0x%llx tail=0x%llx seq=%u jc_age=%u jc=0x%llx cfg=0x%08x sw=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 			slot, status, p7580_js_status_name(status),
 			t_stat, t_raw,
 			(unsigned long long)head, (unsigned long long)tail,
-			job->seqno, (unsigned long long)job->jc,
+			job->seqno, job->jc_age, (unsigned long long)job->jc,
 			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0,
 			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
 			job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
@@ -1092,10 +1391,36 @@ int p7580_job_submit(struct p7580_job_dev *jd, struct p7580_file_ctx *fctx,
 /* path for the retry decision (Mesa re-submits the batch).           */
 /* ------------------------------------------------------------------ */
 
+/* Read every present slot's JS_STATUS after the GPU reset: true when a
+ * HW fault code survived it. Our own HARD_STOP leaves INTERRUPTED /
+ * STOPPED / TERMINATED (0x02/0x03/0x04) in the stopped slots, so those
+ * are skipped; anything else >= 0x40 is a latched fault, and
+ * POWER_FAULT in particular is only cleared by cycling the cores
+ * (gpu31-readback: without the cycle every following job on the slot
+ * re-reports 0x41 until the block is power-cycled by a suspend). */
+int p7580_job_slots_latched_fault(struct p7580_job_dev *jd)
+{
+	int i;
+
+	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
+		uint32_t st;
+
+		if (!(jd->js_present & (1u << i)))
+			continue;
+		st = p7580_js_read(jd, i, P7580_JS_STATUS);
+		if (p7580_js_status_is_fault(st) &&
+		    !p7580_js_status_is_stop(st))
+			return 1;
+	}
+	return 0;
+}
+
 int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 		      uint32_t status)
 {
 	int i, ret = 0;
+	int cycled = 0;
+	int do_cycle;
 	unsigned long end;
 	struct p7580_submit_job *fault_job = NULL;
 
@@ -1136,21 +1461,50 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 		}
 	}
 
-	/* 3. GPU reset. Prefer SOFT; HARD if RAWSTAT never completes. */
-	p7580_writel(jd, P7580_GPU_CMD, P7580_GPU_CMD_SOFT_RESET);
-	end = jiffies + msecs_to_jiffies(P7580_RESET_TIMEOUT_MS);
-	while (!(p7580_readl(jd, P7580_GPU_INT_RAWSTAT) &
-		 P7580_GPU_IRQ_RESET_COMPLETED)) {
-		if (time_after(jiffies, end)) {
-			p7580_writel(jd, P7580_GPU_CMD,
-				     P7580_GPU_CMD_HARD_RESET);
-			break;
+	/* 3. GPU reset. A GPU-level SOFT/HARD reset clears the JM's job
+	 * state but NOT the "the block lost power with work queued"
+	 * condition: measured on int40, the very next START after the
+	 * soft reset latched JS_STATUS POWER_FAULT (0x41) on the other
+	 * slot within 1 ms, every time (gpu31-firstfault). The core power
+	 * cycle below performs the reset as part of a complete power-on,
+	 * so take that path whenever it is wired: reset + cores + JM
+	 * state then match a cold power-up, and no latch survives.
+	 * Fall back to the plain reset only when the hook is missing. */
+	do_cycle = (jd->power_cycle && jd->pm_dev) ? 1 : 0;
+	if (!do_cycle) {
+		p7580_writel(jd, P7580_GPU_CMD, P7580_GPU_CMD_SOFT_RESET);
+		end = jiffies + msecs_to_jiffies(P7580_RESET_TIMEOUT_MS);
+		while (!(p7580_readl(jd, P7580_GPU_INT_RAWSTAT) &
+			 P7580_GPU_IRQ_RESET_COMPLETED)) {
+			if (time_after(jiffies, end)) {
+				p7580_writel(jd, P7580_GPU_CMD,
+					     P7580_GPU_CMD_HARD_RESET);
+				break;
+			}
+			msleep(1);
 		}
-		msleep(1);
+		p7580_writel(jd, P7580_GPU_INT_CLEAR,
+			     P7580_GPU_IRQ_RESET_COMPLETED);
 	}
-	p7580_writel(jd, P7580_GPU_INT_CLEAR, P7580_GPU_IRQ_RESET_COMPLETED);
 
-	/* 4. re-arm the slot IRQs the handler demuxes. Order mirrors
+	/* 4. Complete core power cycle (gpu31-readback + gpu31-firstfault).
+	 * Cycle on every recovery, not only on a latched 0x41: a plain
+	 * soft reset leaves the JM reporting POWER_FAULT for the next job
+	 * on either slot (measured), which turned one fault into a
+	 * fragment-0x58 / chain-0x41 / power-cycle storm for the rest of
+	 * the process. The caller holds a live runtime-PM ref, so the
+	 * domain stays up. */
+	if (do_cycle) {
+		int crc = jd->power_cycle(jd->pm_dev);
+
+		cycled = 1;
+		if (crc)
+			pr_err("p7580_job: recover-cycle FAIL rc=%d\n", crc);
+		p7580_job_ev(jd, P7580_EV_CYCLE, fault_slot, 0, 0,
+			     (uint32_t)crc, 0, 0);
+	}
+
+	/* 5. re-arm the slot IRQs the handler demuxes. Order mirrors
 	 * kbase_pm_clock_on (mali_kbase_pm_driver.c: MMU first, then
 	 * JOB unmask last at :1109): TRANSTAB + MEMATTR + TRANSCFG(0) +
 	 * UPDATE rebind AS0 BEFORE CLEAR+unmask, so the first post-reset
@@ -1161,7 +1515,25 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 			     P7580_MEMATTR_KBASE_LO, P7580_MEMATTR_KBASE_HI);
 	p7580_job_dev_rearm(jd);
 
+	/* 6. Post-recovery register state, always on (faults are rare):
+	 * proves the slot is usable again (no fault code left in
+	 * JS_STATUS, JOB_INT masked for the present slots) instead of
+	 * leaving the next fault to be discovered by a cascade. */
+	pr_err("p7580_job: recover-done slot=%d latched=0x%08x cycle=%d js0=0x%08x js1=0x%08x intmask=0x%08x drain_rc=%d\n",
+	       fault_slot, status, cycled,
+	       (jd->js_present & 1u) ?
+			p7580_js_read(jd, 0, P7580_JS_STATUS) : 0u,
+	       (jd->js_present & 2u) ?
+			p7580_js_read(jd, 1, P7580_JS_STATUS) : 0u,
+	       p7580_readl(jd, P7580_JOB_INT_MASK), ret);
+
 	mutex_unlock(&jd->reset_lock);
+	/* gpu31-firstfault: one ring record per recovery so the dump
+	 * shows the cascade (or its absence) with timestamps. */
+	p7580_job_ev(jd, P7580_EV_RECOVER, fault_slot,
+		     fault_job ? fault_job->seqno : 0,
+		     fault_job ? fault_job->jc : 0,
+		     status, (uint32_t)cycled, (uint32_t)ret);
 
 	/* 5. fault accounting (F-JOB4): signal exactly once so waiters  */
 	/* do not hang. Skip an already-signaled fence: the IRQ won the */
@@ -1178,6 +1550,40 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 							  fault_job->bo_count);
 		dma_fence_signal( /* 0001 */
 			(struct dma_fence *)fault_job->done_fence);
+	}
+
+	/*
+	 * Recovery hard-stopped every slot, so any other job still parked in
+	 * jd->in_flight[] has an orphaned fence: nobody will ever signal it and
+	 * its BO waiters (KWin's WAIT_BO) block forever.  Sweep every slot,
+	 * taking a fence reference while hw_lock is held so the scheduler
+	 * cannot free the job under us; signal and drop it outside the lock.
+	 */
+	{
+		int s;
+
+		for (s = 0; s < P7580_NUM_JOB_SLOTS; s++) {
+			struct dma_fence *f = NULL;
+			unsigned long fl;
+
+			spin_lock_irqsave(&jd->hw_lock, fl);
+			if (jd->in_flight[s]) {
+				void *df = jd->in_flight[s]->done_fence;
+
+				jd->in_flight[s] = NULL;
+				if (df) {
+					f = (struct dma_fence *)df;
+					dma_fence_get(f);	/* 3.10 returns void */
+				}
+			}
+			spin_unlock_irqrestore(&jd->hw_lock, fl);
+
+			if (!f)
+				continue;
+			if (!dma_fence_is_signaled(f))
+				dma_fence_signal(f);
+			dma_fence_put(f);
+		}
 	}
 	(void)status;
 	return ret;
@@ -1282,6 +1688,9 @@ int p7580_job_dump_show(struct p7580_job_dev *jd, struct seq_file *m)
 	seq_printf(m, "job_int stat=0x%08x rawstat=0x%08x mask=0x%08x js_present=0x%x pgd=0x%llx\n",
 		   job_stat, job_raw, job_mask, jd->js_present,
 		   (unsigned long long)jd->pgd_dma);
+	seq_printf(m, "faultdbg ev_arm=%u ev_head=%u ev_dumped=%u serialize_fs=%u hang_arm=%u\n",
+		   jd->ev_arm, jd->ev_head, jd->ev_dumped, jd->serialize_fs,
+		   jd->hang_arm);
 	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 		uint32_t st, h_lo, h_hi, t_lo, t_hi;
 		uint64_t head, tail;
@@ -1380,6 +1789,128 @@ static int p7580_job_chain_set_k(void *data, u64 val)
 DEFINE_SIMPLE_ATTRIBUTE(p7580_job_chain_fops, p7580_job_chain_get,
 			p7580_job_chain_set_k, "%llu\n");
 
+/* gpu31-firstfault knobs.
+ * ev_arm: write 1 to reset the event ring, arm the per-dispatch MMIO
+ *   probes and enable the one-shot first-fault dump; write 0 to
+ *   disarm. Read: 1 = armed, 0 = off.
+ * serialize_fs: write 1 to queue FS (slot 0) submits on the chain
+ *   slot's entity, so the fragment job is ordered behind the tiler by
+ *   one FIFO; 0 keeps the per-slot entities. Runtime A/B, no rebuild. */
+static int p7580_job_ev_arm_get(void *data, u64 *val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd || !val)
+		return -EINVAL;
+	*val = jd->ev_arm;
+	return 0;
+}
+
+static int p7580_job_ev_arm_set(void *data, u64 val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd)
+		return -EINVAL;
+	p7580_job_ev_arm(jd, (unsigned int)val);
+	pr_info("p7580_job: ev_arm=%d (ring %u entries, dump one-shot)\n",
+		jd->ev_arm, P7580_EV_MAX);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(p7580_job_ev_arm_fops, p7580_job_ev_arm_get,
+			p7580_job_ev_arm_set, "%llu\n");
+
+static int p7580_job_serialize_fs_get(void *data, u64 *val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd || !val)
+		return -EINVAL;
+	*val = jd->serialize_fs;
+	return 0;
+}
+
+static int p7580_job_serialize_fs_set(void *data, u64 val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd)
+		return -EINVAL;
+	jd->serialize_fs = val ? 1u : 0u;
+	pr_info("p7580_job: serialize_fs=%u\n", jd->serialize_fs);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(p7580_job_serialize_fs_fops,
+			p7580_job_serialize_fs_get,
+			p7580_job_serialize_fs_set, "%llu\n");
+
+/* gpu31-watchdog knobs.
+ *
+ * hang_inject: write N to mask the slot IRQ for the next N dispatches
+ * (the deterministic silent hang: job runs, no IRQ, fence waits the
+ * full dispatch timeout). 0 disarms. Nothing else changes; recovery
+ * re-arms the mask.
+ *
+ * job_timeout_ms: the driver's sched dispatch timeout (default
+ * P7580_JOB_TIMEOUT_MS = 750 ms). A write applies to entities created
+ * afterwards (each bench run opens a new file) and to the live
+ * sched->timeout; the setter clamps 100..60000. Read-only when the
+ * driver has not wired the hooks. */
+static int p7580_job_hang_get(void *data, u64 *val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd)
+		return -EINVAL;
+	*val = jd->hang_arm;
+	return 0;
+}
+
+static int p7580_job_hang_set(void *data, u64 val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd)
+		return -EINVAL;
+	jd->hang_arm = (unsigned int)val;
+	pr_info("p7580_job: hang_inject=%u (IRQ masked at the next %u dispatches)\n",
+		jd->hang_arm, jd->hang_arm);
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(p7580_job_hang_fops, p7580_job_hang_get,
+			p7580_job_hang_set, "%llu\n");
+
+static int p7580_job_timeout_get(void *data, u64 *val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd)
+		return -EINVAL;
+	if (!jd->get_timeout_ms) {
+		*val = P7580_JOB_TIMEOUT_MS;
+		return 0;
+	}
+	*val = jd->get_timeout_ms(jd->timeout_priv);
+	return 0;
+}
+
+static int p7580_job_timeout_set(void *data, u64 val)
+{
+	struct p7580_job_dev *jd = data;
+
+	if (!jd)
+		return -EINVAL;
+	if (!jd->set_timeout_ms)
+		return -ENODEV;
+	return jd->set_timeout_ms(jd->timeout_priv, (unsigned int)val);
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(p7580_job_timeout_fops, p7580_job_timeout_get,
+			p7580_job_timeout_set, "%llu\n");
+
 static int p7580_job_dump_show_seq(struct seq_file *m, void *v)
 {
 	struct p7580_job_dev *jd = m->private;
@@ -1424,6 +1955,25 @@ static void p7580_job_debugfs_init(struct p7580_job_dev *jd)
 				&p7580_job_chain_fops);
 	if (IS_ERR_OR_NULL(f))
 		pr_info("p7580_job: chain_mode knob unavailable\n");
+	/* gpu31-firstfault: event ring + first-fault page dump arm. */
+	f = debugfs_create_file("ev_arm", 0600, dir, jd,
+				&p7580_job_ev_arm_fops);
+	if (IS_ERR_OR_NULL(f))
+		pr_info("p7580_job: ev_arm knob unavailable\n");
+	/* gpu31-firstfault: FS-after-chain ordering A/B. */
+	f = debugfs_create_file("serialize_fs", 0600, dir, jd,
+				&p7580_job_serialize_fs_fops);
+	if (IS_ERR_OR_NULL(f))
+		pr_info("p7580_job: serialize_fs knob unavailable\n");
+	/* gpu31-watchdog: silent-hang injection + dispatch-timeout A/B. */
+	f = debugfs_create_file("hang_inject", 0600, dir, jd,
+				&p7580_job_hang_fops);
+	if (IS_ERR_OR_NULL(f))
+		pr_info("p7580_job: hang_inject knob unavailable\n");
+	f = debugfs_create_file("job_timeout_ms", 0600, dir, jd,
+				&p7580_job_timeout_fops);
+	if (IS_ERR_OR_NULL(f))
+		pr_info("p7580_job: job_timeout_ms knob unavailable\n");
 	f = debugfs_create_file("dump", 0400, dir, jd,
 				&p7580_job_dump_fops);
 	if (IS_ERR_OR_NULL(f))

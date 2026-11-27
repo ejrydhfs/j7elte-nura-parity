@@ -131,14 +131,40 @@ struct p7580_bo {
 	 * NULL/NULL on never-bound and CMA/imported BOs. */
 	dma_addr_t *dma_addrs;
 	struct device *sync_dev;
+	/* gpu31-mmlock: driver-owned fake mmap offset. The 3.10 core
+	 * manager (dev->mm_private: drm_mm + drm_hashtab) has no internal
+	 * locking and is written from the sched free_job workqueue while
+	 * CREATE_BO/import run in ioctl context, so base.map_list is
+	 * never used (no drm_gem_create/free_mmap_offset call exists).
+	 * offset_node is a page index inside gd->offset_mm; offset_hash
+	 * maps offset_node.start back to this BO. Both, and offset_valid,
+	 * are only touched with gd->mmap_offset_lock held. */
+	struct drm_mm_node offset_node;
+	struct drm_hash_item offset_hash;
+	int offset_valid;
 };
-/* Per-device GEM state: IOVA allocator + the lock that serialises it
- * (the driver allocates this in probe and stores it in dev_private;
- * the GEM helpers below take it by pointer so they stay testable). */
+/* Per-device GEM state: IOVA allocator + fake-mmap-offset manager and
+ * the locks that serialise them (the driver allocates this in probe
+ * and stores it in dev_private; the GEM helpers below take it by
+ * pointer so they stay testable). */
 struct p7580_dev {
 	struct device *dev;
 	struct drm_mm iova_mm;
 	struct mutex iova_lock;
+	/* gpu31-mmlock: driver-owned fake-mmap-offset manager. The 3.10
+	 * core manager is unlocked in every direction and every user of
+	 * it here runs in a different context: create/import in the
+	 * ioctl, free from the sched free_job workqueue, lookup in
+	 * .mmap. Core drm_gem_mmap() additionally takes its object
+	 * reference unreservedly, so it can resurrect an object already
+	 * at refcount 0 (dying in free_object). Own the space instead:
+	 * offset_mm carves page-index offsets out of the core window
+	 * (DRM_FILE_PAGE_OFFSET_*), offset_hash resolves them back, and
+	 * one mutex serialises alloc/free/err-undo/lookup, so no caller
+	 * can ever see a partially linked drm_mm node or hash chain. */
+	struct drm_mm offset_mm;
+	struct drm_open_hash offset_hash;
+	struct mutex mmap_offset_lock;
 };
 
 struct p7580_bo *to_p7580_bo(struct drm_gem_object *obj);
@@ -157,9 +183,10 @@ int p7580_gem_create_with_handle(struct p7580_dev *gd,
 				 uint32_t *handle);
 void p7580_gem_free_object(struct drm_gem_object *obj);
 int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
-/* Published to the core as driver->gem_vm_ops (main.c); defined in
- * panfrost7580_gem.c. Must stay non-NULL: drm_gem_mmap() -EINVALs when
- * the driver table is NULL. */
+/* Published to the core as driver->gem_vm_ops (main.c) and installed
+ * by the driver's own .mmap lookup (p7580_gem_mmap); defined in
+ * panfrost7580_gem.c. Must stay non-NULL: the mmap handler rejects a
+ * NULL table. */
 extern const struct vm_operations_struct p7580_gem_vm_ops;
 int p7580_gem_mmap(struct file *filp, struct vm_area_struct *vma);
 long p7580_gem_wait(struct drm_device *dev, struct drm_file *file_priv,
@@ -232,8 +259,9 @@ void p7580_gem_dma_unbind(struct drm_gem_object *obj);
 phys_addr_t p7580_bo_dma_addr(struct drm_gem_object *obj, unsigned int idx);
 /* gpu31-iova: free-time GPU unmap (driver snapshot, submit.c).
  * Called from p7580_gem_free_object before iova_free; clears the
- * BO's leaf PTEs + PM-held TLB invalidate + bo_list unlink + DMA
- * unbind. Never-bound BOs no-op. Register hook is link-compat. */
+ * BO's leaf PTEs + PM-held TLB invalidate + bo_list unlink (weak
+ * entry, no ref drop) + DMA unbind. Never-bound BOs no-op. Register
+ * hook is link-compat. */
 void p7580_gem_gpu_unmap(struct drm_gem_object *obj);
 void p7580_gem_mmu_register_notify(void (*fn)(void *, struct drm_gem_object *,
 					      unsigned long, unsigned int),

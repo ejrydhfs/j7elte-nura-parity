@@ -259,8 +259,17 @@ static int pf7580_cores_on_locked(struct pf7580_power *p,
 
 /* Cores off in reverse (tiler -> shader -> L2), polling READY==0. Used on
  * the runtime-suspend path; kbase likewise powers cores down before
- * clock-off while the domain is still up. */
-static void pf7580_cores_off_locked(struct pf7580_power *p)
+ * clock-off while the domain is still up.
+ *
+ * gpu31-readback: a core that does not acknowledge PWRON=0 means the block
+ * is still executing (or wedged). Continuing to gate the clock and drop
+ * pd-g3d then turns that into a GPU power event, which the JM reports as
+ * JS_STATUS POWER_FAULT for the victim job. Measured: 22 x (tiler +
+ * shader + L2 "did not idle") per bench run, i.e. 22 power-offs under a
+ * busy JM, followed by POWER_FAULT storms. Fail closed instead: power the
+ * cores back on and report -EBUSY so runtime_suspend aborts, leaving the
+ * block up (the PM core retries after the next usage put). */
+static int pf7580_cores_off_locked(struct pf7580_power *p)
 {
 	int ret;
 
@@ -268,38 +277,58 @@ static void pf7580_cores_off_locked(struct pf7580_power *p)
 	writel(0, p->regs + PF7580_TILER_PWRON_HI);
 	ret = pf7580_poll(p->regs, PF7580_TILER_READY_LO, 0xFFFFFFFF, 0,
 			  PF7580_CORE_TIMEOUT_US);
-	if (ret)
-		dev_warn(p->dev, "pf7580: tiler did not idle on power-off\n");
+	if (ret) {
+		dev_warn(p->dev, "pf7580: tiler did not idle on power-off, aborting suspend\n");
+		goto busy;
+	}
 
 	writel(0, p->regs + PF7580_SHADER_PWRON_LO);
 	writel(0, p->regs + PF7580_SHADER_PWRON_HI);
 	ret = pf7580_poll(p->regs, PF7580_SHADER_READY_LO, 0xFFFFFFFF, 0,
 			  PF7580_CORE_TIMEOUT_US);
-	if (ret)
-		dev_warn(p->dev, "pf7580: shaders did not idle on power-off\n");
+	if (ret) {
+		dev_warn(p->dev, "pf7580: shaders did not idle on power-off, aborting suspend\n");
+		goto busy;
+	}
 
 	writel(0, p->regs + PF7580_L2_PWRON_LO);
 	writel(0, p->regs + PF7580_L2_PWRON_HI);
 	ret = pf7580_poll(p->regs, PF7580_L2_READY_LO, 0xFFFFFFFF, 0,
 			  PF7580_CORE_TIMEOUT_US);
-	if (ret)
-		dev_warn(p->dev, "pf7580: L2 did not idle on power-off\n");
+	if (ret) {
+		dev_warn(p->dev, "pf7580: L2 did not idle on power-off, aborting suspend\n");
+		goto busy;
+	}
+	return 0;
+
+busy:
+	/* Put the cores back on while the domain and clock are still up,
+	 * so an aborted suspend never leaves a half-powered block. */
+	writel(readl(p->regs + PF7580_L2_PRESENT_LO),
+	       p->regs + PF7580_L2_PWRON_LO);
+	writel(0, p->regs + PF7580_L2_PWRON_HI);
+	writel(readl(p->regs + PF7580_SHADER_PRESENT_LO),
+	       p->regs + PF7580_SHADER_PWRON_LO);
+	writel(0, p->regs + PF7580_SHADER_PWRON_HI);
+	writel(readl(p->regs + PF7580_TILER_PRESENT_LO),
+	       p->regs + PF7580_TILER_PWRON_LO);
+	writel(0, p->regs + PF7580_TILER_PWRON_HI);
+	return -EBUSY;
 }
 
-int pf7580_runtime_resume(struct pf7580_power *p)
+/* Power-on sequence shared by runtime resume and the fault-recovery
+ * power cycle. Caller holds p->lock and has established that the domain
+ * is up (runtime-PM active). Clock on -> SOFT_RESET (+HARD_RESET
+ * fallback) -> cores on L2 -> shader -> tiler with READY polls. */
+static int pf7580_power_on_locked(struct pf7580_power *p)
 {
 	u32 shader_present, tiler_present, l2_present;
 	int ret;
 
-	if (!p)
-		return -ENODEV;
-
-	mutex_lock(&p->lock);
-
 	/* 1. functional clock (kbase gpu_control_enable_clock). */
 	ret = pf7580_clk_on_locked(p, true);
 	if (ret)
-		goto out;
+		return ret;
 
 	/* 2. reset the block (kbase kbase_pm_init_hw reset leg). */
 	ret = pf7580_soft_reset_locked(p);
@@ -315,23 +344,73 @@ int pf7580_runtime_resume(struct pf7580_power *p)
 	if (ret)
 		goto err_clk;
 
-	mutex_unlock(&p->lock);
 	return 0;
 
 err_clk:
 	pf7580_clk_off_locked(p);
-out:
+	return ret;
+}
+
+int pf7580_runtime_resume(struct pf7580_power *p)
+{
+	int ret;
+
+	if (!p)
+		return -ENODEV;
+
+	mutex_lock(&p->lock);
+	ret = pf7580_power_on_locked(p);
+	mutex_unlock(&p->lock);
+	return ret;
+}
+
+/* Full core power cycle for fault recovery (gpu31-readback): cores off
+ * (tiler -> shader -> L2) and clock gated, then the complete power-on
+ * sequence. A JM POWER_FAULT (JS_STATUS 0x41) is the slot's "powered
+ * down with work queued" latch; it survives the GPU-level SOFT/HARD
+ * reset that p7580_job_recover() already issues, so a slot that latched
+ * it reports the same fault for every following job until the cores are
+ * actually cycled. kbase treats a power fault the same way (force
+ * power-off/on through its PM state machine); this is the collapsed
+ * version for a driver whose PM is already held by the caller. Caller
+ * context: p7580_job_recover(), process context, reset_lock held and a
+ * live runtime-PM ref taken, so the domain cannot go away underneath.
+ * MMU AS0 reprogram + JOB_INT re-arm stay with the jobs slice: they
+ * must run after this returns (the reset cleared the registers). */
+int pf7580_power_cycle(struct pf7580_power *p)
+{
+	int ret;
+
+	if (!p)
+		return -ENODEV;
+
+	mutex_lock(&p->lock);
+	/* A busy core cannot be idled; cycle anyway: the following power-on
+	 * issues the reset that clears the state the cores are stuck in. */
+	if (pf7580_cores_off_locked(p))
+		dev_warn(p->dev, "pf7580: power cycle with busy cores\n");
+	pf7580_clk_off_locked(p);
+	ret = pf7580_power_on_locked(p);
 	mutex_unlock(&p->lock);
 	return ret;
 }
 
 int pf7580_runtime_suspend(struct pf7580_power *p)
 {
+	int ret;
+
 	if (!p)
 		return -ENODEV;
 
 	mutex_lock(&p->lock);
-	pf7580_cores_off_locked(p);
+	ret = pf7580_cores_off_locked(p);
+	if (ret) {
+		/* Cores still executing: keep the clock and the domain up.
+		 * -EBUSY makes the PM core retry this suspend later instead
+		 * of powering off under a live job (gpu31-readback). */
+		mutex_unlock(&p->lock);
+		return ret;
+	}
 	pf7580_clk_off_locked(p);
 	mutex_unlock(&p->lock);
 	return 0;

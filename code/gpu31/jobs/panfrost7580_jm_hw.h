@@ -210,6 +210,20 @@ static inline int p7580_js_status_is_fault(uint32_t status)
 	return status >= 0x40u;
 }
 
+/* Latched JM status codes (kbase jm_hw.h). 0x41 = POWER_FAULT: the slot
+ * was powered down with work queued. It survives the GPU-level SOFT/HARD
+ * reset, so recovery must power-cycle the cores to clear it
+ * (gpu31-readback). The other three are what our own STOP/HARD_STOP
+ * leaves in JS_STATUS; they are stop results, not latched HW faults. */
+#define P7580_JS_STATUS_POWER_FAULT	0x41u
+
+static inline int p7580_js_status_is_stop(uint32_t status)
+{
+	return status == 0x02u /* INTERRUPTED */ ||
+	       status == 0x03u /* STOPPED */ ||
+	       status == 0x04u /* TERMINATED */;
+}
+
 /* ------------------------------------------------------------------ */
 /* Job descriptor header (what job->jc points at). [KT]                */
 /* mali_kbase_defs.h:1689-1712, "identical for all GPU archs". 32      */

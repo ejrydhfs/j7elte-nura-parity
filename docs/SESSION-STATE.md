@@ -1,6 +1,6 @@
 # Session state (survives context compaction)
 
-Updated: 2026-11-19 (GPS GLME hand-off + ESW on hardware; modem CP power proven secure-only; GPU M1 built; USB link down pending physical re-plug). Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
+Updated: 2026-11-27 (kernel #37 int121; KWin 6.8.3 + plasmashell 6.8.3 on the in-tree DECON KMS driver; panel flashing under investigation). Target: **samsung-j7elte**, SM-J700M, Nura (pmOS) 3.10.108.
 
 ## Audio / UCM (2026-11-18)
 - ADMA prealloc: `sound/soc/samsung/dma.c` `preallocate_dma_buffer_of()`
@@ -389,3 +389,26 @@ Kernel **int48** (Image 911e7bf1..., boot 70345435...; driver 0001 04db08d, over
   diagnostic overlay should name it, but `p7580/prof_arm` fails to register
   (`debugfs_create_dir("p7580")` returns -EEXIST); int49 fixes that. `submit_err` now logs
   `n=` and is independent of the 8-line sched_trace budget.
+
+## Panel flashing under KWin 6.8.3 (2026-11-27, int121)
+- Kernel **#37** built 15:49 EST, flashed to `/dev/block/mmcblk0p10` with md5-verified readback;
+  the `exynos_drm7580` module is **int121** and carries the blank-frame guard (an atomic update
+  is skipped when the fb has <= 3 distinct sampled colours).
+- Userspace: KWin 6.8.3 (Wayland, `--drm`) + plasmashell 6.8.3 on the in-tree DECON KMS driver.
+- Symptom: panel black most of the time, intermittently flashing blue/magenta wallpaper frames
+  and black frames (sometimes solid black, sometimes solid blue); title bars occasionally visible.
+- Driver scanout dumps: successive KMS commits alternate between all-zero buffers (skipped by the
+  guard) and buffers with real content.
+- Panfrost: job timeout every ~1.3 s, `js_status=0x08`, `head == tail`, `jc_age=0`, followed by
+  `recover-done` and bursts of `rawstat=0x02` IRQs.
+- `kill -STOP` on KWin for 6 s produced zero panel flashing in photo sampling; flashing resumed
+  after the process was continued.
+- Panel is AMOLED; there is no valid backlight node.
+- Open: whether the flashing follows DECON commit cadence or is retriggered by panfrost timeout
+  recovery; why all-zero buffers still reach scanout; whether the panfrost timeouts are cause or
+  side effect.
+- Next: composite with software GL (no panfrost jobs) and sample the panel photographically;
+  correlate the DECON commit / fb id with photographed frames. Full status:
+  `docs/reports/panel-flash-status.md`.
+- Rollback: TWRP from `mmcblk0p11`, then restore `/data/backup-boot-p10.img` over
+  `/dev/block/mmcblk0p10`.
