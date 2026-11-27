@@ -59,3 +59,27 @@ Written after context compaction risk; this file is the authoritative
    tiler heap first page at timeout; the fault address is constant
    `0x0b2aa000`, outside every BO in `ERR-MAP`.
 3. If the fragment job is fixed, retest with panfrost GL (`cs28`) and int124.
+
+## Update 23:0x UTC — software session
+
+- Display module now **int125**: blank predicate is `<= 2 distinct colours`
+  (a dark theme with a panel is 3+ colours and must be scanned out; the 90 %
+  near-black rule froze the panel on the shadow image).
+- Working software configuration:
+  `MESA_LOADER_DRIVER_OVERRIDE=swrast LIBGL_ALWAYS_SOFTWARE=1 LP_NUM_THREADS=0`
+  plus `QT_QUICK_BACKEND=software` for plasmashell. This makes GBM allocate
+  **dumb buffers** (720x1292, pitch 2880) on renderD128, so kms_swrast really
+  owns the scanout buffers (the earlier `kms_swrast`-only override left GBM on
+  panfrost and produced untouched/zero frames).
+- Session script: `/home/user/cs31.sh` (dbus, KWin, kactivitymanagerd from
+  `/usr/lib/libexec`, kded6, plasmashell).
+- Observed: KWin starts, creates the primary/cursor fbs, commits **one** blank
+  frame, then goes idle (all threads futex/ppoll; no DRM ioctl wait). A new
+  client (`qmlscene6 /data/redfull.qml`) does not trigger another commit.
+  plasmashell loads the mobile shell QML (homescreen applets) but nothing is
+  painted to the panel.
+- Conclusion: with int125 the guard is no longer freezing dark UI; KWin is
+  simply not submitting further frames on the kms_swrast path. Next angle:
+  kms_swrast swap/callback (LOG `WAYLAND_DEBUG=1` on a client, KWin's
+  `kwin_scene_opengl`/swap debug, and whether a second atomic commit ever
+  reaches `exynos7580_plane_commit_frame`).
