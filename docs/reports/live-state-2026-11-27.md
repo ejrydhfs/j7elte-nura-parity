@@ -254,3 +254,22 @@ fault-address PTE/owner dump at TIMEOUT-DIAG.
 - Next: KWin scene/client-surface capture with `kwin_scene_opengl.debug`, and
   check whether the client surfaces are committed but dropped (texture import)
   or never committed.
+
+## Kernel #46 — shadow lifetime pin; client content composites
+
+- Root cause of the 8/30 content losses on #44 (probe: TRANSLATION_FAULT at
+  chain node2+0x40, i.e. a page of the driver-owned chain-shadow BO):
+  `p7580_drv_shadow_put()` unmapped the shadow when its node refs hit zero,
+  which is also when the last GEM reference drops and `gem_free_object` runs.
+  Removing the explicit unmap alone was a no-op relocation (the object died at
+  the same instant).
+- Real fix in #46: `shadow_create` takes one extra GEM reference and hangs the
+  object on `df->shadow_pins`; `p7580_drv_file_fini()` unpins after the entity
+  drain (labels: `p7580 shadow pin obj=… iova=… refs=…` /
+  `p7580 shadow unpin n=…`). Shadow pages now stay mapped for the file's life.
+- Result on #46 with an animated Wayland client (qmlscene6, rotating box):
+  **0 TIMEOUT / 0 TIMEOUT-DIAG**, and the client's frames are now on glass —
+  two stills differ by max 96/765 with ~15k changed pixels; the composited
+  window (white area + rotating box) is visible in the camera photo.
+- Shell after client exit: wallpaper on glass; shell restart shows the
+  wallpaper again (photo), panel still not confirmed visually at this angle.
