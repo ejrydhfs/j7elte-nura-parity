@@ -233,3 +233,24 @@ VA outside the submitted BO set, not a hole in one of them.
 Pending (next build): move the `JSn_STATUS` read before `JOB_INT_CLEAR`
 (panfrost7580_job.c:847 vs :879) so DONE prints 0x01 not 0x00, and add a
 fault-address PTE/owner dump at TIMEOUT-DIAG.
+
+## Kernel #44 — all-BO mapping removes KWin's fault stream
+
+- `p7580_drv_map_file_bos()` (panfrost7580_submit.c:1756, called :1858) walks
+  `file_priv->object_idr` and maps every BO the DRM file owns before dispatch.
+  This closes the hypothesis that Mesa 26 references a context BO that is not
+  in the batch handle array (the 0x24864000 execute VA).
+- With an animated Wayland client (qmlscene6, rotating box + 16 ms timer,
+  kwin 46% CPU) on #44: **0 TIMEOUT and 0 TIMEOUT-DIAG in dmesg**, versus
+  1-43 faults per 2.5 s window on #43. The fault stream is gone.
+- Not fixed: no client window reaches the panel. The shell background is
+  scanned out (guard log: `fb 30 blank=0 colours=4 dark=27/230400
+  ffd0e7dc ...`), but a GL qmlscene window, the same window forced to
+  `QT_QUICK_BACKEND=software` (shm), and the shell's own PanelView are all
+  absent from the composite; photos 0.5 s apart differ by max 34/765 and the
+  panel never changes. KWin's `commit_tail` lines at 205-207 s with changing
+  `ADD0` are not accompanied by fresh guard lines, so they are not primary
+  frames from KWin.
+- Next: KWin scene/client-surface capture with `kwin_scene_opengl.debug`, and
+  check whether the client surfaces are committed but dropped (texture import)
+  or never committed.
