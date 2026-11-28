@@ -190,3 +190,25 @@ timeout and find the field equal to FBD+0xaa000 (candidates: tiler
   descriptor BO layout, not the framebuffer — it moved with every allocation
   change, consistent with the AF-fault falsely aborting the job at a
   descriptor-relative address.
+
+## Update 06:30 UTC — GPU clean, wallpaper on glass, panel windows not composited
+
+- Kernel **#43** (AF bit removed, heap override reverted) + system Mesa 26.3:
+  `timeouts=0 faults=0`; the shell's wallpaper is rendered on the panel
+  (photo: 720x1280 gradient, stable). This is the first time the compositor's
+  real content is on glass with no GPU faults.
+- Session scripts: `rm -f $RUN/wayland-0 $RUN/wayland-0.lock` is now required
+  (a killed KWin leaves the lock and the next start dies with
+  "could not add wayland socket").
+- The shell's panel windows exist and render (`PanelView` 720x56, 218 scene
+  graph update lines; containments `org.kde.plasma.mobile.taskpanel` and
+  `org.kde.plasma.mobile.panel` are in the appletsrc) but neither appears in
+  the composite:
+  - `KWIN_USE_OVERLAYS=0`, `KWIN_DRM_NO_DIRECT_SCANOUT=1`, and disabling the
+    fullscreen effect did not change it.
+  - Shell uses LayerShellQt (`org.kde.layershell`) for its windows; next check
+    is the layer/anchor the panels request vs what KWin composites, and whether
+    the panel surface is mapped at all (KWin supportInformation no longer lists
+    windows on this build).
+- Screen right now: the shell wallpaper (blue gradient) with the cursor; no
+  panel, no clock.
