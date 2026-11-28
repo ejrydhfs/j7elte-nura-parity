@@ -330,3 +330,23 @@ fault-address PTE/owner dump at TIMEOUT-DIAG.
 - A controlled SMPTE test (`modetest -s 21@19:720x1280 -F smpte`) did not
   produce usable bars (dark striped buffer), so the colour test still needs a
   solid-colour fb (fbdev pan or a KMS solid pattern) to measure per-bar RGB.
+
+### Colour probe method (runtime, no rebuild)
+
+`exynos7580_plane.c` has a diagnostic override: module parameter
+`exynos7580_fourcc32` (32-bpp fourcc handed to DECON).  The compiled-in remap
+then turns ARGB→XRGB, ABGR→XBGR, RGBA→RGBX, BGRA→BGRX, so the parameter
+selects one of four WINCON BPPMODEs:
+
+| param value | DRM fourcc | remapped to | WINCON BPPMODE |
+| --- | --- | --- | --- |
+| 0x34325241 | ARGB8888 | XRGB8888 | BGRX (current) |
+| 0x34324241 | ABGR8888 | XBGR8888 | RGBX |
+| 0x34324152 | RGBA8888 | RGBX8888 | XRGB |
+| 0x34324142 | BGRA8888 | BGRX8888 | ARGB |
+
+Apply with `echo <value> > /sys/module/exynos_drm7580/parameters/exynos7580_fourcc32`;
+the next compositor frame picks it up (an animated client makes the change
+visible live).  Colour probe: the qml test window's `#c03030` box must
+photograph RED under the correct mapping (currently it photographs cyan/
+magenta because of the alpha-byte interpretation).
