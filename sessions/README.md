@@ -53,3 +53,14 @@ Continuation of `01a1eaa3` after a full UI/GPU push:
   window white, green wallpaper green).
 - Boot autostart: `/etc/local.d/plasma.start` loads int129 and starts
   `/home/user/cs47.sh`.
+
+## Photos for session 01a21eee
+
+The omp JSONL stores images as `blob:sha256:` references, so the image bytes are
+not inside the transcript.  They are committed here:
+
+- `sessions/photos-01a21eee/` — 32 images extracted from the omp blob store, in
+  transcript order (`photo-NN-<sha8>.<ext>`), plus `INDEX.md` mapping each file
+  to the tool call that produced it.
+- `sessions/2026-11-27_01a21eee-photos.md` — the same set rendered as a
+  companion document to the transcript.
