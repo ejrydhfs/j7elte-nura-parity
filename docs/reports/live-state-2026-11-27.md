@@ -370,3 +370,15 @@ path, not in DECON (no inversion bit) and not in the fourcc mapping.
 Next: re-run the vendor ea8061 gamma sequence (`dsim_panel_gamma_ctrl`,
 ea8061_lcd_ctrl.c:187, called from the panel init sequence at :343) on every
 panel enable, and check `br_index`/gamma mode used at KMS enable.
+
+### Colour fix landed (int129) + boot autostart
+
+- Measured correct mapping: ARGB8888 buffers display correctly when DECON is
+  handed **BGRX8888** (WINCON BPPMODE_XRGB8888, format=7).  The module param
+  `exynos7580_fourcc32=0x34324142` proved it live (screen turned green to match
+  the 0x22b567 framebuffer; photo sat-mean (1,220,142)).
+- int129 makes it the compiled default: `DRM_FORMAT_ARGB8888 -> BGRX8888`
+  (exynos_drm7580_plane.c), so no module parameter is needed.
+- `/etc/local.d/plasma.start` now loads int129 and starts `/home/user/cs47.sh`
+  in the background at boot, so the phone brings up KWin + plasmashell without
+  an SSH session (log: /data/plasma-boot.log).
