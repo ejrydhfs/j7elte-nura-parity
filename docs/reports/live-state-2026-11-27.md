@@ -130,3 +130,26 @@ Written after context compaction risk; this file is the authoritative
 - In flight: native musl Mesa 20.3.5 build on the device
   (`/data/mesa203-build`, install prefix `/data/mesa203-install`) — the stack
   that was previously validated at 151 fps against this driver.
+
+## Update 04:40 UTC — Mesa 20.3.5 built; kernel MMU fault is the remaining GPU gate
+
+- Mesa 20.3.5 built natively on the device (musl, gcc 15) and installed at
+  `/data/mesa203-install` (panfrost + kmsro, no LLVM, 16.6 MB). Smoke test:
+  `GL_RENDERER="Mali T720 (Panfrost)"`, `GL_VERSION="OpenGL ES 3.0 Mesa 20.3.5"`.
+  Patch 0007 (vertex attribute bounds) applied; no heap/syncobj patch needed.
+- Correction from the build agent: fragment jobs still hit
+  `js_status=0x8 ACTIVE`, `head==tail`, and the driver recovers after ~120 ms;
+  every draw also logs `AS0 FAULTSTATUS=0x800002d8 FAULTADDRESS=<job desc VA>`
+  (ACCESS_FLAG, 0xD8) inside BOs that are in the submit list and whose
+  page-table leaves match (PTEWALK leaf_phys == bo_phys, AF=1). Readback is
+  not run-to-run stable -> kernel MMU defect, not a Mesa build problem.
+- KWin 6.8.3 cannot run on Mesa 20.3.5's libgbm: `libkwin.so.6` needs
+  `gbm_bo_create_with_modifiers2` and `gbm_bo_get_fd_for_plane`. Keeping the
+  system libgbm 26.3 and taking only libEGL/libGLESv2/GL/dri from 20.3
+  (`/data/mesa203-kwin/lib` symlink set) loads, but KWin then segfaults during
+  GL init (backtrace captured via `/home/user/segv.so`, frames in libgallium).
+- Consequence: the remaining GPU blocker is the MMU ACCESS_FLAG fault in the
+  kernel port, independent of Mesa version. Next: compare our leaf/table ATE
+  programming for the t72x with `kbase_mmu_get_mmu_flags`/`kbase_mmu_setup`
+  around the exact faulting BO, and check the upper-level table entries
+  (PTEWALK only validated the leaf).
