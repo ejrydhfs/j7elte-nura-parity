@@ -25,7 +25,9 @@ cross-compilation, static analysis and emulated selftests.
 | [`patches/`](patches/) | 27 patches + series apply/header files |
 | [`code/userspace/`](code/userspace/) | RIL, GPS, camera, sensors, audio, connectivity, GPU sources |
 | [`code/pmaports/`](code/pmaports/) | 13 package recipes under `device/archived` |
-| [`build/`](build/) | `Image`, 3 DTBs, `System.map`, kernel config, build/verify scripts |
+| [`code/gpu31/`](code/gpu31/) | panfrost7580 + DECON/DSIM KMS driver sources; `driver/0141-*.patch` is the complete pristine→final kernel patch |
+| [`build/`](build/) | Latest working kernel #46 `Image` (18,309,384 B), int129 `exynos-drm7580.ko`, 3 DTBs, `System.map`, final config, build/verify scripts |
+| [`sessions/`](sessions/) | Verbatim omp transcripts of the four sessions, photo companions, full archive |
 | [`session/`](session/) | Full and no-artifacts omp session archives |
 
 ## Result
@@ -41,7 +43,7 @@ cross-compilation, static analysis and emulated selftests.
 | Audio | UCM2 routing + automatic jack routing |
 | Sensors / power / Wi-Fi / BT / FDE | Implemented userspace packages |
 | GPU | Software GL; Mesa-on-kbase first milestone, not linked |
-| Verification | `verify.sh`: 22 OK / 5 skipped / 0 failed; kernel build exit 0, `Image` 17,545,608 B; RIL selftest 44 exact frames |
+| Verification | `verify.sh`: 22 OK / 5 skipped / 0 failed; latest kernel build exit 0, `Image` 18,309,384 B (kernel #46, 2026-11-28); RIL selftest 44 exact frames |
 
 ## Reproduce
 

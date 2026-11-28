@@ -76,7 +76,7 @@ static void exynos7580_dump_pixels(struct drm_framebuffer *fb, const char *tag)
 {
 	struct drm_gem_object *obj;
 	void *map;
-	const u32 ys[3] = { 100, 640, 1200 };
+	const u32 ys[6] = { 10, 28, 45, 100, 640, 1200 };
 	unsigned int pitch, i;
 
 	if (!fb || !fb->pitches[0])
@@ -99,11 +99,26 @@ static void exynos7580_dump_pixels(struct drm_framebuffer *fb, const char *tag)
 		return;
 	}
 	pitch = fb->pitches[0];
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < 6; i++) {
 		unsigned int y = ys[i] < fb->height ? ys[i] : fb->height - 1;
 		u32 px = ((const u32 *)((const u8 *)map + y * pitch))[360];
 		pr_info("scanout-dump[%s]: %ux%u y=%u px=%08x\n",
 			tag, fb->width, fb->height, y, px);
+	}
+	/* Coarse 6x10 grid: enough to see whether the scanned frame is the
+	 * wallpaper, a dark UI, or a clear frame. */
+	{
+		unsigned int gy, gx;
+		for (gy = 0; gy < 6; gy++) {
+			u32 row[10];
+			unsigned int yy = (fb->height * (gy * 2 + 1)) / 12;
+			const u32 *line = (const u32 *)((const u8 *)map + yy * pitch);
+			for (gx = 0; gx < 10; gx++)
+				row[gx] = line[(fb->width * (gx * 2 + 1)) / 20];
+			pr_info("grid[%s] %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				tag, row[0], row[1], row[2], row[3], row[4],
+				row[5], row[6], row[7], row[8], row[9]);
+		}
 	}
 	dma_buf_vunmap(obj->import_attach->dmabuf, map);
 	dma_buf_end_cpu_access(obj->import_attach->dmabuf, 0, obj->size,
@@ -152,8 +167,8 @@ bool exynos7580_fb_is_blank(struct drm_framebuffer *fb)
 	struct drm_gem_object *obj;
 	void *map;
 	u32 seen[4] = { 0, 0, 0, 0 };
-	unsigned int nseen = 0, y, x, i;
-	bool few = true, dup;
+	unsigned int nseen = 0, y, x, i, total = 0, dark = 0;
+	bool blank, dup;
 
 	if (!fb || !fb->pitches[0] || !fb->height)
 		return false;
@@ -171,38 +186,147 @@ bool exynos7580_fb_is_blank(struct drm_framebuffer *fb)
 	}
 	/*
 	 * An unrendered KWin frame is a clear colour or two (00000000 /
-	 * ff000000 / ff161616), never a picture.  Stop as soon as a fourth
-	 * distinct sampled value shows up: that is real content.
+	 * ff000000 / ff161616) plus whatever the status bar draws on top of
+	 * it, so counting colours alone lets a mostly-black frame through.
+	 * Count near-black samples as well: 90% of the panel at (or below)
+	 * 0x0f per channel is a clear frame, not a picture.
 	 */
-	for (y = 0; y < fb->height && few; y++) {
+	for (y = 0; y < fb->height; y++) {
 		const u32 *row = (const u32 *)((const u8 *)map + y * fb->pitches[0]);
 
 		for (x = 0; x < fb->width; x += 4) {
 			u32 cur = row[x];
 
+			total++;
+			if ((cur & 0x00f0f0f0u) == 0)
+				dark++;
+			if (nseen == 4)
+				continue;
 			dup = false;
 			for (i = 0; i < nseen; i++)
 				if (seen[i] == cur) {
 					dup = true;
 					break;
 				}
-			if (dup)
-				continue;
-			if (nseen == 3) {	/* fourth colour: real content */
-				few = false;
-				break;
-			}
-			seen[nseen++] = cur;
+			if (!dup)
+				seen[nseen++] = cur;
 		}
 	}
 	dma_buf_vunmap(obj->import_attach->dmabuf, map);
 	dma_buf_end_cpu_access(obj->import_attach->dmabuf, 0, obj->size,
 			       DMA_FROM_DEVICE);
-	pr_info("exynos7580: fb %u blank=%d colours=%u %08x %08x %08x %08x\n",
-		fb->base.id, few, nseen, seen[0], seen[1], seen[2], seen[3]);
-	return few;
+	/*
+	 * A clear frame is one or two uniform values (00000000 / ff000000 /
+	 * ff161616 / ff616161).  A dark theme with a panel is *three or more*
+	 * colours and must not be mistaken for a clear frame: rejecting it
+	 * freezes the panel on the shadow image.  The dark count is kept in
+	 * the log for diagnosis only.
+	 */
+	blank = (nseen <= 2);
+	pr_info("exynos7580: fb %u blank=%d colours=%u dark=%u/%u %08x %08x %08x %08x\n",
+		fb->base.id, blank, nseen, dark, total,
+		seen[0], seen[1], seen[2], seen[3]);
+	return blank;
 }
 EXPORT_SYMBOL_GPL(exynos7580_fb_is_blank);
+
+/*
+ * Shadow frame copies.
+ *
+ * KWin's buffer is released to it as soon as the flip event is sent (this
+ * stack sends it at commit time), so a buffer still being scanned out can be
+ * rewritten by the compositor's next frame - and that frame may be the clear
+ * one produced when a panfrost job fails.  The panel then goes black even
+ * though the driver never programmed a blank frame.  These helpers let the
+ * plane code keep a complete frame and put it into the buffer it is about to
+ * program, so client buffer recycling cannot black the panel.
+ */
+static int exynos7580_fb_cpu_map(struct drm_framebuffer *fb,
+				 struct dma_buf **out, void **map,
+				 enum dma_data_direction dir)
+{
+	struct drm_gem_object *obj;
+	struct dma_buf *db;
+	void *m;
+
+	if (!fb || !fb->pitches[0] || !fb->height)
+		return -EINVAL;
+	obj = drm_fb_cma_get_gem_obj(fb, 0);
+	if (!obj)
+		return -ENODEV;
+	if (!obj->import_attach || !obj->import_attach->dmabuf) {
+		/* CMA/dumb buffer: the kernel mapping is permanent. */
+		*out = NULL;
+		*map = to_drm_gem_cma_obj(obj)->vaddr;
+		return *map ? 0 : -ENOMEM;
+	}
+	db = obj->import_attach->dmabuf;
+	if (dma_buf_begin_cpu_access(db, 0, obj->size, dir))
+		return -EIO;
+	m = dma_buf_vmap(db);
+	if (!m) {
+		dma_buf_end_cpu_access(db, 0, obj->size, dir);
+		return -ENOMEM;
+	}
+	*out = db;
+	*map = m;
+	return 0;
+}
+
+static void exynos7580_fb_cpu_unmap(struct drm_framebuffer *fb,
+				    struct dma_buf *db, void *map,
+				    enum dma_data_direction dir)
+{
+	struct drm_gem_object *obj;
+
+	if (!db)
+		return;
+	obj = drm_fb_cma_get_gem_obj(fb, 0);
+	dma_buf_vunmap(db, map);
+	if (obj)
+		dma_buf_end_cpu_access(db, 0, obj->size, dir);
+}
+
+bool exynos7580_fb_shadow_read(struct drm_framebuffer *fb, void *shadow,
+			       unsigned int pitch)
+{
+	struct dma_buf *db;
+	void *map;
+	unsigned int y, n;
+
+	if (exynos7580_fb_cpu_map(fb, &db, &map, DMA_FROM_DEVICE))
+		return false;
+	n = min(fb->pitches[0], pitch);
+	for (y = 0; y < fb->height; y++)
+		memcpy((u8 *)shadow + y * pitch,
+		       (const u8 *)map + y * fb->pitches[0], n);
+	exynos7580_fb_cpu_unmap(fb, db, map, DMA_FROM_DEVICE);
+	return true;
+}
+EXPORT_SYMBOL_GPL(exynos7580_fb_shadow_read);
+
+bool exynos7580_fb_shadow_write(struct drm_framebuffer *fb, const void *shadow,
+				unsigned int pitch, size_t shadow_size)
+{
+	struct dma_buf *db;
+	void *map;
+	unsigned int y, rows, n;
+
+	if (!pitch || !shadow_size)
+		return false;
+	if (exynos7580_fb_cpu_map(fb, &db, &map, DMA_TO_DEVICE))
+		return false;
+	n = min(fb->pitches[0], pitch);
+	/* Never read past the shadow: it can be smaller than this frame when
+	 * a small (cursor) buffer was the last one cached. */
+	rows = min(fb->height, (unsigned int)(shadow_size / pitch));
+	for (y = 0; y < rows; y++)
+		memcpy((u8 *)map + y * fb->pitches[0],
+		       (const u8 *)shadow + y * pitch, n);
+	exynos7580_fb_cpu_unmap(fb, db, map, DMA_TO_DEVICE);
+	return true;
+}
+EXPORT_SYMBOL_GPL(exynos7580_fb_shadow_write);
 
 
 /* DECON windows are programmed with SYSMMU/IOVMM addresses; iovmm_map() only

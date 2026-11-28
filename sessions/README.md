@@ -59,9 +59,10 @@ Continuation of `01a1eaa3` after a full UI/GPU push:
 The omp JSONL stores images as `blob:sha256:` references, so the image bytes are
 not inside the transcript.  They are committed here:
 
-- `sessions/photos-01a21eee/` — 32 images extracted from the omp blob store, in
-  transcript order (`photo-NN-<sha8>.<ext>`), plus `INDEX.md` mapping each file
-  to the tool call that produced it.
+- `sessions/photos-01a21eee/` — 33 images: 32 extracted from the omp blob store
+  in transcript order (`photo-NN-<sha8>.<ext>`) plus the final camera snapshot
+  `photo-33-latest-bdeb4be4.jpg` (2026-11-28 14:49 UTC, supervised plasmashell
+  restart). `INDEX.md` maps each file to the tool call that produced it.
 - `sessions/2026-11-27_01a21eee-photos.md` — the same set rendered as a
   companion document to the transcript.
 

@@ -996,6 +996,66 @@ int p7580_gem_create_with_handle(struct p7580_dev *gd,
 	return 0;
 }
 
+/*
+ * Dumb buffers.
+ *
+ * Mesa's kms_swrast (and modetest, and any non-GL client) allocates its
+ * scanout resources with CREATE_DUMB/MAP_DUMB on the DRM node it was handed.
+ * KWin renders through /dev/dri/renderD128 (this driver), so without these
+ * two hooks the software-rendering path fails at "Failed to create scanout
+ * resource".  The storage is the same SHMEM BO every other allocation uses.
+ */
+int p7580_dumb_create(struct drm_file *file_priv, struct drm_device *dev,
+		      struct drm_mode_create_dumb *args)
+{
+	struct p7580_dev *gd = dev->dev_private;
+	u32 cpp, pitch;
+	size_t size;
+	int ret;
+
+	if (!gd || !args->width || !args->height || !args->bpp)
+		return -EINVAL;
+	cpp = DIV_ROUND_UP(args->bpp, 8);
+	if (args->width > (u32)(UINT_MAX / cpp))
+		return -EINVAL;
+	pitch = ALIGN(args->width * cpp, 64);
+	if (args->height > (u32)(UINT_MAX / pitch))
+		return -EINVAL;
+	size = (size_t)pitch * args->height;
+
+	args->pitch = pitch;
+	args->size = size;
+	ret = p7580_gem_create_with_handle(gd, file_priv, dev, size,
+					   P7580_BO_SHMEM, P7580_GEM_WC,
+					   &args->handle);
+	pr_info("p7580_dumb_create: %ux%u bpp=%u pitch=%u size=%zu handle=%u rc=%d\n",
+		args->width, args->height, args->bpp, pitch, size,
+		args->handle, ret);
+	return ret;
+}
+
+int p7580_dumb_map_offset(struct drm_file *file_priv, struct drm_device *dev,
+			  uint32_t handle, uint64_t *offset)
+{
+	struct p7580_dev *gd = dev->dev_private;
+	struct drm_gem_object *obj;
+	struct p7580_bo *bo;
+	int ret = 0;
+
+	if (!gd)
+		return -ENODEV;
+	obj = drm_gem_object_lookup(dev, file_priv, handle);
+	if (!obj)
+		return -ENOENT;
+	bo = to_p7580_bo(obj);
+	if (!bo->offset_valid)
+		ret = p7580_offset_alloc(gd, bo);
+	if (!ret)
+		*offset = (uint64_t)bo->offset_node.start << PAGE_SHIFT;
+	drm_gem_object_unreference_unlocked(obj);
+	return ret;
+}
+
 /* Forward: frees one live BO's GPU mapping before its IOVA is
  * recycled (p7580_gem_free_object below). Defined in the driver
  * snapshot (submit.c, PM-held TLB invalidate + bo_list unlink); the

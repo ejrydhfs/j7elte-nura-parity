@@ -89,6 +89,26 @@
 #define P7580_GPU_CMD_SOFT_RESET	0x01u
 #define P7580_GPU_CMD_HARD_RESET	0x02u
 #define P7580_GPU_INT_RAWSTAT		0x0020u
+/* kbase GPU_CONTROL block (mali_midg_regmap.h): unlike the mainline
+ * 0x028 GPU_INT_MASK used by the power slice, this is the register stock
+ * kbase unmasks to ALL so a fault is never silent. */
+#define P7580_GPU_IRQ_MASK		0x1058u
+#define P7580_GPU_IRQ_MASK_ALL		0x10581u
+/* t72x r1p0 erratum 10797 (kbase GPUCORE-10797): SC_ENABLE_TEXGRD_FLAGS.
+ * No reset leaves it set, so it must be written after every reset. */
+#define P7580_GPU_SHADER_CONFIG		0x0F04u
+#define P7580_GPU_SHADER_CONFIG_T72X	0x02000000u
+/* MMU block (0x2000) and address-space registers (0x2400 + as*0x40). */
+#define P7580_MMU_INT_RAWSTAT		0x2000u
+#define P7580_MMU_INT_CLEAR		0x2004u
+#define P7580_MMU_INT_MASK		0x2008u
+#define P7580_MMU_INT_STAT		0x200Cu
+#define P7580_MMU_AS_BASE		0x2400u
+#define P7580_MMU_AS_STRIDE		0x40u
+#define P7580_MMU_AS_FAULTSTATUS	0x1Cu
+#define P7580_MMU_AS_FAULTADDRESS_LO	0x20u
+#define P7580_MMU_AS_FAULTADDRESS_HI	0x24u
+#define P7580_MMU_AS_FAULTEXTRA_LO	0x38u
 #define P7580_GPU_INT_CLEAR		0x0024u
 #define P7580_GPU_IRQ_RESET_COMPLETED	(1u << 8)
 
@@ -194,6 +214,23 @@ static const struct p7580_js_fault p7580_js_faults[] = {
 static inline const char *p7580_js_status_name(uint32_t status)
 {
 	unsigned int i;
+
+	/* kbase jm_hw.h slot states, so a TIMEOUT line says what the JM
+	 * actually did: 0x00 never started, 0x01 finished, 0x08 running. */
+	switch (status) {
+	case 0x00u:
+		return "NOT_STARTED/OK";
+	case 0x01u:
+		return "DONE";
+	case 0x02u:
+		return "INTERRUPTED";
+	case 0x03u:
+		return "STOPPED";
+	case 0x04u:
+		return "TERMINATED";
+	case 0x08u:
+		return "ACTIVE";
+	}
 
 	for (i = 0; i < sizeof(p7580_js_faults) /
 			sizeof(p7580_js_faults[0]); i++) {

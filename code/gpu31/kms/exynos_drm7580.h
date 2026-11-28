@@ -46,6 +46,18 @@ struct exynos7580_device {
 	struct drm_crtc		crtc;
 	struct drm_plane	planes[EXYNOS7580_MAX_PLANES];
 	unsigned int		num_planes;
+	/* Framebuffers currently programmed into DECON.  The atomic state
+	 * drops its reference as soon as the next commit swaps in, but the
+	 * hardware keeps scanning the old buffer out when we skip a frame,
+	 * so the driver must keep it alive until it is really replaced. */
+	struct drm_framebuffer	*last_fb[EXYNOS7580_MAX_PLANES];
+	/* Copy of the last complete frame.  KWin gets its buffer back as soon
+	 * as the flip event is sent, so the buffer still being scanned out can
+	 * be rewritten (and cleared by the next failed render).  This copy is
+	 * what the plane code programs instead. */
+	void			*shadow;
+	size_t			shadow_size;
+	unsigned int		shadow_pitch;
 
 	struct drm_encoder	encoder;
 	struct drm_connector	connector;
@@ -117,3 +129,8 @@ void exynos7580_fbdev_fini(void);
 extern unsigned int exynos7580_dump_fb;
 void exynos7580_dump_scanout(struct drm_framebuffer *fb);
 bool exynos7580_fb_is_blank(struct drm_framebuffer *fb);
+/* Copy rows between a scanout framebuffer and the driver's shadow frame. */
+bool exynos7580_fb_shadow_read(struct drm_framebuffer *fb, void *shadow,
+			       unsigned int pitch);
+bool exynos7580_fb_shadow_write(struct drm_framebuffer *fb, const void *shadow,
+				unsigned int pitch, size_t shadow_size);

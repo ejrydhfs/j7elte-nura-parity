@@ -412,3 +412,23 @@ Kernel **int48** (Image 911e7bf1..., boot 70345435...; driver 0001 04db08d, over
   `docs/reports/panel-flash-status.md`.
 - Rollback: TWRP from `mmcblk0p11`, then restore `/data/backup-boot-p10.img` over
   `/dev/block/mmcblk0p10`.
+
+## Final working state (2026-11-28, kernel #46 / module int129)
+- Kernel `#46 SMP PREEMPT Sat Nov 28 00:36:09 EST 2026`, built from
+  `scratch-k94`; `build/Image` is 18,309,384 B. The display module is
+  **int129** (`build/exynos-drm7580-int129.ko`), now the compiled default:
+  `ARGB8888 -> BGRX8888`, correct colours; qml probe red box/white window,
+  postmarketOS wallpaper correct after reboot.
+- GPU: leaf ATEs lose the ACCESS_FLAG bit, every DRM-file BO is mapped at
+  dispatch, and chain-shadow BOs are pinned for the file lifetime; probe
+  30/30 PASS, 0 FAIL (was 8/30). KWin composites client content with 0
+  faults/timeouts.
+- Reproduce the kernel tree: apply
+  `code/gpu31/driver/0141-j7elte-kernel-final-2026-11-28.patch` alone to
+  pristine `universal7580-2a746c1` (81 files; verified to reproduce the final
+  sources byte-for-byte). `0001-...driver-sources.patch` is regenerated from
+  the same final sources.
+- Device session scripts (autostart `cs48.sh`, crash/dumb-buffer probes, KWin
+  scripts, QML and camera colour probes) are in `code/experience/panel-ui/`.
+- Latest photo: `sessions/photos-01a21eee/photo-33-latest-bdeb4be4.jpg`
+  (supervisor restart, 2026-11-28 14:49 UTC).

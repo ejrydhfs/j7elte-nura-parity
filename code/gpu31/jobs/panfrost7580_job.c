@@ -352,6 +352,31 @@ static inline uint32_t p7580_readl(struct p7580_job_dev *jd, uint32_t reg)
 {
 	return readl(jd->regs + reg);
 }
+
+/* int95: unmask the interrupt sources stock kbase keeps enabled, so an
+ * MMU fault or a GPU-level error is delivered instead of leaving a slot
+ * silent.  MMU_INT_CLEAR first drains any latch, then MASK=ALL. */
+static void p7580_job_irq_program(struct p7580_job_dev *jd, const char *where)
+{
+	p7580_writel(jd, P7580_MMU_INT_CLEAR, 0xFFFFFFFFu);
+	p7580_writel(jd, P7580_MMU_INT_MASK, 0xFFFFFFFFu);
+	p7580_writel(jd, P7580_GPU_IRQ_MASK, P7580_GPU_IRQ_MASK_ALL);
+	pr_info("p7580_job: %s irq-mask gpu_irq_mask=0x%08x(rd 0x%08x) mmu_mask=0x%08x(rd 0x%08x) mmu_raw=0x%08x\n",
+		where, P7580_GPU_IRQ_MASK_ALL,
+		p7580_readl(jd, P7580_GPU_IRQ_MASK),
+		0xFFFFFFFFu, p7580_readl(jd, P7580_MMU_INT_MASK),
+		p7580_readl(jd, P7580_MMU_INT_RAWSTAT));
+}
+
+/* t72x r1p0 erratum 10797: re-assert SC_ENABLE_TEXGRD_FLAGS after every
+ * reset (kbase panfrost_gpu_init_quirks does it once at probe; the bit is
+ * cleared by a reset, so a post-recovery GPU ran without it). */
+static void p7580_job_post_reset(struct p7580_job_dev *jd)
+{
+	p7580_writel(jd, P7580_GPU_SHADER_CONFIG, P7580_GPU_SHADER_CONFIG_T72X);
+	pr_info("p7580_job: post-reset SHADER_CONFIG=0x%08x (t72x erratum 10797)\n",
+		p7580_readl(jd, P7580_GPU_SHADER_CONFIG));
+}
 /* gpu31-iova: fault-time mapping resolver registration (process
  * context, before faults). The driver registers a hook that renders
  * the faulting job's {handle,iova,size} snapshot into the ERR pin;
@@ -553,6 +578,7 @@ int p7580_job_dev_init(struct p7580_job_dev *jd, void __iomem *regs,
 	 * before the first START (bounded: two extra reads at probe). */
 	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
 	p7580_writel(jd, P7580_JOB_INT_MASK, mask & (js_present | (js_present << 16)));
+	p7580_job_irq_program(jd, "dev-init");
 	pr_info("p7580_job: irq-arm rawstat=0x%08x stat=0x%08x mask=0x%08x js_present=0x%x\n",
 		p7580_readl(jd, P7580_JOB_INT_RAWSTAT),
 		p7580_readl(jd, P7580_JOB_INT_STAT),
@@ -590,6 +616,7 @@ void p7580_job_dev_rearm(struct p7580_job_dev *jd)
 	p7580_writel(jd, P7580_JOB_INT_CLEAR, mask);
 	p7580_writel(jd, P7580_JOB_INT_MASK,
 		     mask & (jd->js_present | (jd->js_present << 16)));
+	p7580_job_irq_program(jd, "rearm");
 }
 
 /* Idle when no slot has a queued command, no job is in flight and no
@@ -1163,6 +1190,25 @@ void p7580_job_timedout(struct p7580_job_dev *jd,
 			(jd->last.valid && jd->last.slot == (unsigned int)slot) ? jd->last.cfg : 0,
 			job->desc[0], job->desc[1], job->desc[2], job->desc[3],
 			job->desc[4], job->desc[5], job->desc[6], job->desc[7]);
+		/* int95: a silent 0x08 timeout is indistinguishable from a
+		 * dropped MMU fault unless the AS/MMU/GPU interrupt state is
+		 * printed. AS0 is the only address space this driver uses
+		 * (P7580_DRV_AS_NR), so read AS0's fault trio. */
+		{
+			void __iomem *as = jd->regs + P7580_MMU_AS_BASE +
+				(0u * P7580_MMU_AS_STRIDE);
+
+			pr_err("p7580_job: TIMEOUT-DIAG slot=%d js=%s(0x%02x) AS%d FAULTSTATUS=0x%08x FAULTADDRESS=0x%08x%08x EXTRA_LO=0x%08x MMU_RAWSTAT=0x%08x MMU_STAT=0x%08x GPU_INT_RAWSTAT=0x%08x\n",
+				slot, p7580_js_status_name(status), status,
+				0u, /* AS0: the only address space this driver programs */
+				readl(as + P7580_MMU_AS_FAULTSTATUS),
+				readl(as + P7580_MMU_AS_FAULTADDRESS_HI),
+				readl(as + P7580_MMU_AS_FAULTADDRESS_LO),
+				readl(as + P7580_MMU_AS_FAULTEXTRA_LO),
+				p7580_readl(jd, P7580_MMU_INT_RAWSTAT),
+				p7580_readl(jd, P7580_MMU_INT_STAT),
+				p7580_readl(jd, P7580_GPU_INT_RAWSTAT));
+		}
 		/* gpu31-iova: same mapping line as the ERR pin (process
 		 * context here, but the hook is IRQ-safe anyway). */
 		if (jd->iova_resolve && job->iova_handles &&
@@ -1439,6 +1485,10 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 	/* that still shows a pending command is hard-stopped too. */
 	p7580_js_write(jd, fault_slot, P7580_JS_COMMAND_NEXT,
 		       P7580_JS_CMD_HARD_STOP);
+	/* The wedged job is the *current* one.  Writing only NEXT leaves a
+	 * job that is already executing untouched, so the tiler/MMU access
+	 * stays pending and the next START inherits the wedge. */
+	p7580_js_write(jd, fault_slot, P7580_JS_COMMAND, P7580_JS_CMD_HARD_STOP);
 	for (i = 0; i < P7580_NUM_JOB_SLOTS; i++) {
 		if (i != fault_slot &&
 		    p7580_js_read(jd, i, P7580_JS_COMMAND_NEXT))
@@ -1485,6 +1535,7 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 		}
 		p7580_writel(jd, P7580_GPU_INT_CLEAR,
 			     P7580_GPU_IRQ_RESET_COMPLETED);
+		p7580_job_post_reset(jd);
 	}
 
 	/* 4. Complete core power cycle (gpu31-readback + gpu31-firstfault).
@@ -1502,6 +1553,8 @@ int p7580_job_recover(struct p7580_job_dev *jd, int fault_slot,
 			pr_err("p7580_job: recover-cycle FAIL rc=%d\n", crc);
 		p7580_job_ev(jd, P7580_EV_CYCLE, fault_slot, 0, 0,
 			     (uint32_t)crc, 0, 0);
+		/* the cycle performed the reset: re-assert the erratum bit */
+		p7580_job_post_reset(jd);
 	}
 
 	/* 5. re-arm the slot IRQs the handler demuxes. Order mirrors

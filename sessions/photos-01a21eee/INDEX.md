@@ -36,3 +36,4 @@ Extracted from the omp blob store in transcript order.  `ctx` is the tool call t
 | 30 | `photo-30-699ba3c7.jpg` | image/jpeg | None |
 | 31 | `photo-31-c4795efc.jpg` | image/jpeg | None |
 | 32 | `photo-32-b5f7a022.jpg` | image/jpeg | None |
+| 33 | `photo-33-latest-bdeb4be4.jpg` | image/jpeg | camera snapshot, 2026-11-28 14:49 UTC: supervised plasmashell restart, correct colours |

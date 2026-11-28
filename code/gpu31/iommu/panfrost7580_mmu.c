@@ -287,9 +287,12 @@ int p7580_mmu_map(struct p7580_mmu *mmu, u64 iova, phys_addr_t paddr,
 	{
 		u64 *cpu = p7580_kmap_dma(cur);
 		u64 idx = p7580_index(iova, P7580_MMU_LEVELS - 1);
+		/* Match the vendor PTE exactly: kbase_mmu_get_mmu_flags()
+		 * never sets ENTRY_ACCESS_BIT (1<<10).  Setting it produced
+		 * ACCESS_FLAG (0xD8) faults on t72x against leaves whose
+		 * address/attr/prot match the BO. */
 		u64 leaf = (paddr & P7580_ADDR_MASK) | P7580_PTE_TYPE_ATE |
-			((u64)(memattr_idx & 0x7) << P7580_PTE_ATTR_SHIFT) |
-			P7580_PTE_AF_BIT;
+			((u64)(memattr_idx & 0x7) << P7580_PTE_ATTR_SHIFT);
 
 		if (prot & P7580_PROT_RD)
 			leaf |= P7580_PTE_RD_BIT;

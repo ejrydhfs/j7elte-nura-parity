@@ -32,7 +32,8 @@ tristate, default n.
 
 | Patch | Contents |
 |---|---|
-| `code/gpu31/driver/0001-panfrost7580-driver-sources.patch` | 19 new files under `drivers/gpu/drm/panfrost/`: 3 new driver files (`_main.c`, `_submit.c`, `_drv.h`) + verbatim snapshots of the 16 live slice sources (GEM×7 incl. UAPI and syncobj, jobs×3, MMU×2, power×2, devfreq×2). Re-snapshotted 2026-11-27 at kernel int121. |
+| `code/gpu31/driver/0001-panfrost7580-driver-sources.patch` | 19 new files under `drivers/gpu/drm/panfrost/`: the 3 new driver files (`_main.c`, `_submit.c`, `_drv.h`) + verbatim snapshots of the 16 live slice sources (GEM×7 incl. UAPI and syncobj, jobs×3, MMU×2, power×2, devfreq×2). Re-snapshotted 2026-11-28 at kernel #46 / module int129 (final working image). Standalone copies of `_main.c`, `_submit.c` and `_drv.h` are in this directory. |
+| `code/gpu31/driver/0141-j7elte-kernel-final-2026-11-28.patch` | **Complete** pristine-baseline → final-working-tree patch (81 files): DRM atomic/sched/syncobj backport, Exynos 7580 DECON/DSIM KMS stack, `exynos7580` KMS sources, panfrost7580 driver (all 19 sources + Kconfig/Makefile), decon KMS API/vsync changes and build wiring. Apply it alone to `universal7580-2a746c1` to get the kernel #46 tree; 0001–0140 remain as the historical series. |
 | `code/gpu31/driver/0002-panfrost7580-build-wiring.patch` | `drivers/gpu/drm/{Makefile,Kconfig}` one-line additions + new `drivers/gpu/drm/panfrost/{Kconfig,Makefile}` (`CONFIG_DRM_PANFROST7580`, `default n`, `depends on DRM && ARM64 && MMU`) |
 | (int4 fix, folded 2026-11-19) | panfrost `ccflags-y` gains `-Idrivers/gpu/drm` so the 0003/0004 shim headers (`drm_syncobj.h`/`drm_sched.h`, local files in `drivers/gpu/drm/`, no stock `-I` covers that dir) resolve via quoted includes; `select DRM_GEM_CMA_HELPER` kept, requires the dmabuf slice's `0001-drm-gem-cma-use-dma-attrs-writecombine.patch` (stock `drm_gem_cma_helper.c` uses 32-bit-only `dma_alloc_writecombine`) |
 

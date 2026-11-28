@@ -181,6 +181,14 @@ int p7580_gem_create_with_handle(struct p7580_dev *gd,
 				 unsigned int backing,
 				 unsigned int cache_attr,
 				 uint32_t *handle);
+/* CREATE_DUMB / MAP_DUMB: kms_swrast and every non-GL scanout user. */
+struct drm_mode_create_dumb;
+struct drm_file;
+struct drm_device;
+int p7580_dumb_create(struct drm_file *file_priv, struct drm_device *dev,
+		      struct drm_mode_create_dumb *args);
+int p7580_dumb_map_offset(struct drm_file *file_priv, struct drm_device *dev,
+			  uint32_t handle, uint64_t *offset);
 void p7580_gem_free_object(struct drm_gem_object *obj);
 int p7580_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
 /* Published to the core as driver->gem_vm_ops (main.c) and installed

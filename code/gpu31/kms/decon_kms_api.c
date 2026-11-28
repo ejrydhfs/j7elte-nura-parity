@@ -38,6 +38,8 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/errno.h>
+#include <linux/sched.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -46,6 +48,7 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/pm_runtime.h>
+#include <linux/clk.h>
 #include <linux/ion.h>
 #include <linux/exynos_ion.h>
 #include <linux/exynos_iovmm.h>
@@ -57,6 +60,7 @@
 #include "../../../staging/android/sw_sync.h"
 
 #include "decon.h"
+#include "decon_helper.h"
 
 struct decon_kms_dev {
 	struct decon_device	*decon;
@@ -69,6 +73,8 @@ struct decon_kms_dev {
 /* DECON is a single-instance driver (get_decon_drvdata() ignores its id). */
 static struct decon_kms_dev *kms_instance;
 static DEFINE_MUTEX(kms_lock);
+
+static void decon_kms_arm_frame(struct decon_device *decon, const char *where);
 
 /* ------------------------------------------------------------------------ */
 /* helpers                                                                  */
@@ -167,8 +173,31 @@ static int decon_kms_program(struct decon_device *decon,
 		}
 	}
 
-	return decon_export_set_win_config(decon, regs, cfg,
-					   decon->pdata->max_win);
+	/* int93: one block per commit describing exactly what will be
+	 * programmed; compare a working kmscube commit with KWin's. */
+	decon_info("decon_kms_program: nwin=%u max_win=%u num_of_window(pre)=%u\n",
+		   nr_wins, decon->pdata->max_win, regs->num_of_window);
+	for (i = 0; i < nr_wins; i++) {
+		decon_info("decon_kms_program: win[%u] kms_state=%u vendor_state=%u fourcc=0x%08x format=%u idma=%u blend=%u alpha=%d addr=0x%llx,0x%llx,0x%llx src=%d,%d %ux%u f=%ux%u dst=%d,%d %ux%u\n",
+			   i, wins[i].state, cfg[i].state, wins[i].fourcc,
+			   cfg[i].format, cfg[i].idma_type, cfg[i].blending,
+			   cfg[i].plane_alpha,
+			   (unsigned long long)wins[i].addr[0],
+			   (unsigned long long)wins[i].addr[1],
+			   (unsigned long long)wins[i].addr[2],
+			   wins[i].src.x, wins[i].src.y, wins[i].src.w,
+			   wins[i].src.h, wins[i].src.f_w, wins[i].src.f_h,
+			   wins[i].dst.x, wins[i].dst.y, wins[i].dst.w,
+			   wins[i].dst.h);
+	}
+
+	ret = decon_export_set_win_config(decon, regs, cfg,
+					  decon->pdata->max_win);
+	decon_info("decon_kms_program: set_win_config rc=%d num_of_window=%u wincon0=0x%08x wincon1=0x%08x wincon2=0x%08x\n",
+		   ret, regs->num_of_window, regs->wincon[0],
+		   regs->wincon[1] ? regs->wincon[1] : 0,
+		   regs->wincon[2] ? regs->wincon[2] : 0);
+	return ret;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -403,11 +432,30 @@ static void decon_kms_teardown(struct decon_kms_dev *d)
 	}
 	mutex_unlock(&kms_lock);
 
+	decon->kms_teardown = true;
+	{
+		struct decon_psr_info psr;
+
+		decon_to_psr_info(decon, &psr);
+		decon_reg_set_int(DECON_INT, &psr, DSI_MODE_SINGLE, 0);
+	}
+	wake_up_interruptible_all(&decon->vsync_info.wait);
+	wake_up_interruptible_all(&decon->wait_frmdone);
+	msleep(20);
+
 	if (decon->state != DECON_STATE_OFF)
 		decon_disable(decon);
 
-	if (decon->update_regs_thread)
-		kthread_stop(decon->update_regs_thread);
+	if (decon->update_regs_thread) {
+		unsigned long st = ACCESS_ONCE(decon->update_regs_thread->state);
+
+		if (st & TASK_UNINTERRUPTIBLE) {
+			decon_err("teardown: update worker in D state (0x%lx), skipping kthread_stop\n", st);
+		} else {
+			kthread_stop(decon->update_regs_thread);
+			decon_info("teardown: update worker stopped\n");
+		}
+	}
 
 	decon_unregister_entity(decon);
 
@@ -424,6 +472,19 @@ static void decon_kms_teardown(struct decon_kms_dev *d)
 	if (decon->vsync_info.thread)
 		kthread_stop(decon->vsync_info.thread);
 	decon_int_destroy_vsync_thread(decon);
+
+	/* int66: balance the explicit clock enables from decon_probe_common(). */
+	{
+		struct clk *cks[5] = {
+			decon->res.pclk, decon->res.aclk, decon->res.eclk,
+			decon->res.vclk, decon->res.aclk_disp,
+		};
+		int k;
+
+		for (k = 0; k < 5; k++)
+			if (!IS_ERR_OR_NULL(cks[k]))
+				clk_disable_unprepare(cks[k]);
+	}
 
 	decon_put_clocks(decon);
 	iovmm_deactivate(decon->dev);
@@ -503,16 +564,121 @@ int decon_kms_enable(struct decon_kms_dev *d)
 	 * full sequence (decon-kms-dsi.md 2.3: "Do not copy the vendor's
 	 * DECON_STATE_INIT short-circuit"), so drop to OFF first.
 	 */
-	if (decon->state == DECON_STATE_INIT)
+	if (decon->state == DECON_STATE_INIT) {
+		decon_info("decon_kms_enable: INIT -> OFF\n");
 		decon->state = DECON_STATE_OFF;
+	}
+
+	decon_info("decon_kms_enable: enter state=%d psr_mode=%d trig=%d\n",
+		   decon->state, decon->pdata->psr_mode, decon->pdata->trig_mode);
 
 	ret = decon_enable(decon);
+
+	decon_info("decon_kms_enable: decon_enable ret=%d state=%d\n", ret, decon->state);
+	if (!ret) {
+		decon_info("decon_kms_enable: VIDCON0=%08x VIDOUTCON0=%08x VIDINTCON0=%08x VIDINTCON1=%08x TRIGCON=%08x\n",
+			   decon_read(DECON_INT, VIDCON0),
+			   decon_read(DECON_INT, VIDOUTCON0),
+			   decon_read(DECON_INT, VIDINTCON0),
+			   decon_read(DECON_INT, VIDINTCON1),
+			   decon_read(DECON_INT, TRIGCON));
+		/*
+		 * int70: in VIDEO mode the FRAME interrupt is armed by
+		 * decon_activate_vsync(); decon_enable()'s decon_reg_init()
+		 * runs after our vblank registration and can clear
+		 * VIDINTCON0.  Re-arm it here and balance it in disable().
+		 */
+		if (decon->pdata->psr_mode == DECON_VIDEO_MODE && d->vblank_cb) {
+			/* Hold one vsync reference for the pipe lifetime:
+			 * decon_wait_for_vsync() activates/deactivates around
+			 * every commit, and with a 0 refcount its deactivate
+			 * clears INT_ENABLE, leaving the FRAME line disarmed
+			 * and the DECON shadow update unlatched. */
+			decon_activate_vsync(decon);
+			decon_kms_arm_frame(decon, "after decon_enable/reg_start");
+			decon_info("decon_kms_enable: FRAME irq armed, VIDINTCON0=%08x\n",
+				   decon_read(DECON_INT, VIDINTCON0));
+		}
+	}
 
 	mutex_unlock(&kms_lock);
 
 	return ret;
 }
 EXPORT_SYMBOL_GPL(decon_kms_enable);
+
+/*
+ * int72: force the FRAME interrupt on, bypassing the vsync refcount.
+ * decon_activate_vsync() only programs VIDINTCON0 when the refcount goes
+ * 0->1; ->load() used to take that reference before the first
+ * decon_reg_init()/reg_start() cleared VIDINTCON0, so later arming saw a
+ * non-zero refcount and did nothing.  Program the mask and the DSIM vsync
+ * source unconditionally here, exactly like the vendor pan_display path does
+ * through decon_wait_for_vsync() (decon_core.c:1228-1265).
+ */
+static void decon_kms_arm_frame(struct decon_device *decon, const char *where)
+{
+	struct decon_psr_info psr;
+	int ret = 0;
+
+	if (!decon || decon->pdata->psr_mode != DECON_VIDEO_MODE)
+		return;
+
+	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 before=%08x refcount=%d\n",
+		   where, decon_read(DECON_INT, VIDINTCON0),
+		   (int)decon->vsync_info.irq_refcount);
+
+	decon_info("decon_kms_arm_frame(%s): state=%d pdata dsi_mode=%d psr_mode=%d trig=%d drvdata_ok=%d output_sd=%p\n",
+		   where, decon->state, decon->pdata->dsi_mode,
+		   decon->pdata->psr_mode, decon->pdata->trig_mode,
+		   decon_int_drvdata == decon, decon->output_sd);
+	{
+		u32 scratch = decon_read(DECON_INT, VIDOUTCON0);
+
+		decon_write_mask(DECON_INT, VIDOUTCON0, scratch, ~0);
+		decon_info("decon_kms_arm_frame(%s): scratch VIDOUTCON0 %08x -> %08x\n",
+			   where, scratch, decon_read(DECON_INT, VIDOUTCON0));
+	}
+	decon_to_psr_info(decon, &psr);
+	decon_reg_set_int(DECON_INT, &psr, DSI_MODE_SINGLE, 1);
+	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 after set_int=%08x\n",
+		   where, decon_read(DECON_INT, VIDINTCON0));
+
+	if (decon->output_sd) {
+		ret = v4l2_subdev_call(decon->output_sd, core, ioctl,
+				       DSIM_IOC_VSYNC, (unsigned long *)1);
+		decon_info("decon_kms_arm_frame(%s): DSIM_IOC_VSYNC ret=%d\n", where, ret);
+	}
+
+	decon_info("decon_kms_arm_frame(%s): VIDINTCON0 final=%08x VIDINTCON1=%08x\n",
+		   where, decon_read(DECON_INT, VIDINTCON0),
+		   decon_read(DECON_INT, VIDINTCON1));
+	if (!decon_read(DECON_INT, VIDINTCON0))
+		decon_err("decon_kms_arm_frame(%s): VIDINTCON0 still zero after arm\n", where);
+}
+
+/*
+ * int70: dump the state and the four video registers the KMS path cares about.
+ * Exported for the fbdev slice, which has no decon pointer of its own.
+ */
+void decon_kms_log_state(struct decon_kms_dev *d, const char *tag)
+{
+	struct decon_device *decon;
+
+	if (!d)
+		return;
+	decon = d->decon;
+
+	decon_info("%s: state=%d psr_mode=%d trig=%d VIDCON0=%08x VIDOUTCON0=%08x VIDINTCON0=%08x VIDINTCON1=%08x TRIGCON=%08x\n",
+		   tag ? tag : "decon state",
+		   decon->state, decon->pdata->psr_mode, decon->pdata->trig_mode,
+		   decon_read(DECON_INT, VIDCON0),
+		   decon_read(DECON_INT, VIDOUTCON0),
+		   decon_read(DECON_INT, VIDINTCON0),
+		   decon_read(DECON_INT, VIDINTCON1),
+		   decon_read(DECON_INT, TRIGCON));
+}
+EXPORT_SYMBOL_GPL(decon_kms_log_state);
 
 int decon_kms_disable(struct decon_kms_dev *d)
 {
@@ -524,18 +690,52 @@ int decon_kms_disable(struct decon_kms_dev *d)
 
 	decon = d->decon;
 
+	decon_info("decon_kms_disable: state=%d by %s\n",
+		   decon->state, current->comm);
+
 	mutex_lock(&kms_lock);
 	if (decon->state == DECON_STATE_OFF) {
 		mutex_unlock(&kms_lock);
 		return 0;
 	}
 
+	decon_deactivate_vsync(decon);
 	ret = decon_disable(decon);
 	mutex_unlock(&kms_lock);
 
 	return ret;
 }
 EXPORT_SYMBOL_GPL(decon_kms_disable);
+
+/* int93: read back the window and video registers the commit just wrote. */
+static void decon_kms_dump_regs(struct decon_device *decon, const char *where)
+{
+	unsigned int i;
+
+	if (!decon || !decon->pdata)
+		return;
+	decon_info("decon_kms_regs[%s]: VIDCON0=%08x VIDOUTCON0=%08x VIDINTCON0=%08x VIDINTCON1=%08x TRIGCON=%08x\n",
+		   where, decon_read(DECON_INT, VIDCON0),
+		   decon_read(DECON_INT, VIDOUTCON0),
+		   decon_read(DECON_INT, VIDINTCON0),
+		   decon_read(DECON_INT, VIDINTCON1),
+		   decon_read(DECON_INT, TRIGCON));
+	for (i = 0; i < decon->pdata->max_win; i++)
+		decon_info("decon_kms_regs[%s]: win[%u] WINCON=%08x ADD0=0x%08x ADD2=0x%08x ADD3=0x%08x VIDOSD_A=%08x B=%08x C=%08x D=%08x WHOLE_X=%u WHOLE_Y=%u OFF_X=%u OFF_Y=%u\n",
+			   where, i,
+			   decon_read(DECON_INT, WINCON(i)),
+			   decon_read(DECON_INT, VIDW_ADD0(i)),
+			   decon_read(DECON_INT, VIDW_ADD2(i)),
+			   decon_read(DECON_INT, VIDW_ADD3(i)),
+			   decon_read(DECON_INT, VIDOSD_A(i)),
+			   decon_read(DECON_INT, VIDOSD_B(i)),
+			   decon_read(DECON_INT, VIDOSD_C(i)),
+			   decon_read(DECON_INT, VIDOSD_D(i)),
+			   decon_read(DECON_INT, VIDW_WHOLE_X(i)),
+			   decon_read(DECON_INT, VIDW_WHOLE_Y(i)),
+			   decon_read(DECON_INT, VIDW_OFFSET_X(i)),
+			   decon_read(DECON_INT, VIDW_OFFSET_Y(i)));
+}
 
 int decon_kms_commit(struct decon_kms_dev *d,
 		     const struct decon_kms_win *wins, unsigned int nr_wins)
@@ -549,8 +749,27 @@ int decon_kms_commit(struct decon_kms_dev *d,
 
 	decon = d->decon;
 
-	if (decon->state != DECON_STATE_ON)
-		return -EAGAIN;
+	/*
+	 * int92: the KMS pipe can be left off by a disable that raced (or by
+	 * the fbdev restore sequence) while a client keeps committing frames;
+	 * the old code then returned -EAGAIN for every frame and the panel
+	 * stayed black.  Bring the pipe back exactly like crtc_enable_link()
+	 * does and retry this commit once.  Bounded: no loop, one enable.
+	 */
+	if (decon->state != DECON_STATE_ON) {
+		int oldstate = decon->state;
+		int eret;
+
+		decon_info("decon_kms_commit: state=%d -> enable -> retry by %s\n",
+			   oldstate, current->comm);
+		eret = decon_kms_enable(d);
+		decon_info("decon_kms_commit: enable rc=%d state=%d\n",
+			   eret, decon->state);
+		if (eret || decon->state != DECON_STATE_ON) {
+			decon_kms_log_state(d, "commit not ON after enable");
+			return eret ? eret : -EAGAIN;
+		}
+	}
 
 	regs = decon_export_regs_alloc();
 	if (!regs)
@@ -564,8 +783,39 @@ int decon_kms_commit(struct decon_kms_dev *d,
 	mutex_lock(&decon->output_lock);
 
 	ret = decon_kms_program(decon, regs, wins, nr_wins);
-	if (!ret)
+	if (!ret) {
+		/* arm after any decon_reg_start() the program performed */
+		decon_kms_arm_frame(decon, "commit after program");
 		decon_export_update_regs(decon, regs);
+		decon_kms_dump_regs(decon, "after update_regs");
+		{
+			int attempt, latched = 0;
+
+			/*
+			 * The vsync wait can miss its frame: the completion may
+			 * already have been consumed by the arm/update pair above,
+			 * and the wait's deactivate clears VIDINTCON0, so no new
+			 * interrupt arrives.  Re-arm and retry a few frames instead
+			 * of leaving the shadow update unapplied (the panel then
+			 * keeps the previous buffer).
+			 */
+			for (attempt = 0; attempt < 5; attempt++) {
+				decon_kms_arm_frame(decon, "commit retry");
+				if (decon_wait_for_vsync(decon, 100) == 0) {
+					latched = 1;
+					break;
+				}
+			}
+			if (latched) {
+				decon_kms_arm_frame(decon, "commit after wait");
+				decon_kms_dump_regs(decon, "after vsync");
+			} else {
+				/* Registers are programmed; report but keep the frame. */
+				decon_err("decon_kms_commit: vsync never latched after 5 tries\n");
+				decon_kms_log_state(d, "commit vsync timeout");
+			}
+		}
+	}
 
 	mutex_unlock(&decon->output_lock);
 
@@ -671,14 +921,11 @@ int decon_kms_register_vblank_cb(struct decon_kms_dev *d,
 	decon->kms_vblank_data = data;
 
 	/*
-	 * decon_activate_vsync()/decon_deactivate_vsync() refcount the FRAME
-	 * interrupt and the DSIM vsync source, so they stay the only owners of
-	 * VIDINTCON1 - DRM code must never touch it (decon-kms-dsi.md 1.6).
+	 * int72: registration only stores the callback.  Arming is done per
+	 * decon_reg_start() by decon_kms_arm_frame(), because taking the
+	 * refcounted reference here made every later refcounted arm a no-op
+	 * after decon_reg_init()/reg_start() cleared VIDINTCON0.
 	 */
-	if (cb)
-		decon_activate_vsync(decon);
-	else
-		decon_deactivate_vsync(decon);
 
 	mutex_unlock(&kms_lock);
 

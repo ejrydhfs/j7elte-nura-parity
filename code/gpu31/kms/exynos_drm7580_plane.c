@@ -38,6 +38,7 @@
 #include "exynos_drm7580.h"
 
 #include <linux/module.h>
+#include <linux/vmalloc.h>
 static unsigned int exynos7580_fourcc32;
 module_param(exynos7580_fourcc32, uint, 0644);
 MODULE_PARM_DESC(exynos7580_fourcc32,
@@ -270,7 +271,10 @@ static int exynos7580_plane_state_to_win(struct exynos7580_device *ex,
 
 	if (win->blending == DECON_KMS_BLENDING_NONE) {
 		switch (win->fourcc) {
-		case DRM_FORMAT_ARGB8888: win->fourcc = DRM_FORMAT_XRGB8888; break;
+		/* Measured: ARGB buffers display correctly when DECON is
+		 * handed BGRX8888 (WINCON BPPMODE_XRGB8888); the previous
+		 * XRGB mapping complemented/shifted the channels. */
+		case DRM_FORMAT_ARGB8888: win->fourcc = DRM_FORMAT_BGRX8888; break;
 		case DRM_FORMAT_ABGR8888: win->fourcc = DRM_FORMAT_XBGR8888; break;
 		case DRM_FORMAT_RGBA8888: win->fourcc = DRM_FORMAT_RGBX8888; break;
 		case DRM_FORMAT_BGRA8888: win->fourcc = DRM_FORMAT_BGRX8888; break;
@@ -360,6 +364,32 @@ static bool exynos7580_have_frame;
 static struct drm_atomic_state *exynos7580_last_commit_state;
 static unsigned int exynos7580_last_commit_count;
 
+/* Keep one linear copy of the last complete frame (reallocated if the
+ * geometry ever changes). */
+static void exynos7580_shadow_prepare(struct exynos7580_device *ex,
+				      struct drm_framebuffer *fb)
+{
+	size_t size;
+
+	if (!fb || !fb->pitches[0] || !fb->height)
+		return;
+	size = (size_t)fb->pitches[0] * fb->height;
+	if (ex->shadow && ex->shadow_size >= size &&
+	    ex->shadow_pitch == fb->pitches[0])
+		return;
+	vfree(ex->shadow);
+	ex->shadow = vmalloc(size);
+	if (!ex->shadow) {
+		ex->shadow_size = 0;
+		ex->shadow_pitch = 0;
+		return;
+	}
+	ex->shadow_size = size;
+	ex->shadow_pitch = fb->pitches[0];
+	pr_info("exynos7580: shadow frame %zu bytes pitch %u\n", size,
+		fb->pitches[0]);
+}
+
 static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
 					 struct drm_plane *plane,
 					 struct drm_plane_state *old_state)
@@ -420,6 +450,49 @@ static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
 		}
 	}
 
+	/*
+	 * Never program a frame the GPU has not filled in.  A panfrost job
+	 * that faults or is still running leaves the imported buffer zeroed
+	 * or only cleared, and scanning that out is the blue/black flashing.
+	 * The decision must be made BEFORE decon_kms_commit(): once the
+	 * DECON registers are written the frame is on the panel.
+	 *
+	 * Skipping alone is not enough.  KWin receives the flip event at
+	 * commit time, so the buffer that is still on screen is already back
+	 * in its swapchain and can be rewritten - including by the next
+	 * failed, cleared render.  Keep a driver copy of the last complete
+	 * frame and put that copy into the buffer being programmed.
+	 */
+	{
+		struct drm_framebuffer *pfb =
+			ex->planes[0].state ? ex->planes[0].state->fb : NULL;
+
+		if (pfb) {
+			bool blank = exynos7580_fb_is_blank(pfb);
+
+			if (!blank && pfb->width >= 320 && pfb->height >= 480) {
+				/* Cache only a real scanout frame, never the
+				 * 32x32 cursor buffer KWin may put on the
+				 * primary plane first. */
+				exynos7580_shadow_prepare(ex, pfb);
+				if (ex->shadow)
+					exynos7580_fb_shadow_read(pfb, ex->shadow,
+								  ex->shadow_pitch);
+			} else if (blank && exynos7580_have_frame && ex->shadow &&
+				   pfb->height <= ex->shadow_size / ex->shadow_pitch &&
+				   exynos7580_fb_shadow_write(pfb, ex->shadow,
+							      ex->shadow_pitch,
+							      ex->shadow_size)) {
+				pr_info("exynos7580: blank frame replaced from shadow\n");
+				blank = false;
+			}
+			if (blank && exynos7580_have_frame) {
+				pr_info("exynos7580: blank frame, keeping previous\n");
+				return 1;
+			}
+		}
+	}
+
 	ret = decon_kms_commit(ex->decon, wins, nplanes);
 	if (ret == -ETIMEDOUT) {
 		/*
@@ -438,20 +511,28 @@ static int exynos7580_plane_commit_frame(struct exynos7580_device *ex,
 		}
 	}
 	/*
-	 * A faulted panfrost job leaves the buffer untouched, and flipping it
-	 * makes the panel flash black.  Keep the previous frame instead.
+	 * Pin the buffers that are now being scanned out.  A skipped frame
+	 * keeps last_fb[] untouched, which is exactly what keeps the panel
+	 * image valid while the compositor recycles its own references.
 	 */
-	if (plane->state && plane->state->fb && exynos7580_fb_is_blank(plane->state->fb)) {
-		if (exynos7580_have_frame) {
-			pr_info("exynos7580: blank frame, keeping previous\n");
-			return 1;
+	if (!ret) {
+		for (i = 0; i < nplanes; i++) {
+			struct drm_framebuffer *fb = ex->planes[i].state ?
+						    ex->planes[i].state->fb : NULL;
+
+			if (fb)
+				drm_framebuffer_reference(fb);
+			if (ex->last_fb[i])
+				drm_framebuffer_unreference(ex->last_fb[i]);
+			ex->last_fb[i] = fb;
 		}
-	} else if (plane->state && plane->state->fb) {
-		exynos7580_have_frame = true;
+		if (ex->planes[0].state && ex->planes[0].state->fb)
+			exynos7580_have_frame = true;
 	}
 
-	if (exynos7580_dump_fb && plane->state && plane->state->fb)
-		exynos7580_dump_scanout(plane->state->fb);
+	if (exynos7580_dump_fb && ex->planes[0].state &&
+	    ex->planes[0].state->fb)
+		exynos7580_dump_scanout(ex->planes[0].state->fb);
 
 	if (ret)
 		DRM_ERROR("DECON commit failed: %d\n", ret);

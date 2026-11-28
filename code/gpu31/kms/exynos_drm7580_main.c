@@ -41,6 +41,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
+#include <linux/vmalloc.h>
 #include <linux/slab.h>
 
 #include <drm/drmP.h>
@@ -468,6 +469,10 @@ static int exynos7580_unload(struct drm_device *drm)
 		ex->decon = NULL;
 	}
 
+	vfree(ex->shadow);
+	ex->shadow = NULL;
+	ex->shadow_size = 0;
+
 	drm->dev_private = NULL;
 	ex->drm = NULL;
 
@@ -707,4 +712,4 @@ late_initcall_sync(exynos7580_drm_init);
 MODULE_AUTHOR("gpu31-kms");
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
-MODULE_VERSION("int121");
+MODULE_VERSION("int129");

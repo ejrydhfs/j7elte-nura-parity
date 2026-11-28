@@ -27,4 +27,11 @@ install -m755 start-ui.sh /usr/local/bin/start-ui.sh
 rc-update add xsession default
 ```
 
+## DECON/KMS + Plasma session (2026-11-27/28)
+
+`panel-ui/` contains the device scripts from the KWin 6.8.3 / Plasma Mobile
+session on the in-tree DECON KMS driver: session launchers (`cs48.sh` is the
+deployed autostart), crash and dumb-buffer probes, KWin scripts, QML test
+scenes and the camera-image colour probes. See `panel-ui/README.md`.
+
 See `docs/HARDWARE-BRINGUP-2026-11-16.md` for the full findings.
