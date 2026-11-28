@@ -273,3 +273,25 @@ fault-address PTE/owner dump at TIMEOUT-DIAG.
   window (white area + rotating box) is visible in the camera photo.
 - Shell after client exit: wallpaper on glass; shell restart shows the
   wallpaper again (photo), panel still not confirmed visually at this angle.
+
+## #46 validation and the panel question
+
+- Probe (Mesa 20.3.5, 30x 720x1280, content-verified) on #46: **30/30 PASS,
+  0 FAIL, 0 VOID**; every run `pin=1 unpin=1`, no faults/timeouts, correct
+  `rgba=128,64,191`, spread 0. Baseline #44 without the pin was 8/30 FAIL at
+  chain node2+0x40 with black content. The lifetime pin closes that class.
+- The current pin is unbounded (one 4 KiB shadow page per chain until close,
+  ~1.7 GB/h at 60 fps) and must NOT ship. Production shape agreed with the
+  probe agent: a per-file ring of N=2 (N=4 margin) shadow slots, slot k reused
+  only after submit k+1 completes; all submits of a file are serialised by
+  df->serial_prev, so one submit of slack is provable. Bounded by open files.
+- KWin scene enumeration via a KWin script (`org.kde.kwin.Scripting`, loaded
+  over the session bus) shows exactly two windows: 720x1280 at 0,0 (layer 0)
+  and **720x56 at 0,0 (layer 3, Below)**, i.e. the panel window exists at the
+  top of the screen. The shell's clock applet is alive (`ClockText`, 22x15).
+  KWin scripting's window properties (keepAbove/minimized/layer) are
+  read-only in 6.8.3 — assignments did not stick.
+- Photo zoom of the top 56/1280 rows shows only the wallpaper gradient; a
+  22x15 clock would be ~1 photo pixel at this angle, so "panel absent" is not
+  yet proven. Next: sample the scanout buffer at y=10/28/45 (extend
+  exynos7580_dump_fb) or add a KWin-side layer rule, before patching KWin.
