@@ -308,3 +308,25 @@ fault-address PTE/owner dump at TIMEOUT-DIAG.
 - Open: obtain one *displayed* frame's panel rows (sample right after a
   repaid commit, or take a KWin-side capture) to decide whether the panel is
   composited-but-transparent or stacked below the desktop.
+
+## Colour: panel shows the complement of the framebuffer (leading finding)
+
+- Guard sample of the wallpaper frame: `ff22b567` (RGB 0x22,0xb5,0x67 = green).
+  Camera photo of the same moment: magenta/purple; the qml test window's
+  `#c03030` red box photographed as cyan.  Complement of red is cyan,
+  complement of the green sample is magenta — i.e. the panel is displaying an
+  inverted (complemented) image.
+- The camera itself does not invert (the phone's white Samsung logo and the
+  teal wall photograph with their true polarity).
+- No inversion bit in DECON `VIDOUTCON0` (only `LCD_ON` bit 24 and the IF
+  select).  The DECON RGB-order mapping (`decon_rgborder()`,
+  decon_core.c:518-556) only swaps channels, never complements.
+- Therefore the inversion is in the panel path (ea8061 gamma / inversion).
+  Vendor `ea8061_init()` (ea8061_lcd_ctrl.c:881) calls the DSI init sequence
+  that includes `dsim_panel_gamma_ctrl()` (:343/:187); the KMS path enables
+  the panel through `decon_kms_enable()` -> `decon_enable()`, so the next check
+  is whether the gamma sequence actually runs (and with which br_index), and
+  whether the panel needs the vendor's "gamma mode"/inversion parameter set.
+- A controlled SMPTE test (`modetest -s 21@19:720x1280 -F smpte`) did not
+  produce usable bars (dark striped buffer), so the colour test still needs a
+  solid-colour fb (fbdev pan or a KMS solid pattern) to measure per-bar RGB.
