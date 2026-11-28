@@ -212,3 +212,24 @@ timeout and find the field equal to FBD+0xaa000 (candidates: tiler
     windows on this build).
 - Screen right now: the shell wallpaper (blue gradient) with the cursor; no
   panel, no clock.
+
+## Contended matrix (#43) and the remaining KWin fault
+
+Mesa 20.3.5 probe, 34 runs, own-jc attribution (agent report):
+- own MMU faults: **0/34** after the AF-bit removal (the #42 shadow
+  translation-fault family is gone).
+- own timeouts: 3/15 DRAWS=1, 7/8 DRAWS=2, 0/5 with gap=500, 0/5 with pad,
+  0/1 at 720x1280; every recover now ends `latched=0x00000000` (the
+  `JSn_COMMAND` hard-stop takes effect).
+- Foreign (kwin): 1-43 faults and 0-1 timeouts in **every** run window.
+
+Direct capture of kwin on #43: `FAULTSTATUS=0x090002c3` (translation, access
+type 2), `FAULTADDRESS=0x24864000`, `recover-done latched=0x8`, ~5 timeouts/s.
+That address is **not inside any BO of the submit** (ERR-MAP for seq 1496/1505
+covers 0x160xxxxx-0x165xxxxx, 0x1b5ba000, 0x23cf8000..0x24084000, 0x293f000,
+0x3176000, 0x882c000; no range contains 0x24864000). So Mesa 26 references a
+VA outside the submitted BO set, not a hole in one of them.
+
+Pending (next build): move the `JSn_STATUS` read before `JOB_INT_CLEAR`
+(panfrost7580_job.c:847 vs :879) so DONE prints 0x01 not 0x00, and add a
+fault-address PTE/owner dump at TIMEOUT-DIAG.
