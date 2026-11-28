@@ -406,3 +406,14 @@ panel enable, and check `br_index`/gamma mode used at KMS enable.
   `/home/user/cs48.sh` (the supervised variant) at boot.
 - Rebooted to exercise the autostart end to end (module int129, param 0,
   KWin+plasmashell without any SSH command).
+
+## Verified end-to-end (2026-11-28)
+
+- Reboot with no SSH session: local.d autostart loaded **int129** (param 0) and
+  brought up kwin + plasmashell.  Photo after boot shows the postmarketOS
+  wallpaper in **full correct colour** (blue field with orange/pink flowers) —
+  no magenta cast.
+- Supervisor verified: `killall -9 plasmashell` → `PLASMA_EXIT=137` logged and a
+  new plasmashell started within ~2 s; the wallpaper returned.
+- Current state: kernel #46, display module int129, kwin + supervised
+  plasmashell, 0 panfrost timeouts, correct RGB.
