@@ -393,3 +393,16 @@ panel enable, and check `br_index`/gamma mode used at KMS enable.
   `/home/user/cs47.sh` in the background at boot, so KWin + plasmashell come up
   without an SSH session.
 - Session transcript archived in `sessions/` with this commit.
+
+## plasmashell crash and supervisor (2026-11-28)
+
+- Symptom: wallpaper and title bar disappeared while kwin stayed up.
+  `/data/plasma.exit` = `PLASMA_EXIT=134` (SIGABRT), `kf.crash: Could not find
+  drkonqi`; kwin kept the last client frame.  Restarting plasmashell restored
+  the shell (photo: green wallpaper, correct colours).
+- Fix: the session script now supervises plasmashell —
+  `while true; do plasmashell >> log; sleep 2; done` — so a shell crash
+  self-heals.  `/etc/local.d/plasma.start` loads int129 and starts
+  `/home/user/cs48.sh` (the supervised variant) at boot.
+- Rebooted to exercise the autostart end to end (module int129, param 0,
+  KWin+plasmashell without any SSH command).
