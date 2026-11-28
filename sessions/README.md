@@ -64,3 +64,12 @@ not inside the transcript.  They are committed here:
   to the tool call that produced it.
 - `sessions/2026-11-27_01a21eee-photos.md` — the same set rendered as a
   companion document to the transcript.
+
+## Full archive for session 01a21eee
+
+`sessions/omp-archive-2026-11-27_01a21eee.zip` (30.5 MB) is the complete omp
+archive export of this session: main transcript, the five subagent sessions
+verbatim, all untruncated tool/background-job output, the 26 artifact files
+(the camera photos), and a standalone `viewer.html`.  This is the form that
+includes the photos; the JSONL transcript stores images only as
+`blob:sha256:` references.
