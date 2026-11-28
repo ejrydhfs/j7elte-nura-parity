@@ -153,3 +153,18 @@ Written after context compaction risk; this file is the authoritative
   programming for the t72x with `kbase_mmu_get_mmu_flags`/`kbase_mmu_setup`
   around the exact faulting BO, and check the upper-level table entries
   (PTEWALK only validated the leaf).
+
+## Descriptor evidence (last capture)
+
+Fragment node at jc=0x13202a00:
+`00000000 00000000 00000000 00000000 00010013 00000000 00000000 00000000
+ 00000000 004f002c 13202000 00000000 ...` — header type 9 (FRAGMENT), bounds
+0x004f002c (44x79 tiles), FBD pointer **0x13202000**.
+
+The timeout fault is at **0x132aa000 = FBD + 0xaa000** (and earlier
+0x0b2aa000 = FBD + 0xaa000 on the 128 MiB-heap layout). So the GPU follows a
+pointer inside the SFBD that lands 696,320 bytes past the framebuffer
+descriptor, and the address moves with the descriptor allocation, not with the
+framebuffer. Next: dump the first 320 bytes of the SFBD (at `job->fbd`) at
+timeout and find the field equal to FBD+0xaa000 (candidates: tiler
+`polygon_list` / `polygon_list_body` / sample-position or varying pointer).
