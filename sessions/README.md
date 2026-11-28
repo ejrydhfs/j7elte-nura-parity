@@ -67,7 +67,7 @@ not inside the transcript.  They are committed here:
 
 ## Full archive for session 01a21eee
 
-`sessions/omp-archive-2026-11-27_01a21eee.zip` (30.5 MB) is the complete omp
+`sessions/omp-archive-2026-11-27_01a21eee.zip` (10.0 MB) is the complete omp
 archive export of this session: main transcript, the five subagent sessions
 verbatim, all untruncated tool/background-job output, the 26 artifact files
 (the camera photos), and a standalone `viewer.html`.  This is the form that
