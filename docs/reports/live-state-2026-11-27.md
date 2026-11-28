@@ -104,3 +104,29 @@ Written after context compaction risk; this file is the authoritative
   (shm vs dma-buf: plasmashell is `QT_QUICK_BACKEND=software`, qmlscene is GL).
 - Driver switch note: `modetest` cannot open card0 while KWin holds master;
   stop the session first.
+
+## Update 22:35 UTC — vsync reference held; heap experiment; Mesa 20.3.5 building
+
+- Kernel **#41** (built 22:31) holds one `decon_activate_vsync()` reference for
+  the pipe lifetime (released in `decon_kms_disable`). Before this, every
+  `decon_wait_for_vsync()` activated/deactivated with refcount 0 and its
+  deactivate cleared `VIDINTCON0.INT_ENABLE`, so the FRAME line was disarmed
+  and the DECON shadow update could stay unlatched. After #41 the panel
+  changed from the stale blue to the currently committed (black) frame — the
+  panel now follows DECON.
+- Display module **int127**: `exynos7580_dump_fb` now dumps the *primary*
+  plane (was the triggering/cursor plane) and logs a 6x10 pixel grid.
+  Dump of the committed frame: all `ff000000` with `ff616161` at the centre —
+  a black frame plus the cursor. Client content is still missing.
+- Heap experiment (kernel #40): BOs created with `PANFROST_BO_HEAP` are
+  allocated with 256 MiB (`heap1` count was 0, so Mesa 26.3 did not set the
+  flag; allocation unaffected). The timeout fault address moved from
+  `0x0b2aa000` to `0x132aa000` — exactly +0x8000000 — i.e. the access is
+  relative to the heap layout, `0x12aa000` past the 4 KiB BO that follows the
+  heap. The tiler access is therefore a fixed offset past the heap chain, not
+  a random unmapped page.
+- Recovery now also writes the *current* slot command (`JSn_COMMAND` 0x20,
+  HARD_STOP) in addition to `JS_COMMAND_NEXT`.
+- In flight: native musl Mesa 20.3.5 build on the device
+  (`/data/mesa203-build`, install prefix `/data/mesa203-install`) — the stack
+  that was previously validated at 151 fps against this driver.
