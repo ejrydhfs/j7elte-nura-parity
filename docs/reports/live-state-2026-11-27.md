@@ -382,3 +382,14 @@ panel enable, and check `br_index`/gamma mode used at KMS enable.
 - `/etc/local.d/plasma.start` now loads int129 and starts `/home/user/cs47.sh`
   in the background at boot, so the phone brings up KWin + plasmashell without
   an SSH session (log: /data/plasma-boot.log).
+
+## Final state (2026-11-28): colours correct, UI composited
+
+- int129 (`ARGB8888 -> BGRX8888`) is deployed and is now the compiled default;
+  the final photo of the qml probe window shows **red box (correct), white
+  window (correct), green wallpaper (correct)** — the magenta/complement tint
+  is gone.
+- `/etc/local.d/plasma.start` loads the display module and starts
+  `/home/user/cs47.sh` in the background at boot, so KWin + plasmashell come up
+  without an SSH session.
+- Session transcript archived in `sessions/` with this commit.
