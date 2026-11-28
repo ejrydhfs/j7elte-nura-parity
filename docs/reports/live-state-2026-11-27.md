@@ -168,3 +168,25 @@ descriptor, and the address moves with the descriptor allocation, not with the
 framebuffer. Next: dump the first 320 bytes of the SFBD (at `job->fbd`) at
 timeout and find the field equal to FBD+0xaa000 (candidates: tiler
 `polygon_list` / `polygon_list_body` / sample-position or varying pointer).
+
+## Update 05:55 UTC — AF bit removed: Mesa 20.3.5 renders with zero faults
+
+- **Root cause of the ACCESS_FLAG faults: our leaf ATEs set bit 10 (AF).**
+  Vendor `kbase_mmu_get_mmu_flags()` (mali_kbase_mmu.c:475-498) never sets
+  `ENTRY_ACCESS_BIT` (1<<10); our `panfrost7580_mmu.c` OR'd
+  `P7580_PTE_AF_BIT` into every leaf. Removing it (kernel **#42**):
+  - Mesa 20.3.5 smoke (`/data/mesa203-run-smoke.sh`, gbm 720x1280):
+    `fragment-job csum=0x83bb99d80da181cb RENDERED`, `eglSwapBuffers ok`,
+    `RESULT PASS`, and the kernel log has **0 FAULTSTATUS lines**.
+- libgbm 20.3.5 patched with `gbm_bo_create_with_modifiers2` and
+  `gbm_bo_get_fd_for_plane` (Mesa 20.3.5 predates them, KWin 6.8 links them);
+  rebuilt and installed into `/data/mesa203-install`.
+- KWin with the full 20.3.5 stack now loads but fails at
+  `DRM_IOCTL_PANFROST_CREATE_BO failed: Invalid argument` after a few
+  successful CREATE_BOs. The 256 MiB heap override from the previous build was
+  reverted (kernel #43, building); it did not change the hang and could be the
+  failing allocation.
+- Note: the earlier "descriptor is 0xaa000 past" relation tracked the
+  descriptor BO layout, not the framebuffer — it moved with every allocation
+  change, consistent with the AF-fault falsely aborting the job at a
+  descriptor-relative address.
