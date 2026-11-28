@@ -295,3 +295,16 @@ fault-address PTE/owner dump at TIMEOUT-DIAG.
   22x15 clock would be ~1 photo pixel at this angle, so "panel absent" is not
   yet proven. Next: sample the scanout buffer at y=10/28/45 (extend
   exynos7580_dump_fb) or add a KWin-side layer rule, before patching KWin.
+
+## Panel-row scanout sample (int128) and shell config
+
+- int128 extends `exynos7580_dump_fb` to y=10/28/45 (the 56 px panel band).
+  On #46 + the restarted shell, the sampled commit read all black at
+  y=10/28/45/100/1200 and `ff616161` at y=640 — i.e. the frames arriving at the
+  commit path at that moment are clear frames (the guard skips them; the panel
+  shows the held wallpaper). The panel's own pixels therefore cannot be
+  judged from these commits.
+- The mobile-shell appletsrc has no `panelVisibility`/opacity keys (defaults).
+- Open: obtain one *displayed* frame's panel rows (sample right after a
+  repaid commit, or take a KWin-side capture) to decide whether the panel is
+  composited-but-transparent or stacked below the desktop.
