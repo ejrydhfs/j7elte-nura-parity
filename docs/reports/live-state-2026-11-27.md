@@ -350,3 +350,23 @@ the next compositor frame picks it up (an animated client makes the change
 visible live).  Colour probe: the qml test window's `#c03030` box must
 photograph RED under the correct mapping (currently it photographs cyan/
 magenta because of the alpha-byte interpretation).
+
+### Colour permutation result: the panel inverts; fourcc only permutes
+
+Animated box (#c03030 red) photographed under each `exynos7580_fourcc32`
+mapping (mean of the most saturated pixels):
+
+| param | mapping | box colour |
+| --- | --- | --- |
+| 0x34325241 | ARGB→XRGB (BGRX) | (1,189,236) cyan = complement of red |
+| 0x34324241 | ABGR→XBGR (RGBX) | (254,68,214) magenta |
+| 0x34324152 | RGBA→RGBX (XRGB) | (255,2,174) magenta |
+| 0x34324142 | BGRA→BGRX (ARGB) | (1,27,227) blue |
+
+No permutation yields red, and the best case (BGRX) is the *complement* of the
+source colour.  So the channel order is only a rotation; the panel is applying
+an inverted (complemented) transfer.  The inversion is in the ea8061 gamma
+path, not in DECON (no inversion bit) and not in the fourcc mapping.
+Next: re-run the vendor ea8061 gamma sequence (`dsim_panel_gamma_ctrl`,
+ea8061_lcd_ctrl.c:187, called from the panel init sequence at :343) on every
+panel enable, and check `br_index`/gamma mode used at KMS enable.
